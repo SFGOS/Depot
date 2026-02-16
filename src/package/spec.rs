@@ -1,0 +1,712 @@
+//! Package specification structures and TOML parsing
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use serde::Deserializer;
+use std::fmt;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+
+/// Complete package specification from TOML
+#[derive(Debug, Deserialize)]
+pub struct PackageSpec {
+    pub package: PackageInfo,
+    #[serde(default)]
+    pub alternatives: Alternatives,
+    /// Manual (local) sources to copy before fetching remote sources.
+    #[serde(default)]
+    pub manual_sources: Vec<ManualSource>,
+    #[serde(default, deserialize_with = "deserialize_sources")]
+    pub source: Vec<Source>,
+    pub build: Build,
+    #[serde(default)]
+    pub dependencies: Dependencies,
+
+    /// Directory containing the spec file (used to resolve relative paths such as patches).
+    #[serde(skip)]
+    pub spec_dir: PathBuf,
+}
+
+impl PackageSpec {
+    /// Load package spec from a TOML file
+    pub fn from_file(path: &Path) -> Result<Self> {
+        // Canonicalize path to ensure spec_dir is absolute
+        let abs_path = path
+            .canonicalize()
+            .with_context(|| format!("Failed to resolve path: {}", path.display()))?;
+
+        let content = fs::read_to_string(&abs_path)
+            .with_context(|| format!("Failed to read package spec: {}", abs_path.display()))?;
+        let mut spec: PackageSpec = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse package spec: {}", abs_path.display()))?;
+        spec.spec_dir = abs_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // Require at least one source (remote or manual)
+        if spec.source.is_empty() && spec.manual_sources.is_empty() {
+            anyhow::bail!("Package must have at least one source or manual_sources entry");
+        }
+
+        Ok(spec)
+    }
+
+    /// Expand variables like $name and $version in a string
+    pub fn expand_vars(&self, input: &str) -> String {
+        let specdir = self.spec_dir.to_string_lossy();
+        input
+            .replace("$name", &self.package.name)
+            .replace("$version", &self.package.version)
+            .replace("$specdir", &specdir)
+            .replace("$NYAPM_SPECDIR", &specdir)
+    }
+
+    pub fn sources(&self) -> &[Source] {
+        &self.source
+    }
+
+    /// Apply system configuration overrides and appends
+    pub fn apply_config(&mut self, config: &crate::config::Config) {
+        // Apply build overrides from /etc/depot.d/build.toml
+        self.apply_toml_overrides(&config.build_overrides, "build");
+
+        // Apply appends from /etc/depot.d/build.toml (e.g. build.flags.cflags += ["-O3"])
+        for (key, values) in &config.appends {
+            if let Some(subkey) = key.strip_prefix("build.flags.") {
+                self.apply_append(subkey, values);
+            }
+        }
+    }
+
+    fn apply_toml_overrides(&mut self, overrides: &toml::Value, _prefix: &str) {
+        // Support both [build.flags] and top-level [build] fields
+        if let Some(table) = overrides.as_table() {
+            self.apply_flags_table(table);
+        }
+        if let Some(table) = overrides.get("flags").and_then(|f| f.as_table()) {
+            self.apply_flags_table(table);
+        }
+    }
+
+    fn apply_flags_table(&mut self, table: &toml::map::Map<String, toml::Value>) {
+        for (k, v) in table {
+            match k.as_str() {
+                "cflags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.cflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.cflags = vec![s.to_string()];
+                    }
+                }
+                "ldflags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.ldflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.ldflags = vec![s.to_string()];
+                    }
+                }
+                "cc" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.cc = s.to_string();
+                    }
+                }
+                "ar" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.ar = s.to_string();
+                    }
+                }
+                "prefix" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.prefix = s.to_string();
+                    }
+                }
+                "chost" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.chost = s.to_string();
+                    }
+                }
+                "cbuild" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.cbuild = s.to_string();
+                    }
+                }
+                // Add more fields as needed
+                _ => {}
+            }
+        }
+    }
+
+    fn apply_append(&mut self, key: &str, values: &[toml::Value]) {
+        match key {
+            "cflags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .cflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.cflags.push(s.to_string());
+                    }
+                }
+            }
+            "ldflags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .ldflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.ldflags.push(s.to_string());
+                    }
+                }
+            }
+            "configure" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .configure
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.configure.push(s.to_string());
+                    }
+                }
+            }
+            "cargs" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .cargs
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.cargs.push(s.to_string());
+                    }
+                }
+            }
+            "rustflags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .rustflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.rustflags.push(s.to_string());
+                    }
+                }
+            }
+            "cc" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.cc = s.to_string();
+                }
+            }
+            "ar" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.ar = s.to_string();
+                }
+            }
+            "prefix" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.prefix = s.to_string();
+                }
+            }
+            "chost" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.chost = s.to_string();
+                }
+            }
+            "cbuild" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.cbuild = s.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_source_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo-$version.tar.gz"
+sha256 = "skip"
+extract_dir = "foo-$version"
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.package.name, "foo");
+        assert_eq!(spec.sources().len(), 1);
+        assert_eq!(
+            spec.expand_vars(&spec.sources()[0].url),
+            "https://example.com/foo-1.0.tar.gz"
+        );
+        assert!(spec.sources()[0].patches.is_empty());
+        assert!(spec.sources()[0].post_extract.is_empty());
+        assert_eq!(spec.spec_dir, tmp.path());
+    }
+
+    #[test]
+    fn parse_source_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[[source]]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[[source]]
+url = "https://example.com/bar.tar.gz"
+sha256 = "skip"
+extract_dir = "bar"
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.sources().len(), 2);
+        assert_eq!(spec.sources()[0].extract_dir, "foo");
+        assert_eq!(spec.sources()[1].extract_dir, "bar");
+    }
+
+    #[test]
+    fn parse_rejects_empty_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        // `source = []` is not accepted (must have at least one entry)
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+source = []
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        assert!(PackageSpec::from_file(&path).is_err());
+    }
+
+    #[test]
+    fn test_apply_config() {
+        let mut spec = mk_spec("foo", "1.0");
+        let mut config = crate::config::Config::for_rootfs(Path::new("/tmp/nonexistent"));
+
+        // Mock some overrides and appends
+        config.build_overrides = toml::from_str(
+            r#"
+[flags]
+cc = "my-cc"
+cflags = ["-O2"]
+"#,
+        )
+        .unwrap();
+        config.appends.insert(
+            "build.flags.cflags".to_string(),
+            vec![toml::Value::String("-g".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.rustflags".to_string(),
+            vec![toml::Value::Array(vec![
+                toml::Value::String("-C".to_string()),
+                toml::Value::String("opt-level=3".to_string()),
+            ])],
+        );
+
+        spec.apply_config(&config);
+
+        assert_eq!(spec.build.flags.cc, "my-cc");
+        assert!(spec.build.flags.cflags.contains(&"-O2".to_string()));
+        assert!(spec.build.flags.cflags.contains(&"-g".to_string()));
+        assert!(spec.build.flags.rustflags.contains(&"-C".to_string()));
+        assert!(
+            spec.build
+                .flags
+                .rustflags
+                .contains(&"opt-level=3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_chost_cbuild_overrides() {
+        let mut spec = mk_spec("foo", "1.0");
+        let config = crate::config::Config {
+            cache_dir: "/tmp".into(),
+            build_dir: "/tmp".into(),
+            db_dir: "/tmp".into(),
+            build_overrides: toml::from_str(
+                r#"
+chost = "x86_64-sfg-linux-gnu"
+cbuild = "x86_64-pc-linux-gnu"
+"#,
+            )
+            .unwrap(),
+            package_overrides: toml::Value::Table(toml::map::Map::new()),
+            appends: std::collections::HashMap::new(),
+        };
+
+        spec.apply_config(&config);
+        assert_eq!(spec.build.flags.chost, "x86_64-sfg-linux-gnu");
+        assert_eq!(spec.build.flags.cbuild, "x86_64-pc-linux-gnu");
+    }
+
+    #[test]
+    fn test_package_filename() {
+        let mut spec = mk_spec("foo", "1.0");
+        spec.package.revision = 2;
+        assert_eq!(
+            spec.package_filename("x86_64"),
+            "foo-1.0-2-x86_64.depot.pkg.tar.zst"
+        );
+    }
+
+    fn mk_spec(name: &str, version: &str) -> PackageSpec {
+        PackageSpec {
+            package: PackageInfo {
+                name: name.into(),
+                version: version.into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: "MIT".into(),
+            },
+            alternatives: Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: vec![Source {
+                url: "h".into(),
+                sha256: "s".into(),
+                extract_dir: "e".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+            }],
+            build: Build {
+                build_type: BuildType::Custom,
+                flags: BuildFlags::default(),
+            },
+            dependencies: Dependencies::default(),
+            spec_dir: PathBuf::from("."),
+        }
+    }
+}
+
+impl fmt::Display for PackageSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "Package: {} v{}",
+            self.package.name, self.package.version
+        )?;
+        writeln!(f, "Description: {}", self.package.description)?;
+        writeln!(f, "Homepage: {}", self.package.homepage)?;
+        writeln!(f, "License: {}", self.package.license)?;
+        writeln!(f, "Sources: {}", self.source.len())?;
+        writeln!(f, "Build Type: {:?}", self.build.build_type)?;
+        if !self.alternatives.provides.is_empty() {
+            writeln!(f, "Provides: {}", self.alternatives.provides.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+/// Package metadata
+#[derive(Debug, Deserialize, serde::Serialize, Clone)]
+pub struct PackageInfo {
+    pub name: String,
+    pub version: String,
+    /// Maintenance revision of the package (defaults to 1)
+    #[serde(default = "default_revision")]
+    pub revision: u32,
+    pub description: String,
+    pub homepage: String,
+    pub license: String,
+}
+
+fn default_revision() -> u32 {
+    1
+}
+
+impl PackageSpec {
+    /// Generate the standard package filename: <name>-<version>-<revision>-<arch>.depot.pkg.tar.zst
+    pub fn package_filename(&self, arch: &str) -> String {
+        format!(
+            "{}-{}-{}-{}.depot.pkg.tar.zst",
+            self.package.name, self.package.version, self.package.revision, arch
+        )
+    }
+}
+
+/// Package alternatives (provides/replaces)
+#[derive(Debug, Default, Deserialize)]
+pub struct Alternatives {
+    #[serde(default)]
+    pub provides: Vec<String>,
+    /// Reserved for future package replacement feature
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub replaces: Vec<String>,
+}
+
+/// Source tarball information
+#[derive(Debug, Deserialize)]
+pub struct Source {
+    pub url: String,
+    /// SHA256 checksum or "skip" to bypass
+    pub sha256: String,
+    /// Directory name after extraction (supports $name, $version)
+    pub extract_dir: String,
+
+    /// Patch files or URLs to apply after extraction.
+    ///
+    /// Example:
+    /// patches = ["fix-build.patch", "<https://example.com/patches/foo.patch>"]
+    #[serde(default)]
+    pub patches: Vec<String>,
+
+    /// Commands to run after extraction (and after patches), executed in the source directory.
+    ///
+    /// Example:
+    /// post_extract = ["autoreconf -fi"]
+    #[serde(default)]
+    pub post_extract: Vec<String>,
+}
+
+/// Manual (local) source file to copy before fetching remote sources.
+#[derive(Debug, Deserialize)]
+pub struct ManualSource {
+    /// Filename in the spec directory
+    pub file: String,
+    /// SHA256 checksum (optional, use "skip" to bypass verification)
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Destination path relative to build work directory (default: same as file)
+    #[serde(default)]
+    pub dest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OneOrManySources {
+    One(Source),
+    Many(Vec<Source>),
+}
+
+fn deserialize_sources<'de, D>(deserializer: D) -> std::result::Result<Vec<Source>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Try to deserialize; if the field is missing/null, return empty vec
+    let parsed = Option::<OneOrManySources>::deserialize(deserializer)?;
+    match parsed {
+        Some(OneOrManySources::One(s)) => Ok(vec![s]),
+        Some(OneOrManySources::Many(v)) => Ok(v),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Build configuration
+#[derive(Debug, Deserialize)]
+pub struct Build {
+    #[serde(rename = "type")]
+    pub build_type: BuildType,
+    #[serde(default)]
+    pub flags: BuildFlags,
+}
+
+/// Supported build systems
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildType {
+    Autotools,
+    CMake,
+    Meson,
+    Custom,
+    Rust,
+    /// Binary distribution installer (e.g., .deb, .rpm)
+    Bin,
+}
+
+/// Build flags and toolchain configuration
+#[derive(Debug, Default, Deserialize)]
+pub struct BuildFlags {
+    #[serde(default, deserialize_with = "deserialize_string_or_array")]
+    pub cflags: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_array")]
+    pub ldflags: Vec<String>,
+    #[serde(default)]
+    pub configure: Vec<String>,
+    /// C compiler
+    #[serde(default = "default_cc")]
+    pub cc: String,
+    /// Archiver
+    #[serde(default = "default_ar")]
+    pub ar: String,
+    /// Dynamic loader path
+    #[serde(default)]
+    pub libc: String,
+    /// Root filesystem for installation (per-package override)
+    #[serde(default = "default_rootfs")]
+    #[allow(dead_code)]
+    pub rootfs: String,
+    /// Commands to run after compile (after make, before make install)
+    #[serde(default)]
+    pub post_compile: Vec<String>,
+    /// Commands to run after install (after make install)
+    #[serde(default)]
+    pub post_install: Vec<String>,
+
+    /// Installation prefix (default: /usr)
+    #[serde(default = "default_prefix")]
+    pub prefix: String,
+
+    /// Target architecture triple (CHOST equivalent)
+    #[serde(default)]
+    pub chost: String,
+
+    /// Build architecture triple (CBUILD equivalent)
+    #[serde(default)]
+    pub cbuild: String,
+
+    // Rust-specific fields
+    /// Rust build profile: "debug" or "release" (default: release)
+    #[serde(default = "default_profile")]
+    pub profile: String,
+    /// Rust target triple (e.g., x86_64-unknown-linux-musl). Optional.
+    #[serde(default)]
+    pub target: String,
+    /// RUSTFLAGS environment variable
+    #[serde(default, deserialize_with = "deserialize_string_or_array")]
+    pub rustflags: Vec<String>,
+    /// Additional cargo arguments (short name)
+    #[serde(default)]
+    pub cargs: Vec<String>,
+    /// Binary installation directory relative to DESTDIR (default: /usr/bin)
+    #[serde(default = "default_bindir")]
+    pub bindir: String,
+
+    /// Subdirectory within extracted source to use as the actual source root.
+    /// Useful for monorepos like llvm-project where you want to build just one component.
+    #[serde(default)]
+    pub source_subdir: String,
+    /// Binary package type when using BuildType::Bin (e.g. "deb")
+    #[serde(default)]
+    pub binary_type: String,
+}
+
+fn deserialize_string_or_array<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrArray {
+        String(String),
+        Array(Vec<String>),
+    }
+
+    match Option::<StringOrArray>::deserialize(deserializer)? {
+        Some(StringOrArray::String(s)) => Ok(s.split_whitespace().map(String::from).collect()),
+        Some(StringOrArray::Array(a)) => Ok(a),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn default_cc() -> String {
+    // Prefer clang if available (supports -print-resource-dir and other useful flags)
+    if std::process::Command::new("which")
+        .arg("clang")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return "clang".to_string();
+    }
+    "gcc".to_string()
+}
+
+fn default_ar() -> String {
+    "ar".to_string()
+}
+
+fn default_rootfs() -> String {
+    "/".to_string()
+}
+
+fn default_profile() -> String {
+    "release".to_string()
+}
+
+fn default_bindir() -> String {
+    "/usr/bin".to_string()
+}
+
+fn default_prefix() -> String {
+    "/usr".to_string()
+}
+
+/// Package dependencies
+#[derive(Debug, Default, Deserialize)]
+pub struct Dependencies {
+    #[serde(default)]
+    pub build: Vec<String>,
+    #[serde(default)]
+    pub runtime: Vec<String>,
+}

@@ -1,0 +1,304 @@
+//! Package creation and archive management
+
+use crate::config::Config;
+use crate::package::PackageSpec;
+use anyhow::{Context, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
+use tar::Builder;
+use zstd::stream::write::Encoder;
+
+pub struct Packager {
+    pub spec: PackageSpec,
+    pub destdir: PathBuf,
+    pub config: Config,
+}
+
+impl Packager {
+    pub fn new(spec: PackageSpec, destdir: PathBuf, config: Config) -> Self {
+        Self {
+            spec,
+            destdir,
+            config,
+        }
+    }
+
+    /// Create a package archive (.depot.pkg.tar.zst) from the destdir
+    pub fn create_package(&self, output_dir: &Path, arch: &str) -> Result<PathBuf> {
+        let filename = self.spec.package_filename(arch);
+        let output_path = output_dir.join(&filename);
+
+        println!("Creating package {}...", filename);
+
+        // Generate .files.yaml
+        self.generate_files_yaml()?;
+
+        // Generate .metadata.toml
+        self.generate_metadata_toml()?;
+
+        // Create tar.zst
+        let file = fs::File::create(&output_path)
+            .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
+
+        // Respect zstd level from config (default to 3 if not specified)
+        let level = self
+            .config
+            .package_overrides
+            .get("compression_level")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(3) as i32;
+
+        let mut encoder = Encoder::new(file, level)?;
+        let _ = encoder.multithread(num_cpus() as u32);
+
+        let mut tar = Builder::new(encoder);
+
+        // Manual walk to ensure symlinks aren't followed (preserving them as links)
+        for entry in walkdir::WalkDir::new(&self.destdir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            let rel_path = path.strip_prefix(&self.destdir)?;
+
+            // Skip the root of the destdir
+            if rel_path.as_os_str().is_empty() {
+                continue;
+            }
+
+            let file_type = entry.file_type();
+            if file_type.is_dir() {
+                tar.append_dir(rel_path, path)?;
+            } else if file_type.is_symlink() {
+                // For symlinks, we need to read the link and append to tar correctly
+                let target = fs::read_link(path)?;
+                let mut header = tar::Header::new_gnu();
+                header.set_metadata_in_mode(
+                    &fs::symlink_metadata(path)?,
+                    tar::HeaderMode::Deterministic,
+                );
+                tar.append_link(&mut header, rel_path, target)?;
+            } else {
+                // Files
+                let mut file = fs::File::open(path)?;
+                tar.append_file(rel_path, &mut file)?;
+            }
+        }
+
+        let encoder = tar.into_inner()?;
+        encoder.finish()?;
+
+        println!("Created package: {}", output_path.display());
+        Ok(output_path)
+    }
+
+    fn generate_metadata_toml(&self) -> Result<()> {
+        let metadata_path = self.destdir.join(".metadata.toml");
+
+        // Construct a simple metadata structure
+        let mut map = toml::map::Map::new();
+        map.insert(
+            "name".to_string(),
+            toml::Value::String(self.spec.package.name.clone()),
+        );
+        map.insert(
+            "version".to_string(),
+            toml::Value::String(self.spec.package.version.clone()),
+        );
+        map.insert(
+            "revision".to_string(),
+            toml::Value::Integer(self.spec.package.revision as i64),
+        );
+        map.insert(
+            "description".to_string(),
+            toml::Value::String(self.spec.package.description.clone()),
+        );
+        map.insert(
+            "homepage".to_string(),
+            toml::Value::String(self.spec.package.homepage.clone()),
+        );
+        map.insert(
+            "license".to_string(),
+            toml::Value::String(self.spec.package.license.clone()),
+        );
+
+        // Add provides
+        map.insert(
+            "provides".to_string(),
+            toml::Value::Array(
+                self.spec
+                    .alternatives
+                    .provides
+                    .iter()
+                    .map(|s| toml::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+
+        // Add dependencies if useful for repo indexing
+        let mut build_deps = toml::map::Map::new();
+        build_deps.insert(
+            "build".to_string(),
+            toml::Value::Array(
+                self.spec
+                    .dependencies
+                    .build
+                    .iter()
+                    .map(|s| toml::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+        build_deps.insert(
+            "runtime".to_string(),
+            toml::Value::Array(
+                self.spec
+                    .dependencies
+                    .runtime
+                    .iter()
+                    .map(|s| toml::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+        map.insert("dependencies".to_string(), toml::Value::Table(build_deps));
+
+        let toml_str = toml::to_string(&toml::Value::Table(map))
+            .context("Failed to serialize metadata to TOML")?;
+
+        fs::write(&metadata_path, toml_str)
+            .with_context(|| format!("Failed to write metadata: {}", metadata_path.display()))?;
+
+        Ok(())
+    }
+
+    fn generate_files_yaml(&self) -> Result<()> {
+        let files_path = self.destdir.join(".files.yaml");
+        let mut files = Vec::new();
+
+        // Recursively list all files in destdir
+        self.collect_files(&self.destdir, &self.destdir, &mut files)?;
+
+        let mut out_str = String::new();
+        {
+            let mut emitter = yaml_rust2::YamlEmitter::new(&mut out_str);
+            let yaml_vec: Vec<yaml_rust2::Yaml> =
+                files.into_iter().map(yaml_rust2::Yaml::String).collect();
+            emitter
+                .dump(&yaml_rust2::Yaml::Array(yaml_vec))
+                .context("Failed to emit YAML")?;
+        }
+
+        fs::write(&files_path, out_str)?;
+
+        Ok(())
+    }
+
+    fn collect_files(&self, base: &Path, current: &Path, files: &mut Vec<String>) -> Result<()> {
+        for entry in fs::read_dir(current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            let relative = path.strip_prefix(base)?.to_string_lossy().to_string();
+
+            if file_type.is_dir() {
+                self.collect_files(base, &path, files)?;
+            } else {
+                files.push(relative);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::package::{Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo};
+
+    fn mk_packager(destdir: PathBuf) -> Packager {
+        Packager::new(
+            PackageSpec {
+                package: PackageInfo {
+                    name: "test".into(),
+                    version: "1.0".into(),
+                    revision: 1,
+                    description: "d".into(),
+                    homepage: "h".into(),
+                    license: "MIT".into(),
+                },
+                alternatives: Alternatives::default(),
+                manual_sources: Vec::new(),
+                source: Vec::new(),
+                build: Build {
+                    build_type: BuildType::Custom,
+                    flags: BuildFlags::default(),
+                },
+                dependencies: Dependencies::default(),
+                spec_dir: PathBuf::from("."),
+            },
+            destdir,
+            Config::for_rootfs(Path::new("/tmp/nonexistent")),
+        )
+    }
+
+    #[test]
+    fn test_collect_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+        fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        fs::write(dest.join("usr/bin/foo"), "x").unwrap();
+        fs::create_dir_all(dest.join("etc")).unwrap();
+        fs::write(dest.join("etc/config"), "y").unwrap();
+
+        let packager = mk_packager(dest.to_path_buf());
+        let mut files = Vec::new();
+        packager.collect_files(dest, dest, &mut files).unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&"usr/bin/foo".to_string()));
+        assert!(files.contains(&"etc/config".to_string()));
+    }
+
+    #[test]
+    fn test_generate_files_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+        fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        fs::write(dest.join("usr/bin/foo"), "x").unwrap();
+
+        let packager = mk_packager(dest.to_path_buf());
+        packager.generate_files_yaml().unwrap();
+
+        let yaml_path = dest.join(".files.yaml");
+        assert!(yaml_path.exists());
+        let yaml_content = fs::read_to_string(yaml_path).unwrap();
+        assert!(yaml_content.contains("usr/bin/foo"));
+    }
+
+    #[test]
+    fn test_generate_metadata_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+
+        let packager = mk_packager(dest.to_path_buf());
+        packager.generate_metadata_toml().unwrap();
+
+        let meta_path = dest.join(".metadata.toml");
+        assert!(meta_path.exists());
+        let content = fs::read_to_string(meta_path).unwrap();
+        let val: toml::Value = toml::from_str(&content).unwrap();
+
+        assert_eq!(val.get("name").and_then(|v| v.as_str()), Some("test"));
+        assert_eq!(val.get("version").and_then(|v| v.as_str()), Some("1.0"));
+        assert_eq!(val.get("revision").and_then(|v| v.as_integer()), Some(1));
+        assert_eq!(val.get("license").and_then(|v| v.as_str()), Some("MIT"));
+
+        let deps = val.get("dependencies").unwrap();
+        assert!(deps.get("build").unwrap().as_array().unwrap().is_empty());
+    }
+}
