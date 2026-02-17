@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Global configuration settings
+#[derive(Clone)]
 pub struct Config {
     /// Directory for cached source tarballs
     pub cache_dir: PathBuf,
@@ -19,6 +20,11 @@ pub struct Config {
     pub package_overrides: toml::Value,
     /// Appends found in system TOML files (key -> values to append)
     pub appends: HashMap<String, Vec<toml::Value>>,
+    /// Mirrors mapping read from /etc/depot.d/mirrors.toml (reponame -> git url)
+    pub mirrors: std::collections::HashMap<String, String>,
+    /// Directory where git mirrors are cloned (absolute path). Defaults to
+    /// <rootfs>/usr/src/depot unless overridden in depot.toml
+    pub repo_clone_dir: PathBuf,
 }
 
 impl Config {
@@ -63,6 +69,8 @@ impl Config {
             build_overrides: toml::Value::Table(toml::map::Map::new()),
             package_overrides: toml::Value::Table(toml::map::Map::new()),
             appends: HashMap::new(),
+            mirrors: std::collections::HashMap::new(),
+            repo_clone_dir: abs_rootfs.join("usr/src/depot"),
         };
 
         if let Err(e) = config.load_system(&abs_rootfs) {
@@ -74,9 +82,18 @@ impl Config {
 
     /// Load system-level and user-level overrides
     pub fn load_system(&mut self, rootfs: &Path) -> Result<()> {
-        let mut config_paths = vec![rootfs.join("etc/depot.toml")];
+        // Load host system config (fallback) and then the requested rootfs config
+        // so that rootfs-specific settings override host settings when present.
+        let mut config_paths: Vec<PathBuf> = Vec::new();
+        let host_etc = PathBuf::from("/etc/depot.toml");
+        let rootfs_etc = rootfs.join("etc/depot.toml");
 
-        // Add user-level config paths if we are not root or if HOME is set
+        if host_etc.exists() && host_etc != rootfs_etc {
+            config_paths.push(host_etc);
+        }
+        config_paths.push(rootfs_etc);
+
+        // Add user-level config paths (user override) — these should remain highest precedence
         if let Ok(home) = std::env::var("HOME") {
             let home_path = PathBuf::from(home);
             config_paths.push(home_path.join(".config/depot.toml"));
@@ -104,14 +121,14 @@ impl Config {
             }
         }
 
-        // Keep existing etc/depot.d/ support for backward compatibility/modular config
+        // Keep existing etc/depot.d/ support.  Check host (/etc/depot.d) first as a
+        // fallback, then the rootfs path so the rootfs can override host settings.
+        let host_build = PathBuf::from("/etc/depot.d/build.toml");
         let build_path = rootfs.join("etc/depot.d/build.toml");
-        if build_path.exists() {
-            let content = fs::read_to_string(&build_path).with_context(|| {
-                format!(
-                    "Failed to read system build config: {}",
-                    build_path.display()
-                )
+
+        if host_build.exists() && host_build != build_path {
+            let content = fs::read_to_string(&host_build).with_context(|| {
+                format!("Failed to read system build config: {}", host_build.display())
             })?;
             let (val, appends) = self.preprocess_toml(&content)?;
             merge_toml_values(&mut self.build_overrides, &val);
@@ -120,18 +137,65 @@ impl Config {
             }
         }
 
+        if build_path.exists() {
+            let content = fs::read_to_string(&build_path).with_context(|| {
+                format!("Failed to read system build config: {}", build_path.display())
+            })?;
+            let (val, appends) = self.preprocess_toml(&content)?;
+            merge_toml_values(&mut self.build_overrides, &val);
+            for (k, v) in appends {
+                self.appends.insert(format!("build.{}", k), v);
+            }
+        }
+
+        let host_package = PathBuf::from("/etc/depot.d/package.toml");
         let package_path = rootfs.join("etc/depot.d/package.toml");
-        if package_path.exists() {
-            let content = fs::read_to_string(&package_path).with_context(|| {
-                format!(
-                    "Failed to read system package config: {}",
-                    package_path.display()
-                )
+
+        if host_package.exists() && host_package != package_path {
+            let content = fs::read_to_string(&host_package).with_context(|| {
+                format!("Failed to read system package config: {}", host_package.display())
             })?;
             let (val, appends) = self.preprocess_toml(&content)?;
             merge_toml_values(&mut self.package_overrides, &val);
             for (k, v) in appends {
                 self.appends.insert(format!("package.{}", k), v);
+            }
+        }
+
+        if package_path.exists() {
+            let content = fs::read_to_string(&package_path).with_context(|| {
+                format!("Failed to read system package config: {}", package_path.display())
+            })?;
+            let (val, appends) = self.preprocess_toml(&content)?;
+            merge_toml_values(&mut self.package_overrides, &val);
+            for (k, v) in appends {
+                self.appends.insert(format!("package.{}", k), v);
+            }
+        }
+
+        // Load mirrors file: /etc/depot.d/mirrors.toml
+        let mirrors_path = rootfs.join("etc/depot.d/mirrors.toml");
+        if mirrors_path.exists() {
+            let content = fs::read_to_string(&mirrors_path).with_context(|| {
+                format!("Failed to read mirrors config: {}", mirrors_path.display())
+            })?;
+            let val: toml::Value = toml::from_str(&content)?;
+            if let Some(table) = val.as_table() {
+                for (k, v) in table {
+                    if let Some(s) = v.as_str() {
+                        self.mirrors.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
+        }
+
+        // Allow overriding repo clone dir via [repo] clone_dir in depot.toml
+        if let Some(repo_table) = self.build_overrides.get("repo").and_then(|v| v.as_table()) {
+            if let Some(clone_val) = repo_table.get("clone_dir").and_then(|v| v.as_str()) {
+                let p = PathBuf::from(clone_val);
+                // If relative path, make it relative to rootfs
+                let repo_dir = if p.is_absolute() { p } else { rootfs.join(p) };
+                self.repo_clone_dir = repo_dir;
             }
         }
 
@@ -304,9 +368,12 @@ cflags += ["-g"]
 
     #[test]
     fn test_config_non_root_fallback() {
-        // We can't easily mock is_root() here without more complex infrastructure,
-        // but we can at least check if the logic for abs_rootfs == "/" triggers
-        // the HOME join if we were non-root.
+        // Make the test deterministic by overriding HOME for the duration of the check.
+        // Save and restore the original value so other tests aren't affected.
+        let orig_home = std::env::var_os("HOME");
+        let fake_home = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HOME", &fake_home.path()); }
+
         let config = Config::for_rootfs(Path::new("/"));
 
         if !crate::fakeroot::is_root() {
@@ -321,6 +388,13 @@ cflags += ["-g"]
         } else {
             // If running as root (e.g. in some CI), it should use /var
             assert_eq!(config.cache_dir, PathBuf::from("/var/cache/depot/sources"));
+        }
+
+        // restore original HOME
+        if let Some(v) = orig_home {
+            unsafe { std::env::set_var("HOME", v); }
+        } else {
+            unsafe { std::env::remove_var("HOME"); }
         }
     }
 

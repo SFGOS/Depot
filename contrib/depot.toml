@@ -1,0 +1,24 @@
+# Example /etc/depot.toml - system-wide configuration for Depot
+
+[build]
+# Installation prefix for package builds
+prefix = "/usr"
+# Default compiler and archiver
+cc = "gcc"
+ar = "ar"
+
+[build.flags]
+# Basic compiler flags
+cflags = ["-O2"]
+# Append additional flags (demonstrates += append support)
+cflags += ["-g"]
+
+# Linker flags
+ldflags = ["-Wl,-O1"]
+
+# Target architecture short name (CARCH). Defaults to host arch if unset.
+carch = "x86_64"
+
+# Target triples (optional)
+#chost = "x86_64-pc-linux-gnu"
+#cbuild = "x86_64-pc-linux-gnu"

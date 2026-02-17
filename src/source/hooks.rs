@@ -8,6 +8,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::builder::state::{BuildStep, StateTracker};
+
 /// Apply patches and run `post_extract` commands in the extracted source tree.
 pub fn post_extract(
     spec: &PackageSpec,
@@ -15,8 +17,18 @@ pub fn post_extract(
     src_dir: &Path,
     cache_dir: &Path,
 ) -> Result<()> {
-    apply_patches(spec, source, src_dir, cache_dir)?;
-    run_post_extract_commands(spec, source, src_dir)?;
+    let mut state = StateTracker::new(src_dir)?;
+
+    if !state.is_done(BuildStep::PatchesApplied) {
+        apply_patches(spec, source, src_dir, cache_dir)?;
+        state.mark_done(BuildStep::PatchesApplied)?;
+    }
+
+    if !state.is_done(BuildStep::PostExtractDone) {
+        run_post_extract_commands(spec, source, src_dir)?;
+        state.mark_done(BuildStep::PostExtractDone)?;
+    }
+
     Ok(())
 }
 
@@ -80,7 +92,7 @@ fn run_post_extract_commands(spec: &PackageSpec, source: &Source, src_dir: &Path
         // Use a shell for convenience; this is a package manager, so specs are trusted input.
         let status = Command::new("sh")
             .current_dir(src_dir)
-            .env("NYAPM_SPECDIR", &spec.spec_dir)
+            .env("DEPOT_SPECDIR", &spec.spec_dir)
             .arg("-c")
             .arg(&cmd)
             .status()
@@ -109,8 +121,9 @@ pub fn run_post_compile_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
 
         let status = Command::new("sh")
             .current_dir(src_dir)
-            .env("NYAPM_SPECDIR", &spec.spec_dir)
+            .env("DEPOT_SPECDIR", &spec.spec_dir)
             .env("DESTDIR", destdir)
+            .env("DEPOT_ROOTFS", &spec.build.flags.rootfs)
             .env("CC", &spec.build.flags.cc)
             .env("AR", &spec.build.flags.ar)
             .arg("-c")
@@ -141,8 +154,9 @@ pub fn run_post_install_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
 
         let status = Command::new("sh")
             .current_dir(src_dir)
-            .env("NYAPM_SPECDIR", &spec.spec_dir)
+            .env("DEPOT_SPECDIR", &spec.spec_dir)
             .env("DESTDIR", destdir)
+            .env("DEPOT_ROOTFS", &spec.build.flags.rootfs)
             .env("CC", &spec.build.flags.cc)
             .env("AR", &spec.build.flags.ar)
             .arg("-c")
@@ -241,6 +255,7 @@ mod tests {
                 homepage: "h".into(),
                 license: "MIT".into(),
             },
+            packages: Vec::new(),
             alternatives: Alternatives::default(),
             manual_sources: Vec::new(),
             source: vec![Source {

@@ -1,0 +1,10 @@
+# Example per-user configuration (~/.config/depot.toml)
+
+[build]
+prefix = "/usr/local"
+cc = "clang"
+
+[build.flags]
+cflags = ["-O2"]
+cflags += ["-g"]
+carch = "x86_64"

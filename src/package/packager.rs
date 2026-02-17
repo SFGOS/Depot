@@ -40,13 +40,13 @@ impl Packager {
         let file = fs::File::create(&output_path)
             .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
 
-        // Respect zstd level from config (default to 3 if not specified)
+        // Respect zstd level from config (default to 19 if not specified)
         let level = self
             .config
             .package_overrides
             .get("compression_level")
             .and_then(|v| v.as_integer())
-            .unwrap_or(3) as i32;
+            .unwrap_or(19) as i32;
 
         let mut encoder = Encoder::new(file, level)?;
         let _ = encoder.multithread(num_cpus() as u32);
@@ -231,6 +231,7 @@ mod tests {
                     homepage: "h".into(),
                     license: "MIT".into(),
                 },
+                packages: Vec::new(),
                 alternatives: Alternatives::default(),
                 manual_sources: Vec::new(),
                 source: Vec::new(),

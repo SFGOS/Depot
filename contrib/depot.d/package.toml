@@ -1,0 +1,6 @@
+[package]
+# System-wide package overrides. Example: set default provides or package metadata
+# name = ""
+
+# Example: provide a virtual runtime package name to satisfy runtime deps
+# provides = ["filesystem"]

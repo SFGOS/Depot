@@ -1,0 +1,17 @@
+[flags]
+# Default build flags applied to all packages via /etc/depot.d/build.toml
+# Compiler selection
+cc = "gcc"
+
+# Default CFLAGS
+cflags = ["-O2"]
+cflags += ["-pipe"]
+
+# Default LDFLAGS
+ldflags = ["-Wl,-O1"]
+
+# CARCH short name (can be overridden per-package)
+carch = "x86_64"
+
+# Example of appending per-package cflags: (will be exposed as build.cflags appends)
+# cflags += ["-march=native"]

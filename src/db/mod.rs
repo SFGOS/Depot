@@ -69,9 +69,66 @@ pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> R
         )?;
     }
 
-    // Insert files
+    // Detect ownership conflicts and separate into auto-removable vs fatal.
+    let mut fatal_conflicts: Vec<(String, String)> = Vec::new();
+    let mut auto_conflicts: Vec<(String, String)> = Vec::new();
+
     for file in &manifest.files {
-        // Enforce single-owner semantics for file paths.
+        let owner_res: rusqlite::Result<String> = tx.query_row(
+            "SELECT p.name FROM files f JOIN packages p ON f.package_id = p.id WHERE f.path = ?1",
+            params![file],
+            |row| row.get(0),
+        );
+        if let Ok(owner) = owner_res {
+            if owner != spec.package.name {
+                if is_auto_removable_path(file) {
+                    auto_conflicts.push((file.clone(), owner));
+                } else {
+                    fatal_conflicts.push((file.clone(), owner));
+                }
+            }
+        }
+    }
+
+    if !fatal_conflicts.is_empty() {
+        let mut msg = String::from("File ownership conflict detected:\n");
+        for (f, owner) in &fatal_conflicts {
+            msg.push_str(&format!("  {} -> owned by {}\n", f, owner));
+        }
+        anyhow::bail!("{}", msg);
+    }
+
+    // For auto-removable conflicts, remove previous DB ownership entries and
+    // attempt to delete the on-disk file if we can infer the rootfs.
+    if !auto_conflicts.is_empty() {
+        let rootfs_opt = detect_rootfs_from_db_path(db_path);
+        for (f, owner) in &auto_conflicts {
+            // Remove DB row(s) marking the previous owner for this path
+            tx.execute(
+                "DELETE FROM files WHERE path = ?1 AND package_id = (SELECT id FROM packages WHERE name = ?2)",
+                params![f, owner],
+            )?;
+
+            if let Some(rootfs) = &rootfs_opt {
+                let disk_path = rootfs.join(f);
+                if disk_path.exists() {
+                    let _ = std::fs::remove_file(&disk_path);
+                    println!(
+                        "Auto-removed conflicting path: {} (was owned by {})",
+                        f, owner
+                    );
+                }
+            } else {
+                println!(
+                    "Auto-cleared DB ownership for path: {} (previously owned by {})",
+                    f, owner
+                );
+            }
+        }
+    }
+
+    // Insert files (no fatal conflicts remain)
+    for file in &manifest.files {
         tx.execute(
             "INSERT INTO files (package_id, path) VALUES (?1, ?2)",
             params![pkg_id, file],
@@ -103,13 +160,20 @@ pub fn get_package_files(db_path: &Path, name: &str) -> Result<Vec<String>> {
     }
 
     let conn = Connection::open(db_path)?;
-    let pkg_id: i64 = conn
-        .query_row(
-            "SELECT id FROM packages WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        )
-        .context(format!("Package '{}' not found", name))?;
+
+    // If the package is not present in the DB (fresh install), treat that as
+    // "no previously installed files" rather than an error.
+    let pkg_id_res: rusqlite::Result<i64> = conn.query_row(
+        "SELECT id FROM packages WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    );
+
+    let pkg_id = match pkg_id_res {
+        Ok(id) => id,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
 
     let mut stmt = conn.prepare("SELECT path FROM files WHERE package_id = ?1")?;
     let files: Vec<String> = stmt
@@ -340,6 +404,40 @@ fn init_db(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Decide whether a conflicting path is safe to auto-remove ownership for.
+/// This covers shared index files (e.g. `usr/share/info/dir`) and common
+/// language-shared trees such as Perl site/vendor/lib directories.
+fn is_auto_removable_path(path: &str) -> bool {
+    let p = path.trim_start_matches('/');
+
+    // Exact info index file (and compressed variants)
+    if p == "usr/share/info/dir" || p.starts_with("usr/share/info/dir.") {
+        return true;
+    }
+
+    // Perl shared trees (common multi-package locations)
+    if p.starts_with("usr/lib/perl")
+        || p.starts_with("usr/share/perl")
+        || p.starts_with("usr/lib/perl5")
+        || p.starts_with("usr/share/perl5")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Attempt to infer the rootfs path from the database path. If the DB path
+/// follows the standard layout `<rootfs>/var/lib/depot/packages.db`, return
+/// the `<rootfs>` portion. Otherwise return None.
+fn detect_rootfs_from_db_path(db_path: &Path) -> Option<std::path::PathBuf> {
+    // Look for the suffix `var/lib/depot/packages.db` and return the ancestor 4 levels up
+    if db_path.ends_with(std::path::Path::new("var/lib/depot/packages.db")) {
+        return db_path.ancestors().nth(4).map(|p| p.to_path_buf());
+    }
+    None
+}
+
 /// Calculate which files need to be removed during an upgrade.
 /// Returns paths that exist in the old version but NOT in the new version.
 pub fn calculate_upgrade_paths(
@@ -379,6 +477,7 @@ mod tests {
                 homepage: "h".into(),
                 license: "MIT".into(),
             },
+            packages: Vec::new(),
             alternatives: Alternatives {
                 provides: vec![format!("{}-virtual", name)],
                 replaces: Vec::new(),
@@ -446,6 +545,75 @@ mod tests {
 
         let version = get_package_version(&db_path, "foo").unwrap();
         assert_eq!(version.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn register_package_detects_conflicting_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+
+        // Install package 'alpha' owning usr/bin/shared
+        let spec_a = mk_spec("alpha", "1.0");
+        let dest_a = tmp.path().join("dest_a");
+        std::fs::create_dir_all(dest_a.join("usr/bin")).unwrap();
+        std::fs::write(dest_a.join("usr/bin/shared"), "a").unwrap();
+        register_package(&db_path, &spec_a, &dest_a).unwrap();
+
+        // Try to install package 'beta' that also includes the same path -> should fail
+        let spec_b = mk_spec("beta", "1.0");
+        let dest_b = tmp.path().join("dest_b");
+        std::fs::create_dir_all(dest_b.join("usr/bin")).unwrap();
+        std::fs::write(dest_b.join("usr/bin/shared"), "b").unwrap();
+
+        let res = register_package(&db_path, &spec_b, &dest_b);
+        assert!(res.is_err());
+        let err = format!("{}", res.err().unwrap());
+        assert!(err.contains("File ownership conflict detected"));
+        assert!(err.contains("usr/bin/shared"));
+        assert!(err.contains("alpha"));
+    }
+
+    #[test]
+    fn register_package_auto_clears_safe_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+
+        // Install package 'alpha' owning usr/share/info/dir
+        let spec_a = mk_spec("alpha", "1.0");
+        let dest_a = tmp.path().join("dest_a");
+        std::fs::create_dir_all(dest_a.join("usr/share/info")).unwrap();
+        std::fs::write(dest_a.join("usr/share/info/dir"), "index").unwrap();
+        register_package(&db_path, &spec_a, &dest_a).unwrap();
+
+        // Now install package 'beta' that also provides usr/share/info/dir -> should auto-clear
+        let spec_b = mk_spec("beta", "1.0");
+        let dest_b = tmp.path().join("dest_b");
+        std::fs::create_dir_all(dest_b.join("usr/share/info")).unwrap();
+        std::fs::write(dest_b.join("usr/share/info/dir"), "index2").unwrap();
+
+        // This should succeed and transfer ownership of the 'dir' path to beta
+        register_package(&db_path, &spec_b, &dest_b).unwrap();
+
+        // Verify DB: alpha should no longer own the path, beta should
+        let files_a = get_package_files(&db_path, "alpha").unwrap();
+        assert!(!files_a.contains(&"usr/share/info/dir".to_string()));
+        let files_b = get_package_files(&db_path, "beta").unwrap();
+        assert!(files_b.contains(&"usr/share/info/dir".to_string()));
+    }
+
+    #[test]
+    fn get_package_files_missing_package_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+
+        // Create an empty database file with schema but no packages
+        let conn = Connection::open(&db_path).unwrap();
+        init_db(&conn).unwrap();
+        drop(conn);
+
+        // Querying files for a package that doesn't exist should return an empty list
+        let files = get_package_files(&db_path, "nonexistent").unwrap();
+        assert!(files.is_empty());
     }
 
     #[test]

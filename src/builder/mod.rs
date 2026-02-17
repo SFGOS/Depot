@@ -4,8 +4,10 @@ mod autotools;
 mod bin;
 mod cmake;
 mod custom;
+mod makefile;
 mod meson;
 mod rust;
+pub mod state;
 
 use crate::cross::CrossConfig;
 use crate::package::{BuildType, PackageSpec};
@@ -17,7 +19,7 @@ use std::process::Command;
 pub fn prepare_command(cmd: &mut Command, env_vars: &[(&str, String)]) {
     cmd.env_clear();
     // Preserve essential environment variables
-    for var in &["PATH", "LANG", "HOME", "SHELL", "DESTDIR"] {
+    for var in &["PATH", "LANG", "HOME", "SHELL", "DESTDIR", "DEPOT_ROOTFS"] {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);
         }
@@ -56,6 +58,7 @@ pub fn build(
         BuildType::Custom => custom::build(spec, src_dir, destdir, cross),
         BuildType::Rust => rust::build(spec, src_dir, destdir, cross),
         BuildType::Bin => bin::build(spec, src_dir, destdir, cross),
+        BuildType::Makefile => makefile::build(spec, src_dir, destdir, cross),
     }
 }
 #[cfg(test)]
@@ -71,6 +74,7 @@ mod tests {
         unsafe {
             std::env::set_var("PATH", "/usr/bin");
             std::env::set_var("HOME", "/home/test");
+            std::env::set_var("DEPOT_ROOTFS", "/my/rootfs");
         }
 
         prepare_command(&mut cmd, &[("MYVAR", "myval".to_string())]);
@@ -82,6 +86,11 @@ mod tests {
         assert_eq!(
             envs.get(std::ffi::OsStr::new("MYVAR")),
             Some(&Some(std::ffi::OsString::from("myval").as_os_str()))
+        );
+        // DEPOT_ROOTFS should be preserved from the parent environment
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("DEPOT_ROOTFS")),
+            Some(&Some(std::ffi::OsString::from("/my/rootfs").as_os_str()))
         );
     }
 

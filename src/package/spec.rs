@@ -9,9 +9,12 @@ use std::path::Path;
 use std::path::PathBuf;
 
 /// Complete package specification from TOML
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct PackageSpec {
     pub package: PackageInfo,
+    /// Optional additional package outputs produced from the same spec/destdir
+    #[serde(default)]
+    pub packages: Vec<PackageInfo>,
     #[serde(default)]
     pub alternatives: Alternatives,
     /// Manual (local) sources to copy before fetching remote sources.
@@ -60,11 +63,19 @@ impl PackageSpec {
             .replace("$name", &self.package.name)
             .replace("$version", &self.package.version)
             .replace("$specdir", &specdir)
-            .replace("$NYAPM_SPECDIR", &specdir)
+            .replace("$DEPOT_SPECDIR", &specdir)
     }
 
     pub fn sources(&self) -> &[Source] {
         &self.source
+    }
+
+    /// Return all package outputs this spec will produce (primary + any extras)
+    pub fn outputs(&self) -> Vec<PackageInfo> {
+        let mut v = Vec::new();
+        v.push(self.package.clone());
+        v.extend(self.packages.clone());
+        v
     }
 
     /// Apply system configuration overrides and appends
@@ -138,6 +149,11 @@ impl PackageSpec {
                 "cbuild" => {
                     if let Some(s) = v.as_str() {
                         self.build.flags.cbuild = s.to_string();
+                    }
+                }
+                "carch" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.carch = s.to_string();
                     }
                 }
                 // Add more fields as needed
@@ -231,6 +247,11 @@ impl PackageSpec {
             "cbuild" => {
                 if let Some(s) = values.last().and_then(|v| v.as_str()) {
                     self.build.flags.cbuild = s.to_string();
+                }
+            }
+            "carch" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.carch = s.to_string();
                 }
             }
             _ => {}
@@ -400,11 +421,28 @@ cbuild = "x86_64-pc-linux-gnu"
             .unwrap(),
             package_overrides: toml::Value::Table(toml::map::Map::new()),
             appends: std::collections::HashMap::new(),
+            mirrors: std::collections::HashMap::new(),
+            repo_clone_dir: PathBuf::from("/tmp"),
         };
 
         spec.apply_config(&config);
         assert_eq!(spec.build.flags.chost, "x86_64-sfg-linux-gnu");
         assert_eq!(spec.build.flags.cbuild, "x86_64-pc-linux-gnu");
+    }
+
+    #[test]
+    fn test_default_and_override_carch() {
+        let mut spec = mk_spec("foo", "1.0");
+        // Default should be host arch
+        assert_eq!(spec.build.flags.carch, std::env::consts::ARCH.to_string());
+
+        // Override via config
+        let mut config = crate::config::Config::for_rootfs(Path::new("/tmp/nonexistent"));
+        config.build_overrides = toml::from_str(r#"[flags]
+carch = "armv7"
+"#).unwrap();
+        spec.apply_config(&config);
+        assert_eq!(spec.build.flags.carch, "armv7");
     }
 
     #[test]
@@ -417,6 +455,46 @@ cbuild = "x86_64-pc-linux-gnu"
         );
     }
 
+    #[test]
+    fn parse_packages_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[[packages]]
+name = "foo-dev"
+version = "1.0"
+description = "development files"
+homepage = "h"
+license = "MIT"
+
+[[source]]
+url = "https://example.com/foo-1.0.tar.gz"
+sha256 = "skip"
+extract_dir = "foo-1.0"
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        let outputs = spec.outputs();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].name, "foo");
+        assert_eq!(outputs[1].name, "foo-dev");
+    }
+
     fn mk_spec(name: &str, version: &str) -> PackageSpec {
         PackageSpec {
             package: PackageInfo {
@@ -427,6 +505,7 @@ cbuild = "x86_64-pc-linux-gnu"
                 homepage: "h".into(),
                 license: "MIT".into(),
             },
+            packages: Vec::new(),
             alternatives: Alternatives::default(),
             manual_sources: Vec::new(),
             source: vec![Source {
@@ -493,21 +572,22 @@ impl PackageSpec {
 }
 
 /// Package alternatives (provides/replaces)
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct Alternatives {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provides: Vec<String>,
     /// Reserved for future package replacement feature
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[allow(dead_code)]
     pub replaces: Vec<String>,
 }
 
 /// Source tarball information
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Source {
     pub url: String,
-    /// SHA256 checksum or "skip" to bypass
+    /// Checksum for the source (e.g. `sha256:...`, `sha512:...`, `md5:...`, or raw SHA256 hex).
+    /// Use `skip` to bypass verification.
     pub sha256: String,
     /// Directory name after extraction (supports $name, $version)
     pub extract_dir: String,
@@ -528,7 +608,7 @@ pub struct Source {
 }
 
 /// Manual (local) source file to copy before fetching remote sources.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ManualSource {
     /// Filename in the spec directory
     pub file: String,
@@ -561,7 +641,7 @@ where
 }
 
 /// Build configuration
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Build {
     #[serde(rename = "type")]
     pub build_type: BuildType,
@@ -570,7 +650,7 @@ pub struct Build {
 }
 
 /// Supported build systems
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum BuildType {
     Autotools,
@@ -578,12 +658,12 @@ pub enum BuildType {
     Meson,
     Custom,
     Rust,
-    /// Binary distribution installer (e.g., .deb, .rpm)
+    Makefile,
     Bin,
 }
 
 /// Build flags and toolchain configuration
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct BuildFlags {
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub cflags: Vec<String>,
@@ -611,6 +691,12 @@ pub struct BuildFlags {
     #[serde(default)]
     pub post_install: Vec<String>,
 
+    /// Specific commands for 'makefile' build type
+    #[serde(default)]
+    pub makefile_commands: Vec<String>,
+    #[serde(default)]
+    pub makefile_install_commands: Vec<String>,
+
     /// Installation prefix (default: /usr)
     #[serde(default = "default_prefix")]
     pub prefix: String,
@@ -622,6 +708,10 @@ pub struct BuildFlags {
     /// Build architecture triple (CBUILD equivalent)
     #[serde(default)]
     pub cbuild: String,
+
+    /// CPU architecture short name (CARCH equivalent), e.g. "x86_64", "aarch64"
+    #[serde(default = "default_carch")]
+    pub carch: String,
 
     // Rust-specific fields
     /// Rust build profile: "debug" or "release" (default: release)
@@ -644,9 +734,42 @@ pub struct BuildFlags {
     /// Useful for monorepos like llvm-project where you want to build just one component.
     #[serde(default)]
     pub source_subdir: String,
+    /// Build directory relative to source root (e.g. "build")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_dir: Option<String>,
     /// Binary package type when using BuildType::Bin (e.g. "deb")
     #[serde(default)]
     pub binary_type: String,
+}
+
+impl Default for BuildFlags {
+    fn default() -> Self {
+        BuildFlags {
+            cflags: Vec::new(),
+            ldflags: Vec::new(),
+            configure: Vec::new(),
+            cc: default_cc(),
+            ar: default_ar(),
+            libc: String::new(),
+            rootfs: default_rootfs(),
+            post_compile: Vec::new(),
+            post_install: Vec::new(),
+            makefile_commands: Vec::new(),
+            makefile_install_commands: Vec::new(),
+            prefix: default_prefix(),
+            chost: String::new(),
+            cbuild: String::new(),
+            carch: default_carch(),
+            profile: default_profile(),
+            target: String::new(),
+            rustflags: Vec::new(),
+            cargs: Vec::new(),
+            bindir: default_bindir(),
+            source_subdir: String::new(),
+            build_dir: None,
+            binary_type: String::new(),
+        }
+    }
 }
 
 fn deserialize_string_or_array<'de, D>(
@@ -702,8 +825,12 @@ fn default_prefix() -> String {
     "/usr".to_string()
 }
 
+fn default_carch() -> String {
+    std::env::consts::ARCH.to_string()
+}
+
 /// Package dependencies
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct Dependencies {
     #[serde(default)]
     pub build: Vec<String>,

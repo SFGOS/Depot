@@ -79,6 +79,12 @@ enum Commands {
     },
     /// Show current configuration
     Config,
+    /// Create a new package specification interactively
+    MakeSpec {
+        /// Output file path (defaults to <name>.toml)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -89,6 +95,10 @@ enum RepoCommands {
         #[arg(default_value = ".")]
         dir: PathBuf,
     },
+    /// Sync git mirrors configured in /etc/depot.d/mirrors.toml into /usr/src/depot
+    Sync,
+    /// Show status of configured git mirrors
+    Status,
 }
 
 fn main() -> Result<()> {
@@ -99,10 +109,26 @@ fn main() -> Result<()> {
             spec_or_archive,
             spec,
         } => {
-            let spec_path = spec.unwrap_or(spec_or_archive);
-            println!("Installing package from: {}", spec_path.display());
+            let mut spec_path = spec.unwrap_or(spec_or_archive);
 
+            // Load configuration early so we can use the configured repo clone dir
             let config = config::Config::for_rootfs(&cli.rootfs);
+
+            // Repo clone dir is available via `config.repo_clone_dir` and
+            // is passed explicitly to index builders below.
+
+            // If the provided path doesn't exist, treat it as a package name and
+            // try to locate a spec under configured repo dir or local packages/.
+            if !spec_path.exists() {
+                let name = spec_path.to_string_lossy().to_string();
+                println!("Looking up package '{}' in local indexes...", name);
+                let pkg_index = index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
+                if let Some(found) = pkg_index.find(&name) {
+                    spec_path = found;
+                }
+            }
+
+            println!("Installing package from: {}", spec_path.display());
 
             let (pkg_spec, staging_dir): (package::PackageSpec, Option<tempfile::TempDir>) =
                 if spec_path.to_string_lossy().ends_with(".tar.zst") {
@@ -177,6 +203,7 @@ fn main() -> Result<()> {
                                 .unwrap_or("")
                                 .to_string(),
                         },
+                        packages: Vec::new(),
                         alternatives: package::Alternatives::default(),
                         manual_sources: Vec::new(),
                         source: Vec::new(),
@@ -228,9 +255,6 @@ fn main() -> Result<()> {
                 pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
             );
 
-            // Get config relative to rootfs
-            let config = config::Config::for_rootfs(&cli.rootfs);
-
             // Ensure database directory exists
             std::fs::create_dir_all(&config.db_dir).with_context(|| {
                 format!(
@@ -277,7 +301,7 @@ fn main() -> Result<()> {
 
                     if input == "y" || input == "yes" || input.is_empty() {
                         // Build package index for fast lookups
-                        let pkg_index = index::PackageIndex::build();
+                        let pkg_index = index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
 
                         // Build new dep chain
                         let new_chain = if dep_chain.is_empty() {
@@ -374,9 +398,13 @@ fn main() -> Result<()> {
             let tx = staging::install_atomic(&destdir, &cli.rootfs, &tx_base, &remove_paths)?;
 
             // 6. Register in database (rollback install on DB error)
-            if let Err(e) = db::register_package(&db_path, &pkg_spec, &destdir) {
-                let _ = tx.rollback();
-                return Err(e);
+            for out in pkg_spec.outputs() {
+                let mut spec_for_out = pkg_spec.clone();
+                spec_for_out.package = out;
+                if let Err(e) = db::register_package(&db_path, &spec_for_out, &destdir) {
+                    let _ = tx.rollback();
+                    return Err(e);
+                }
             }
             tx.commit()?;
 
@@ -455,15 +483,24 @@ fn main() -> Result<()> {
 
             staging::process(&destdir, &pkg_spec)?;
 
-            // Create package archive
-            let packager = package::Packager::new(pkg_spec, destdir.clone(), config);
+            // Create package archive(s) — support multiple outputs from a single spec.
             let arch = cli
                 .cross_prefix
                 .as_deref()
                 .unwrap_or(std::env::consts::ARCH);
-            let pkg_file = packager.create_package(Path::new("."), arch)?;
 
-            println!("Build complete. Package created: {}", pkg_file.display());
+            let mut created_files = Vec::new();
+            for out in pkg_spec.outputs() {
+                let mut spec_for_out = pkg_spec.clone();
+                spec_for_out.package = out;
+                let packager = package::Packager::new(spec_for_out.clone(), destdir.clone(), config.clone());
+                let pkg_file = packager.create_package(Path::new("."), arch)?;
+                created_files.push(pkg_file);
+            }
+
+            for f in &created_files {
+                println!("Build complete. Package created: {}", f.display());
+            }
         }
         Commands::Info { package } => {
             // Try as file first, then as installed package name
@@ -493,6 +530,27 @@ fn main() -> Result<()> {
                 let db_path = repo.create_repo_db()?;
                 println!("Created repository database: {}", db_path.display());
             }
+            RepoCommands::Sync => {
+                // Only root may run sync
+                if !crate::fakeroot::is_root() {
+                    anyhow::bail!("The 'repo sync' command must be run as root");
+                }
+                let config = config::Config::for_rootfs(&cli.rootfs);
+                if config.mirrors.is_empty() {
+                    println!("No mirrors configured in /etc/depot.d/mirrors.toml");
+                } else {
+                    db::repo::sync_mirrors(&config.repo_clone_dir, &config.mirrors)?;
+                    println!("Mirrors synchronized into {}", config.repo_clone_dir.display());
+                }
+            }
+            RepoCommands::Status => {
+                let config = config::Config::for_rootfs(&cli.rootfs);
+                if config.mirrors.is_empty() {
+                    println!("No mirrors configured in /etc/depot.d/mirrors.toml");
+                } else {
+                    db::repo::mirrors_status(&config.repo_clone_dir, &config.mirrors)?;
+                }
+            }
         },
         Commands::Config => {
             let config = config::Config::for_rootfs(&cli.rootfs);
@@ -507,6 +565,28 @@ fn main() -> Result<()> {
                     println!("  {} = {:?}", k, v);
                 }
             }
+        }
+        Commands::MakeSpec { output } => {
+            let spec = package::create_interactive()?;
+            // Produce a minimal TOML for interactive-created specs (omit defaults)
+            let toml_string = package::spec_to_minimal_toml(&spec)?;
+
+            let output_path = output.unwrap_or_else(|| PathBuf::from(format!("{}.toml", spec.package.name)));
+
+            if output_path.exists() {
+                println!(
+                    "Warning: File {} already exists. Overwrite? [y/N]",
+                    output_path.display()
+                );
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    anyhow::bail!("Aborted");
+                }
+            }
+
+            fs::write(&output_path, toml_string)?;
+            println!("Package specification saved to {}", output_path.display());
         }
     }
 

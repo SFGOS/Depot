@@ -9,7 +9,6 @@ use crate::package::PackageSpec;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Read;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -36,15 +35,13 @@ pub fn copy_manual_sources(spec: &PackageSpec, build_dir: &Path) -> Result<()> {
             );
         }
 
-        // Verify SHA256 if provided (unless "skip")
+        // Verify checksum if provided (supports `sha256:...`, `sha512:...`, `md5:...`, or raw SHA256).
         if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip") {
-            let actual_hash = compute_sha256(&src_path)?;
-            if actual_hash != *expected_hash {
+            if !verify_file_hash(&src_path, expected_hash)? {
                 bail!(
-                    "SHA256 mismatch for {}: expected {}, got {}",
+                    "Checksum mismatch for {}: expected {}",
                     manual.file,
-                    expected_hash,
-                    actual_hash
+                    expected_hash
                 );
             }
         }
@@ -71,18 +68,76 @@ pub fn copy_manual_sources(spec: &PackageSpec, build_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn compute_sha256(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
+/// Verify a file against an `expected` checksum string.
+///
+/// Formats accepted: `sha256:HEX`, `sha512:HEX`, `md5:HEX`, or plain `HEX` (assumed sha256).
+fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
+    use anyhow::bail;
+    use std::io::Read;
+
+    let exp = expected.trim();
+    if exp.eq_ignore_ascii_case("skip") {
+        println!("Checksum verification skipped");
+        return Ok(true);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+
+    // parse `alg:hex` or default to sha256 when no algorithm given
+    let (alg, hex) = if let Some(pos) = exp.find(':') {
+        let a = exp[..pos].trim().to_ascii_lowercase();
+        let h = exp[pos + 1..].trim().to_ascii_lowercase();
+        let alg = if a.is_empty() { "sha256".to_string() } else { a };
+        (alg, h.to_string())
+    } else {
+        ("sha256".to_string(), exp.to_ascii_lowercase())
+    };
+
+    match alg.as_str() {
+        "sha256" => {
+            let mut f = fs::File::open(path)?;
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            let actual = format!("{:x}", hasher.finalize());
+            Ok(actual == hex)
+        }
+        "sha512" => {
+            use sha2::Sha512;
+            let mut f = fs::File::open(path)?;
+            let mut hasher = Sha512::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            let actual = format!("{:x}", hasher.finalize());
+            Ok(actual == hex)
+        }
+        "md5" => {
+            let mut ctx = md5::Context::new();
+            let mut f = fs::File::open(path)?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                ctx.consume(&buf[..n]);
+            }
+            let digest = ctx.finalize();
+            let actual = format!("{:x}", digest);
+            Ok(actual == hex)
+        }
+        _ => bail!("Unsupported checksum algorithm: {}", alg),
+    }
 }
 
 /// Fetch + extract all sources.
@@ -128,12 +183,33 @@ fn prepare_one(
         if local_path.is_dir() {
             let dst = build_dir.join(&extract_dir_name);
             if dst.exists() {
+                // If it exists and has a state file, assume we are resuming
+                if dst.join(".depot_state").exists() {
+                    println!(
+                        "Resuming build in existing source directory: {}",
+                        dst.display()
+                    );
+                    return Ok(dst);
+                }
                 fs::remove_dir_all(&dst)?;
             }
             copy_dir_recursive(&local_path, &dst)?;
             hooks::post_extract(spec, source, &dst, cache_dir)?;
             return Ok(dst);
         } else if local_path.is_file() {
+            let src_dir = build_dir.join(&extract_dir_name);
+            if src_dir.exists() {
+                if src_dir.join(".depot_state").exists() {
+                    println!(
+                        "Resuming build in existing source directory: {}",
+                        src_dir.display()
+                    );
+                    return Ok(src_dir);
+                }
+                // If no state file, or we want a fresh start, we'd delete it.
+                // For now, let's just delete if no state file.
+                fs::remove_dir_all(&src_dir)?;
+            }
             let src_dir = extractor::extract_archive(&local_path, spec, source, build_dir)?;
             hooks::post_extract(spec, source, &src_dir, cache_dir)?;
             return Ok(src_dir);
@@ -146,6 +222,13 @@ fn prepare_one(
     // (except when it clearly looks like an archive URL)
     if let Some((base, rev)) = split_git_url(&url) {
         let checkout_dir = build_dir.join(&extract_dir_name);
+        if checkout_dir.exists() && checkout_dir.join(".depot_state").exists() {
+            println!(
+                "Resuming build in existing git directory: {}",
+                checkout_dir.display()
+            );
+            return Ok(checkout_dir);
+        }
         git::checkout(
             &base,
             &rev,
@@ -155,6 +238,15 @@ fn prepare_one(
         )?;
         hooks::post_extract(spec, source, &checkout_dir, cache_dir)?;
         return Ok(checkout_dir);
+    }
+
+    let src_dir = build_dir.join(&extract_dir_name);
+    if src_dir.exists() && src_dir.join(".depot_state").exists() {
+        println!(
+            "Resuming build in existing source directory: {}",
+            src_dir.display()
+        );
+        return Ok(src_dir);
     }
 
     let archive_path = fetcher::fetch_archive(spec, source, cache_dir)?;
@@ -218,7 +310,7 @@ fn split_git_url(url: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_git_url;
+    use super::*;
 
     #[test]
     fn split_git_url_accepts_git_with_rev() {
@@ -246,4 +338,32 @@ mod tests {
         assert_eq!(base, "https://example.com/repo.git");
         assert_eq!(rev, "HEAD");
     }
+
+    #[test]
+    fn verify_file_hash_accepts_multiple_algorithms() {
+        use sha2::{Digest, Sha256, Sha512};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"abc").unwrap();
+
+        let sha256_hex = {
+            let mut h = Sha256::new();
+            h.update(b"abc");
+            format!("{:x}", h.finalize())
+        };
+        let sha512_hex = {
+            let mut h = Sha512::new();
+            h.update(b"abc");
+            format!("{:x}", h.finalize())
+        };
+        let md5_hex = format!("{:x}", md5::compute(b"abc"));
+
+        assert!(verify_file_hash(tmp.path(), &sha256_hex).unwrap());
+        assert!(verify_file_hash(tmp.path(), &format!("sha256:{}", sha256_hex)).unwrap());
+        assert!(verify_file_hash(tmp.path(), &format!("sha512:{}", sha512_hex)).unwrap());
+        assert!(verify_file_hash(tmp.path(), &format!("md5:{}", md5_hex)).unwrap());
+        assert!(verify_file_hash(tmp.path(), &format!(":{}", sha256_hex)).unwrap());
+        assert!(!verify_file_hash(tmp.path(), "md5:deadbeef").unwrap());
+    }
 }
+

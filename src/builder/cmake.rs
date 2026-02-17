@@ -70,6 +70,14 @@ pub fn build(
     }
     env_vars.push(("CC", cc));
 
+    // Export rootfs for build scripts
+    env_vars.push(("DEPOT_ROOTFS", flags.rootfs.clone()));
+
+    // CARCH support
+    if !flags.carch.is_empty() {
+        env_vars.push(("CARCH", flags.carch.clone()));
+    }
+
     // Add cross-compilation env
     if let Some(cc_cfg) = cross {
         env_vars.push(("CXX", cc_cfg.cxx.clone()));
@@ -91,71 +99,95 @@ pub fn build(
         None
     };
 
+    use crate::builder::state::{BuildStep, StateTracker};
+    let mut state = StateTracker::new(&actual_src)?;
+
     // Run cmake configure
-    println!("Running cmake configure...");
-    let mut cmake_cmd = Command::new("cmake");
-    cmake_cmd.current_dir(&build_dir);
-    cmake_cmd.arg("-S").arg(&actual_src);
-    cmake_cmd.arg("-B").arg(&build_dir);
-    cmake_cmd.arg(format!("-DCMAKE_INSTALL_PREFIX={}", prefix));
-    cmake_cmd.arg("-DCMAKE_BUILD_TYPE=Release");
+    if !state.is_done(BuildStep::Configured) {
+        println!("Running cmake configure...");
+        let mut cmake_cmd = Command::new("cmake");
+        cmake_cmd.current_dir(&build_dir);
+        cmake_cmd.arg("-S").arg(&actual_src);
+        cmake_cmd.arg("-B").arg(&build_dir);
+        cmake_cmd.arg(format!("-DCMAKE_INSTALL_PREFIX={}", prefix));
+        cmake_cmd.arg("-DCMAKE_BUILD_TYPE=Release");
 
-    // Add toolchain file for cross-compilation
-    if let Some(ref tf) = toolchain_file {
-        cmake_cmd.arg(format!("-DCMAKE_TOOLCHAIN_FILE={}", tf.display()));
-    }
-
-    // Add custom configure flags from spec (supports cross-compilation overrides)
-    for flag in &flags.configure {
-        // Expand environment variables in the flag
-        let expanded = expand_env_vars(flag);
-        cmake_cmd.arg(&expanded);
-    }
-
-    crate::builder::prepare_command(&mut cmake_cmd, &env_vars);
-
-    let status = cmake_cmd.status().context("Failed to run cmake")?;
-    if !status.success() {
-        anyhow::bail!("cmake configure failed");
-    }
-
-    // Run cmake build
-    println!("Running cmake build...");
-    let mut build_cmd = Command::new("cmake");
-    build_cmd.arg("--build").arg(&build_dir);
-    build_cmd.arg("-j").arg(num_cpus().to_string());
-
-    crate::builder::prepare_command(&mut build_cmd, &env_vars);
-
-    let status = build_cmd
-        .status()
-        .with_context(|| format!("Failed to run cmake build for {}", spec.package.name))?;
-    if !status.success() {
-        anyhow::bail!("cmake build failed");
-    }
-
-    // Run cmake install with fakeroot if not root
-    println!(
-        "Running cmake install{}...",
-        if fakeroot::is_root() {
-            ""
-        } else {
-            " (with fakeroot)"
+        // Add toolchain file for cross-compilation
+        if let Some(ref tf) = toolchain_file {
+            cmake_cmd.arg(format!("-DCMAKE_TOOLCHAIN_FILE={}", tf.display()));
         }
-    );
 
-    let mut install_cmd = fakeroot::wrap_install_command("cmake", destdir);
-    install_cmd.arg("--install").arg(&build_dir);
+        // Add custom configure flags from spec (supports cross-compilation overrides)
+        for flag in &flags.configure {
+            // Expand environment variables in the flag
+            let expanded = expand_env_vars(flag);
+            cmake_cmd.arg(&expanded);
+        }
 
-    let mut install_env = env_vars.clone();
-    install_env.push(("DESTDIR", destdir.to_string_lossy().into_owned()));
-    crate::builder::prepare_command(&mut install_cmd, &install_env);
+        crate::builder::prepare_command(&mut cmake_cmd, &env_vars);
 
-    let status = install_cmd
-        .status()
-        .with_context(|| format!("Failed to run cmake install for {}", spec.package.name))?;
-    if !status.success() {
-        anyhow::bail!("cmake install failed");
+        let status = cmake_cmd.status().context("Failed to run cmake")?;
+        if !status.success() {
+            anyhow::bail!("cmake configure failed");
+        }
+        state.mark_done(BuildStep::Configured)?;
+    } else {
+        println!("Skipping cmake configure (already done)");
+    }
+
+    if !state.is_done(BuildStep::PostCompileDone) {
+        // Run cmake build
+        println!("Running cmake build...");
+        let mut build_cmd = Command::new("cmake");
+        build_cmd.arg("--build").arg(&build_dir);
+        build_cmd.arg("-j").arg(num_cpus().to_string());
+
+        crate::builder::prepare_command(&mut build_cmd, &env_vars);
+
+        let status = build_cmd
+            .status()
+            .with_context(|| format!("Failed to run cmake build for {}", spec.package.name))?;
+        if !status.success() {
+            anyhow::bail!("cmake build failed");
+        }
+
+        // Note: CMake doesn't have a direct "after make, before install" hook as easy as autotools,
+        // but we can run it here.
+        crate::source::hooks::run_post_compile_commands(spec, &actual_src, destdir)?;
+        state.mark_done(BuildStep::PostCompileDone)?;
+    } else {
+        println!("Skipping cmake build and post-compile hooks (already done)");
+    }
+
+    if !state.is_done(BuildStep::PostInstallDone) {
+        // Run cmake install with fakeroot if not root
+        println!(
+            "Running cmake install{}...",
+            if fakeroot::is_root() {
+                ""
+            } else {
+                " (with fakeroot)"
+            }
+        );
+
+        let mut install_cmd = fakeroot::wrap_install_command("cmake", destdir);
+        install_cmd.arg("--install").arg(&build_dir);
+
+        let mut install_env = env_vars.clone();
+        install_env.push(("DESTDIR", destdir.to_string_lossy().into_owned()));
+        crate::builder::prepare_command(&mut install_cmd, &install_env);
+
+        let status = install_cmd
+            .status()
+            .with_context(|| format!("Failed to run cmake install for {}", spec.package.name))?;
+        if !status.success() {
+            anyhow::bail!("cmake install failed");
+        }
+
+        crate::source::hooks::run_post_install_commands(spec, &actual_src, destdir)?;
+        state.mark_done(BuildStep::PostInstallDone)?;
+    } else {
+        println!("Skipping cmake install and post-install hooks (already done)");
     }
 
     Ok(())
@@ -176,4 +208,25 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_expand_env_vars_replaces_vars() {
+        // Set a test env var
+        unsafe { std::env::set_var("DEPOT_TEST_FOO", "bar") };
+        let input = "$DEPOT_TEST_FOO and ${DEPOT_TEST_FOO}";
+        let out = expand_env_vars(input);
+        assert!(out.contains("bar"));
+        assert_eq!(out, "bar and bar");
+    }
+
+    #[test]
+    fn test_num_cpus_at_least_one() {
+        let n = num_cpus();
+        assert!(n >= 1);
+    }
 }

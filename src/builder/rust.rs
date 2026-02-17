@@ -52,6 +52,11 @@ pub fn build(
         env_vars.push(("RUSTFLAGS", flags.rustflags.join(" ")));
     }
 
+    // CARCH support
+    if !flags.carch.is_empty() {
+        env_vars.push(("CARCH", flags.carch.clone()));
+    }
+
     // If cross-compiling, set linker via CARGO_TARGET_*_LINKER
     if let Some(cc_cfg) = cross {
         // Convert target triple to uppercase with underscores for env var
@@ -70,6 +75,9 @@ pub fn build(
     if std::env::var("RUSTUP_TOOLCHAIN").is_err() {
         env_vars.push(("RUSTUP_TOOLCHAIN", "stable".to_string()));
     }
+
+    // Export DEPOT_ROOTFS so build scripts can detect the target rootfs
+    env_vars.push(("DEPOT_ROOTFS", flags.rootfs.clone()));
 
     // Run cargo build
     println!(

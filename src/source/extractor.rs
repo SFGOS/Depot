@@ -7,6 +7,8 @@ use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use tempfile::{tempdir, NamedTempFile};
+use walkdir::WalkDir;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 /// Extract an archive source to the build directory.
@@ -36,34 +38,34 @@ pub fn extract_archive(
     println!("Extracting: {}", filename);
 
     if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
-        extract_tar_gz(archive_path, build_dir)?;
+        extract_tar_gz(archive_path, &extract_path)?;
     } else if filename.ends_with(".tar.xz") || filename.ends_with(".txz") {
-        extract_tar_xz(archive_path, build_dir)?;
+        extract_tar_xz(archive_path, &extract_path)?;
     } else if filename.ends_with(".tar.bz2") || filename.ends_with(".tbz2") {
-        extract_tar_bz2(archive_path, build_dir)?;
+        extract_tar_bz2(archive_path, &extract_path)?;
     } else if filename.ends_with(".tar.zst") || filename.ends_with(".tzst") {
-        extract_tar_zst(archive_path, build_dir)?;
+        extract_tar_zst(archive_path, &extract_path)?;
     } else if filename.ends_with(".zip") {
-        extract_zip(archive_path, build_dir)?;
+        extract_zip(archive_path, &extract_path)?;
     } else if filename.ends_with(".tar") {
-        extract_tar(archive_path, build_dir)?;
+        extract_tar(archive_path, &extract_path)?;
     } else if filename.ends_with(".deb") {
-        extract_deb(archive_path, build_dir)?;
+        extract_deb(archive_path, &extract_path)?;
     } else if filename.ends_with(".rpm") {
-        extract_rpm(archive_path, build_dir)?;
+        extract_rpm(archive_path, &extract_path)?;
     } else if filename.ends_with(".gz") {
-        extract_gz_file(archive_path, build_dir)?;
+        extract_gz_file(archive_path, &extract_path)?;
     } else if filename.ends_with(".xz") {
-        extract_xz_file(archive_path, build_dir)?;
+        extract_xz_file(archive_path, &extract_path)?;
     } else if filename.ends_with(".zst") {
-        extract_zst_file(archive_path, build_dir)?;
+        extract_zst_file(archive_path, &extract_path)?;
     } else {
         bail!("Unsupported archive format: {}", filename);
     }
 
     if !extract_path.exists() {
         bail!(
-            "Expected extraction directory not found: {}",
+            "Extraction did not create expected path: {}",
             extract_path.display()
         );
     }
@@ -73,48 +75,274 @@ pub fn extract_archive(
 }
 
 fn extract_tar_gz(path: &Path, dest: &Path) -> Result<()> {
+    let tmp = tempdir()?;
     let file = File::open(path)?;
     let decoder = GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(dest)?;
+    archive.unpack(tmp.path())?;
+
+    // If the archive produced a single top-level directory, decide whether to
+    // strip that top directory (source tarballs like foo-1.2.3/) or preserve
+    // it (system-layout archives like usr/). Otherwise move all top-level
+    // entries into `dest` so `dest` always contains the source root.
+    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    if top.len() == 1 && top[0].path().is_dir() {
+        let top_name = top[0].file_name().to_string_lossy().to_string();
+        let expected_basename = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // blacklist of system-layout directories we should NOT strip
+        let sys_blacklist = [
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
+            "dev", "proc", "sys", "boot", "srv", "home",
+        ];
+
+        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
+            && (top_name == expected_basename
+                || (!expected_basename.is_empty() && top_name.contains(expected_basename))
+                || looks_like_versioned(&top_name));
+
+        if should_strip {
+            // strip the single top-level folder (move its contents into dest)
+            move_dir_contents(&top[0].path(), dest)?;
+        } else {
+            // preserve the top-level folder (move the directory itself under dest)
+            fs::create_dir_all(dest)?;
+            let dest_top = dest.join(top_name);
+            if fs::rename(&top[0].path(), &dest_top).is_err() {
+                copy_dir_recursive_local(&top[0].path(), &dest_top)?;
+                fs::remove_dir_all(&top[0].path())?;
+            }
+        }
+    } else {
+        move_dir_contents(tmp.path(), dest)?;
+    }
     Ok(())
 }
 
 fn extract_tar_xz(path: &Path, dest: &Path) -> Result<()> {
+    let tmp = tempdir()?;
     let file = File::open(path)?;
     let decoder = xz2::read::XzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(dest)?;
+    archive.unpack(tmp.path())?;
+
+    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    if top.len() == 1 && top[0].path().is_dir() {
+        let top_name = top[0].file_name().to_string_lossy().to_string();
+        let expected_basename = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // blacklist of system-layout directories we should NOT strip
+        let sys_blacklist = [
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
+            "dev", "proc", "sys", "boot", "srv", "home",
+        ];
+
+        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
+            && (top_name == expected_basename
+                || (!expected_basename.is_empty() && top_name.contains(expected_basename))
+                || looks_like_versioned(&top_name));
+
+        if should_strip {
+            // strip the single top-level folder (move its contents into dest)
+            move_dir_contents(&top[0].path(), dest)?;
+        } else {
+            // preserve the top-level folder (move the directory itself under dest)
+            fs::create_dir_all(dest)?;
+            let dest_top = dest.join(top_name);
+            if fs::rename(&top[0].path(), &dest_top).is_err() {
+                copy_dir_recursive_local(&top[0].path(), &dest_top)?;
+                fs::remove_dir_all(&top[0].path())?;
+            }
+        }
+    } else {
+        move_dir_contents(tmp.path(), dest)?;
+    }
     Ok(())
 }
 
 fn extract_tar_bz2(path: &Path, dest: &Path) -> Result<()> {
+    let tmp = tempdir()?;
     let file = File::open(path)?;
     let decoder = bzip2::read::BzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(dest)?;
+    archive.unpack(tmp.path())?;
+
+    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    if top.len() == 1 && top[0].path().is_dir() {
+        let top_name = top[0].file_name().to_string_lossy().to_string();
+        let expected_basename = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // blacklist of system-layout directories we should NOT strip
+        let sys_blacklist = [
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
+            "dev", "proc", "sys", "boot", "srv", "home",
+        ];
+
+        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
+            && (top_name == expected_basename
+                || (!expected_basename.is_empty() && top_name.contains(expected_basename))
+                || looks_like_versioned(&top_name));
+
+        if should_strip {
+            // strip the single top-level folder (move its contents into dest)
+            move_dir_contents(&top[0].path(), dest)?;
+        } else {
+            // preserve the top-level folder (move the directory itself under dest)
+            fs::create_dir_all(dest)?;
+            let dest_top = dest.join(top_name);
+            if fs::rename(&top[0].path(), &dest_top).is_err() {
+                copy_dir_recursive_local(&top[0].path(), &dest_top)?;
+                fs::remove_dir_all(&top[0].path())?;
+            }
+        }
+    } else {
+        move_dir_contents(tmp.path(), dest)?;
+    }
     Ok(())
 }
 
 fn extract_tar(path: &Path, dest: &Path) -> Result<()> {
+    let tmp = tempdir()?;
     let file = File::open(path)?;
     let mut archive = tar::Archive::new(file);
-    archive.unpack(dest)?;
+    archive.unpack(tmp.path())?;
+
+    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    if top.len() == 1 && top[0].path().is_dir() {
+        let top_name = top[0].file_name().to_string_lossy().to_string();
+        let expected_basename = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // blacklist of system-layout directories we should NOT strip
+        let sys_blacklist = [
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
+            "dev", "proc", "sys", "boot", "srv", "home",
+        ];
+
+        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
+            && (top_name == expected_basename
+                || (!expected_basename.is_empty() && top_name.contains(expected_basename))
+                || looks_like_versioned(&top_name));
+
+        if should_strip {
+            // strip the single top-level folder (move its contents into dest)
+            move_dir_contents(&top[0].path(), dest)?;
+        } else {
+            // preserve the top-level folder (move the directory itself under dest)
+            fs::create_dir_all(dest)?;
+            let dest_top = dest.join(top_name);
+            if fs::rename(&top[0].path(), &dest_top).is_err() {
+                copy_dir_recursive_local(&top[0].path(), &dest_top)?;
+                fs::remove_dir_all(&top[0].path())?;
+            }
+        }
+    } else {
+        move_dir_contents(tmp.path(), dest)?;
+    }
     Ok(())
 }
 
 fn extract_zip(path: &Path, dest: &Path) -> Result<()> {
+    let tmp = tempdir()?;
     let file = File::open(path)?;
     let mut archive = zip::ZipArchive::new(file)?;
-    archive.extract(dest)?;
+    archive.extract(tmp.path())?;
+
+    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    if top.len() == 1 && top[0].path().is_dir() {
+        let top_name = top[0].file_name().to_string_lossy().to_string();
+        let expected_basename = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // blacklist of system-layout directories we should NOT strip
+        let sys_blacklist = [
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
+            "dev", "proc", "sys", "boot", "srv", "home",
+        ];
+
+        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
+            && (top_name == expected_basename
+                || (!expected_basename.is_empty() && top_name.contains(expected_basename))
+                || looks_like_versioned(&top_name));
+
+        if should_strip {
+            // strip the single top-level folder (move its contents into dest)
+            move_dir_contents(&top[0].path(), dest)?;
+        } else {
+            // preserve the top-level folder (move the directory itself under dest)
+            fs::create_dir_all(dest)?;
+            let dest_top = dest.join(top_name);
+            if fs::rename(&top[0].path(), &dest_top).is_err() {
+                copy_dir_recursive_local(&top[0].path(), &dest_top)?;
+                fs::remove_dir_all(&top[0].path())?;
+            }
+        }
+    } else {
+        move_dir_contents(tmp.path(), dest)?;
+    }
     Ok(())
 }
 
 fn extract_tar_zst(path: &Path, dest: &Path) -> Result<()> {
+    let tmp = tempdir()?;
     let file = File::open(path)?;
     let decoder = ZstdDecoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(dest)?;
+    archive.unpack(tmp.path())?;
+
+    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    if top.len() == 1 && top[0].path().is_dir() {
+        let top_name = top[0].file_name().to_string_lossy().to_string();
+        let expected_basename = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // blacklist of system-layout directories we should NOT strip
+        let sys_blacklist = [
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
+            "dev", "proc", "sys", "boot", "srv", "home",
+        ];
+
+        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
+            && (top_name == expected_basename
+                || (!expected_basename.is_empty() && top_name.contains(expected_basename))
+                || looks_like_versioned(&top_name));
+
+        if should_strip {
+            // strip the single top-level folder (move its contents into dest)
+            move_dir_contents(&top[0].path(), dest)?;
+        } else {
+            // preserve the top-level folder (move the directory itself under dest)
+            fs::create_dir_all(dest)?;
+            let dest_top = dest.join(top_name);
+            if fs::rename(&top[0].path(), &dest_top).is_err() {
+                copy_dir_recursive_local(&top[0].path(), &dest_top)?;
+                fs::remove_dir_all(&top[0].path())?;
+            }
+        }
+    } else {
+        move_dir_contents(tmp.path(), dest)?;
+    }
     Ok(())
 }
 
@@ -186,38 +414,32 @@ fn extract_deb(path: &Path, dest: &Path) -> Result<()> {
     let file = File::open(path)?;
     let mut ar = ar::Archive::new(file);
 
-    // Iterate members and look for data.tar, data.tar.gz, data.tar.xz, data.tar.zst
     while let Some(entry_result) = ar.next_entry() {
-        let entry = entry_result?;
+        let mut entry = entry_result?;
         let id = String::from_utf8_lossy(entry.header().identifier()).to_string();
         let lower = id.to_ascii_lowercase();
         if lower.starts_with("data.tar") {
-            // Determine compression
+            // write the inner member to a temporary file and reuse tar extraction logic
+            let mut tmpf = NamedTempFile::new()?;
+            std::io::copy(&mut entry, &mut tmpf)?;
+            let tmp_path = tmpf.path().to_path_buf();
+
             if lower.ends_with(".gz") {
-                let decoder = GzDecoder::new(entry);
-                let mut archive = tar::Archive::new(decoder);
-                archive.unpack(dest)?;
+                extract_tar_gz(&tmp_path, dest)?;
                 return Ok(());
             } else if lower.ends_with(".xz") {
-                let decoder = xz2::read::XzDecoder::new(entry);
-                let mut archive = tar::Archive::new(decoder);
-                archive.unpack(dest)?;
+                extract_tar_xz(&tmp_path, dest)?;
                 return Ok(());
             } else if lower.ends_with(".zst") {
-                let decoder = ZstdDecoder::new(entry)?;
-                let mut archive = tar::Archive::new(decoder);
-                archive.unpack(dest)?;
+                extract_tar_zst(&tmp_path, dest)?;
                 return Ok(());
             } else {
-                // plain tar
-                let mut archive = tar::Archive::new(entry);
-                archive.unpack(dest)?;
+                extract_tar(&tmp_path, dest)?;
                 return Ok(());
             }
         }
     }
 
-    // No data member found
     anyhow::bail!("No data.tar.* member found in deb: {}", path.display());
 }
 
@@ -334,27 +556,34 @@ fn extract_rpm(path: &Path, dest: &Path) -> Result<()> {
     let zst_sig = b"\x28\xb5\x2f\xfd";
     let cpio_sig = b"070701";
 
+    // Extract into a temporary directory first, then move/strip into `dest`.
+    let tmp = tempdir()?;
+
     if let Some(pos) = find_subslice(&data, gz_sig) {
         let cursor = Cursor::new(&data[pos..]);
         let decoder = GzDecoder::new(cursor);
-        extract_cpio_newc_from_reader(decoder, dest)?;
+        extract_cpio_newc_from_reader(decoder, tmp.path())?;
+        move_dir_contents(tmp.path(), dest)?;
         return Ok(());
     }
     if let Some(pos) = find_subslice(&data, xz_sig) {
         let cursor = Cursor::new(&data[pos..]);
         let decoder = xz2::read::XzDecoder::new(cursor);
-        extract_cpio_newc_from_reader(decoder, dest)?;
+        extract_cpio_newc_from_reader(decoder, tmp.path())?;
+        move_dir_contents(tmp.path(), dest)?;
         return Ok(());
     }
     if let Some(pos) = find_subslice(&data, zst_sig) {
         let cursor = Cursor::new(&data[pos..]);
         let decoder = ZstdDecoder::new(cursor)?;
-        extract_cpio_newc_from_reader(decoder, dest)?;
+        extract_cpio_newc_from_reader(decoder, tmp.path())?;
+        move_dir_contents(tmp.path(), dest)?;
         return Ok(());
     }
     if let Some(pos) = find_subslice(&data, cpio_sig) {
         let cursor = Cursor::new(&data[pos..]);
-        extract_cpio_newc_from_reader(cursor, dest)?;
+        extract_cpio_newc_from_reader(cursor, tmp.path())?;
+        move_dir_contents(tmp.path(), dest)?;
         return Ok(());
     }
 
@@ -366,6 +595,48 @@ fn extract_rpm(path: &Path, dest: &Path) -> Result<()> {
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Move contents of `src` into `dest`. If `src` contains exactly one directory
+/// and `strip_single_top` is intended, callers can pass the inner dir instead.
+fn move_dir_contents(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        if fs::rename(&src_path, &dest_path).is_err() {
+            // fallback to copy-and-remove across filesystems
+            if src_path.is_dir() {
+                copy_dir_recursive_local(&src_path, &dest_path)?;
+                fs::remove_dir_all(&src_path)?;
+            } else {
+                fs::copy(&src_path, &dest_path)?;
+                fs::remove_file(&src_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive_local(src: &Path, dst: &Path) -> Result<()> {
+    for entry in WalkDir::new(src) {
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(src).unwrap();
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_symlink() {
+            let target_link = fs::read_link(entry.path())?;
+            unix_fs::symlink(target_link, &target)?;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
