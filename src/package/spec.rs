@@ -103,7 +103,8 @@ impl PackageSpec {
 
     fn apply_flags_table(&mut self, table: &toml::map::Map<String, toml::Value>) {
         for (k, v) in table {
-            match k.as_str() {
+            // match case-insensitively for common keys (allow CXX/Cc etc.)
+            match k.to_lowercase().as_str() {
                 "cflags" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.cflags = arr
@@ -129,6 +130,11 @@ impl PackageSpec {
                 "cc" => {
                     if let Some(s) = v.as_str() {
                         self.build.flags.cc = s.to_string();
+                    }
+                }
+                "cxx" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.cxx = s.to_string();
                     }
                 }
                 "ar" => {
@@ -674,6 +680,9 @@ pub struct BuildFlags {
     /// C compiler
     #[serde(default = "default_cc")]
     pub cc: String,
+    /// C++ compiler
+    #[serde(default = "default_cxx")]
+    pub cxx: String,
     /// Archiver
     #[serde(default = "default_ar")]
     pub ar: String,
@@ -749,6 +758,7 @@ impl Default for BuildFlags {
             ldflags: Vec::new(),
             configure: Vec::new(),
             cc: default_cc(),
+            cxx: default_cxx(),
             ar: default_ar(),
             libc: String::new(),
             rootfs: default_rootfs(),
@@ -827,6 +837,16 @@ fn default_prefix() -> String {
 
 fn default_carch() -> String {
     std::env::consts::ARCH.to_string()
+}
+
+fn default_cxx() -> String {
+    // Infer a sensible C++ compiler name from default_cc()
+    let cc = default_cc();
+    if cc.contains("clang") {
+        "clang++".to_string()
+    } else {
+        "g++".to_string()
+    }
 }
 
 /// Package dependencies
