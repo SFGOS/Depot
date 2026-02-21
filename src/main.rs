@@ -8,6 +8,7 @@ mod db;
 mod deps;
 mod fakeroot;
 mod index;
+mod install;
 mod package;
 mod source;
 mod staging;
@@ -71,6 +72,35 @@ fn install_staged_to_rootfs(
     })?;
     let db_path = config.db_dir.join("packages.db");
 
+    let is_update = db::get_package_version(&db_path, &pkg_spec.package.name)?.is_some();
+    let staged_scripts_dir = install::scripts::staged_scripts_dir(destdir);
+    let installed_scripts_dir =
+        install::scripts::installed_scripts_dir(rootfs, &pkg_spec.package.name);
+
+    if is_update {
+        let has_staged_pre = install::scripts::run_hook_if_present(
+            &staged_scripts_dir,
+            install::scripts::Hook::PreUpdate,
+            rootfs,
+            &pkg_spec.package.name,
+        )?;
+        if !has_staged_pre {
+            let _ = install::scripts::run_hook_if_present(
+                &installed_scripts_dir,
+                install::scripts::Hook::PreUpdate,
+                rootfs,
+                &pkg_spec.package.name,
+            )?;
+        }
+    } else {
+        let _ = install::scripts::run_hook_if_present(
+            &staged_scripts_dir,
+            install::scripts::Hook::PreInstall,
+            rootfs,
+            &pkg_spec.package.name,
+        )?;
+    }
+
     let new_files = staging::generate_manifest_with_dirs(destdir)?;
     let remove_paths =
         db::calculate_upgrade_paths(&db_path, &pkg_spec.package.name, &new_files.files)?;
@@ -93,6 +123,28 @@ fn install_staged_to_rootfs(
         }
     }
     tx.commit()?;
+
+    install::scripts::sync_staged_scripts_to_rootfs(
+        &staged_scripts_dir,
+        rootfs,
+        &pkg_spec.package.name,
+    )?;
+
+    if is_update {
+        let _ = install::scripts::run_hook_if_present(
+            &installed_scripts_dir,
+            install::scripts::Hook::PostUpdate,
+            rootfs,
+            &pkg_spec.package.name,
+        )?;
+    } else {
+        let _ = install::scripts::run_hook_if_present(
+            &installed_scripts_dir,
+            install::scripts::Hook::PostInstall,
+            rootfs,
+            &pkg_spec.package.name,
+        )?;
+    }
 
     Ok(())
 }
@@ -347,11 +399,6 @@ fn main() -> Result<()> {
                     // Install from spec (normal build)
                     let mut pkg_spec = package::PackageSpec::from_file(&spec_path)?;
                     pkg_spec.apply_config(&config);
-
-                    // ... existing build logic ...
-                    // Jump to the part where build actually happens.
-                    // To keep the code clean, I'll move the build/stage logic into a helper or similar?
-                    // Actually, I'll just structure it so we can skip build if staging_dir is Some.
                     (pkg_spec, None)
                 };
 
@@ -513,6 +560,7 @@ fn main() -> Result<()> {
 
                 // 3.1 Copy license files into staged tree
                 staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
+                install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
 
                 destdir
             };
@@ -551,7 +599,23 @@ fn main() -> Result<()> {
             println!("Removing package: {}", package);
             let config = config::Config::for_rootfs(&cli.rootfs);
             let db_path = config.db_dir.join("packages.db");
+            let script_dir = install::scripts::installed_scripts_dir(&cli.rootfs, &package);
+            let _ = install::scripts::run_hook_if_present(
+                &script_dir,
+                install::scripts::Hook::PreRemove,
+                &cli.rootfs,
+                &package,
+            )?;
             db::remove_package(&db_path, &package, &cli.rootfs)?;
+            let post_remove = install::scripts::run_hook_if_present(
+                &script_dir,
+                install::scripts::Hook::PostRemove,
+                &cli.rootfs,
+                &package,
+            );
+            let cleanup_scripts = install::scripts::remove_installed_scripts(&cli.rootfs, &package);
+            post_remove?;
+            cleanup_scripts?;
             println!("Successfully removed {}", package);
         }
         Commands::Build {
@@ -610,6 +674,7 @@ fn main() -> Result<()> {
             )?;
 
             staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
+            install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
 
             staging::process(&destdir, &pkg_spec)?;
 

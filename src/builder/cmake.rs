@@ -97,8 +97,6 @@ pub fn build(
             anyhow::bail!("cmake build failed");
         }
 
-        // Note: CMake doesn't have a direct "after make, before install" hook as easy as autotools,
-        // but we can run it here.
         crate::source::hooks::run_post_compile_commands(spec, &actual_src, destdir)?;
         state.mark_done(BuildStep::PostCompileDone)?;
     } else {

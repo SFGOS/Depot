@@ -14,6 +14,8 @@ fn is_skipped_install_path(rel_path: &str) -> bool {
     let p = rel_path.trim_start_matches('/');
     p == ".metadata.toml"
         || p == ".files.yaml"
+        || p == "scripts"
+        || p.starts_with("scripts/")
         || p == "usr/share/info/dir"
         || p.starts_with("usr/share/info/dir.")
 }
@@ -652,6 +654,24 @@ mod tests {
     }
 
     #[test]
+    fn install_atomic_skips_package_scripts_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(destdir.join("scripts")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::write(destdir.join("scripts/pre_install"), "#!/bin/sh\necho pre\n").unwrap();
+        std::fs::write(destdir.join("usr/bin/ok"), "ok").unwrap();
+
+        let _tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
+
+        assert!(!rootfs.join("scripts/pre_install").exists());
+        assert!(rootfs.join("usr/bin/ok").exists());
+    }
+
+    #[test]
     fn generate_manifest_skips_info_dir_index() {
         let tmp = tempfile::tempdir().unwrap();
         let destdir = tmp.path().join("dest");
@@ -689,6 +709,21 @@ mod tests {
 
         assert!(!manifest.files.contains(&".metadata.toml".to_string()));
         assert!(!manifest.files.contains(&".files.yaml".to_string()));
+        assert!(manifest.files.contains(&"usr/bin/ok".to_string()));
+    }
+
+    #[test]
+    fn generate_manifest_skips_package_scripts_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("scripts")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::write(destdir.join("scripts/pre_install"), "echo pre").unwrap();
+        std::fs::write(destdir.join("usr/bin/ok"), "ok").unwrap();
+
+        let manifest = generate_manifest_with_dirs(&destdir).unwrap();
+
+        assert!(!manifest.files.contains(&"scripts/pre_install".to_string()));
         assert!(manifest.files.contains(&"usr/bin/ok".to_string()));
     }
 }
