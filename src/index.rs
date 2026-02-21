@@ -45,7 +45,11 @@ impl PackageIndex {
                                     .by_name
                                     .insert(spec.package.name.clone(), path.clone());
                                 for provided in &spec.alternatives.provides {
-                                    index.by_provides.entry(provided.clone()).or_default().push(path.clone());
+                                    index
+                                        .by_provides
+                                        .entry(provided.clone())
+                                        .or_default()
+                                        .push(path.clone());
                                 }
                             }
                         }
@@ -63,9 +67,15 @@ impl PackageIndex {
                     let path = entry.path().to_path_buf();
                     if path.extension().map(|e| e == "toml").unwrap_or(false) {
                         if let Ok(spec) = PackageSpec::from_file(&path) {
-                            index.by_name.insert(spec.package.name.clone(), path.clone());
+                            index
+                                .by_name
+                                .insert(spec.package.name.clone(), path.clone());
                             for provided in &spec.alternatives.provides {
-                                index.by_provides.entry(provided.clone()).or_default().push(path.clone());
+                                index
+                                    .by_provides
+                                    .entry(provided.clone())
+                                    .or_default()
+                                    .push(path.clone());
                             }
                         }
                     }

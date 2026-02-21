@@ -7,7 +7,7 @@ use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
-use tempfile::{tempdir, NamedTempFile};
+use tempfile::{NamedTempFile, tempdir};
 use walkdir::WalkDir;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
@@ -85,21 +85,21 @@ fn extract_tar_gz(path: &Path, dest: &Path) -> Result<()> {
     // strip that top directory (source tarballs like foo-1.2.3/) or preserve
     // it (system-layout archives like usr/). Otherwise move all top-level
     // entries into `dest` so `dest` always contains the source root.
-    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    let top = fs::read_dir(tmp.path())?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
     if top.len() == 1 && top[0].path().is_dir() {
         let top_name = top[0].file_name().to_string_lossy().to_string();
-        let expected_basename = dest
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let expected_basename = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         // blacklist of system-layout directories we should NOT strip
         let sys_blacklist = [
-            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
-            "dev", "proc", "sys", "boot", "srv", "home",
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run", "dev",
+            "proc", "sys", "boot", "srv", "home",
         ];
 
-        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let looks_like_versioned =
+            |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
         let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
             && (top_name == expected_basename
                 || (!expected_basename.is_empty() && top_name.contains(expected_basename))
@@ -130,21 +130,21 @@ fn extract_tar_xz(path: &Path, dest: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(tmp.path())?;
 
-    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    let top = fs::read_dir(tmp.path())?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
     if top.len() == 1 && top[0].path().is_dir() {
         let top_name = top[0].file_name().to_string_lossy().to_string();
-        let expected_basename = dest
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let expected_basename = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         // blacklist of system-layout directories we should NOT strip
         let sys_blacklist = [
-            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
-            "dev", "proc", "sys", "boot", "srv", "home",
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run", "dev",
+            "proc", "sys", "boot", "srv", "home",
         ];
 
-        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let looks_like_versioned =
+            |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
         let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
             && (top_name == expected_basename
                 || (!expected_basename.is_empty() && top_name.contains(expected_basename))
@@ -175,21 +175,21 @@ fn extract_tar_bz2(path: &Path, dest: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(tmp.path())?;
 
-    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    let top = fs::read_dir(tmp.path())?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
     if top.len() == 1 && top[0].path().is_dir() {
         let top_name = top[0].file_name().to_string_lossy().to_string();
-        let expected_basename = dest
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let expected_basename = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         // blacklist of system-layout directories we should NOT strip
         let sys_blacklist = [
-            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
-            "dev", "proc", "sys", "boot", "srv", "home",
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run", "dev",
+            "proc", "sys", "boot", "srv", "home",
         ];
 
-        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let looks_like_versioned =
+            |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
         let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
             && (top_name == expected_basename
                 || (!expected_basename.is_empty() && top_name.contains(expected_basename))
@@ -219,21 +219,21 @@ fn extract_tar(path: &Path, dest: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(file);
     archive.unpack(tmp.path())?;
 
-    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    let top = fs::read_dir(tmp.path())?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
     if top.len() == 1 && top[0].path().is_dir() {
         let top_name = top[0].file_name().to_string_lossy().to_string();
-        let expected_basename = dest
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let expected_basename = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         // blacklist of system-layout directories we should NOT strip
         let sys_blacklist = [
-            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
-            "dev", "proc", "sys", "boot", "srv", "home",
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run", "dev",
+            "proc", "sys", "boot", "srv", "home",
         ];
 
-        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let looks_like_versioned =
+            |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
         let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
             && (top_name == expected_basename
                 || (!expected_basename.is_empty() && top_name.contains(expected_basename))
@@ -263,21 +263,21 @@ fn extract_zip(path: &Path, dest: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(file)?;
     archive.extract(tmp.path())?;
 
-    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    let top = fs::read_dir(tmp.path())?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
     if top.len() == 1 && top[0].path().is_dir() {
         let top_name = top[0].file_name().to_string_lossy().to_string();
-        let expected_basename = dest
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let expected_basename = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         // blacklist of system-layout directories we should NOT strip
         let sys_blacklist = [
-            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
-            "dev", "proc", "sys", "boot", "srv", "home",
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run", "dev",
+            "proc", "sys", "boot", "srv", "home",
         ];
 
-        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let looks_like_versioned =
+            |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
         let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
             && (top_name == expected_basename
                 || (!expected_basename.is_empty() && top_name.contains(expected_basename))
@@ -308,21 +308,21 @@ fn extract_tar_zst(path: &Path, dest: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(tmp.path())?;
 
-    let top = fs::read_dir(tmp.path())?.filter_map(|r| r.ok()).collect::<Vec<_>>();
+    let top = fs::read_dir(tmp.path())?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
     if top.len() == 1 && top[0].path().is_dir() {
         let top_name = top[0].file_name().to_string_lossy().to_string();
-        let expected_basename = dest
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let expected_basename = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         // blacklist of system-layout directories we should NOT strip
         let sys_blacklist = [
-            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run",
-            "dev", "proc", "sys", "boot", "srv", "home",
+            "usr", "bin", "sbin", "lib", "lib64", "etc", "share", "opt", "var", "run", "dev",
+            "proc", "sys", "boot", "srv", "home",
         ];
 
-        let looks_like_versioned = |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
+        let looks_like_versioned =
+            |s: &str| s.contains('-') && s.chars().any(|c| c.is_ascii_digit());
         let should_strip = (!sys_blacklist.contains(&top_name.as_str()))
             && (top_name == expected_basename
                 || (!expected_basename.is_empty() && top_name.contains(expected_basename))

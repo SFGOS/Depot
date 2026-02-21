@@ -10,43 +10,21 @@ pub fn build(
     src_dir: &Path,
     destdir: &Path,
     cross: Option<&CrossConfig>,
+    export_compiler_flags: bool,
 ) -> Result<()> {
     let mut state = StateTracker::new(src_dir)?;
     let flags = &spec.build.flags;
 
-    // Use cross-compilation tools if configured, otherwise use flags from spec
-    // Note: Makefile builds might rely on CC/CXX/AR being set, or might use make flags.
-    // We set them in env vars.
-    let (cc, ar) = if let Some(cc_cfg) = cross {
-        (cc_cfg.cc.as_str(), cc_cfg.ar.as_str())
-    } else {
-        (flags.cc.as_str(), flags.ar.as_str())
-    };
+    let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
 
-    let mut env_vars: Vec<(&str, String)> = vec![("CC", cc.to_string()), ("AR", ar.to_string())];
-
-    let cflags;
-    if !flags.cflags.is_empty() {
-        cflags = flags.cflags.join(" ");
-        env_vars.push(("CFLAGS", cflags));
-    }
-
-    let ldflags;
-    if !flags.ldflags.is_empty() {
-        ldflags = flags.ldflags.join(" ");
-        env_vars.push(("LDFLAGS", ldflags));
-    }
-
-    // CARCH support
-    if !flags.carch.is_empty() {
-        env_vars.push(("CARCH", flags.carch.clone()));
-    }
-
-    // Export PKG_CONFIG_SYSROOT_DIR for pkg-config and a general DEPOT_ROOTFS
+    // Export PKG_CONFIG_SYSROOT_DIR for pkg-config
     if !flags.rootfs.is_empty() && flags.rootfs != "/" {
-        env_vars.push(("PKG_CONFIG_SYSROOT_DIR", flags.rootfs.clone()));
+        crate::builder::set_env_var(
+            &mut env_vars,
+            "PKG_CONFIG_SYSROOT_DIR",
+            flags.rootfs.clone(),
+        );
     }
-    env_vars.push(("DEPOT_ROOTFS", flags.rootfs.clone()));
 
     if !state.is_done(BuildStep::PostCompileDone) {
         println!("Running makefile build commands...");
@@ -95,7 +73,10 @@ pub fn build(
             cmd.current_dir(src_dir);
 
             let mut install_env = env_vars.clone();
-            install_env.push(("DESTDIR", destdir.to_string_lossy().into_owned()));
+            install_env.push((
+                "DESTDIR".to_string(),
+                destdir.to_string_lossy().into_owned(),
+            ));
             crate::builder::prepare_command(&mut cmd, &install_env);
 
             let status = cmd
@@ -130,7 +111,7 @@ mod tests {
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
-                license: "MIT".into(),
+                license: vec!["MIT".into()],
             },
             packages: Vec::new(),
             alternatives: Default::default(),
@@ -168,7 +149,7 @@ mod tests {
             "cp built.txt $DESTDIR/usr/bin/installed.txt".into(),
         ];
 
-        build(&spec, src_path, dest_path, None)?;
+        build(&spec, src_path, dest_path, None, true)?;
 
         // Verify build step
         let built_file = src_path.join("built.txt");

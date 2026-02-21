@@ -4,10 +4,13 @@ use crate::package::{PackageSpec, Source};
 use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use url::Url;
+
+const MAX_MIRROR_RETRIES: usize = 8;
 
 /// Fetch an archive source tarball, returning path to downloaded file.
 pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> Result<PathBuf> {
@@ -30,33 +33,48 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
     // Parse URL early so we can handle non-HTTP schemes (FTP support)
     let parsed_url = Url::parse(&url).with_context(|| format!("Invalid URL: {}", url))?;
 
-    // If this is an FTP URL, fetch via the ftp crate into the cache and continue
+    // If this is an FTP URL, fetch via suppaftp into the cache and continue
     if parsed_url.scheme() == "ftp" {
         // Connect and login (anonymous fallback)
         let host = parsed_url.host_str().context("FTP URL missing host")?;
         let port = parsed_url.port_or_known_default().unwrap_or(21);
         let addr = format!("{}:{}", host, port);
-        let mut ftp_stream = ftp::FtpStream::connect(addr.as_str())
+        let mut ftp_stream = suppaftp::FtpStream::connect(addr.as_str())
             .with_context(|| format!("Failed to connect to FTP host: {}", addr))?;
-        let user = if parsed_url.username().is_empty() { "anonymous" } else { parsed_url.username() };
+        let user = if parsed_url.username().is_empty() {
+            "anonymous"
+        } else {
+            parsed_url.username()
+        };
         let pass = parsed_url.password().unwrap_or("anonymous@");
-        ftp_stream.login(user, pass).with_context(|| format!("FTP login failed for {}", host))?;
+        ftp_stream
+            .login(user, pass)
+            .with_context(|| format!("FTP login failed for {}", host))?;
 
         // Retrieve the path (try with and without leading slash)
         let path = parsed_url.path();
         let candidates = [path.to_string(), path.trim_start_matches('/').to_string()];
         let mut retrieved = false;
         for p in candidates.iter().filter(|s| !s.is_empty()) {
-            match ftp_stream.retr(p, |reader: &mut dyn Read| -> std::result::Result<(), ftp::FtpError> {
-                let mut file = File::create(&dest_path).map_err(ftp::FtpError::ConnectionError)?;
-                let mut buffer = [0u8; 8192];
-                loop {
-                    let bytes_read = reader.read(&mut buffer).map_err(ftp::FtpError::ConnectionError)?;
-                    if bytes_read == 0 { break; }
-                    file.write_all(&buffer[..bytes_read]).map_err(ftp::FtpError::ConnectionError)?;
-                }
-                Ok(())
-            }) {
+            match ftp_stream.retr(
+                p,
+                |reader: &mut dyn Read| -> std::result::Result<(), suppaftp::FtpError> {
+                    let mut file =
+                        File::create(&dest_path).map_err(suppaftp::FtpError::ConnectionError)?;
+                    let mut buffer = [0u8; 8192];
+                    loop {
+                        let bytes_read = reader
+                            .read(&mut buffer)
+                            .map_err(suppaftp::FtpError::ConnectionError)?;
+                        if bytes_read == 0 {
+                            break;
+                        }
+                        file.write_all(&buffer[..bytes_read])
+                            .map_err(suppaftp::FtpError::ConnectionError)?;
+                    }
+                    Ok(())
+                },
+            ) {
                 Ok(_) => {
                     retrieved = true;
                     break;
@@ -74,10 +92,8 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
     // Use a sensible default User-Agent so servers that reject empty/unknown agents (e.g. IANA)
     // will accept requests. Include package name/version at compile time.
     let ua = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(ua)
-        .build()
-        .with_context(|| "Failed to build HTTP client")?;
+    let client =
+        super::build_blocking_client(&ua, None).with_context(|| "Failed to build HTTP client")?;
 
     let mut response = client
         .get(&url)
@@ -132,42 +148,71 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
 
     // Quick validation: ensure the downloaded file looks like the expected
     // archive (detect obvious HTML error pages or wrong formats by magic).
-    // If validate_downloaded_archive returns an alternate URL (e.g. SourceForge
-    // mirror), retry the download with that URL once.
-    if let Some(alt) = validate_downloaded_archive(&dest_path, &filename, &url)? {
+    // If validation returns an alternate URL (e.g. SourceForge mirror), follow
+    // and retry a few times.
+    let mut next_alt = validate_downloaded_archive(&dest_path, &filename, &url)?;
+    let mut seen_alts: HashSet<String> = HashSet::new();
+    let mut retries = 0usize;
+    while let Some(alt) = next_alt {
+        retries += 1;
+        if retries > MAX_MIRROR_RETRIES {
+            bail!(
+                "Exceeded mirror retry limit ({}) while fetching {}",
+                MAX_MIRROR_RETRIES,
+                url
+            );
+        }
+        if !seen_alts.insert(alt.clone()) {
+            bail!("Mirror retry loop detected for URL: {}", alt);
+        }
         println!("Retrying download from mirror: {}", alt);
         fs::remove_file(&dest_path).ok();
 
-        // If mirror URL is FTP -> use ftp crate; otherwise use HTTP retry.
+        // If mirror URL is FTP -> use suppaftp; otherwise use HTTP retry.
         if let Ok(alt_url) = Url::parse(&alt) {
             if alt_url.scheme() == "ftp" {
                 // FTP mirror retrieval
                 let host = alt_url.host_str().context("FTP mirror URL missing host")?;
                 let port = alt_url.port_or_known_default().unwrap_or(21);
                 let addr = format!("{}:{}", host, port);
-                let mut ftp_stream = ftp::FtpStream::connect(addr.as_str())
+                let mut ftp_stream = suppaftp::FtpStream::connect(addr.as_str())
                     .with_context(|| format!("Failed to connect to FTP host: {}", addr))?;
-                let user = if alt_url.username().is_empty() { "anonymous" } else { alt_url.username() };
+                let user = if alt_url.username().is_empty() {
+                    "anonymous"
+                } else {
+                    alt_url.username()
+                };
                 let pass = alt_url.password().unwrap_or("anonymous@");
-                ftp_stream.login(user, pass).with_context(|| format!("FTP login failed for {}", host))?;
+                ftp_stream
+                    .login(user, pass)
+                    .with_context(|| format!("FTP login failed for {}", host))?;
 
                 let path = alt_url.path();
                 let candidates = [path.to_string(), path.trim_start_matches('/').to_string()];
                 let mut retrieved = false;
                 for p in candidates.iter().filter(|s| !s.is_empty()) {
-                    match ftp_stream.retr(p, |reader: &mut dyn Read| -> std::result::Result<(), ftp::FtpError> {
-                        let mut file = File::create(&dest_path).map_err(ftp::FtpError::ConnectionError)?;
-                        let mut buffer = [0u8; 8192];
-                        let mut downloaded = 0u64;
-                        loop {
-                            let bytes_read = reader.read(&mut buffer).map_err(ftp::FtpError::ConnectionError)?;
-                            if bytes_read == 0 { break; }
-                            file.write_all(&buffer[..bytes_read]).map_err(ftp::FtpError::ConnectionError)?;
-                            downloaded += bytes_read as u64;
-                            pb.set_position(downloaded);
-                        }
-                        Ok(())
-                    }) {
+                    match ftp_stream.retr(
+                        p,
+                        |reader: &mut dyn Read| -> std::result::Result<(), suppaftp::FtpError> {
+                            let mut file = File::create(&dest_path)
+                                .map_err(suppaftp::FtpError::ConnectionError)?;
+                            let mut buffer = [0u8; 8192];
+                            let mut downloaded = 0u64;
+                            loop {
+                                let bytes_read = reader
+                                    .read(&mut buffer)
+                                    .map_err(suppaftp::FtpError::ConnectionError)?;
+                                if bytes_read == 0 {
+                                    break;
+                                }
+                                file.write_all(&buffer[..bytes_read])
+                                    .map_err(suppaftp::FtpError::ConnectionError)?;
+                                downloaded += bytes_read as u64;
+                                pb.set_position(downloaded);
+                            }
+                            Ok(())
+                        },
+                    ) {
                         Ok(_) => {
                             retrieved = true;
                             break;
@@ -182,14 +227,29 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
             } else {
                 // HTTP(S) mirror retry (recreate client for retry)
                 let ua = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-                let client = reqwest::blocking::Client::builder()
-                    .user_agent(ua)
-                    .build()
+                let client = super::build_blocking_client(&ua, None)
                     .with_context(|| "Failed to build HTTP client")?;
                 let mut response = client
                     .get(&alt)
                     .send()
                     .with_context(|| format!("Failed to fetch mirror URL: {}", alt))?;
+
+                let status = response.status();
+                if !status.is_success() {
+                    let mut preview_bytes = Vec::new();
+                    let _ = response.take(1024).read_to_end(&mut preview_bytes);
+                    let preview = String::from_utf8_lossy(&preview_bytes);
+                    bail!(
+                        "HTTP error fetching {}: {}{}",
+                        alt,
+                        status,
+                        if preview.trim().is_empty() {
+                            "".to_string()
+                        } else {
+                            format!(" — preview: {}", preview.trim())
+                        }
+                    );
+                }
 
                 let mut file = File::create(&dest_path)
                     .with_context(|| format!("Failed to create: {}", dest_path.display()))?;
@@ -211,9 +271,7 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
         }
 
         pb.finish_with_message("Download complete (mirror)");
-
-        // Re-validate the mirrored file
-        validate_downloaded_archive(&dest_path, &filename, &alt)?;
+        next_alt = validate_downloaded_archive(&dest_path, &filename, &alt)?;
     }
 
     // Verify checksum
@@ -239,13 +297,12 @@ fn verify_checksum(path: &Path, expected: &str) -> Result<bool> {
     super::verify_file_hash(path, expected)
 }
 
-
 /// Derive a stable filename from a URL.
 ///
 /// Rules:
 /// - Parse as URL and use the last path segment if it looks like a filename (contains a dot)
 /// - Otherwise fall back to a stable hash-based name: source-{sha256(url)[..12]}.download
-fn derive_filename_from_url(url: &str) -> String {
+pub(crate) fn derive_filename_from_url(url: &str) -> String {
     // try to parse the URL
     if let Some(last) = Url::parse(url).ok().and_then(|parsed| {
         parsed
@@ -267,7 +324,11 @@ fn derive_filename_from_url(url: &str) -> String {
 
 /// Validate downloaded file's magic header to make sure it is the expected
 /// archive format (avoids saving HTML pages or other unexpected content).
-fn validate_downloaded_archive(path: &std::path::Path, filename: &str, orig_url: &str) -> Result<Option<String>> {
+fn validate_downloaded_archive(
+    path: &std::path::Path,
+    filename: &str,
+    orig_url: &str,
+) -> Result<Option<String>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut buf = [0u8; 4096];
@@ -275,114 +336,251 @@ fn validate_downloaded_archive(path: &std::path::Path, filename: &str, orig_url:
     let head = &buf[..n.min(4096)];
 
     // Detect obvious HTML error pages (case-insensitive)
-    let head_str = String::from_utf8_lossy(head).to_ascii_lowercase();
-    if head_str.starts_with("<!doctype html") || head_str.starts_with("<html") || head_str.contains("<html") {
-        // If this came from SourceForge project URL, try to extract a direct
-        // downloads.sourceforge.net mirror link and return it for a retry.
-        let body = String::from_utf8_lossy(head).to_string();
-        if orig_url.contains("sourceforge.net") {
-            // helper: find nearest href attribute before `pos` and support
-            // both double- and single-quoted attributes.
-            let find_href_before = |body: &str, pos: usize| -> Option<String> {
-                if let Some(start) = body[..pos].rfind("href=\"") {
-                    let rest = &body[start + 6..];
-                    if let Some(end) = rest.find('"') {
-                        return Some(rest[..end].to_string());
-                    }
-                }
-                if let Some(start) = body[..pos].rfind("href='") {
-                    let rest = &body[start + 6..];
-                    if let Some(end) = rest.find('\'') {
-                        return Some(rest[..end].to_string());
-                    }
-                }
-                None
-            };
-
-            // look for downloads.sourceforge.net links in HTML
-            if let Some(pos) = body.find("downloads.sourceforge.net") {
-                if let Some(href) = find_href_before(&body, pos) {
-                    let alt = if href.starts_with("//") {
-                        format!("https:{}", href)
-                    } else if href.starts_with("/") {
-                        format!("https://downloads.sourceforge.net{}", href)
-                    } else {
-                        href
-                    };
-                    return Ok(Some(alt));
-                }
+    if is_html_content(head) {
+        if url_contains_sourceforge_host(orig_url) {
+            let body = std::fs::read(path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                .unwrap_or_else(|_| String::from_utf8_lossy(head).to_string());
+            if let Some(alt) = sourceforge_alt_url_from_html(&body, orig_url) {
+                return Ok(Some(alt));
             }
-
-            // Also try to find '/download' link anywhere in the body
-            if let Some(pos) = body.find("/download") {
-                if let Some(href) = find_href_before(&body, pos) {
-                    let alt = if href.starts_with("//") {
-                        format!("https:{}", href)
-                    } else {
-                        href
-                    };
-                    return Ok(Some(alt));
-                }
-            }
-
-            // Final fallback for SF project pages: append '/download' to the
-            // original URL (this normally triggers the mirror redirect).
-            return Ok(Some(format!("{}/download", orig_url.trim_end_matches('/'))));
         }
 
-        let preview = String::from_utf8_lossy(&head[..head.len().min(1024)]);
         anyhow::bail!(
             "Downloaded file '{}' looks like HTML (not an archive). Preview: {}",
             filename,
-            preview.trim()
+            html_preview(head)
         );
     }
 
     // Validate by extension (best-effort)
     let lower = filename.to_ascii_lowercase();
-    let is_ok = if lower.ends_with(".tar.xz") || lower.ends_with(".txz") || lower.ends_with(".xz") {
+    let is_ok = classify_archive_magic(head, &lower, path);
+
+    if !is_ok {
+        anyhow::bail!(
+            "Downloaded file '{}' does not match expected archive magic; preview: {}",
+            filename,
+            html_preview(head)
+        );
+    }
+
+    Ok(None)
+}
+
+fn sourceforge_alt_url_from_html(body: &str, orig_url: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    for href in extract_hrefs(body, &lower) {
+        if href.contains("downloads.sourceforge.net")
+            && let Some(url) = sourceforge_candidate_from_href(&href)
+        {
+            return Some(url);
+        }
+    }
+    for href in extract_hrefs(body, &lower) {
+        if href.contains("/download")
+            && let Some(url) = sourceforge_candidate_from_href(&href)
+        {
+            return Some(url);
+        }
+    }
+    sourceforge_download_fallback(orig_url)
+}
+
+fn extract_hrefs(body: &str, lower: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("href=") {
+        let start = i + rel + 5;
+        if start >= body.len() {
+            break;
+        }
+        let quote = body.as_bytes()[start] as char;
+        if quote != '"' && quote != '\'' {
+            i = start + 1;
+            continue;
+        }
+        let val_start = start + 1;
+        if val_start > body.len() {
+            break;
+        }
+        if let Some(end_rel) = body[val_start..].find(quote) {
+            out.push(body[val_start..val_start + end_rel].to_string());
+            i = val_start + end_rel + 1;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn normalize_downloads_sf_href(href: &str) -> String {
+    let href = href.replace("&amp;", "&");
+    if href.starts_with("//") {
+        format!("https:{}", href)
+    } else if href.starts_with('/') {
+        format!("https://downloads.sourceforge.net{}", href)
+    } else {
+        href
+    }
+}
+
+fn normalize_sf_href(href: &str) -> String {
+    let href = href.replace("&amp;", "&");
+    if href.starts_with("//") {
+        format!("https:{}", href)
+    } else if href.starts_with('/') {
+        format!("https://sourceforge.net{}", href)
+    } else {
+        href
+    }
+}
+
+fn sourceforge_candidate_from_href(href: &str) -> Option<String> {
+    let normalized = if href.contains("downloads.sourceforge.net") {
+        normalize_downloads_sf_href(href)
+    } else {
+        normalize_sf_href(href)
+    };
+    let parsed = Url::parse(&normalized).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+
+    if is_sourceforge_host(&host) || is_downloads_sourceforge_host(&host) {
+        return Some(normalized);
+    }
+
+    // Some HTML pages use social share links that embed a real SourceForge URL
+    // in a query parameter (e.g. x.com/share?url=...).
+    if is_social_share_host(&host) {
+        for (k, v) in parsed.query_pairs() {
+            if (k.eq_ignore_ascii_case("url") || k.eq_ignore_ascii_case("u"))
+                && let Ok(inner) = Url::parse(v.as_ref())
+                && let Some(inner_host) = inner.host_str()
+            {
+                let inner_host = inner_host.to_ascii_lowercase();
+                if is_sourceforge_host(&inner_host) || is_downloads_sourceforge_host(&inner_host) {
+                    return Some(inner.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn sourceforge_download_fallback(orig_url: &str) -> Option<String> {
+    let parsed = Url::parse(orig_url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+
+    if is_sourceforge_host(&host) || is_downloads_sourceforge_host(&host) {
+        return Some(format!("{}/download", orig_url.trim_end_matches('/')));
+    }
+
+    if is_social_share_host(&host) {
+        for (k, v) in parsed.query_pairs() {
+            if (k.eq_ignore_ascii_case("url") || k.eq_ignore_ascii_case("u"))
+                && let Ok(inner) = Url::parse(v.as_ref())
+                && let Some(inner_host) = inner.host_str()
+            {
+                let inner_host = inner_host.to_ascii_lowercase();
+                if is_sourceforge_host(&inner_host) || is_downloads_sourceforge_host(&inner_host) {
+                    return Some(format!("{}/download", inner.as_str().trim_end_matches('/')));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn is_sourceforge_host(host: &str) -> bool {
+    host == "sourceforge.net" || host.ends_with(".sourceforge.net")
+}
+
+fn is_downloads_sourceforge_host(host: &str) -> bool {
+    host == "downloads.sourceforge.net" || host.ends_with(".downloads.sourceforge.net")
+}
+
+fn is_social_share_host(host: &str) -> bool {
+    matches!(
+        host,
+        "x.com"
+            | "www.x.com"
+            | "twitter.com"
+            | "www.twitter.com"
+            | "facebook.com"
+            | "www.facebook.com"
+            | "linkedin.com"
+            | "www.linkedin.com"
+            | "reddit.com"
+            | "www.reddit.com"
+            | "t.me"
+            | "telegram.me"
+    )
+}
+
+fn url_contains_sourceforge_host(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .map(|h| is_sourceforge_host(&h) || is_downloads_sourceforge_host(&h))
+        .unwrap_or_else(|| {
+            url.contains("://sourceforge.net/")
+                || url.contains("://downloads.sourceforge.net/")
+                || url.contains(".sourceforge.net/")
+        })
+}
+
+fn html_preview(head: &[u8]) -> String {
+    String::from_utf8_lossy(&head[..head.len().min(1024)])
+        .trim()
+        .to_string()
+}
+
+fn is_html_content(head: &[u8]) -> bool {
+    let head_str = String::from_utf8_lossy(head).to_ascii_lowercase();
+    head_str.starts_with("<!doctype html")
+        || head_str.starts_with("<html")
+        || head_str.contains("<html")
+}
+
+fn classify_archive_magic(head: &[u8], lower_filename: &str, path: &Path) -> bool {
+    if lower_filename.ends_with(".tar.xz")
+        || lower_filename.ends_with(".txz")
+        || lower_filename.ends_with(".xz")
+    {
         head.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00])
-    } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".gz") {
+    } else if lower_filename.ends_with(".tar.gz")
+        || lower_filename.ends_with(".tgz")
+        || lower_filename.ends_with(".gz")
+    {
         head.starts_with(&[0x1F, 0x8B])
-    } else if lower.ends_with(".tar.zst") || lower.ends_with(".tzst") || lower.ends_with(".zst") {
+    } else if lower_filename.ends_with(".tar.zst")
+        || lower_filename.ends_with(".tzst")
+        || lower_filename.ends_with(".zst")
+    {
         head.starts_with(&[0x28, 0xB5, 0x2F, 0xFD])
-    } else if lower.ends_with(".zip") {
+    } else if lower_filename.ends_with(".zip") {
         head.starts_with(b"PK\x03\x04")
-    } else if lower.ends_with(".tar.bz2") || lower.ends_with(".tbz2") {
+    } else if lower_filename.ends_with(".tar.bz2") || lower_filename.ends_with(".tbz2") {
         head.starts_with(&[0x42, 0x5A, 0x68])
-    } else if lower.ends_with(".tar") {
-        // check for ustar magic at offset 257
+    } else if lower_filename.ends_with(".tar") {
         if let Ok(mut f2) = std::fs::File::open(path) {
             let mut hdr = [0u8; 262];
             if f2.read_exact(&mut hdr).is_ok() {
                 &hdr[257..262] == b"ustar"
             } else {
-                true // can't validate; be permissive
+                true
             }
         } else {
             true
         }
-    } else if lower.ends_with(".deb") {
-        // ar archive starts with "!<arch>\n"
+    } else if lower_filename.ends_with(".deb") {
         head.starts_with(b"!<arch>")
-    } else if lower.ends_with(".rpm") {
-        // rpm contains cpio magic later; best-effort: accept
-        true
     } else {
-        // Unknown extension -> be permissive
+        // rpm/unknown extensions: keep permissive as before.
         true
-    };
-
-    if !is_ok {
-        let preview = String::from_utf8_lossy(&head[..head.len().min(1024)]);
-        anyhow::bail!(
-            "Downloaded file '{}' does not match expected archive magic; preview: {}",
-            filename,
-            preview.trim()
-        );
     }
-
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -413,7 +611,10 @@ mod tests {
 
     #[test]
     fn filename_from_ftp_url() {
-        assert_eq!(derive_filename_from_url("ftp://example.com/foo-1.2.3.tar.gz"), "foo-1.2.3.tar.gz");
+        assert_eq!(
+            derive_filename_from_url("ftp://example.com/foo-1.2.3.tar.gz"),
+            "foo-1.2.3.tar.gz"
+        );
     }
 
     #[test]
@@ -426,7 +627,11 @@ mod tests {
     fn sourceforge_html_no_link_falls_back_to_download_suffix() {
         use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        write!(tmp, "<!doctype html><html><body>No direct link</body></html>").unwrap();
+        write!(
+            tmp,
+            "<!doctype html><html><body>No direct link</body></html>"
+        )
+        .unwrap();
         let alt = validate_downloaded_archive(
             tmp.path(),
             "zsh-5.9.tar.xz",
@@ -455,7 +660,73 @@ mod tests {
         .unwrap();
         assert_eq!(
             alt,
-            Some("https://downloads.sourceforge.net/project/zsh/zsh/5.9/zsh-5.9.tar.xz?download".to_string())
+            Some(
+                "https://downloads.sourceforge.net/project/zsh/zsh/5.9/zsh-5.9.tar.xz?download"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn sourceforge_html_large_page_extracts_downloads_link_beyond_4k() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            "<!doctype html><html><body>{}<a href='//downloads.sourceforge.net/project/tcl/tcl8.6.17-src.tar.gz?download'>download</a></body></html>",
+            "x".repeat(9000)
+        )
+        .unwrap();
+        let alt = validate_downloaded_archive(
+            tmp.path(),
+            "tcl8.6.17-src.tar.gz",
+            "https://sourceforge.net/projects/tcl/files/tcl8.6.17-src.tar.gz",
+        )
+        .unwrap();
+        assert_eq!(
+            alt,
+            Some(
+                "https://downloads.sourceforge.net/project/tcl/tcl8.6.17-src.tar.gz?download"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn sourceforge_html_ignores_social_share_links_and_unwraps_url_param() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            "<!doctype html><a href='https://x.com/share?url=https://sourceforge.net/projects/tcl/files/Tcl/8.6.17/tcl8.6.17-src.tar.gz/download&amp;text=share'>share</a>"
+        )
+        .unwrap();
+        let alt = validate_downloaded_archive(
+            tmp.path(),
+            "tcl8.6.17-src.tar.gz",
+            "https://sourceforge.net/projects/tcl/files/Tcl/8.6.17/tcl8.6.17-src.tar.gz",
+        )
+        .unwrap();
+        assert_eq!(
+            alt,
+            Some(
+                "https://sourceforge.net/projects/tcl/files/Tcl/8.6.17/tcl8.6.17-src.tar.gz/download"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn sourceforge_share_url_fallback_uses_embedded_sourceforge_url() {
+        let fallback = sourceforge_download_fallback(
+            "https://x.com/share?url=https://sourceforge.net/projects/tcl/files/Tcl/8.6.17/tcl8.6.17-src.tar.gz",
+        );
+        assert_eq!(
+            fallback,
+            Some(
+                "https://sourceforge.net/projects/tcl/files/Tcl/8.6.17/tcl8.6.17-src.tar.gz/download"
+                    .to_string()
+            )
         );
     }
 
@@ -495,5 +766,3 @@ mod tests {
         assert!(!verify_checksum(tmp.path(), "md5:deadbeef").unwrap());
     }
 }
-
-

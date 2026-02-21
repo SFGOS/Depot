@@ -13,6 +13,7 @@ pub fn build(
     src_dir: &Path,
     destdir: &Path,
     cross: Option<&CrossConfig>,
+    export_compiler_flags: bool,
 ) -> Result<()> {
     let flags = &spec.build.flags;
 
@@ -45,16 +46,12 @@ pub fn build(
     };
 
     // Build environment
-    let mut env_vars: Vec<(&str, String)> = vec![];
+    let mut env_vars =
+        crate::builder::standard_build_env(spec, cross, false, export_compiler_flags);
 
     // RUSTFLAGS
     if !flags.rustflags.is_empty() {
-        env_vars.push(("RUSTFLAGS", flags.rustflags.join(" ")));
-    }
-
-    // CARCH support
-    if !flags.carch.is_empty() {
-        env_vars.push(("CARCH", flags.carch.clone()));
+        crate::builder::set_env_var(&mut env_vars, "RUSTFLAGS", flags.rustflags.join(" "));
     }
 
     // If cross-compiling, set linker via CARGO_TARGET_*_LINKER
@@ -66,18 +63,15 @@ pub fn build(
             .to_uppercase()
             .replace('-', "_");
         let linker_var = format!("CARGO_TARGET_{}_LINKER", target_env);
-        env_vars.push((linker_var.leak(), cc_cfg.cc.clone()));
-        env_vars.push(("CC".to_string().leak(), cc_cfg.cc.clone()));
-        env_vars.push(("AR".to_string().leak(), cc_cfg.ar.clone()));
+        crate::builder::set_env_var(&mut env_vars, &linker_var, cc_cfg.cc.clone());
+        crate::builder::set_env_var(&mut env_vars, "CC", cc_cfg.cc.clone());
+        crate::builder::set_env_var(&mut env_vars, "AR", cc_cfg.ar.clone());
     }
 
     // Set default rustup toolchain if not already set
     if std::env::var("RUSTUP_TOOLCHAIN").is_err() {
-        env_vars.push(("RUSTUP_TOOLCHAIN", "stable".to_string()));
+        crate::builder::set_env_var(&mut env_vars, "RUSTUP_TOOLCHAIN", "stable");
     }
-
-    // Export DEPOT_ROOTFS so build scripts can detect the target rootfs
-    env_vars.push(("DEPOT_ROOTFS", flags.rootfs.clone()));
 
     // Run cargo build
     println!(

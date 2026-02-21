@@ -13,6 +13,7 @@ pub fn build(
     src_dir: &Path,
     destdir: &Path,
     cross: Option<&CrossConfig>,
+    export_compiler_flags: bool,
 ) -> Result<()> {
     let flags = &spec.build.flags;
     let build_dir = src_dir.join("builddir");
@@ -22,51 +23,7 @@ pub fn build(
     fs::create_dir_all(destdir)?;
 
     // Environment variables
-    let mut env_vars: Vec<(&str, String)> = vec![];
-
-    // Use cross-compilation tools if configured
-    let cc = if let Some(cc_cfg) = cross {
-        cc_cfg.cc.clone()
-    } else {
-        flags.cc.clone()
-    };
-
-    if !flags.cflags.is_empty() {
-        env_vars.push(("CFLAGS", flags.cflags.join(" ")));
-    }
-    if !flags.chost.is_empty() {
-        env_vars.push(("CHOST", flags.chost.clone()));
-    }
-    if !flags.cbuild.is_empty() {
-        env_vars.push(("CBUILD", flags.cbuild.clone()));
-    }
-    if !flags.ldflags.is_empty() {
-        let ldflags = if flags.libc.is_empty() {
-            flags.ldflags.join(" ")
-        } else {
-            format!(
-                "{} -Wl,--dynamic-linker={}",
-                flags.ldflags.join(" "),
-                flags.libc
-            )
-        };
-        env_vars.push(("LDFLAGS", ldflags));
-    }
-    env_vars.push(("CC", cc));
-
-    // Export rootfs for build scripts
-    env_vars.push(("DEPOT_ROOTFS", flags.rootfs.clone()));
-
-    // Add cross-compilation env
-    if let Some(cc_cfg) = cross {
-        env_vars.push(("CXX", cc_cfg.cxx.clone()));
-        env_vars.push(("AR", cc_cfg.ar.clone()));
-    }
-
-    // CARCH support
-    if !flags.carch.is_empty() {
-        env_vars.push(("CARCH", flags.carch.clone()));
-    }
+    let env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
 
     // Extract prefix from configure flags
     let prefix = flags
@@ -150,7 +107,10 @@ pub fn build(
         install_cmd.arg("-C").arg(&build_dir);
 
         let mut install_env = env_vars.clone();
-        install_env.push(("DESTDIR", destdir.to_string_lossy().into_owned()));
+        install_env.push((
+            "DESTDIR".to_string(),
+            destdir.to_string_lossy().into_owned(),
+        ));
         crate::builder::prepare_command(&mut install_cmd, &install_env);
 
         let status = install_cmd

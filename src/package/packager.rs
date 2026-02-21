@@ -8,6 +8,19 @@ use std::path::{Path, PathBuf};
 use tar::Builder;
 use zstd::stream::write::Encoder;
 
+fn license_value(licenses: &[String]) -> toml::Value {
+    if licenses.len() == 1 {
+        toml::Value::String(licenses[0].clone())
+    } else {
+        toml::Value::Array(
+            licenses
+                .iter()
+                .map(|license| toml::Value::String(license.clone()))
+                .collect(),
+        )
+    }
+}
+
 pub struct Packager {
     pub spec: PackageSpec,
     pub destdir: PathBuf,
@@ -119,7 +132,7 @@ impl Packager {
         );
         map.insert(
             "license".to_string(),
-            toml::Value::String(self.spec.package.license.clone()),
+            license_value(&self.spec.package.license),
         );
 
         // Add provides
@@ -154,6 +167,17 @@ impl Packager {
                 self.spec
                     .dependencies
                     .runtime
+                    .iter()
+                    .map(|s| toml::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+        build_deps.insert(
+            "test".to_string(),
+            toml::Value::Array(
+                self.spec
+                    .dependencies
+                    .test
                     .iter()
                     .map(|s| toml::Value::String(s.clone()))
                     .collect(),
@@ -229,7 +253,7 @@ mod tests {
                     revision: 1,
                     description: "d".into(),
                     homepage: "h".into(),
-                    license: "MIT".into(),
+                    license: vec!["MIT".into()],
                 },
                 packages: Vec::new(),
                 alternatives: Alternatives::default(),
@@ -301,5 +325,28 @@ mod tests {
 
         let deps = val.get("dependencies").unwrap();
         assert!(deps.get("build").unwrap().as_array().unwrap().is_empty());
+        assert!(deps.get("runtime").unwrap().as_array().unwrap().is_empty());
+        assert!(deps.get("test").unwrap().as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_generate_metadata_toml_with_multiple_licenses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+
+        let mut packager = mk_packager(dest.to_path_buf());
+        packager.spec.package.license = vec!["MIT".into(), "Apache-2.0".into()];
+        packager.generate_metadata_toml().unwrap();
+
+        let meta_path = dest.join(".metadata.toml");
+        let content = fs::read_to_string(meta_path).unwrap();
+        let val: toml::Value = toml::from_str(&content).unwrap();
+        let arr = val
+            .get("license")
+            .and_then(|v| v.as_array())
+            .expect("license should be an array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_str(), Some("MIT"));
+        assert_eq!(arr[1].as_str(), Some("Apache-2.0"));
     }
 }

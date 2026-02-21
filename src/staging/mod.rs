@@ -2,11 +2,58 @@
 
 use crate::package::PackageSpec;
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::fs;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
+
+fn is_skipped_install_path(rel_path: &str) -> bool {
+    let p = rel_path.trim_start_matches('/');
+    p == ".metadata.toml"
+        || p == ".files.yaml"
+        || p == "usr/share/info/dir"
+        || p.starts_with("usr/share/info/dir.")
+}
+
+fn normalize_relative_path(path: &str) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("keep paths must not be empty");
+    }
+
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        anyhow::bail!("keep paths must be relative: {}", trimmed);
+    }
+
+    let mut normalized = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::Normal(seg) => normalized.push(seg),
+            Component::CurDir => {}
+            _ => {
+                anyhow::bail!(
+                    "keep paths must not contain traversal or root components: {}",
+                    trimmed
+                );
+            }
+        }
+    }
+
+    let s = normalized
+        .to_str()
+        .context("keep paths must be valid UTF-8")?
+        .to_string();
+
+    if s.is_empty() {
+        anyhow::bail!("keep paths must not resolve to empty paths: {}", trimmed);
+    }
+
+    Ok(s)
+}
 
 /// Process staged files - remove .la files, strip binaries, etc.
 pub fn process(destdir: &Path, _spec: &PackageSpec) -> Result<()> {
@@ -112,7 +159,7 @@ impl FsTransaction {
         for rel in &self.removed {
             let src = self.removed_backup_path(rel);
             let dst = self.rootfs.join(rel);
-            if src.exists() {
+            if src.symlink_metadata().is_ok() {
                 if let Some(parent) = dst.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -132,7 +179,7 @@ impl FsTransaction {
         for rel in &self.backed_up {
             let src = self.backup_path(rel);
             let dst = self.rootfs.join(rel);
-            if src.exists() {
+            if src.symlink_metadata().is_ok() {
                 if let Some(parent) = dst.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -174,7 +221,13 @@ pub fn install_atomic(
     rootfs: &Path,
     tx_base_dir: &Path,
     remove_paths: &[String],
+    keep_paths: &[String],
 ) -> Result<FsTransaction> {
+    let keep_set: HashSet<String> = keep_paths
+        .iter()
+        .map(|p| normalize_relative_path(p))
+        .collect::<Result<HashSet<_>>>()?;
+
     fs::create_dir_all(tx_base_dir)
         .with_context(|| format!("Failed to create tx dir: {}", tx_base_dir.display()))?;
 
@@ -236,7 +289,18 @@ pub fn install_atomic(
                 .to_string_lossy()
                 .to_string();
 
-            let dest_path = rootfs.join(&rel_path);
+            if is_skipped_install_path(&rel_path) {
+                continue;
+            }
+
+            let keep_as_depotnew = keep_set.contains(&rel_path) && rootfs.join(&rel_path).exists();
+            let install_rel_path = if keep_as_depotnew {
+                format!("{}.depotnew", rel_path)
+            } else {
+                rel_path.clone()
+            };
+
+            let dest_path = rootfs.join(&install_rel_path);
 
             if let Some(parent) = dest_path.parent() {
                 fs::create_dir_all(parent)?;
@@ -245,7 +309,7 @@ pub fn install_atomic(
             if dest_path.symlink_metadata().is_ok() {
                 // lexists checks existence without following symlinks
                 // Backup existing
-                let backup_path = tx.backup_path(&rel_path);
+                let backup_path = tx.backup_path(&install_rel_path);
                 if let Some(parent) = backup_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -259,9 +323,9 @@ pub fn install_atomic(
                     fs::copy(&dest_path, &backup_path)?;
                 }
 
-                tx.backed_up.push(rel_path.clone());
+                tx.backed_up.push(install_rel_path.clone());
             } else {
-                tx.created.push(rel_path.clone());
+                tx.created.push(install_rel_path.clone());
             }
 
             // Install new file/symlink
@@ -277,10 +341,10 @@ pub fn install_atomic(
             if file_type.is_symlink() {
                 let target = fs::read_link(src_path)?;
                 std::os::unix::fs::symlink(target, &dest_path)
-                    .with_context(|| format!("Failed to create symlink: {}", rel_path))?;
+                    .with_context(|| format!("Failed to create symlink: {}", install_rel_path))?;
             } else {
                 fs::copy(src_path, &dest_path)
-                    .with_context(|| format!("Failed to install: {}", rel_path))?;
+                    .with_context(|| format!("Failed to install: {}", install_rel_path))?;
             }
         }
 
@@ -288,21 +352,38 @@ pub fn install_atomic(
         for rel in remove_paths {
             let rel = rel.as_str();
             let dest_path = rootfs.join(rel);
-            if !dest_path.exists() {
+            let dest_meta = match dest_path.symlink_metadata() {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("Failed to inspect obsolete path before removal: {}", rel)
+                    });
+                }
+            };
+
+            if dest_meta.file_type().is_dir() {
+                // Only obsolete files/symlinks are removed here.
                 continue;
             }
-            if !dest_path.is_file() {
-                // Only track files for now.
-                continue;
-            }
+
             let backup_path = tx.removed_backup_path(rel);
             if let Some(parent) = backup_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(&dest_path, &backup_path)
-                .with_context(|| format!("Failed to backup removed file: {}", rel))?;
+
+            if dest_meta.file_type().is_symlink() {
+                let target = fs::read_link(&dest_path)
+                    .with_context(|| format!("Failed to read obsolete symlink target: {}", rel))?;
+                std::os::unix::fs::symlink(&target, &backup_path)
+                    .with_context(|| format!("Failed to backup removed symlink: {}", rel))?;
+            } else {
+                fs::copy(&dest_path, &backup_path)
+                    .with_context(|| format!("Failed to backup removed file: {}", rel))?;
+            }
+
             fs::remove_file(&dest_path)
-                .with_context(|| format!("Failed to remove obsolete file: {}", rel))?;
+                .with_context(|| format!("Failed to remove obsolete file/symlink: {}", rel))?;
             tx.removed.push(rel.to_string());
         }
 
@@ -362,7 +443,7 @@ mod tests {
         std::fs::write(destdir.join("usr/bin/new_only"), "added").unwrap();
 
         let remove_paths = vec!["usr/bin/old_only".to_string()];
-        let tx = install_atomic(&destdir, &rootfs, &tx_base, &remove_paths).unwrap();
+        let tx = install_atomic(&destdir, &rootfs, &tx_base, &remove_paths, &[]).unwrap();
 
         // After install: updated + new present, obsolete removed
         assert_eq!(
@@ -383,6 +464,94 @@ mod tests {
     }
 
     #[test]
+    fn install_atomic_keep_existing_installs_depotnew() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(rootfs.join("etc")).unwrap();
+        std::fs::create_dir_all(destdir.join("etc")).unwrap();
+
+        std::fs::write(rootfs.join("etc/locale.gen"), "existing").unwrap();
+        std::fs::write(destdir.join("etc/locale.gen"), "from-package").unwrap();
+
+        let keep = vec!["etc/locale.gen".to_string()];
+        let tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &keep).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("etc/locale.gen")).unwrap(),
+            "existing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("etc/locale.gen.depotnew")).unwrap(),
+            "from-package"
+        );
+
+        tx.rollback().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("etc/locale.gen")).unwrap(),
+            "existing"
+        );
+        assert!(!rootfs.join("etc/locale.gen.depotnew").exists());
+    }
+
+    #[test]
+    fn install_atomic_rejects_unsafe_keep_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(destdir.join("etc")).unwrap();
+        std::fs::write(destdir.join("etc/locale.gen"), "x").unwrap();
+
+        let keep = vec!["../etc/shadow".to_string()];
+        let err = install_atomic(&destdir, &rootfs, &tx_base, &[], &keep)
+            .expect_err("expected keep path traversal to be rejected");
+        assert!(
+            err.to_string()
+                .contains("keep paths must not contain traversal")
+        );
+    }
+
+    #[test]
+    fn install_atomic_removes_obsolete_symlink_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(rootfs.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::write(destdir.join("usr/bin/new"), "ok").unwrap();
+
+        std::os::unix::fs::symlink("../lib/libold.so", rootfs.join("usr/lib/libold.so.link"))
+            .unwrap();
+        assert!(
+            rootfs
+                .join("usr/lib/libold.so.link")
+                .symlink_metadata()
+                .is_ok()
+        );
+
+        let remove_paths = vec!["usr/lib/libold.so.link".to_string()];
+        let tx = install_atomic(&destdir, &rootfs, &tx_base, &remove_paths, &[]).unwrap();
+
+        assert!(
+            rootfs
+                .join("usr/lib/libold.so.link")
+                .symlink_metadata()
+                .is_err()
+        );
+
+        tx.rollback().unwrap();
+        let restored = rootfs
+            .join("usr/lib/libold.so.link")
+            .symlink_metadata()
+            .expect("symlink should be restored");
+        assert!(restored.file_type().is_symlink());
+    }
+
+    #[test]
     fn install_atomic_commit_removes_tx_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let rootfs = tmp.path().join("root");
@@ -392,7 +561,7 @@ mod tests {
         std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
         std::fs::write(destdir.join("usr/bin/foo"), "x").unwrap();
 
-        let tx = install_atomic(&destdir, &rootfs, &tx_base, &[]).unwrap();
+        let tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
         let tx_dir = tx.tx_dir.clone();
         assert!(tx_dir.exists());
         tx.commit().unwrap();
@@ -410,7 +579,7 @@ mod tests {
         // Create a symlink bin -> usr/bin in destdir
         std::os::unix::fs::symlink("usr/bin", destdir.join("bin")).unwrap();
 
-        let _tx = install_atomic(&destdir, &rootfs, &tx_base, &[]).unwrap();
+        let _tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
 
         // Verify rootfs/bin is a symlink, not a directory
         let meta = rootfs
@@ -442,6 +611,86 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn install_atomic_skips_info_dir_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/share/info")).unwrap();
+        std::fs::write(destdir.join("usr/share/info/dir"), "index").unwrap();
+        std::fs::write(destdir.join("usr/share/info/dir.gz"), "index gz").unwrap();
+        std::fs::write(destdir.join("usr/share/info/ok.info"), "ok").unwrap();
+
+        let _tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
+
+        assert!(!rootfs.join("usr/share/info/dir").exists());
+        assert!(!rootfs.join("usr/share/info/dir.gz").exists());
+        assert!(rootfs.join("usr/share/info/ok.info").exists());
+    }
+
+    #[test]
+    fn install_atomic_skips_package_metadata_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&destdir).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::write(destdir.join(".metadata.toml"), "name='foo'").unwrap();
+        std::fs::write(destdir.join(".files.yaml"), "files: []").unwrap();
+        std::fs::write(destdir.join("usr/bin/ok"), "ok").unwrap();
+
+        let _tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
+
+        assert!(!rootfs.join(".metadata.toml").exists());
+        assert!(!rootfs.join(".files.yaml").exists());
+        assert!(rootfs.join("usr/bin/ok").exists());
+    }
+
+    #[test]
+    fn generate_manifest_skips_info_dir_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/share/info")).unwrap();
+        std::fs::write(destdir.join("usr/share/info/dir"), "index").unwrap();
+        std::fs::write(destdir.join("usr/share/info/dir.xz"), "index xz").unwrap();
+        std::fs::write(destdir.join("usr/share/info/ok.info"), "ok").unwrap();
+
+        let manifest = generate_manifest_with_dirs(&destdir).unwrap();
+
+        assert!(!manifest.files.contains(&"usr/share/info/dir".to_string()));
+        assert!(
+            !manifest
+                .files
+                .contains(&"usr/share/info/dir.xz".to_string())
+        );
+        assert!(
+            manifest
+                .files
+                .contains(&"usr/share/info/ok.info".to_string())
+        );
+    }
+
+    #[test]
+    fn generate_manifest_skips_package_metadata_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(&destdir).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::write(destdir.join(".metadata.toml"), "name='foo'").unwrap();
+        std::fs::write(destdir.join(".files.yaml"), "files: []").unwrap();
+        std::fs::write(destdir.join("usr/bin/ok"), "ok").unwrap();
+
+        let manifest = generate_manifest_with_dirs(&destdir).unwrap();
+
+        assert!(!manifest.files.contains(&".metadata.toml".to_string()));
+        assert!(!manifest.files.contains(&".files.yaml".to_string()));
+        assert!(manifest.files.contains(&"usr/bin/ok".to_string()));
+    }
 }
 
 /// Manifest containing files and directories for a package
@@ -465,6 +714,10 @@ pub fn generate_manifest_with_dirs(destdir: &Path) -> Result<Manifest> {
 
         // Skip the root (empty path)
         if rel_path.is_empty() {
+            continue;
+        }
+
+        if is_skipped_install_path(&rel_path) {
             continue;
         }
 

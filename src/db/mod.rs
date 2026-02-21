@@ -9,6 +9,10 @@ use rusqlite::{Connection, params};
 use std::fs;
 use std::path::Path;
 
+fn format_licenses(licenses: &[String]) -> String {
+    licenses.join(", ")
+}
+
 /// Initialize database and register a package
 pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> Result<()> {
     // Create parent directory (auto-create db dir if missing)
@@ -40,7 +44,7 @@ pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> R
             spec.package.revision,
             spec.package.description,
             spec.package.homepage,
-            spec.package.license,
+            format_licenses(&spec.package.license),
         ],
     )?;
 
@@ -405,15 +409,10 @@ fn init_db(conn: &Connection) -> Result<()> {
 }
 
 /// Decide whether a conflicting path is safe to auto-remove ownership for.
-/// This covers shared index files (e.g. `usr/share/info/dir`) and common
-/// language-shared trees such as Perl site/vendor/lib directories.
+/// This covers common language-shared trees such as Perl site/vendor/lib
+/// directories.
 fn is_auto_removable_path(path: &str) -> bool {
     let p = path.trim_start_matches('/');
-
-    // Exact info index file (and compressed variants)
-    if p == "usr/share/info/dir" || p.starts_with("usr/share/info/dir.") {
-        return true;
-    }
 
     // Perl shared trees (common multi-package locations)
     if p.starts_with("usr/lib/perl")
@@ -475,7 +474,7 @@ mod tests {
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
-                license: "MIT".into(),
+                license: vec!["MIT".into()],
             },
             packages: Vec::new(),
             alternatives: Alternatives {
@@ -578,27 +577,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("packages.db");
 
-        // Install package 'alpha' owning usr/share/info/dir
+        // Install package 'alpha' owning a known shared Perl path
         let spec_a = mk_spec("alpha", "1.0");
         let dest_a = tmp.path().join("dest_a");
-        std::fs::create_dir_all(dest_a.join("usr/share/info")).unwrap();
-        std::fs::write(dest_a.join("usr/share/info/dir"), "index").unwrap();
+        std::fs::create_dir_all(dest_a.join("usr/share/perl5")).unwrap();
+        std::fs::write(dest_a.join("usr/share/perl5/shared.pm"), "package A;").unwrap();
         register_package(&db_path, &spec_a, &dest_a).unwrap();
 
-        // Now install package 'beta' that also provides usr/share/info/dir -> should auto-clear
+        // Now install package 'beta' that also provides the same shared path -> should auto-clear
         let spec_b = mk_spec("beta", "1.0");
         let dest_b = tmp.path().join("dest_b");
-        std::fs::create_dir_all(dest_b.join("usr/share/info")).unwrap();
-        std::fs::write(dest_b.join("usr/share/info/dir"), "index2").unwrap();
+        std::fs::create_dir_all(dest_b.join("usr/share/perl5")).unwrap();
+        std::fs::write(dest_b.join("usr/share/perl5/shared.pm"), "package B;").unwrap();
 
-        // This should succeed and transfer ownership of the 'dir' path to beta
+        // This should succeed and transfer ownership of the shared path to beta
         register_package(&db_path, &spec_b, &dest_b).unwrap();
 
         // Verify DB: alpha should no longer own the path, beta should
         let files_a = get_package_files(&db_path, "alpha").unwrap();
-        assert!(!files_a.contains(&"usr/share/info/dir".to_string()));
+        assert!(!files_a.contains(&"usr/share/perl5/shared.pm".to_string()));
         let files_b = get_package_files(&db_path, "beta").unwrap();
-        assert!(files_b.contains(&"usr/share/info/dir".to_string()));
+        assert!(files_b.contains(&"usr/share/perl5/shared.pm".to_string()));
     }
 
     #[test]
@@ -668,7 +667,7 @@ mod tests {
         std::fs::write(dest1.join("usr/bin/shared_dir/old_file"), "old").unwrap();
 
         register_package(&db_path, &spec_v1, &dest1).unwrap();
-        let _ = crate::staging::install_atomic(&dest1, &rootfs, &tx_base, &[]).unwrap();
+        let _ = crate::staging::install_atomic(&dest1, &rootfs, &tx_base, &[], &[]).unwrap();
 
         assert!(rootfs.join("usr/bin/foo").exists());
         assert!(rootfs.join("usr/bin/shared_dir/old_file").exists());
@@ -689,7 +688,8 @@ mod tests {
             vec!["usr/bin/shared_dir/old_file".to_string()]
         );
 
-        let tx = crate::staging::install_atomic(&dest2, &rootfs, &tx_base, &remove_paths).unwrap();
+        let tx =
+            crate::staging::install_atomic(&dest2, &rootfs, &tx_base, &remove_paths, &[]).unwrap();
         register_package(&db_path, &spec_v2, &dest2).unwrap();
         tx.commit().unwrap();
 

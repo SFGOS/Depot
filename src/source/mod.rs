@@ -11,13 +11,15 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use url::Url;
 use walkdir::WalkDir;
 
-/// Copy manual (local) sources to the build directory before fetching remote sources.
+/// Copy manual sources to the build directory before fetching remote sources.
 ///
-/// Manual sources are checked first, allowing local files like utility source code
-/// to be available during the build process.
-pub fn copy_manual_sources(spec: &PackageSpec, build_dir: &Path) -> Result<()> {
+/// Manual sources support:
+/// - local mode: `file = "..."` (path relative to spec directory)
+/// - remote mode: `url = "..."` (downloaded first, then copied)
+pub fn copy_manual_sources(spec: &PackageSpec, cache_dir: &Path, build_dir: &Path) -> Result<()> {
     if spec.manual_sources.is_empty() {
         return Ok(());
     }
@@ -26,40 +28,83 @@ pub fn copy_manual_sources(spec: &PackageSpec, build_dir: &Path) -> Result<()> {
     println!("Copying {} manual source(s)...", spec.manual_sources.len());
 
     for manual in &spec.manual_sources {
-        let src_path = spec.spec_dir.join(&manual.file);
-        if !src_path.exists() {
-            bail!(
-                "Manual source not found: {} (expected at {})",
-                manual.file,
-                src_path.display()
-            );
-        }
+        let (source_path, source_label, default_dest): (PathBuf, String, String) =
+            if let Some(file) = manual.file.as_ref() {
+                let file = spec.expand_vars(file);
+                let src_path = spec.spec_dir.join(&file);
+                if !src_path.exists() {
+                    bail!(
+                        "Manual source not found: {} (expected at {})",
+                        file,
+                        src_path.display()
+                    );
+                }
 
-        // Verify checksum if provided (supports `sha256:...`, `sha512:...`, `md5:...`, or raw SHA256).
-        if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip") {
-            if !verify_file_hash(&src_path, expected_hash)? {
-                bail!(
-                    "Checksum mismatch for {}: expected {}",
-                    manual.file,
-                    expected_hash
-                );
-            }
-        }
+                // Verify checksum if provided.
+                if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip")
+                    && !verify_file_hash(&src_path, expected_hash)?
+                {
+                    bail!("Checksum mismatch for {}: expected {}", file, expected_hash);
+                }
+
+                (src_path, file.clone(), file)
+            } else if let Some(url_raw) = manual.url.as_ref() {
+                let expanded_url = spec.expand_vars(url_raw);
+                let parsed = Url::parse(&expanded_url)
+                    .with_context(|| format!("Invalid URL: {}", expanded_url))?;
+
+                if parsed.scheme() == "file" {
+                    let src_path = parsed
+                        .to_file_path()
+                        .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", expanded_url))?;
+                    if !src_path.exists() {
+                        bail!("Manual source file URL not found: {}", src_path.display());
+                    }
+                    if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip")
+                        && !verify_file_hash(&src_path, expected_hash)?
+                    {
+                        bail!(
+                            "Checksum mismatch for {}: expected {}",
+                            expanded_url,
+                            expected_hash
+                        );
+                    }
+                    let default_dest = fetcher::derive_filename_from_url(&expanded_url);
+                    (src_path, expanded_url, default_dest)
+                } else {
+                    let source = crate::package::Source {
+                        url: expanded_url.clone(),
+                        sha256: manual.sha256.clone().unwrap_or_else(|| "skip".to_string()),
+                        extract_dir: "manual-source".to_string(),
+                        patches: Vec::new(),
+                        post_extract: Vec::new(),
+                    };
+                    let fetched = fetcher::fetch_archive(spec, &source, &cache_dir.join("manual"))?;
+                    let default_dest = fetcher::derive_filename_from_url(&expanded_url);
+                    (fetched, expanded_url, default_dest)
+                }
+            } else {
+                bail!("Manual source must define either 'file' or 'url'");
+            };
 
         // Determine destination
-        let dest_name = manual.dest.as_deref().unwrap_or(&manual.file);
-        let dest_path = build_dir.join(dest_name);
+        let dest_name = if let Some(dest) = manual.dest.as_ref() {
+            spec.expand_vars(dest)
+        } else {
+            default_dest
+        };
+        let dest_path = build_dir.join(&dest_name);
 
         // Create parent directories if needed
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        println!("  {} -> {}", manual.file, dest_path.display());
-        fs::copy(&src_path, &dest_path).with_context(|| {
+        println!("  {} -> {}", source_label, dest_path.display());
+        fs::copy(&source_path, &dest_path).with_context(|| {
             format!(
                 "Failed to copy {} to {}",
-                src_path.display(),
+                source_path.display(),
                 dest_path.display()
             )
         })?;
@@ -85,7 +130,11 @@ fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
     let (alg, hex) = if let Some(pos) = exp.find(':') {
         let a = exp[..pos].trim().to_ascii_lowercase();
         let h = exp[pos + 1..].trim().to_ascii_lowercase();
-        let alg = if a.is_empty() { "sha256".to_string() } else { a };
+        let alg = if a.is_empty() {
+            "sha256".to_string()
+        } else {
+            a
+        };
         (alg, h.to_string())
     } else {
         ("sha256".to_string(), exp.to_ascii_lowercase())
@@ -140,6 +189,22 @@ fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
     }
 }
 
+/// Build a blocking reqwest HTTP client using the platform-default TLS backend.
+/// Any error building the client is returned directly (no fallback).
+pub(crate) fn build_blocking_client(
+    user_agent: &str,
+    timeout: Option<std::time::Duration>,
+) -> anyhow::Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder().user_agent(user_agent.to_string());
+    if let Some(t) = timeout {
+        builder = builder.timeout(t);
+    }
+
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))
+}
+
 /// Fetch + extract all sources.
 ///
 /// Returns the primary source directory (the first source entry, or work_dir for manual-only packages).
@@ -148,12 +213,12 @@ pub fn prepare(spec: &PackageSpec, cache_dir: &Path, build_dir: &Path) -> Result
     if spec.sources().is_empty() {
         let work_dir = build_dir.join(&spec.package.name);
         fs::create_dir_all(&work_dir)?;
-        copy_manual_sources(spec, &work_dir)?;
+        copy_manual_sources(spec, cache_dir, &work_dir)?;
         return Ok(work_dir);
     }
 
     // Copy manual sources first (before any remote fetching)
-    copy_manual_sources(spec, build_dir)?;
+    copy_manual_sources(spec, cache_dir, build_dir)?;
 
     let mut primary: Option<PathBuf> = None;
 
@@ -311,6 +376,39 @@ fn split_git_url(url: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::package::{
+        Alternatives, Build, BuildFlags, BuildType, Dependencies, ManualSource, PackageInfo,
+        PackageSpec, Source,
+    };
+
+    fn mk_spec_with_manuals(spec_dir: PathBuf, manuals: Vec<ManualSource>) -> PackageSpec {
+        PackageSpec {
+            package: PackageInfo {
+                name: "foo".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Alternatives::default(),
+            manual_sources: manuals,
+            source: vec![Source {
+                url: "https://example.com/src.tar.gz".into(),
+                sha256: "skip".into(),
+                extract_dir: "src".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+            }],
+            build: Build {
+                build_type: BuildType::Custom,
+                flags: BuildFlags::default(),
+            },
+            dependencies: Dependencies::default(),
+            spec_dir,
+        }
+    }
 
     #[test]
     fn split_git_url_accepts_git_with_rev() {
@@ -365,5 +463,70 @@ mod tests {
         assert!(verify_file_hash(tmp.path(), &format!(":{}", sha256_hex)).unwrap());
         assert!(!verify_file_hash(tmp.path(), "md5:deadbeef").unwrap());
     }
-}
 
+    #[test]
+    fn build_blocking_client_with_and_without_timeout() {
+        use std::time::Duration;
+        let ua = "depot/test";
+        let c1 = build_blocking_client(ua, None).expect("client build failed");
+        assert!(c1.get("https://example.com").build().is_ok());
+
+        let c2 =
+            build_blocking_client(ua, Some(Duration::from_secs(5))).expect("client build failed");
+        assert!(c2.get("https://example.com").build().is_ok());
+    }
+
+    #[test]
+    fn copy_manual_sources_local_file_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec_dir = tmp.path().join("spec");
+        let cache_dir = tmp.path().join("cache");
+        let build_dir = tmp.path().join("build");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(spec_dir.join("manual.patch"), "patch-data").unwrap();
+
+        let spec = mk_spec_with_manuals(
+            spec_dir.clone(),
+            vec![ManualSource {
+                file: Some("manual.patch".into()),
+                url: None,
+                sha256: None,
+                dest: None,
+            }],
+        );
+
+        copy_manual_sources(&spec, &cache_dir, &build_dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(build_dir.join("manual.patch")).unwrap(),
+            "patch-data"
+        );
+    }
+
+    #[test]
+    fn copy_manual_sources_url_mode_file_scheme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec_dir = tmp.path().join("spec");
+        let cache_dir = tmp.path().join("cache");
+        let build_dir = tmp.path().join("build");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        let remote_file = tmp.path().join("remote-resource.txt");
+        std::fs::write(&remote_file, "remote-data").unwrap();
+        let url = format!("file://{}", remote_file.display());
+
+        let spec = mk_spec_with_manuals(
+            spec_dir,
+            vec![ManualSource {
+                file: None,
+                url: Some(url),
+                sha256: Some("skip".into()),
+                dest: Some("assets/manual.txt".into()),
+            }],
+        );
+
+        copy_manual_sources(&spec, &cache_dir, &build_dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(build_dir.join("assets/manual.txt")).unwrap(),
+            "remote-data"
+        );
+    }
+}

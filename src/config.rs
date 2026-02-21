@@ -128,7 +128,10 @@ impl Config {
 
         if host_build.exists() && host_build != build_path {
             let content = fs::read_to_string(&host_build).with_context(|| {
-                format!("Failed to read system build config: {}", host_build.display())
+                format!(
+                    "Failed to read system build config: {}",
+                    host_build.display()
+                )
             })?;
             let (val, appends) = self.preprocess_toml(&content)?;
             merge_toml_values(&mut self.build_overrides, &val);
@@ -139,7 +142,10 @@ impl Config {
 
         if build_path.exists() {
             let content = fs::read_to_string(&build_path).with_context(|| {
-                format!("Failed to read system build config: {}", build_path.display())
+                format!(
+                    "Failed to read system build config: {}",
+                    build_path.display()
+                )
             })?;
             let (val, appends) = self.preprocess_toml(&content)?;
             merge_toml_values(&mut self.build_overrides, &val);
@@ -153,7 +159,10 @@ impl Config {
 
         if host_package.exists() && host_package != package_path {
             let content = fs::read_to_string(&host_package).with_context(|| {
-                format!("Failed to read system package config: {}", host_package.display())
+                format!(
+                    "Failed to read system package config: {}",
+                    host_package.display()
+                )
             })?;
             let (val, appends) = self.preprocess_toml(&content)?;
             merge_toml_values(&mut self.package_overrides, &val);
@@ -164,7 +173,10 @@ impl Config {
 
         if package_path.exists() {
             let content = fs::read_to_string(&package_path).with_context(|| {
-                format!("Failed to read system package config: {}", package_path.display())
+                format!(
+                    "Failed to read system package config: {}",
+                    package_path.display()
+                )
             })?;
             let (val, appends) = self.preprocess_toml(&content)?;
             merge_toml_values(&mut self.package_overrides, &val);
@@ -372,7 +384,9 @@ cflags += ["-g"]
         // Save and restore the original value so other tests aren't affected.
         let orig_home = std::env::var_os("HOME");
         let fake_home = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("HOME", &fake_home.path()); }
+        unsafe {
+            std::env::set_var("HOME", &fake_home.path());
+        }
 
         let config = Config::for_rootfs(Path::new("/"));
 
@@ -392,9 +406,13 @@ cflags += ["-g"]
 
         // restore original HOME
         if let Some(v) = orig_home {
-            unsafe { std::env::set_var("HOME", v); }
+            unsafe {
+                std::env::set_var("HOME", v);
+            }
         } else {
-            unsafe { std::env::remove_var("HOME"); }
+            unsafe {
+                std::env::remove_var("HOME");
+            }
         }
     }
 

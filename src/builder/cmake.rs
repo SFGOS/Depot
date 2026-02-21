@@ -13,12 +13,12 @@ pub fn build(
     src_dir: &Path,
     destdir: &Path,
     cross: Option<&CrossConfig>,
+    export_compiler_flags: bool,
 ) -> Result<()> {
     let flags = &spec.build.flags;
 
     // Determine actual source directory (support source_subdir)
     let actual_src = resolve_actual_src(spec, src_dir)?;
-
 
     let build_dir = actual_src.join("build");
 
@@ -27,55 +27,7 @@ pub fn build(
     fs::create_dir_all(destdir)?;
 
     // Environment variables
-    let mut env_vars: Vec<(&str, String)> = vec![];
-
-    // Use cross-compilation tools if configured
-    let cc = if let Some(cc_cfg) = cross {
-        cc_cfg.cc.clone()
-    } else {
-        flags.cc.clone()
-    };
-
-    if !flags.cflags.is_empty() {
-        env_vars.push(("CFLAGS", flags.cflags.join(" ")));
-    }
-    if !flags.chost.is_empty() {
-        env_vars.push(("CHOST", flags.chost.clone()));
-    }
-    if !flags.cbuild.is_empty() {
-        env_vars.push(("CBUILD", flags.cbuild.clone()));
-    }
-    if !flags.ldflags.is_empty() {
-        let ldflags = if flags.libc.is_empty() {
-            flags.ldflags.join(" ")
-        } else {
-            format!(
-                "{} -Wl,--dynamic-linker={}",
-                flags.ldflags.join(" "),
-                flags.libc
-            )
-        };
-        env_vars.push(("LDFLAGS", ldflags));
-    }
-    env_vars.push(("CC", cc));
-
-    // Ensure CXX is exported for configure flags that reference $CXX
-    // prefer cross-config CXX when cross-compiling (handled earlier), otherwise use flags.cxx
-    env_vars.push(("CXX", flags.cxx.clone()));
-
-    // Export rootfs for build scripts
-    env_vars.push(("DEPOT_ROOTFS", flags.rootfs.clone()));
-
-    // CARCH support
-    if !flags.carch.is_empty() {
-        env_vars.push(("CARCH", flags.carch.clone()));
-    }
-
-    // Add cross-compilation env
-    if let Some(cc_cfg) = cross {
-        env_vars.push(("CXX", cc_cfg.cxx.clone()));
-        env_vars.push(("AR", cc_cfg.ar.clone()));
-    }
+    let env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
 
     // Extract prefix from configure flags (cmake-style -DCMAKE_INSTALL_PREFIX=)
     let prefix = flags
@@ -168,7 +120,10 @@ pub fn build(
         install_cmd.arg("--install").arg(&build_dir);
 
         let mut install_env = env_vars.clone();
-        install_env.push(("DESTDIR", destdir.to_string_lossy().into_owned()));
+        install_env.push((
+            "DESTDIR".to_string(),
+            destdir.to_string_lossy().into_owned(),
+        ));
         crate::builder::prepare_command(&mut install_cmd, &install_env);
 
         let status = install_cmd
@@ -199,7 +154,7 @@ fn expand_env_vars(input: &str) -> String {
 }
 
 /// Expand using a provided set of env vars (used to expand flags before spawning child).
-fn expand_with_envs(input: &str, envs: &Vec<(&str, String)>) -> String {
+fn expand_with_envs(input: &str, envs: &[(String, String)]) -> String {
     let mut result = input.to_string();
     for (k, v) in envs {
         result = result.replace(&format!("${}", k), v);
@@ -220,29 +175,38 @@ fn num_cpus() -> usize {
 /// - `src_dir/<sub>` -> use if exists
 /// - `spec.spec_dir/<sub>` -> use if exists (supports `../llvm`)
 /// - bare relative path (cwd)
-fn resolve_actual_src(spec: &crate::package::PackageSpec, src_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
+fn resolve_actual_src(
+    spec: &crate::package::PackageSpec,
+    src_dir: &Path,
+) -> anyhow::Result<std::path::PathBuf> {
     let flags = &spec.build.flags;
-    if flags.source_subdir.is_empty() {
+    let source_subdir = spec.expand_vars(&flags.source_subdir);
+    if source_subdir.is_empty() {
         return Ok(src_dir.to_path_buf());
     }
 
-    let candidate = std::path::Path::new(&flags.source_subdir);
+    let candidate = std::path::Path::new(&source_subdir);
     // 1) absolute path -> use directly
     if candidate.is_absolute() {
         if candidate.exists() {
             return Ok(candidate.to_path_buf());
         }
-        anyhow::bail!("Source directory not found: {} (source_subdir: {})", candidate.display(), flags.source_subdir);
+        anyhow::bail!(
+            "Source directory not found: {} (source_subdir: {} -> {})",
+            candidate.display(),
+            flags.source_subdir,
+            source_subdir
+        );
     }
 
     // 2) src_dir/<source_subdir>
-    let under_src = src_dir.join(&flags.source_subdir);
+    let under_src = src_dir.join(&source_subdir);
     if under_src.exists() {
         return Ok(under_src);
     }
 
     // 3) spec_dir/<source_subdir> (useful for ../llvm relative to spec)
-    let spec_path = spec.spec_dir.join(&flags.source_subdir);
+    let spec_path = spec.spec_dir.join(&source_subdir);
     if spec_path.exists() {
         return Ok(spec_path);
     }
@@ -254,7 +218,8 @@ fn resolve_actual_src(spec: &crate::package::PackageSpec, src_dir: &Path) -> any
 
     // fallback error
     anyhow::bail!(
-        "Source directory not found: {} (tried src_dir, spec_dir, and absolute path)",
+        "Source directory not found: {} (expanded from '{}'; tried src_dir, spec_dir, and absolute path)",
+        source_subdir,
         flags.source_subdir
     );
 }
@@ -277,7 +242,10 @@ mod tests {
 
     #[test]
     fn test_expand_with_envs_prefers_provided_envs() {
-        let envs = vec![("CXX", "my-cxx".to_string()), ("CC", "my-cc".to_string())];
+        let envs = vec![
+            ("CXX".to_string(), "my-cxx".to_string()),
+            ("CC".to_string(), "my-cc".to_string()),
+        ];
         let s = "-DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=${CXX} -DROOT=$HOME";
         let out = expand_with_envs(s, &envs);
         assert!(out.contains("my-cc"));
@@ -297,18 +265,33 @@ mod tests {
         let src_root = tmp.path().join("srcroot");
         let spec_dir = tmp.path().join("specdir");
         let external = tmp.path().join("external");
+        let expanded = src_root.join("x-1.0").join("sub");
         std::fs::create_dir_all(&src_root.join("sub")).unwrap();
+        std::fs::create_dir_all(&expanded).unwrap();
         // create directories for candidates
         std::fs::create_dir_all(&spec_dir.join("../llvm")).unwrap();
         std::fs::create_dir_all(&external).unwrap();
 
         let spec = PackageSpec {
-            package: PackageInfo { name: "x".into(), version: "1.0".into(), revision: 1, description: "".into(), homepage: "".into(), license: "MIT".into() },
+            package: PackageInfo {
+                name: "x".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "".into(),
+                homepage: "".into(),
+                license: vec!["MIT".into()],
+            },
             packages: Vec::new(),
             alternatives: Default::default(),
             manual_sources: Vec::new(),
             source: Vec::new(),
-            build: Build { build_type: BuildType::CMake, flags: BuildFlags { source_subdir: "sub".into(), ..BuildFlags::default() } },
+            build: Build {
+                build_type: BuildType::CMake,
+                flags: BuildFlags {
+                    source_subdir: "sub".into(),
+                    ..BuildFlags::default()
+                },
+            },
             dependencies: Default::default(),
             spec_dir: spec_dir.clone(),
         };
@@ -328,5 +311,11 @@ mod tests {
         spec3.build.flags.source_subdir = external.to_string_lossy().into_owned();
         let p3 = resolve_actual_src(&spec3, &src_root).unwrap();
         assert_eq!(p3, external);
+
+        // case: variable expansion in source_subdir
+        let mut spec4 = spec.clone();
+        spec4.build.flags.source_subdir = "$name-$version/sub".into();
+        let p4 = resolve_actual_src(&spec4, &src_root).unwrap();
+        assert_eq!(p4, expanded);
     }
 }

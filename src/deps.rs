@@ -173,10 +173,31 @@ pub fn check_runtime_deps(spec: &PackageSpec, db_path: &Path) -> Result<Vec<Stri
     Ok(missing)
 }
 
+/// Check if all test dependencies are satisfied
+pub fn check_test_deps(spec: &PackageSpec, db_path: &Path) -> Result<Vec<String>> {
+    let mut missing = Vec::new();
+
+    if !db_path.exists() {
+        return Ok(spec.dependencies.test.clone());
+    }
+
+    let installed = db::get_installed_packages(db_path)?;
+    let provides = db::get_all_provides(db_path)?;
+
+    for dep in &spec.dependencies.test {
+        if !is_dep_satisfied(dep, &installed, &provides, db_path)? {
+            missing.push(dep.clone());
+        }
+    }
+
+    Ok(missing)
+}
+
 /// Print dependency status
 pub fn print_dep_status(spec: &PackageSpec, db_path: &Path) -> Result<()> {
     let missing_build = check_build_deps(spec, db_path)?;
     let missing_runtime = check_runtime_deps(spec, db_path)?;
+    let missing_test = check_test_deps(spec, db_path)?;
 
     if !spec.dependencies.build.is_empty() {
         println!("Build dependencies: {}", spec.dependencies.build.join(", "));
@@ -195,6 +216,13 @@ pub fn print_dep_status(spec: &PackageSpec, db_path: &Path) -> Result<()> {
         }
     }
 
+    if !spec.dependencies.test.is_empty() {
+        println!("Test dependencies: {}", spec.dependencies.test.join(", "));
+        if !missing_test.is_empty() {
+            println!("  Missing: {}", missing_test.join(", "));
+        }
+    }
+
     Ok(())
 }
 
@@ -205,6 +233,20 @@ pub fn require_build_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
     if !missing.is_empty() {
         anyhow::bail!(
             "Missing build dependencies: {}\nInstall them first with: nyapm install <package>",
+            missing.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+/// Verify all test dependencies are installed, error if not
+pub fn require_test_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
+    let missing = check_test_deps(spec, db_path)?;
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Missing test dependencies: {}\nInstall them first with: nyapm install <package>",
             missing.join(", ")
         );
     }
@@ -259,5 +301,42 @@ mod tests {
         assert!(compare_versions("b", "a", VersionOp::Gt));
         assert!(compare_versions("a", "b", VersionOp::Lt));
         assert!(compare_versions("foo", "foo", VersionOp::Exact));
+    }
+
+    #[test]
+    fn test_check_test_deps_returns_test_deps_when_db_missing() {
+        let spec = PackageSpec {
+            package: crate::package::PackageInfo {
+                name: "foo".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Default::default(),
+            manual_sources: Vec::new(),
+            source: vec![crate::package::Source {
+                url: "https://example.test/foo.tar.gz".into(),
+                sha256: "skip".into(),
+                extract_dir: "foo".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+            }],
+            build: crate::package::Build {
+                build_type: crate::package::BuildType::Custom,
+                flags: crate::package::BuildFlags::default(),
+            },
+            dependencies: crate::package::Dependencies {
+                build: Vec::new(),
+                runtime: Vec::new(),
+                test: vec!["bats".into(), "python".into()],
+            },
+            spec_dir: std::path::PathBuf::from("."),
+        };
+
+        let missing = check_test_deps(&spec, Path::new("/definitely/not/a/real/db")).unwrap();
+        assert_eq!(missing, vec!["bats".to_string(), "python".to_string()]);
     }
 }

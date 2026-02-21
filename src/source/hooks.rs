@@ -253,7 +253,7 @@ mod tests {
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
-                license: "MIT".into(),
+                license: vec!["MIT".into()],
             },
             packages: Vec::new(),
             alternatives: Alternatives::default(),

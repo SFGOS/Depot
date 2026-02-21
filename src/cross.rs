@@ -203,12 +203,16 @@ endian = 'little'
     }
 }
 
-/// Find a cross-compilation tool in PATH
+/// Find a cross-compilation tool in PATH and return its absolute path
 fn find_tool(prefix: &str, suffixes: &[&str], required: bool) -> Result<String> {
     for suffix in suffixes {
         let tool_name = format!("{}-{}", prefix, suffix);
-        if tool_exists(&tool_name) {
-            return Ok(tool_name);
+        // Use `which` to resolve to an absolute path (so callers get a usable path)
+        if let Ok(output) = Command::new("which").arg(&tool_name).output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                return Ok(path);
+            }
         }
     }
 
@@ -221,13 +225,4 @@ fn find_tool(prefix: &str, suffixes: &[&str], required: bool) -> Result<String> 
     }
 
     Err(anyhow::anyhow!("Tool not found"))
-}
-
-/// Check if a tool exists in PATH
-fn tool_exists(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }

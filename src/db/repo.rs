@@ -6,6 +6,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use zstd::stream::write::Encoder;
 
+fn parse_license_text(metadata: &toml::Value) -> Option<String> {
+    if let Some(s) = metadata.get("license").and_then(|v| v.as_str()) {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = metadata.get("license").and_then(|v| v.as_array()) {
+        let licenses: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(String::from)
+            .collect();
+        if !licenses.is_empty() {
+            return Some(licenses.join(", "));
+        }
+    }
+    None
+}
+
 pub struct RepoManager {
     pub repo_dir: PathBuf,
 }
@@ -129,10 +146,7 @@ impl RepoManager {
                     .get("homepage")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                license = metadata
-                    .get("license")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+                license = parse_license_text(&metadata);
 
                 if let Some(provides_arr) = metadata.get("provides").and_then(|v| v.as_array()) {
                     provides = provides_arr
@@ -209,8 +223,11 @@ impl RepoManager {
 }
 
 /// Synchronize git mirrors into /usr/src/depot/<reponame>
-pub fn sync_mirrors(repo_dir: &std::path::Path, mirrors: &std::collections::HashMap<String, String>) -> Result<()> {
-    use git2::{Repository, FetchOptions, Cred, RemoteCallbacks, ResetType, build::RepoBuilder};
+pub fn sync_mirrors(
+    repo_dir: &std::path::Path,
+    mirrors: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    use git2::{Cred, FetchOptions, RemoteCallbacks, Repository, ResetType, build::RepoBuilder};
     use std::os::unix::fs::PermissionsExt;
 
     let base = repo_dir.to_path_buf();
@@ -235,7 +252,9 @@ pub fn sync_mirrors(repo_dir: &std::path::Path, mirrors: &std::collections::Hash
 
             let mut builder = RepoBuilder::new();
             builder.fetch_options(fo);
-            builder.clone(url, &target).with_context(|| format!("Failed to clone {}", url))?;
+            builder
+                .clone(url, &target)
+                .with_context(|| format!("Failed to clone {}", url))?;
         } else {
             println!("Updating mirror '{}' in {}", name, target.display());
             // Open repository and fetch updates
@@ -251,8 +270,11 @@ pub fn sync_mirrors(repo_dir: &std::path::Path, mirrors: &std::collections::Hash
             fo.remote_callbacks(cb);
 
             // Fetch from origin
-            let mut remote = repo.find_remote("origin").or_else(|_| repo.remote_anonymous(url))?;
-            remote.fetch(&["refs/heads/*:refs/remotes/origin/*"], Some(&mut fo), None)
+            let mut remote = repo
+                .find_remote("origin")
+                .or_else(|_| repo.remote_anonymous(url))?;
+            remote
+                .fetch(&["refs/heads/*:refs/remotes/origin/*"], Some(&mut fo), None)
                 .with_context(|| format!("Failed to fetch updates for {}", url))?;
 
             // Try to fast-forward HEAD to origin/HEAD by resetting to FETCH_HEAD if present
@@ -280,7 +302,10 @@ pub fn sync_mirrors(repo_dir: &std::path::Path, mirrors: &std::collections::Hash
 }
 
 /// Show status for each mirror repository: path, exists, branch/HEAD, latest commit, dirty
-pub fn mirrors_status(repo_dir: &std::path::Path, mirrors: &std::collections::HashMap<String, String>) -> Result<()> {
+pub fn mirrors_status(
+    repo_dir: &std::path::Path,
+    mirrors: &std::collections::HashMap<String, String>,
+) -> Result<()> {
     use git2::Repository;
 
     let base = repo_dir.to_path_buf();
@@ -308,7 +333,9 @@ pub fn mirrors_status(repo_dir: &std::path::Path, mirrors: &std::collections::Ha
 
                 // Latest commit OID
                 let oid = repo.refname_to_id("HEAD").ok();
-                let short = oid.map(|o| format!("{}", o)).unwrap_or_else(|| "(unknown)".to_string());
+                let short = oid
+                    .map(|o| format!("{}", o))
+                    .unwrap_or_else(|| "(unknown)".to_string());
 
                 // Commit time (seconds since epoch) if available
                 let mut commit_time = String::new();
@@ -327,7 +354,11 @@ pub fn mirrors_status(repo_dir: &std::path::Path, mirrors: &std::collections::Ha
                         continue;
                     }
                 };
-                let dirty = statuses.iter().any(|s| s.status().intersects(git2::Status::WT_MODIFIED | git2::Status::WT_NEW | git2::Status::WT_DELETED));
+                let dirty = statuses.iter().any(|s| {
+                    s.status().intersects(
+                        git2::Status::WT_MODIFIED | git2::Status::WT_NEW | git2::Status::WT_DELETED,
+                    )
+                });
 
                 println!("Path: {}", target.display());
                 println!("Branch/HEAD: {}", branch);
@@ -447,5 +478,42 @@ runtime = []
             .query_row("SELECT count(*) FROM provides", [], |r| r.get(0))
             .unwrap();
         assert_eq!(provides_count, 1);
+    }
+
+    #[test]
+    fn test_index_package_with_multiple_licenses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path();
+        let pkg_path = repo_dir.join("test-1.0-1-x86_64.depot.pkg.tar.zst");
+
+        let file = fs::File::create(&pkg_path).unwrap();
+        let encoder = zstd::stream::write::Encoder::new(file, 3).unwrap();
+        let mut tar = tar::Builder::new(encoder);
+
+        let metadata = r#"
+name = "test"
+version = "1.0"
+revision = 1
+license = ["MIT", "Apache-2.0"]
+"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_path(".metadata.toml").unwrap();
+        header.set_size(metadata.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append(&header, metadata.as_bytes()).unwrap();
+
+        let encoder = tar.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        let manager = RepoManager::new(repo_dir.to_path_buf());
+        manager.init_repo_schema(&mut conn).unwrap();
+        manager.index_package(&mut conn, &pkg_path).unwrap();
+
+        let lic: Option<String> = conn
+            .query_row("SELECT license FROM packages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lic, Some("MIT, Apache-2.0".to_string()));
     }
 }

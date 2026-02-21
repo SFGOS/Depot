@@ -19,15 +19,23 @@ pub fn checkout(
     git_cache_dir: &Path,
     pkgname: &str,
 ) -> Result<()> {
-    fs::create_dir_all(git_cache_dir)
-        .with_context(|| format!("Failed to create git cache dir: {}", git_cache_dir.display()))?;
+    fs::create_dir_all(git_cache_dir).with_context(|| {
+        format!(
+            "Failed to create git cache dir: {}",
+            git_cache_dir.display()
+        )
+    })?;
 
     let mirror_dir = git_cache_dir.join(mirror_key(url));
     ensure_mirror(url, &mirror_dir, pkgname)?;
 
     if checkout_dir.exists() {
-        fs::remove_dir_all(checkout_dir)
-            .with_context(|| format!("Failed to remove existing checkout: {}", checkout_dir.display()))?;
+        fs::remove_dir_all(checkout_dir).with_context(|| {
+            format!(
+                "Failed to remove existing checkout: {}",
+                checkout_dir.display()
+            )
+        })?;
     }
 
     // Clone from local mirror for speed.
@@ -40,8 +48,7 @@ pub fn checkout(
         .with_context(|| format!("Failed to clone from mirror for {}", url))?;
 
     let repo = Repository::open(checkout_dir)?;
-    checkout_rev(&repo, rev)
-        .with_context(|| format!("Failed to checkout revision '{}'", rev))?;
+    checkout_rev(&repo, rev).with_context(|| format!("Failed to checkout revision '{}'", rev))?;
 
     Ok(())
 }

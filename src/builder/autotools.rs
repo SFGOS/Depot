@@ -14,78 +14,28 @@ pub fn build(
     src_dir: &Path,
     destdir: &Path,
     cross: Option<&CrossConfig>,
+    export_compiler_flags: bool,
 ) -> Result<()> {
     let flags = &spec.build.flags;
-
-    // Determine actual source directory (support source_subdir)
-    let actual_src = if !flags.source_subdir.is_empty() {
-        src_dir.join(&flags.source_subdir)
-    } else {
-        src_dir.to_path_buf()
-    };
-
-    if !actual_src.exists() {
-        anyhow::bail!(
-            "Source directory not found: {} (source_subdir: {})",
-            actual_src.display(),
-            flags.source_subdir
-        );
-    }
+    let export_compiler_flags = export_compiler_flags && !flags.no_flags;
+    let actual_src = resolve_actual_src(spec, src_dir)?;
 
     // Create destdir
     fs::create_dir_all(destdir)?;
 
     // Build environment variables
-    let mut env_vars: Vec<(&str, String)> = vec![];
-
-    // Use cross-compilation tools if configured
-    let (cc, ar) = if let Some(cc_cfg) = cross {
-        (cc_cfg.cc.clone(), cc_cfg.ar.clone())
+    let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
+    let cc = if let Some(cc_cfg) = cross {
+        cc_cfg.cc.clone()
     } else {
-        (flags.cc.clone(), flags.ar.clone())
+        flags.cc.clone()
     };
 
-    if !flags.cflags.is_empty() {
+    if export_compiler_flags && !flags.cflags.is_empty() {
         // Expand shell command substitutions like $($CC -print-resource-dir)
         let cflags_str = flags.cflags.join(" ");
         let expanded = expand_shell_commands(&cflags_str, &cc)?;
-        env_vars.push(("CFLAGS", expanded));
-    }
-    if !flags.ldflags.is_empty() {
-        env_vars.push(("LDFLAGS", flags.ldflags.join(" ")));
-    }
-    env_vars.push(("CC", cc.clone()));
-    env_vars.push(("AR", ar));
-
-    // CARCH support
-    if !flags.carch.is_empty() {
-        env_vars.push(("CARCH", flags.carch.clone()));
-    }
-
-    // Export rootfs for build scripts
-    env_vars.push(("DEPOT_ROOTFS", flags.rootfs.clone()));
-
-    // Add cross-compilation environment
-    if let Some(cc_cfg) = cross {
-        env_vars.push(("CXX", cc_cfg.cxx.clone()));
-        env_vars.push(("RANLIB", cc_cfg.ranlib.clone()));
-        env_vars.push(("STRIP", cc_cfg.strip.clone()));
-        env_vars.push(("LD", cc_cfg.ld.clone()));
-        env_vars.push(("NM", cc_cfg.nm.clone()));
-    }
-
-    // Add dynamic loader flag if specified
-    if !flags.libc.is_empty() {
-        let ldflags = if flags.ldflags.is_empty() {
-            format!("-Wl,--dynamic-linker={}", flags.libc)
-        } else {
-            format!(
-                "{} -Wl,--dynamic-linker={}",
-                flags.ldflags.join(" "),
-                flags.libc
-            )
-        };
-        env_vars.push(("LDFLAGS", ldflags));
+        crate::builder::set_env_var(&mut env_vars, "CFLAGS", expanded);
     }
 
     use crate::builder::state::{BuildStep, StateTracker};
@@ -117,18 +67,47 @@ pub fn build(
 
         configure_cmd.arg(format!("--prefix={}", flags.prefix));
 
-        if !flags.chost.is_empty() {
-            configure_cmd.arg(format!("--host={}", flags.chost));
-        }
-        if !flags.cbuild.is_empty() {
-            configure_cmd.arg(format!("--build={}", flags.cbuild));
+        // Some projects use non-GNU configure scripts that reject --host/--build.
+        // Probe support first and only add these options when advertised.
+        let help_text = configure_help_text(configure_path, &build_dir, &env_vars);
+        let supports_host = help_text
+            .as_deref()
+            .map(|s| configure_help_supports_option(s, "--host"))
+            .unwrap_or(true);
+        let supports_build = help_text
+            .as_deref()
+            .map(|s| configure_help_supports_option(s, "--build"))
+            .unwrap_or(true);
+
+        let requested_host = if let Some(cc_cfg) = cross {
+            Some(cc_cfg.host_triple().to_string())
+        } else if !flags.chost.is_empty() {
+            Some(flags.chost.clone())
+        } else {
+            None
+        };
+
+        let requested_build = if cross.is_some() {
+            CrossConfig::build_triple().ok()
+        } else if !flags.cbuild.is_empty() {
+            Some(flags.cbuild.clone())
+        } else {
+            None
+        };
+
+        if let Some(host) = requested_host {
+            if supports_host {
+                configure_cmd.arg(format!("--host={}", host));
+            } else {
+                println!("  configure does not support --host; skipping {}", host);
+            }
         }
 
-        // Add cross-compilation flags
-        if let Some(cc_cfg) = cross {
-            configure_cmd.arg(format!("--host={}", cc_cfg.host_triple()));
-            if let Ok(build) = CrossConfig::build_triple() {
+        if let Some(build) = requested_build {
+            if supports_build {
                 configure_cmd.arg(format!("--build={}", build));
+            } else {
+                println!("  configure does not support --build; skipping {}", build);
             }
         }
 
@@ -154,6 +133,7 @@ pub fn build(
         let mut make_cmd = Command::new("make");
         make_cmd.current_dir(&build_dir);
         make_cmd.arg("-j").arg(num_cpus().to_string());
+        add_make_variable_overrides(&mut make_cmd, &flags.make_vars, "build")?;
 
         crate::builder::prepare_command(&mut make_cmd, &env_vars);
 
@@ -163,6 +143,30 @@ pub fn build(
 
         if !status.success() {
             anyhow::bail!("make failed with status: {}", status);
+        }
+
+        if let Some(test_target) = maybe_find_autotools_test_target(&build_dir, flags.skip_tests)? {
+            println!("Running make {}...", test_target);
+            let mut test_cmd = Command::new("make");
+            test_cmd.current_dir(&build_dir);
+            add_make_variable_overrides(&mut test_cmd, &flags.make_test_vars, "test")?;
+            test_cmd.arg(test_target);
+            crate::builder::prepare_command(&mut test_cmd, &env_vars);
+
+            let status = test_cmd.status().with_context(|| {
+                format!(
+                    "Failed to run make {} in {}",
+                    test_target,
+                    build_dir.display()
+                )
+            })?;
+            if !status.success() {
+                anyhow::bail!("make {} failed with status: {}", test_target, status);
+            }
+        } else if flags.skip_tests {
+            println!("Skipping tests: disabled by build.flags.skip_tests");
+        } else {
+            println!("Skipping tests: no 'check' or 'test' target in Makefile");
         }
 
         // Run post-compile hooks (after make, before make install)
@@ -185,10 +189,17 @@ pub fn build(
 
         let mut install_cmd = fakeroot::wrap_install_command("make", destdir);
         install_cmd.current_dir(&build_dir);
+        if !has_make_variable_override(&flags.make_install_vars, "DESTDIR") {
+            install_cmd.arg(format!("DESTDIR={}", destdir.to_string_lossy()));
+        }
+        add_make_variable_overrides(&mut install_cmd, &flags.make_install_vars, "install")?;
         install_cmd.arg("install");
 
         let mut install_env = env_vars.clone();
-        install_env.push(("DESTDIR", destdir.to_string_lossy().into_owned()));
+        install_env.push((
+            "DESTDIR".to_string(),
+            destdir.to_string_lossy().into_owned(),
+        ));
         crate::builder::prepare_command(&mut install_cmd, &install_env);
 
         let status = install_cmd
@@ -213,6 +224,155 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+fn resolve_actual_src(spec: &PackageSpec, src_dir: &Path) -> Result<std::path::PathBuf> {
+    let flags = &spec.build.flags;
+    let source_subdir = spec.expand_vars(&flags.source_subdir);
+
+    let actual_src = if source_subdir.is_empty() {
+        src_dir.to_path_buf()
+    } else {
+        src_dir.join(&source_subdir)
+    };
+
+    if !actual_src.exists() {
+        anyhow::bail!(
+            "Source directory not found: {} (source_subdir: {} -> {})",
+            actual_src.display(),
+            flags.source_subdir,
+            source_subdir
+        );
+    }
+
+    Ok(actual_src)
+}
+
+fn configure_help_text(
+    configure_path: &str,
+    build_dir: &Path,
+    env_vars: &crate::builder::EnvVars,
+) -> Option<String> {
+    let mut help_cmd = Command::new(configure_path);
+    help_cmd.current_dir(build_dir);
+    help_cmd.arg("--help");
+    crate::builder::prepare_command(&mut help_cmd, env_vars);
+    let output = help_cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Some(text)
+}
+
+fn configure_help_supports_option(help_text: &str, option: &str) -> bool {
+    let with_eq = format!("{}=", option);
+    let with_space = format!("{} ", option);
+    help_text.contains(&with_eq) || help_text.contains(&with_space) || help_text.contains(option)
+}
+
+fn find_autotools_test_target(build_dir: &Path) -> Result<Option<&'static str>> {
+    for target in ["check", "test"] {
+        if makefile_has_target(build_dir, target)? {
+            return Ok(Some(target));
+        }
+    }
+    Ok(None)
+}
+
+fn maybe_find_autotools_test_target(
+    build_dir: &Path,
+    skip_tests: bool,
+) -> Result<Option<&'static str>> {
+    if skip_tests {
+        return Ok(None);
+    }
+    find_autotools_test_target(build_dir)
+}
+
+fn makefile_has_target(build_dir: &Path, target: &str) -> Result<bool> {
+    for name in ["GNUmakefile", "Makefile", "makefile"] {
+        let path = build_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read makefile: {}", path.display()))?;
+        if makefile_content_has_target(&content, target) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn makefile_content_has_target(content: &str, target: &str) -> bool {
+    for raw in content.lines() {
+        let line = raw.trim_start();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('\t') {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix(".PHONY:") {
+            if rest.split_whitespace().any(|t| t == target) {
+                return true;
+            }
+            continue;
+        }
+
+        let Some(colon_pos) = line.find(':') else {
+            continue;
+        };
+        let rhs = &line[colon_pos + 1..];
+        if rhs.starts_with('=') {
+            // Variable assignment (e.g. FOO:=bar), not a make target.
+            continue;
+        }
+
+        let lhs = &line[..colon_pos];
+        if lhs.split_whitespace().any(|t| t == target) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn add_make_variable_overrides(cmd: &mut Command, vars: &[String], phase: &str) -> Result<()> {
+    for raw in vars {
+        let var = raw.trim();
+        if var.is_empty() {
+            continue;
+        }
+        let Some((name, _value)) = var.split_once('=') else {
+            anyhow::bail!(
+                "Invalid make variable override '{}' for {} phase; expected NAME=VALUE",
+                var,
+                phase
+            );
+        };
+        let name = name.trim();
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            anyhow::bail!(
+                "Invalid make variable override '{}' for {} phase; expected NAME=VALUE",
+                var,
+                phase
+            );
+        }
+        cmd.arg(var);
+    }
+    Ok(())
+}
+
+fn has_make_variable_override(vars: &[String], name: &str) -> bool {
+    vars.iter().any(|raw| {
+        let var = raw.trim();
+        let Some((lhs, _rhs)) = var.split_once('=') else {
+            return false;
+        };
+        lhs.trim() == name
+    })
 }
 
 /// Expand shell command substitutions like $($CC -print-resource-dir) in a string
@@ -253,6 +413,9 @@ fn expand_shell_commands(input: &str, cc: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::package::{Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec};
+    use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[test]
     fn test_expand_shell_commands_simple() -> Result<()> {
@@ -266,7 +429,7 @@ mod tests {
         // The command contains $CC which should be replaced with provided cc
         let out = expand_shell_commands("start $($CC -v >/dev/null; echo OK) end", "mycc")?;
         // Since the inner command echoes OK, after replacing $CC it should run and include OK
-        assert!(out.contains("OK") || out.contains("") );
+        assert!(out.contains("OK") || out.contains(""));
         Ok(())
     }
 
@@ -274,5 +437,131 @@ mod tests {
     fn test_num_cpus_at_least_one() {
         let n = num_cpus();
         assert!(n >= 1);
+    }
+
+    #[test]
+    fn test_configure_help_supports_host_build() {
+        let help = "Usage: configure [OPTION]...\n  --host=HOST   cross host\n  --build=BUILD";
+        assert!(configure_help_supports_option(help, "--host"));
+        assert!(configure_help_supports_option(help, "--build"));
+        assert!(!configure_help_supports_option(help, "--target"));
+    }
+
+    #[test]
+    fn test_makefile_content_has_target_detects_check_and_test() {
+        let content = r#"
+.PHONY: all check
+all:
+	@echo all
+check:
+	@echo check
+"#;
+        assert!(makefile_content_has_target(content, "check"));
+        assert!(!makefile_content_has_target(content, "test"));
+    }
+
+    #[test]
+    fn test_makefile_content_has_target_ignores_assignments() {
+        let content = r#"
+TEST := value
+VAR:=$(shell echo hi)
+foo: bar
+	@true
+"#;
+        assert!(!makefile_content_has_target(content, "TEST"));
+        assert!(!makefile_content_has_target(content, "VAR"));
+        assert!(!makefile_content_has_target(content, "check"));
+    }
+
+    #[test]
+    fn test_maybe_find_autotools_test_target_respects_skip_tests() -> Result<()> {
+        let tmp = tempdir().unwrap();
+        std::fs::write(tmp.path().join("Makefile"), "check:\n\t@true\n").unwrap();
+
+        let skipped = maybe_find_autotools_test_target(tmp.path(), true)?;
+        assert_eq!(skipped, None);
+
+        let detected = maybe_find_autotools_test_target(tmp.path(), false)?;
+        assert_eq!(detected, Some("check"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_make_variable_overrides_accepts_valid_assignments() -> Result<()> {
+        let mut cmd = Command::new("make");
+        add_make_variable_overrides(
+            &mut cmd,
+            &[
+                "CC=clang".to_string(),
+                "V=1".to_string(),
+                " CFLAGS=-O2 -pipe ".to_string(),
+            ],
+            "build",
+        )?;
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["CC=clang", "V=1", "CFLAGS=-O2 -pipe"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_make_variable_overrides_rejects_invalid_assignment() {
+        let mut cmd = Command::new("make");
+        let err = add_make_variable_overrides(&mut cmd, &["not-an-assignment".to_string()], "test")
+            .expect_err("expected invalid assignment to fail");
+        assert!(err.to_string().contains("expected NAME=VALUE"));
+    }
+
+    #[test]
+    fn test_has_make_variable_override_detects_destdir() {
+        assert!(has_make_variable_override(
+            &["DESTDIR=/tmp/pkg".to_string()],
+            "DESTDIR"
+        ));
+        assert!(has_make_variable_override(
+            &[" DESTDIR =/tmp/pkg ".to_string()],
+            "DESTDIR"
+        ));
+        assert!(!has_make_variable_override(
+            &["V=1".to_string(), "PREFIX=/usr".to_string()],
+            "DESTDIR"
+        ));
+    }
+
+    #[test]
+    fn test_resolve_actual_src_expands_source_subdir_vars() {
+        let tmp = tempdir().unwrap();
+        let src_root = tmp.path().join("srcroot");
+        let expanded = src_root.join("expect5.45.4").join("unix");
+        std::fs::create_dir_all(&expanded).unwrap();
+
+        let spec = PackageSpec {
+            package: PackageInfo {
+                name: "expect".into(),
+                version: "5.45.4".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Default::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: Build {
+                build_type: BuildType::Autotools,
+                flags: BuildFlags {
+                    source_subdir: "$name$version/unix".into(),
+                    ..BuildFlags::default()
+                },
+            },
+            dependencies: Dependencies::default(),
+            spec_dir: PathBuf::from("."),
+        };
+
+        let resolved = resolve_actual_src(&spec, &src_root).unwrap();
+        assert_eq!(resolved, expanded);
     }
 }

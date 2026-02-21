@@ -3,6 +3,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde::Deserializer;
+use serde::Serialize;
+use serde::Serializer;
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -52,8 +54,41 @@ impl PackageSpec {
         if spec.source.is_empty() && spec.manual_sources.is_empty() {
             anyhow::bail!("Package must have at least one source or manual_sources entry");
         }
+        spec.validate_manual_sources()?;
 
         Ok(spec)
+    }
+
+    fn validate_manual_sources(&self) -> Result<()> {
+        for (idx, manual) in self.manual_sources.iter().enumerate() {
+            let has_file = manual
+                .file
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let has_url = manual
+                .url
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+
+            match (has_file, has_url) {
+                (true, false) | (false, true) => {}
+                (false, false) => {
+                    anyhow::bail!(
+                        "manual_sources[{}] must specify exactly one of 'file' or 'url'",
+                        idx
+                    );
+                }
+                (true, true) => {
+                    anyhow::bail!(
+                        "manual_sources[{}] cannot specify both 'file' and 'url'",
+                        idx
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Expand variables like $name and $version in a string
@@ -127,6 +162,17 @@ impl PackageSpec {
                         self.build.flags.ldflags = vec![s.to_string()];
                     }
                 }
+                "keep" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.keep = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.keep = vec![s.to_string()];
+                    }
+                }
                 "cc" => {
                     if let Some(s) = v.as_str() {
                         self.build.flags.cc = s.to_string();
@@ -162,6 +208,65 @@ impl PackageSpec {
                         self.build.flags.carch = s.to_string();
                     }
                 }
+                "make_vars" | "make-vars" | "make_build_vars" | "make-build-vars" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.make_vars = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.make_vars =
+                            s.split_whitespace().map(String::from).collect();
+                    }
+                }
+                "make_test_vars" | "make-test-vars" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.make_test_vars = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.make_test_vars =
+                            s.split_whitespace().map(String::from).collect();
+                    }
+                }
+                "make_install_vars" | "make-install-vars" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.make_install_vars = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.make_install_vars =
+                            s.split_whitespace().map(String::from).collect();
+                    }
+                }
+                "passthrough_env" | "passthrough-env" | "pass_env" | "pass-env" | "export_env"
+                | "export-env" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.passthrough_env = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.passthrough_env =
+                            s.split_whitespace().map(String::from).collect();
+                    }
+                }
+                "no_flags" | "no-flags" => {
+                    if let Some(b) = v.as_bool() {
+                        self.build.flags.no_flags = b;
+                    }
+                }
+                "skip_tests" | "skip-tests" => {
+                    if let Some(b) = v.as_bool() {
+                        self.build.flags.skip_tests = b;
+                    }
+                }
                 // Add more fields as needed
                 _ => {}
             }
@@ -191,6 +296,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.ldflags.push(s.to_string());
+                    }
+                }
+            }
+            "keep" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .keep
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.keep.push(s.to_string());
                     }
                 }
             }
@@ -258,6 +375,77 @@ impl PackageSpec {
             "carch" => {
                 if let Some(s) = values.last().and_then(|v| v.as_str()) {
                     self.build.flags.carch = s.to_string();
+                }
+            }
+            "make_vars" | "make-vars" | "make_build_vars" | "make-build-vars" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .make_vars
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build
+                            .flags
+                            .make_vars
+                            .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
+            "make_test_vars" | "make-test-vars" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .make_test_vars
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build
+                            .flags
+                            .make_test_vars
+                            .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
+            "make_install_vars" | "make-install-vars" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .make_install_vars
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build
+                            .flags
+                            .make_install_vars
+                            .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
+            "passthrough_env" | "passthrough-env" | "pass_env" | "pass-env" | "export_env"
+            | "export-env" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .passthrough_env
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build
+                            .flags
+                            .passthrough_env
+                            .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
+            "no_flags" | "no-flags" => {
+                if let Some(b) = values.last().and_then(|v| v.as_bool()) {
+                    self.build.flags.no_flags = b;
+                }
+            }
+            "skip_tests" | "skip-tests" => {
+                if let Some(b) = values.last().and_then(|v| v.as_bool()) {
+                    self.build.flags.skip_tests = b;
                 }
             }
             _ => {}
@@ -345,6 +533,39 @@ type = "custom"
     }
 
     #[test]
+    fn parse_multiple_licenses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = ["MIT", "Apache-2.0"]
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.package.license,
+            vec!["MIT".to_string(), "Apache-2.0".to_string()]
+        );
+    }
+
+    #[test]
     fn parse_rejects_empty_sources() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -372,6 +593,101 @@ type = "custom"
     }
 
     #[test]
+    fn parse_manual_source_with_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[[manual_sources]]
+url = "https://example.com/manual.patch"
+sha256 = "skip"
+dest = "patches/manual.patch"
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.manual_sources.len(), 1);
+        assert_eq!(
+            spec.manual_sources[0].url.as_deref(),
+            Some("https://example.com/manual.patch")
+        );
+        assert_eq!(spec.manual_sources[0].file, None);
+    }
+
+    #[test]
+    fn parse_manual_source_rejects_missing_file_and_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[[manual_sources]]
+sha256 = "skip"
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        let err = PackageSpec::from_file(&path).expect_err("spec should be rejected");
+        assert!(err.to_string().contains("exactly one of 'file' or 'url'"));
+    }
+
+    #[test]
+    fn parse_manual_source_rejects_file_and_url_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[[manual_sources]]
+file = "manual.patch"
+url = "https://example.com/manual.patch"
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        let err = PackageSpec::from_file(&path).expect_err("spec should be rejected");
+        assert!(
+            err.to_string()
+                .contains("cannot specify both 'file' and 'url'")
+        );
+    }
+
+    #[test]
     fn test_apply_config() {
         let mut spec = mk_spec("foo", "1.0");
         let mut config = crate::config::Config::for_rootfs(Path::new("/tmp/nonexistent"));
@@ -382,6 +698,11 @@ type = "custom"
 [flags]
 cc = "my-cc"
 cflags = ["-O2"]
+passthrough_env = ["RUSTFLAGS"]
+make_vars = ["V=1"]
+no_flags = true
+skip_tests = true
+keep = ["etc/locale.gen"]
 "#,
         )
         .unwrap();
@@ -396,6 +717,24 @@ cflags = ["-O2"]
                 toml::Value::String("opt-level=3".to_string()),
             ])],
         );
+        config.appends.insert(
+            "build.flags.keep".to_string(),
+            vec![toml::Value::Array(vec![toml::Value::String(
+                "etc/locale.gen".to_string(),
+            )])],
+        );
+        config.appends.insert(
+            "build.flags.passthrough_env".to_string(),
+            vec![toml::Value::String("CARGO_HOME".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.make_test_vars".to_string(),
+            vec![toml::Value::String("TESTS=smoke".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.make_install_vars".to_string(),
+            vec![toml::Value::String("DESTDIR=/tmp/pkg".to_string())],
+        );
 
         spec.apply_config(&config);
 
@@ -408,6 +747,326 @@ cflags = ["-O2"]
                 .flags
                 .rustflags
                 .contains(&"opt-level=3".to_string())
+        );
+        assert!(spec.build.flags.no_flags);
+        assert!(
+            spec.build
+                .flags
+                .keep
+                .contains(&"etc/locale.gen".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .passthrough_env
+                .contains(&"RUSTFLAGS".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .passthrough_env
+                .contains(&"CARGO_HOME".to_string())
+        );
+        assert!(spec.build.flags.make_vars.contains(&"V=1".to_string()));
+        assert!(spec.build.flags.skip_tests);
+        assert!(
+            spec.build
+                .flags
+                .make_test_vars
+                .contains(&"TESTS=smoke".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .make_install_vars
+                .contains(&"DESTDIR=/tmp/pkg".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_no_flags_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+no_flags = true
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert!(spec.build.flags.no_flags);
+    }
+
+    #[test]
+    fn parse_no_flags_alias_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+"no-flags" = true
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert!(spec.build.flags.no_flags);
+    }
+
+    #[test]
+    fn parse_skip_tests_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "autotools"
+
+[build.flags]
+skip_tests = true
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert!(spec.build.flags.skip_tests);
+    }
+
+    #[test]
+    fn parse_skip_tests_alias_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "autotools"
+
+[build.flags]
+"skip-tests" = true
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert!(spec.build.flags.skip_tests);
+    }
+
+    #[test]
+    fn parse_keep_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+keep = ["etc/locale.gen", "etc/resolv.conf"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.build.flags.keep,
+            vec!["etc/locale.gen".to_string(), "etc/resolv.conf".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_passthrough_env_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+passthrough_env = ["RUSTFLAGS", "CARGO_HOME"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.build.flags.passthrough_env,
+            vec!["RUSTFLAGS".to_string(), "CARGO_HOME".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_test_dependencies_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "autotools"
+
+[dependencies]
+build = ["make"]
+test = ["python", "bats"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.dependencies.test,
+            vec!["python".to_string(), "bats".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_make_var_overrides_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "autotools"
+
+[build.flags]
+make_vars = ["V=1", "CC=clang"]
+make_test_vars = ["TESTS=unit"]
+make_install_vars = ["STRIPPROG=true"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.build.flags.make_vars,
+            vec!["V=1".to_string(), "CC=clang".to_string()]
+        );
+        assert_eq!(
+            spec.build.flags.make_test_vars,
+            vec!["TESTS=unit".to_string()]
+        );
+        assert_eq!(
+            spec.build.flags.make_install_vars,
+            vec!["STRIPPROG=true".to_string()]
         );
     }
 
@@ -444,9 +1103,12 @@ cbuild = "x86_64-pc-linux-gnu"
 
         // Override via config
         let mut config = crate::config::Config::for_rootfs(Path::new("/tmp/nonexistent"));
-        config.build_overrides = toml::from_str(r#"[flags]
+        config.build_overrides = toml::from_str(
+            r#"[flags]
 carch = "armv7"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         spec.apply_config(&config);
         assert_eq!(spec.build.flags.carch, "armv7");
     }
@@ -509,7 +1171,7 @@ type = "custom"
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
-                license: "MIT".into(),
+                license: vec!["MIT".into()],
             },
             packages: Vec::new(),
             alternatives: Alternatives::default(),
@@ -540,7 +1202,7 @@ impl fmt::Display for PackageSpec {
         )?;
         writeln!(f, "Description: {}", self.package.description)?;
         writeln!(f, "Homepage: {}", self.package.homepage)?;
-        writeln!(f, "License: {}", self.package.license)?;
+        writeln!(f, "License: {}", self.package.license.join(", "))?;
         writeln!(f, "Sources: {}", self.source.len())?;
         writeln!(f, "Build Type: {:?}", self.build.build_type)?;
         if !self.alternatives.provides.is_empty() {
@@ -560,11 +1222,43 @@ pub struct PackageInfo {
     pub revision: u32,
     pub description: String,
     pub homepage: String,
-    pub license: String,
+    #[serde(
+        deserialize_with = "deserialize_licenses",
+        serialize_with = "serialize_licenses"
+    )]
+    pub license: Vec<String>,
 }
 
 fn default_revision() -> u32 {
     1
+}
+
+fn deserialize_licenses<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrArray {
+        String(String),
+        Array(Vec<String>),
+    }
+
+    match StringOrArray::deserialize(deserializer)? {
+        StringOrArray::String(s) => Ok(vec![s]),
+        StringOrArray::Array(v) => Ok(v),
+    }
+}
+
+fn serialize_licenses<S>(licenses: &[String], serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if licenses.len() == 1 {
+        serializer.serialize_str(&licenses[0])
+    } else {
+        licenses.serialize(serializer)
+    }
 }
 
 impl PackageSpec {
@@ -613,15 +1307,20 @@ pub struct Source {
     pub post_extract: Vec<String>,
 }
 
-/// Manual (local) source file to copy before fetching remote sources.
+/// Manual source copied before standard source fetching.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ManualSource {
-    /// Filename in the spec directory
-    pub file: String,
-    /// SHA256 checksum (optional, use "skip" to bypass verification)
+    /// Filename in the spec directory (local manual source mode).
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Remote URL to fetch (remote manual source mode).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Checksum (optional, use "skip" to bypass verification).
     #[serde(default)]
     pub sha256: Option<String>,
-    /// Destination path relative to build work directory (default: same as file)
+    /// Destination path relative to build work directory.
+    /// Defaults to `file` for local mode or a derived filename for URL mode.
     #[serde(default)]
     pub dest: Option<String>,
 }
@@ -675,6 +1374,15 @@ pub struct BuildFlags {
     pub cflags: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub ldflags: Vec<String>,
+    /// Keep existing files and install package-provided replacement as `<path>.depotnew`.
+    #[serde(default, deserialize_with = "deserialize_string_or_array")]
+    pub keep: Vec<String>,
+    /// Disable exporting CFLAGS/CXXFLAGS/LDFLAGS for this package build.
+    #[serde(default, alias = "no-flags")]
+    pub no_flags: bool,
+    /// Skip automatic build-system test execution (e.g. Autotools `make check`/`make test`).
+    #[serde(default, alias = "skip-tests")]
+    pub skip_tests: bool,
     #[serde(default)]
     pub configure: Vec<String>,
     /// C compiler
@@ -721,6 +1429,41 @@ pub struct BuildFlags {
     /// CPU architecture short name (CARCH equivalent), e.g. "x86_64", "aarch64"
     #[serde(default = "default_carch")]
     pub carch: String,
+    /// Variable overrides passed directly to `make` (compile step), e.g. ["V=1", "CC=clang"].
+    #[serde(
+        default,
+        alias = "make-vars",
+        alias = "make_build_vars",
+        alias = "make-build-vars",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub make_vars: Vec<String>,
+    /// Variable overrides passed directly to `make check` / `make test`.
+    #[serde(
+        default,
+        alias = "make-test-vars",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub make_test_vars: Vec<String>,
+    /// Variable overrides passed directly to `make install`.
+    #[serde(
+        default,
+        alias = "make-install-vars",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub make_install_vars: Vec<String>,
+    /// Additional host environment variable names to export unchanged to build commands.
+    /// Example: ["RUSTFLAGS", "CARGO_HOME"].
+    #[serde(
+        default,
+        alias = "passthrough-env",
+        alias = "pass_env",
+        alias = "pass-env",
+        alias = "export_env",
+        alias = "export-env",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub passthrough_env: Vec<String>,
 
     // Rust-specific fields
     /// Rust build profile: "debug" or "release" (default: release)
@@ -756,6 +1499,9 @@ impl Default for BuildFlags {
         BuildFlags {
             cflags: Vec::new(),
             ldflags: Vec::new(),
+            keep: Vec::new(),
+            no_flags: false,
+            skip_tests: false,
             configure: Vec::new(),
             cc: default_cc(),
             cxx: default_cxx(),
@@ -770,6 +1516,10 @@ impl Default for BuildFlags {
             chost: String::new(),
             cbuild: String::new(),
             carch: default_carch(),
+            make_vars: Vec::new(),
+            make_test_vars: Vec::new(),
+            make_install_vars: Vec::new(),
+            passthrough_env: Vec::new(),
             profile: default_profile(),
             target: String::new(),
             rustflags: Vec::new(),
@@ -852,8 +1602,13 @@ fn default_cxx() -> String {
 /// Package dependencies
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct Dependencies {
+    /// Dependencies required for building packages.
     #[serde(default)]
     pub build: Vec<String>,
+    /// Dependencies required at runtime.
     #[serde(default)]
     pub runtime: Vec<String>,
+    /// Dependencies required to run package test suites.
+    #[serde(default)]
+    pub test: Vec<String>,
 }

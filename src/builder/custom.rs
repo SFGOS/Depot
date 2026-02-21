@@ -12,13 +12,14 @@ pub fn build(
     src_dir: &Path,
     destdir: &Path,
     cross: Option<&CrossConfig>,
+    export_compiler_flags: bool,
 ) -> Result<()> {
     let flags = &spec.build.flags;
 
     // Create destdir
     fs::create_dir_all(destdir)?;
 
-    let mut env_vars: Vec<(&str, String)> = vec![];
+    let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
 
     // For custom builds, look for a build.sh script in the source directory
     let build_script = src_dir.join("build.sh");
@@ -29,8 +30,12 @@ pub fn build(
     let spec_build = spec.spec_dir.join("build.sh");
     if !build_script.exists() && spec_build.exists() {
         fs::create_dir_all(src_dir)?;
-        fs::copy(&spec_build, &build_script)
-            .with_context(|| format!("Failed to copy build.sh from spec dir: {}", spec_build.display()))?;
+        fs::copy(&spec_build, &build_script).with_context(|| {
+            format!(
+                "Failed to copy build.sh from spec dir: {}",
+                spec_build.display()
+            )
+        })?;
         // Ensure executable bit
         #[cfg(unix)]
         {
@@ -50,7 +55,7 @@ pub fn build(
     }
 
     use crate::builder::state::{BuildStep, StateTracker};
-    let mut state = StateTracker::new(&src_dir)?;
+    let mut state = StateTracker::new(src_dir)?;
 
     if !state.is_done(BuildStep::PostInstallDone) {
         println!(
@@ -70,7 +75,8 @@ pub fn build(
             src_dir.to_path_buf()
         };
 
-        let mut cmd = fakeroot::wrap_install_command("bash", destdir);
+        // Use POSIX `sh` (more likely to be available in minimal/chroot environments)
+        let mut cmd = fakeroot::wrap_install_command("sh", destdir);
         cmd.current_dir(&build_dir);
 
         // Ensure build script path is absolute for when we are in a sub-build-dir
@@ -81,62 +87,22 @@ pub fn build(
         };
         cmd.arg(&abs_build_script);
 
-        if !flags.cflags.is_empty() {
-            env_vars.push(("CFLAGS", flags.cflags.join(" ")));
-        }
-        if !flags.ldflags.is_empty() {
-            let ldflags = if flags.libc.is_empty() {
-                flags.ldflags.join(" ")
-            } else {
-                format!(
-                    "{} -Wl,--dynamic-linker={}",
-                    flags.ldflags.join(" "),
-                    flags.libc
-                )
-            };
-            env_vars.push(("LDFLAGS", ldflags));
-        }
-
-        env_vars.push(("DESTDIR", destdir.to_string_lossy().into_owned()));
-        env_vars.push(("PREFIX", spec.build.flags.prefix.clone()));
-        env_vars.push(("DEPOT_ROOTFS", spec.build.flags.rootfs.clone()));
-        env_vars.push((
-            "DEPOT_SPECDIR",
-            spec.spec_dir.to_string_lossy().into_owned(),
-        ));
-
-        if !flags.chost.is_empty() {
-            env_vars.push(("CHOST", flags.chost.clone()));
-        }
-        if !flags.cbuild.is_empty() {
-            env_vars.push(("CBUILD", flags.cbuild.clone()));
-        }
-
-        if !flags.carch.is_empty() {
-            env_vars.push(("CARCH", flags.carch.clone()));
-        }
-
-        // Use cross-compilation tools if configured
-        if let Some(cc_cfg) = cross {
-            env_vars.push(("CC", cc_cfg.cc.clone()));
-            env_vars.push(("CXX", cc_cfg.cxx.clone()));
-            env_vars.push(("AR", cc_cfg.ar.clone()));
-            env_vars.push(("RANLIB", cc_cfg.ranlib.clone()));
-            env_vars.push(("STRIP", cc_cfg.strip.clone()));
-            env_vars.push(("LD", cc_cfg.ld.clone()));
-            env_vars.push(("NM", cc_cfg.nm.clone()));
-            env_vars.push(("CROSS_PREFIX", cc_cfg.prefix.clone()));
-            env_vars.push(("CROSS_COMPILE", format!("{}-", cc_cfg.prefix)));
-        } else {
-            env_vars.push(("CC", flags.cc.clone()));
-            env_vars.push(("AR", flags.ar.clone()));
-        }
+        crate::builder::set_env_var(
+            &mut env_vars,
+            "DESTDIR",
+            destdir.to_string_lossy().into_owned(),
+        );
 
         crate::builder::prepare_command(&mut cmd, &env_vars);
 
-        let status = cmd
-            .status()
-            .with_context(|| format!("Failed to run build script: {}", build_script.display()))?;
+        // Run the command and include the OS error on spawn failures for clearer diagnostics
+        let status = cmd.status().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to run build script {}: {}",
+                build_script.display(),
+                e
+            )
+        })?;
 
         if !status.success() {
             anyhow::bail!("Custom build script failed with status: {}", status);
@@ -163,7 +129,7 @@ mod tests {
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
-                license: "MIT".into(),
+                license: vec!["MIT".into()],
             },
             packages: Vec::new(),
             alternatives: Default::default(),
@@ -191,7 +157,7 @@ mod tests {
 
         let spec = mk_spec("custom-no-build", "1.0");
 
-        let res = build(&spec, tmp_src.path(), tmp_dest.path(), None);
+        let res = build(&spec, tmp_src.path(), tmp_dest.path(), None, true);
         assert!(res.is_err());
         Ok(())
     }
@@ -217,7 +183,7 @@ mod tests {
         spec.spec_dir = spec_dir.path().to_path_buf();
 
         // src_dir is empty; build() should copy build.sh from spec_dir and run it (no-op)
-        let _ = build(&spec, tmp_src.path(), tmp_dest.path(), None)?;
+        let _ = build(&spec, tmp_src.path(), tmp_dest.path(), None, true)?;
         // If we reached here, build() succeeded and build.sh was copied into src
         assert!(tmp_src.path().join("build.sh").exists());
         Ok(())

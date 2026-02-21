@@ -17,6 +17,86 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn parse_licenses_from_toml(metadata: &toml::Value) -> Vec<String> {
+    if let Some(s) = metadata.get("license").and_then(|v| v.as_str()) {
+        return vec![s.to_string()];
+    }
+    if let Some(arr) = metadata.get("license").and_then(|v| v.as_array()) {
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(String::from)
+            .collect();
+    }
+    Vec::new()
+}
+
+fn clean_build_workspace(config: &config::Config) -> Result<()> {
+    if config.build_dir.exists() {
+        fs::remove_dir_all(&config.build_dir).with_context(|| {
+            format!("Failed to clean build dir: {}", config.build_dir.display())
+        })?;
+        println!("Cleaned build workspace: {}", config.build_dir.display());
+    }
+    Ok(())
+}
+
+fn warn_if_running_as_root_for_build(command: &str, rootfs: &Path) {
+    if crate::fakeroot::is_root() {
+        eprintln!(
+            "\x1b[33mWARNING: Running '{}' as root is discouraged.\x1b[0m",
+            command
+        );
+        eprintln!(
+            "\x1b[33mA misconfigured build environment or malicious/buggy build file can overwrite or delete critical system files.\x1b[0m"
+        );
+        eprintln!(
+            "\x1b[33mRecommendation: use a non-root build user and only install as root.\x1b[0m"
+        );
+        eprintln!("\x1b[33mCurrent rootfs target: {}\x1b[0m", rootfs.display());
+    }
+}
+
+fn install_staged_to_rootfs(
+    pkg_spec: &package::PackageSpec,
+    destdir: &Path,
+    rootfs: &Path,
+    config: &config::Config,
+) -> Result<()> {
+    std::fs::create_dir_all(&config.db_dir).with_context(|| {
+        format!(
+            "Failed to create database directory: {}",
+            config.db_dir.display()
+        )
+    })?;
+    let db_path = config.db_dir.join("packages.db");
+
+    let new_files = staging::generate_manifest_with_dirs(destdir)?;
+    let remove_paths =
+        db::calculate_upgrade_paths(&db_path, &pkg_spec.package.name, &new_files.files)?;
+
+    let tx_base = config.build_dir.join("tx");
+    let tx = staging::install_atomic(
+        destdir,
+        rootfs,
+        &tx_base,
+        &remove_paths,
+        &pkg_spec.build.flags.keep,
+    )?;
+
+    for out in pkg_spec.outputs() {
+        let mut spec_for_out = pkg_spec.clone();
+        spec_for_out.package = out;
+        if let Err(e) = db::register_package(&db_path, &spec_for_out, destdir) {
+            let _ = tx.rollback();
+            return Err(e);
+        }
+    }
+    tx.commit()?;
+
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "Depot")]
 #[command(about = "Depot - Source-based package manager for Linux", long_about = None)]
@@ -30,9 +110,24 @@ struct Cli {
     #[arg(long, global = true)]
     no_deps: bool,
 
+    /// Do not export CFLAGS/CXXFLAGS/LDFLAGS to build commands
+    #[arg(
+        long,
+        global = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true"
+    )]
+    no_flags: bool,
+
     /// Cross-compilation prefix (e.g., x86_64-linux-musl, aarch64-linux-gnu)
     #[arg(long, global = true)]
     cross_prefix: Option<String>,
+
+    /// Clean build workspace after successful install/build
+    #[arg(long, global = true)]
+    clean: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -64,6 +159,10 @@ enum Commands {
         /// Explicitly specify path to package spec (.toml file)
         #[arg(short, long = "spec", visible_alias = "package", alias = "p")]
         spec: Option<PathBuf>,
+
+        /// Install package to rootfs after creating package archive(s)
+        #[arg(long)]
+        install: bool,
     },
     /// Show information about a package
     Info {
@@ -109,6 +208,7 @@ fn main() -> Result<()> {
             spec_or_archive,
             spec,
         } => {
+            warn_if_running_as_root_for_build("install", &cli.rootfs);
             let mut spec_path = spec.unwrap_or(spec_or_archive);
 
             // Load configuration early so we can use the configured repo clone dir
@@ -122,7 +222,8 @@ fn main() -> Result<()> {
             if !spec_path.exists() {
                 let name = spec_path.to_string_lossy().to_string();
                 println!("Looking up package '{}' in local indexes...", name);
-                let pkg_index = index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
+                let pkg_index =
+                    index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
                 if let Some(found) = pkg_index.find(&name) {
                     spec_path = found;
                 }
@@ -159,10 +260,6 @@ fn main() -> Result<()> {
                         );
                     }
 
-                    // We need to parse the metadata.toml but we don't have a direct "from_metadata"
-                    // Let's implement a minimal reconstruction or use the metadata to fill a spec.
-                    // Actually, PackageSpec needs a lot of fields.
-                    // Let's extract the WHOLE archive to a temporary staging dir and use it.
                     let file = fs::File::open(&spec_path)?;
                     let zstd_decoder = zstd::stream::read::Decoder::new(file)?;
                     let mut archive = tar::Archive::new(zstd_decoder);
@@ -197,11 +294,7 @@ fn main() -> Result<()> {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string(),
-                            license: metadata
-                                .get("license")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
+                            license: parse_licenses_from_toml(&metadata),
                         },
                         packages: Vec::new(),
                         alternatives: package::Alternatives::default(),
@@ -216,6 +309,18 @@ fn main() -> Result<()> {
                             runtime: if let Some(deps) = metadata
                                 .get("dependencies")
                                 .and_then(|v| v.get("runtime"))
+                                .and_then(|v| v.as_array())
+                            {
+                                deps.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(String::from)
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            },
+                            test: if let Some(deps) = metadata
+                                .get("dependencies")
+                                .and_then(|v| v.get("test"))
                                 .and_then(|v| v.as_array())
                             {
                                 deps.iter()
@@ -266,6 +371,8 @@ fn main() -> Result<()> {
 
             // Check dependencies and prompt for auto-install if needed
             if !cli.no_deps {
+                let needs_test_deps =
+                    matches!(pkg_spec.build.build_type, package::BuildType::Autotools);
                 deps::print_dep_status(&pkg_spec, &db_path)?;
 
                 // Collect all missing dependencies (build + runtime)
@@ -275,6 +382,14 @@ fn main() -> Result<()> {
                 for dep in missing_runtime {
                     if !missing.contains(&dep) {
                         missing.push(dep);
+                    }
+                }
+                if needs_test_deps {
+                    let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+                    for dep in missing_test {
+                        if !missing.contains(&dep) {
+                            missing.push(dep);
+                        }
                     }
                 }
 
@@ -301,7 +416,9 @@ fn main() -> Result<()> {
 
                     if input == "y" || input == "yes" || input.is_empty() {
                         // Build package index for fast lookups
-                        let pkg_index = index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
+                        let pkg_index = index::PackageIndex::build_with_repo_dir(Some(
+                            config.repo_clone_dir.clone(),
+                        ));
 
                         // Build new dep chain
                         let new_chain = if dep_chain.is_empty() {
@@ -324,8 +441,14 @@ fn main() -> Result<()> {
                                 if cli.no_deps {
                                     cmd.arg("--no-deps");
                                 }
+                                if cli.no_flags {
+                                    cmd.arg("--no-flags");
+                                }
                                 if let Some(ref p) = cli.cross_prefix {
                                     cmd.arg("--cross-prefix").arg(p);
+                                }
+                                if cli.clean {
+                                    cmd.arg("--clean");
                                 }
 
                                 cmd.arg("install").arg(&dep_spec_path);
@@ -348,6 +471,9 @@ fn main() -> Result<()> {
 
                 // Enforce build dependencies (runtime deps are warnings only if not installed/prompt declined)
                 deps::require_build_deps(&pkg_spec, &db_path)?;
+                if needs_test_deps {
+                    deps::require_test_deps(&pkg_spec, &db_path)?;
+                }
             }
 
             // Ensure database directory exists
@@ -377,7 +503,13 @@ fn main() -> Result<()> {
                     .as_ref()
                     .map(|p| cross::CrossConfig::from_prefix(p))
                     .transpose()?;
-                builder::build(&pkg_spec, &src_dir, &destdir, cross_config.as_ref())?;
+                builder::build(
+                    &pkg_spec,
+                    &src_dir,
+                    &destdir,
+                    cross_config.as_ref(),
+                    !cli.no_flags,
+                )?;
 
                 // 3.1 Copy license files into staged tree
                 staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
@@ -388,25 +520,8 @@ fn main() -> Result<()> {
             // 4. Stage (clean .la files, etc.)
             staging::process(&destdir, &pkg_spec)?;
 
-            // 5. Install/update to rootfs (atomic)
-            let new_files = staging::generate_manifest_with_dirs(&destdir)?;
-
-            let remove_paths =
-                db::calculate_upgrade_paths(&db_path, &pkg_spec.package.name, &new_files.files)?;
-
-            let tx_base = config.build_dir.join("tx");
-            let tx = staging::install_atomic(&destdir, &cli.rootfs, &tx_base, &remove_paths)?;
-
-            // 6. Register in database (rollback install on DB error)
-            for out in pkg_spec.outputs() {
-                let mut spec_for_out = pkg_spec.clone();
-                spec_for_out.package = out;
-                if let Err(e) = db::register_package(&db_path, &spec_for_out, &destdir) {
-                    let _ = tx.rollback();
-                    return Err(e);
-                }
-            }
-            tx.commit()?;
+            // 5-6. Install/update to rootfs and register in DB
+            install_staged_to_rootfs(&pkg_spec, &destdir, &cli.rootfs, &config)?;
 
             // 7. Check runtime dependencies (warn only)
             if !cli.no_deps {
@@ -427,6 +542,10 @@ fn main() -> Result<()> {
                 "Successfully installed {} v{}",
                 pkg_spec.package.name, pkg_spec.package.version
             );
+
+            if cli.clean {
+                clean_build_workspace(&config)?;
+            }
         }
         Commands::Remove { package } => {
             println!("Removing package: {}", package);
@@ -435,12 +554,12 @@ fn main() -> Result<()> {
             db::remove_package(&db_path, &package, &cli.rootfs)?;
             println!("Successfully removed {}", package);
         }
-        Commands::Build { spec_pos, spec } => {
-            if crate::fakeroot::is_root() {
-                anyhow::bail!(
-                    "The 'build' command must be run as a non-root user to ensure a clean build environment."
-                );
-            }
+        Commands::Build {
+            spec_pos,
+            spec,
+            install,
+        } => {
+            warn_if_running_as_root_for_build("build", &cli.rootfs);
             let spec_path = spec.or(spec_pos).context("No spec file provided")?;
             println!("Building package from: {}", spec_path.display());
             let mut pkg_spec = package::PackageSpec::from_file(&spec_path)?;
@@ -461,8 +580,13 @@ fn main() -> Result<()> {
 
             // Check build dependencies
             if !cli.no_deps {
+                let needs_test_deps =
+                    matches!(pkg_spec.build.build_type, package::BuildType::Autotools);
                 deps::print_dep_status(&pkg_spec, &db_path)?;
                 deps::require_build_deps(&pkg_spec, &db_path)?;
+                if needs_test_deps {
+                    deps::require_test_deps(&pkg_spec, &db_path)?;
+                }
             }
 
             let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
@@ -477,7 +601,13 @@ fn main() -> Result<()> {
                 .as_ref()
                 .map(|p| cross::CrossConfig::from_prefix(p))
                 .transpose()?;
-            builder::build(&pkg_spec, &src_dir, &destdir, cross_config.as_ref())?;
+            builder::build(
+                &pkg_spec,
+                &src_dir,
+                &destdir,
+                cross_config.as_ref(),
+                !cli.no_flags,
+            )?;
 
             staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
 
@@ -493,13 +623,26 @@ fn main() -> Result<()> {
             for out in pkg_spec.outputs() {
                 let mut spec_for_out = pkg_spec.clone();
                 spec_for_out.package = out;
-                let packager = package::Packager::new(spec_for_out.clone(), destdir.clone(), config.clone());
+                let packager =
+                    package::Packager::new(spec_for_out.clone(), destdir.clone(), config.clone());
                 let pkg_file = packager.create_package(Path::new("."), arch)?;
                 created_files.push(pkg_file);
             }
 
             for f in &created_files {
                 println!("Build complete. Package created: {}", f.display());
+            }
+
+            if install {
+                install_staged_to_rootfs(&pkg_spec, &destdir, &cli.rootfs, &config)?;
+                println!(
+                    "Successfully installed {} v{}",
+                    pkg_spec.package.name, pkg_spec.package.version
+                );
+            }
+
+            if cli.clean {
+                clean_build_workspace(&config)?;
             }
         }
         Commands::Info { package } => {
@@ -540,7 +683,10 @@ fn main() -> Result<()> {
                     println!("No mirrors configured in /etc/depot.d/mirrors.toml");
                 } else {
                     db::repo::sync_mirrors(&config.repo_clone_dir, &config.mirrors)?;
-                    println!("Mirrors synchronized into {}", config.repo_clone_dir.display());
+                    println!(
+                        "Mirrors synchronized into {}",
+                        config.repo_clone_dir.display()
+                    );
                 }
             }
             RepoCommands::Status => {
@@ -571,7 +717,8 @@ fn main() -> Result<()> {
             // Produce a minimal TOML for interactive-created specs (omit defaults)
             let toml_string = package::spec_to_minimal_toml(&spec)?;
 
-            let output_path = output.unwrap_or_else(|| PathBuf::from(format!("{}.toml", spec.package.name)));
+            let output_path =
+                output.unwrap_or_else(|| PathBuf::from(format!("{}.toml", spec.package.name)));
 
             if output_path.exists() {
                 println!(

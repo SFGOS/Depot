@@ -1,12 +1,12 @@
 //! Binary package "build" system — used when package supplies a prebuilt binary installer
 
+use crate::cross::CrossConfig;
+use crate::package::PackageSpec;
 use anyhow::{Context, Result};
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::Path;
 use walkdir::WalkDir;
-use crate::package::PackageSpec;
-use crate::cross::CrossConfig;
 
 /// For binary packages we simply copy the extracted files into DESTDIR (preserving
 /// directory structure). This is useful for .deb packages where extract step
@@ -16,9 +16,16 @@ pub fn build(
     src_dir: &Path,
     destdir: &Path,
     _cross: Option<&CrossConfig>,
+    _export_compiler_flags: bool,
 ) -> Result<()> {
-    println!("Binary install: copying files from {} to {} (pkg type={})", src_dir.display(), destdir.display(), _spec.build.flags.binary_type);
-    fs::create_dir_all(destdir).with_context(|| format!("Failed to create destdir: {}", destdir.display()))?;
+    println!(
+        "Binary install: copying files from {} to {} (pkg type={})",
+        src_dir.display(),
+        destdir.display(),
+        _spec.build.flags.binary_type
+    );
+    fs::create_dir_all(destdir)
+        .with_context(|| format!("Failed to create destdir: {}", destdir.display()))?;
 
     for entry in WalkDir::new(src_dir) {
         let entry = entry?;
@@ -28,12 +35,18 @@ pub fn build(
             fs::create_dir_all(&target)?;
         } else if entry.file_type().is_symlink() {
             let link_target = fs::read_link(entry.path())?;
-            if let Some(parent) = target.parent() { fs::create_dir_all(parent)?; }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
             // overwrite existing links/files
-            if target.exists() { let _ = fs::remove_file(&target); }
+            if target.exists() {
+                let _ = fs::remove_file(&target);
+            }
             unix_fs::symlink(link_target, &target)?;
         } else {
-            if let Some(parent) = target.parent() { fs::create_dir_all(parent)?; }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::copy(entry.path(), &target)?;
         }
     }
@@ -45,9 +58,9 @@ pub fn build(
 mod tests {
     use super::*;
     use crate::package::{Build, BuildFlags, BuildType, Dependencies, PackageInfo};
-    use tempfile::tempdir;
     use std::fs;
     use std::os::unix::fs as unix_fs;
+    use tempfile::tempdir;
 
     fn mk_spec(name: &str, version: &str) -> PackageSpec {
         PackageSpec {
@@ -57,7 +70,7 @@ mod tests {
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
-                license: "MIT".into(),
+                license: vec!["MIT".into()],
             },
             packages: Vec::new(),
             alternatives: Default::default(),
@@ -96,7 +109,7 @@ mod tests {
         unix_fs::symlink(&target, src.join("usr/lib/libdummy.so.link"))?;
 
         let spec = mk_spec("bin-test", "1.0");
-        build(&spec, src, dest, None)?;
+        build(&spec, src, dest, None, true)?;
 
         // Check copied file
         assert!(dest.join("usr/bin/hello").exists());
