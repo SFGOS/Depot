@@ -3,21 +3,42 @@
 use crate::package::PackageSpec;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
+use std::io;
+use std::io::Read;
+use std::io::Write;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
+
+pub const INTERNAL_DEPOT_DIR: &str = ".depot";
+pub const INTERNAL_OUTPUTS_DIR: &str = ".depot/outputs";
 
 fn is_skipped_install_path(rel_path: &str) -> bool {
     let p = rel_path.trim_start_matches('/');
     p == ".metadata.toml"
         || p == ".files.yaml"
+        || p == INTERNAL_DEPOT_DIR
+        || p.strip_prefix(INTERNAL_DEPOT_DIR)
+            .is_some_and(|rest| rest.starts_with('/'))
         || p == "scripts"
         || p.starts_with("scripts/")
         || p == "usr/share/info/dir"
         || p.starts_with("usr/share/info/dir.")
+}
+
+/// Return the internal split-output staging root inside a package `destdir`.
+pub fn output_staging_root(destdir: &Path) -> PathBuf {
+    destdir.join(INTERNAL_OUTPUTS_DIR)
+}
+
+/// Return the staging directory for an additional output package.
+pub fn output_staging_dir(destdir: &Path, pkg_name: &str) -> PathBuf {
+    output_staging_root(destdir).join(pkg_name)
 }
 
 fn normalize_relative_path(path: &str) -> Result<String> {
@@ -57,9 +78,287 @@ fn normalize_relative_path(path: &str) -> Result<String> {
     Ok(s)
 }
 
+#[derive(Debug, Clone)]
+enum KeepMatcher {
+    Exact(String),
+    Pattern(String),
+}
+
+impl KeepMatcher {
+    fn from_spec(raw: &str) -> Result<Self> {
+        let normalized = normalize_relative_path(raw)?;
+        if normalized.contains('*') || normalized.contains('?') {
+            Ok(Self::Pattern(normalized))
+        } else {
+            Ok(Self::Exact(normalized))
+        }
+    }
+
+    fn matches(&self, rel_path: &str) -> bool {
+        match self {
+            Self::Exact(p) => p == rel_path,
+            Self::Pattern(p) => glob_match_path(p, rel_path),
+        }
+    }
+}
+
+fn glob_match_path(pattern: &str, path: &str) -> bool {
+    let p_parts: Vec<&str> = pattern.split('/').collect();
+    let s_parts: Vec<&str> = path.split('/').collect();
+    glob_match_path_parts(&p_parts, &s_parts)
+}
+
+fn glob_match_path_parts(pattern_parts: &[&str], path_parts: &[&str]) -> bool {
+    if pattern_parts.is_empty() {
+        return path_parts.is_empty();
+    }
+
+    if pattern_parts[0] == "**" {
+        let mut next = 1usize;
+        while next < pattern_parts.len() && pattern_parts[next] == "**" {
+            next += 1;
+        }
+        let rest = &pattern_parts[next..];
+        if rest.is_empty() {
+            return true;
+        }
+        for skip in 0..=path_parts.len() {
+            if glob_match_path_parts(rest, &path_parts[skip..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if path_parts.is_empty() {
+        return false;
+    }
+
+    glob_match_segment(pattern_parts[0], path_parts[0])
+        && glob_match_path_parts(&pattern_parts[1..], &path_parts[1..])
+}
+
+fn glob_match_segment(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_match_ti = 0usize;
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+            continue;
+        }
+
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            pi += 1;
+            star_match_ti = ti;
+            continue;
+        }
+
+        if let Some(star_pi) = star {
+            pi = star_pi + 1;
+            star_match_ti += 1;
+            ti = star_match_ti;
+            continue;
+        }
+
+        return false;
+    }
+
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == p.len()
+}
+
+fn has_known_compressed_suffix(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".zst")
+        || lower.ends_with(".gz")
+        || lower.ends_with(".xz")
+        || lower.ends_with(".bz2")
+        || lower.ends_with(".lzma")
+        || lower.ends_with(".z")
+}
+
+fn is_manpage_rel_path(rel_path: &str) -> bool {
+    let rel = rel_path.trim_start_matches('/');
+    rel.starts_with("usr/share/man/") && !has_known_compressed_suffix(rel)
+}
+
+fn append_os_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = OsString::from(path.as_os_str());
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+fn is_elf_file(path: &Path) -> Result<bool> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let n = file
+        .read(&mut magic)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(n == 4 && magic == [0x7F, b'E', b'L', b'F'])
+}
+
+fn auto_strip_elf_files(destdir: &Path) -> Result<usize> {
+    let mut stripped = 0usize;
+    for entry in WalkDir::new(destdir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !is_elf_file(path)? {
+            continue;
+        }
+
+        let status = Command::new("strip")
+            .arg("--strip-unneeded")
+            .arg(path)
+            .status()
+            .with_context(|| {
+                format!(
+                    "Failed to execute strip for {} (disable with build.flags.no_strip = true)",
+                    path.display()
+                )
+            })?;
+        if !status.success() {
+            anyhow::bail!(
+                "strip failed for {} with status {} (disable with build.flags.no_strip = true)",
+                path.display(),
+                status
+            );
+        }
+        stripped += 1;
+    }
+    Ok(stripped)
+}
+
+fn compress_manpages_zstd(destdir: &Path) -> Result<usize> {
+    crate::log_info!("Compressing man pages with zstd...");
+    let mut man_files = Vec::new();
+    let mut man_symlinks = Vec::new();
+
+    for entry in WalkDir::new(destdir).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path().to_path_buf();
+        let rel = path
+            .strip_prefix(destdir)
+            .context("Failed to strip destdir prefix during manpage compression")?
+            .to_string_lossy()
+            .to_string();
+        if !is_manpage_rel_path(&rel) {
+            continue;
+        }
+        if entry.file_type().is_file() {
+            man_files.push(path);
+        } else if entry.file_type().is_symlink() {
+            man_symlinks.push(path);
+        }
+    }
+
+    let mut compressed = 0usize;
+    for path in &man_files {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("Failed to inspect man page {}", path.display()))?;
+        let out_path = append_os_suffix(path, ".zst");
+        let tmp_path = append_os_suffix(&out_path, ".tmp");
+
+        if tmp_path.exists() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+
+        let mut input = fs::File::open(path)
+            .with_context(|| format!("Failed to open man page {}", path.display()))?;
+        let out_file = fs::File::create(&tmp_path)
+            .with_context(|| format!("Failed to create {}", tmp_path.display()))?;
+
+        let mut encoder = zstd::stream::write::Encoder::new(out_file, 22)
+            .with_context(|| format!("Failed to start zstd encoder for {}", path.display()))?;
+        io::copy(&mut input, &mut encoder)
+            .with_context(|| format!("Failed to compress {}", path.display()))?;
+        let mut out_file = encoder
+            .finish()
+            .with_context(|| format!("Failed to finish zstd compression for {}", path.display()))?;
+        out_file
+            .flush()
+            .with_context(|| format!("Failed to flush {}", tmp_path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&tmp_path)?.permissions();
+            perms.set_mode(metadata.permissions().mode() & 0o777);
+            fs::set_permissions(&tmp_path, perms)?;
+        }
+
+        fs::rename(&tmp_path, &out_path).with_context(|| {
+            format!(
+                "Failed to finalize compressed man page {} -> {}",
+                tmp_path.display(),
+                out_path.display()
+            )
+        })?;
+        fs::remove_file(path)
+            .with_context(|| format!("Failed to remove original man page {}", path.display()))?;
+        compressed += 1;
+    }
+
+    let mut fixed_symlinks = 0usize;
+    for link_path in man_symlinks {
+        let target = fs::read_link(&link_path)
+            .with_context(|| format!("Failed to read manpage symlink {}", link_path.display()))?;
+        let target_s = target.to_string_lossy();
+        if has_known_compressed_suffix(&target_s) {
+            continue;
+        }
+
+        let new_link_path = append_os_suffix(&link_path, ".zst");
+        let new_target = append_os_suffix(&target, ".zst");
+
+        if new_link_path.symlink_metadata().is_ok() {
+            fs::remove_file(&new_link_path).with_context(|| {
+                format!(
+                    "Failed to remove existing compressed manpage symlink {}",
+                    new_link_path.display()
+                )
+            })?;
+        }
+
+        std::os::unix::fs::symlink(&new_target, &new_link_path).with_context(|| {
+            format!(
+                "Failed to create compressed manpage symlink {} -> {}",
+                new_link_path.display(),
+                new_target.display()
+            )
+        })?;
+        fs::remove_file(&link_path).with_context(|| {
+            format!(
+                "Failed to remove original manpage symlink {}",
+                link_path.display()
+            )
+        })?;
+        fixed_symlinks += 1;
+    }
+
+    if fixed_symlinks > 0 {
+        crate::log_info!(
+            "Updated {} man page symlink(s) for .zst targets",
+            fixed_symlinks
+        );
+    }
+
+    Ok(compressed)
+}
+
 /// Process staged files - remove .la files, strip binaries, etc.
-pub fn process(destdir: &Path, _spec: &PackageSpec) -> Result<()> {
-    println!("Processing staged files...");
+pub fn process(destdir: &Path, spec: &PackageSpec) -> Result<()> {
+    crate::log_info!("Processing staged files...");
 
     let mut removed_count = 0;
 
@@ -68,14 +367,32 @@ pub fn process(destdir: &Path, _spec: &PackageSpec) -> Result<()> {
 
         // Remove libtool .la files
         if path.extension().map(|e| e == "la").unwrap_or(false) {
-            println!("  Removing: {}", path.display());
+            crate::log_info!("  Removing: {}", path.display());
             fs::remove_file(path)?;
             removed_count += 1;
         }
     }
 
     if removed_count > 0 {
-        println!("Removed {} .la file(s)", removed_count);
+        crate::log_info!("Removed {} .la file(s)", removed_count);
+    }
+
+    if spec.build.flags.no_strip {
+        crate::log_info!("Skipping auto-strip: disabled by build.flags.no_strip");
+    } else {
+        let stripped = auto_strip_elf_files(destdir)?;
+        if stripped > 0 {
+            crate::log_info!("Stripped {} ELF file(s)", stripped);
+        }
+    }
+
+    if spec.build.flags.no_compress_man {
+        crate::log_info!("Skipping manpage compression: disabled by build.flags.no_compress_man");
+    } else {
+        let compressed = compress_manpages_zstd(destdir)?;
+        if compressed > 0 {
+            crate::log_info!("Compressed {} man page(s) with zstd -22", compressed);
+        }
     }
 
     Ok(())
@@ -127,7 +444,7 @@ pub fn add_licenses(src_dir: &Path, destdir: &Path, pkgname: &str) -> Result<usi
     }
 
     if copied > 0 {
-        println!(
+        crate::log_info!(
             "Copied {} license file(s) to {}/",
             copied,
             dst_base.display()
@@ -225,10 +542,17 @@ pub fn install_atomic(
     remove_paths: &[String],
     keep_paths: &[String],
 ) -> Result<FsTransaction> {
-    let keep_set: HashSet<String> = keep_paths
+    let keep_rules: Vec<KeepMatcher> = keep_paths
         .iter()
-        .map(|p| normalize_relative_path(p))
-        .collect::<Result<HashSet<_>>>()?;
+        .map(|p| KeepMatcher::from_spec(p))
+        .collect::<Result<Vec<_>>>()?;
+    let keep_set: HashSet<String> = keep_rules
+        .iter()
+        .filter_map(|m| match m {
+            KeepMatcher::Exact(p) => Some(p.clone()),
+            KeepMatcher::Pattern(_) => None,
+        })
+        .collect();
 
     fs::create_dir_all(tx_base_dir)
         .with_context(|| format!("Failed to create tx dir: {}", tx_base_dir.display()))?;
@@ -265,6 +589,10 @@ pub fn install_atomic(
             let rel_path = src_path
                 .strip_prefix(destdir)
                 .context("Failed to strip destdir prefix")?;
+            let rel_path_str = rel_path.to_string_lossy().to_string();
+            if is_skipped_install_path(&rel_path_str) {
+                continue;
+            }
 
             let dest_path = rootfs.join(rel_path);
             if !dest_path.exists() {
@@ -295,7 +623,12 @@ pub fn install_atomic(
                 continue;
             }
 
-            let keep_as_depotnew = keep_set.contains(&rel_path) && rootfs.join(&rel_path).exists();
+            let keep_match = if keep_set.contains(&rel_path) {
+                true
+            } else {
+                keep_rules.iter().any(|m| m.matches(&rel_path))
+            };
+            let keep_as_depotnew = keep_match && rootfs.join(&rel_path).exists();
             let install_rel_path = if keep_as_depotnew {
                 format!("{}.depotnew", rel_path)
             } else {
@@ -498,6 +831,115 @@ mod tests {
     }
 
     #[test]
+    fn install_atomic_keep_wildcard_matches_directory_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(rootfs.join("etc/pam.d")).unwrap();
+        std::fs::create_dir_all(destdir.join("etc/pam.d")).unwrap();
+        std::fs::create_dir_all(destdir.join("etc/pam.d/subdir")).unwrap();
+
+        std::fs::write(rootfs.join("etc/pam.d/system-auth"), "existing-auth").unwrap();
+        std::fs::write(destdir.join("etc/pam.d/system-auth"), "pkg-auth").unwrap();
+        std::fs::write(destdir.join("etc/pam.d/other"), "pkg-other").unwrap();
+        std::fs::write(destdir.join("etc/pam.d/subdir/nested"), "pkg-nested").unwrap();
+
+        let keep = vec!["etc/pam.d/*".to_string()];
+        let tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &keep).unwrap();
+
+        // Existing matched file is preserved and package version becomes .depotnew
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("etc/pam.d/system-auth")).unwrap(),
+            "existing-auth"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("etc/pam.d/system-auth.depotnew")).unwrap(),
+            "pkg-auth"
+        );
+
+        // New matched file installs normally because no existing file is present
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("etc/pam.d/other")).unwrap(),
+            "pkg-other"
+        );
+
+        // Single-segment * does not cross '/'
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("etc/pam.d/subdir/nested")).unwrap(),
+            "pkg-nested"
+        );
+        assert!(!rootfs.join("etc/pam.d/subdir/nested.depotnew").exists());
+
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn keep_glob_matches_question_mark_and_not_path_separator() {
+        assert!(glob_match_path(
+            "etc/pam.d/system-????",
+            "etc/pam.d/system-auth"
+        ));
+        assert!(!glob_match_path("etc/pam.d/*", "etc/pam.d/subdir/file"));
+        assert!(glob_match_path("etc/pam.d/*", "etc/pam.d/file"));
+        assert!(glob_match_path("etc/pam.d/**", "etc/pam.d/subdir/file"));
+        assert!(glob_match_path("etc/**/file", "etc/pam.d/subdir/file"));
+        assert!(glob_match_path("etc/pam.d/**", "etc/pam.d"));
+    }
+
+    #[test]
+    fn is_manpage_rel_path_detects_uncompressed_manpages() {
+        assert!(is_manpage_rel_path("usr/share/man/man1/ls.1"));
+        assert!(is_manpage_rel_path("/usr/share/man/man5/pam.d.5"));
+        assert!(!is_manpage_rel_path("usr/share/man/man1/ls.1.zst"));
+        assert!(!is_manpage_rel_path("usr/share/doc/readme"));
+    }
+
+    #[test]
+    fn is_elf_file_detects_magic_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elf = tmp.path().join("elf.bin");
+        let text = tmp.path().join("text.txt");
+        std::fs::write(&elf, [0x7F, b'E', b'L', b'F', 0x02, 0x01]).unwrap();
+        std::fs::write(&text, b"#!/bin/sh\n").unwrap();
+
+        assert!(is_elf_file(&elf).unwrap());
+        assert!(!is_elf_file(&text).unwrap());
+    }
+
+    #[test]
+    fn compress_manpages_zstd_rewrites_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let man1 = dest.join("usr/share/man/man1");
+        std::fs::create_dir_all(&man1).unwrap();
+
+        let page = man1.join("foo.1");
+        std::fs::write(&page, b"foo manpage\n").unwrap();
+        std::os::unix::fs::symlink("foo.1", man1.join("bar.1")).unwrap();
+
+        let count = compress_manpages_zstd(&dest).unwrap();
+        assert_eq!(count, 1);
+        assert!(!man1.join("foo.1").exists());
+        assert!(man1.join("foo.1.zst").exists());
+        assert!(!man1.join("bar.1").exists());
+
+        let link_meta = std::fs::symlink_metadata(man1.join("bar.1.zst")).unwrap();
+        assert!(link_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(man1.join("bar.1.zst")).unwrap(),
+            PathBuf::from("foo.1.zst")
+        );
+
+        let file = std::fs::File::open(man1.join("foo.1.zst")).unwrap();
+        let mut decoder = zstd::stream::read::Decoder::new(file).unwrap();
+        let mut out = String::new();
+        use std::io::Read as _;
+        decoder.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "foo manpage\n");
+    }
+
+    #[test]
     fn install_atomic_rejects_unsafe_keep_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let rootfs = tmp.path().join("root");
@@ -672,6 +1114,24 @@ mod tests {
     }
 
     #[test]
+    fn install_atomic_skips_internal_output_staging_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(destdir.join(".depot/outputs/clang/usr/bin")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::write(destdir.join(".depot/outputs/clang/usr/bin/clang"), "clang").unwrap();
+        std::fs::write(destdir.join("usr/bin/ok"), "ok").unwrap();
+
+        let _tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
+
+        assert!(rootfs.join("usr/bin/ok").exists());
+        assert!(!rootfs.join(".depot").exists());
+    }
+
+    #[test]
     fn generate_manifest_skips_info_dir_index() {
         let tmp = tempfile::tempdir().unwrap();
         let destdir = tmp.path().join("dest");
@@ -725,6 +1185,25 @@ mod tests {
 
         assert!(!manifest.files.contains(&"scripts/pre_install".to_string()));
         assert!(manifest.files.contains(&"usr/bin/ok".to_string()));
+    }
+
+    #[test]
+    fn generate_manifest_skips_internal_output_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(destdir.join(".depot/outputs/clang/usr/bin")).unwrap();
+        std::fs::write(destdir.join("usr/bin/llvm-config"), "ok").unwrap();
+        std::fs::write(destdir.join(".depot/outputs/clang/usr/bin/clang"), "clang").unwrap();
+
+        let manifest = generate_manifest_with_dirs(&destdir).unwrap();
+
+        assert!(manifest.files.contains(&"usr/bin/llvm-config".to_string()));
+        assert!(
+            !manifest
+                .files
+                .contains(&".depot/outputs/clang/usr/bin/clang".to_string())
+        );
     }
 }
 

@@ -10,6 +10,7 @@
 
 use crate::db;
 use crate::package::PackageSpec;
+use crate::ui;
 use anyhow::Result;
 use std::path::Path;
 
@@ -200,26 +201,35 @@ pub fn print_dep_status(spec: &PackageSpec, db_path: &Path) -> Result<()> {
     let missing_test = check_test_deps(spec, db_path)?;
 
     if !spec.dependencies.build.is_empty() {
-        println!("Build dependencies: {}", spec.dependencies.build.join(", "));
+        ui::info(format!(
+            "Build dependencies: {}",
+            spec.dependencies.build.join(", ")
+        ));
         if !missing_build.is_empty() {
-            println!("  Missing: {}", missing_build.join(", "));
+            ui::warn(format!("Build deps missing: {}", missing_build.join(", ")));
         }
     }
 
     if !spec.dependencies.runtime.is_empty() {
-        println!(
+        ui::info(format!(
             "Runtime dependencies: {}",
             spec.dependencies.runtime.join(", ")
-        );
+        ));
         if !missing_runtime.is_empty() {
-            println!("  Missing: {}", missing_runtime.join(", "));
+            ui::warn(format!(
+                "Runtime deps missing: {}",
+                missing_runtime.join(", ")
+            ));
         }
     }
 
     if !spec.dependencies.test.is_empty() {
-        println!("Test dependencies: {}", spec.dependencies.test.join(", "));
+        ui::info(format!(
+            "Test dependencies: {}",
+            spec.dependencies.test.join(", ")
+        ));
         if !missing_test.is_empty() {
-            println!("  Missing: {}", missing_test.join(", "));
+            ui::warn(format!("Test deps missing: {}", missing_test.join(", ")));
         }
     }
 
@@ -232,7 +242,7 @@ pub fn require_build_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
 
     if !missing.is_empty() {
         anyhow::bail!(
-            "Missing build dependencies: {}\nInstall them first with: nyapm install <package>",
+            "Missing build dependencies: {}\nInstall them first with: depot install <package>",
             missing.join(", ")
         );
     }
@@ -246,7 +256,21 @@ pub fn require_test_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
 
     if !missing.is_empty() {
         anyhow::bail!(
-            "Missing test dependencies: {}\nInstall them first with: nyapm install <package>",
+            "Missing test dependencies: {}\nInstall them first with: depot install <package>",
+            missing.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+/// Verify all runtime dependencies are installed, error if not.
+pub fn require_runtime_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
+    let missing = check_runtime_deps(spec, db_path)?;
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Missing runtime dependencies: {}\nInstall them first with: depot install <package>",
             missing.join(", ")
         );
     }
@@ -333,10 +357,52 @@ mod tests {
                 runtime: Vec::new(),
                 test: vec!["bats".into(), "python".into()],
             },
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: std::path::PathBuf::from("."),
         };
 
         let missing = check_test_deps(&spec, Path::new("/definitely/not/a/real/db")).unwrap();
         assert_eq!(missing, vec!["bats".to_string(), "python".to_string()]);
+    }
+
+    #[test]
+    fn test_require_runtime_deps_errors_when_db_missing() {
+        let spec = PackageSpec {
+            package: crate::package::PackageInfo {
+                name: "foo".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Default::default(),
+            manual_sources: Vec::new(),
+            source: vec![crate::package::Source {
+                url: "https://example.test/foo.tar.gz".into(),
+                sha256: "skip".into(),
+                extract_dir: "foo".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+            }],
+            build: crate::package::Build {
+                build_type: crate::package::BuildType::Custom,
+                flags: crate::package::BuildFlags::default(),
+            },
+            dependencies: crate::package::Dependencies {
+                build: Vec::new(),
+                runtime: vec!["python".into()],
+                test: Vec::new(),
+            },
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: std::path::PathBuf::from("."),
+        };
+
+        let err = require_runtime_deps(&spec, Path::new("/definitely/not/a/real/db"))
+            .expect_err("runtime deps should be required");
+        assert!(err.to_string().contains("Missing runtime dependencies"));
     }
 }

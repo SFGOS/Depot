@@ -16,6 +16,7 @@ pub fn build(
     export_compiler_flags: bool,
 ) -> Result<()> {
     let flags = &spec.build.flags;
+    let make_exec_override = flags.make_exec.trim();
 
     // Determine actual source directory (support source_subdir)
     let actual_src = resolve_actual_src(spec, src_dir)?;
@@ -49,7 +50,7 @@ pub fn build(
 
     // Run cmake configure
     if !state.is_done(BuildStep::Configured) {
-        println!("Running cmake configure...");
+        crate::log_info!("Running cmake configure...");
         let mut cmake_cmd = Command::new("cmake");
         cmake_cmd.current_dir(&build_dir);
         cmake_cmd.arg("-S").arg(&actual_src);
@@ -60,6 +61,17 @@ pub fn build(
         // Add toolchain file for cross-compilation
         if let Some(ref tf) = toolchain_file {
             cmake_cmd.arg(format!("-DCMAKE_TOOLCHAIN_FILE={}", tf.display()));
+        }
+
+        if !make_exec_override.is_empty() {
+            if !cmake_configure_flags_specify_generator(&flags.configure)
+                && let Some(generator) = cmake_generator_for_make_exec(make_exec_override)
+            {
+                cmake_cmd.arg("-G").arg(generator);
+            }
+            if !cmake_configure_flags_set_make_program(&flags.configure) {
+                cmake_cmd.arg(format!("-DCMAKE_MAKE_PROGRAM={make_exec_override}"));
+            }
         }
 
         // Add custom configure flags from spec (supports cross-compilation overrides).
@@ -76,17 +88,26 @@ pub fn build(
         if !status.success() {
             anyhow::bail!("cmake configure failed");
         }
+
+        crate::source::hooks::run_post_configure_commands(spec, &actual_src, destdir)?;
         state.mark_done(BuildStep::Configured)?;
     } else {
-        println!("Skipping cmake configure (already done)");
+        crate::log_info!("Skipping cmake configure (already done)");
     }
 
     if !state.is_done(BuildStep::PostCompileDone) {
         // Run cmake build
-        println!("Running cmake build...");
+        crate::log_info!("Running cmake build...");
+        let build_targets = phase_targets(&flags.make_target, &flags.make_targets);
         let mut build_cmd = Command::new("cmake");
         build_cmd.arg("--build").arg(&build_dir);
         build_cmd.arg("-j").arg(num_cpus().to_string());
+        if !build_targets.is_empty() {
+            build_cmd.arg("--target");
+            for target in &build_targets {
+                build_cmd.arg(target);
+            }
+        }
 
         crate::builder::prepare_command(&mut build_cmd, &env_vars);
 
@@ -97,15 +118,44 @@ pub fn build(
             anyhow::bail!("cmake build failed");
         }
 
+        if flags.skip_tests {
+            crate::log_info!("Skipping tests: disabled by build.flags.skip_tests");
+        } else {
+            let test_targets = phase_targets(&flags.make_test_target, &flags.make_test_targets);
+            if !test_targets.is_empty() {
+                let joined = test_targets.join(" ");
+                crate::log_info!("Running cmake test target(s): {}...", joined);
+                let mut test_cmd = Command::new("cmake");
+                test_cmd.arg("--build").arg(&build_dir);
+                test_cmd.arg("--target");
+                for target in &test_targets {
+                    test_cmd.arg(target);
+                }
+                crate::builder::prepare_command(&mut test_cmd, &env_vars);
+
+                let status = test_cmd.status().with_context(|| {
+                    format!(
+                        "Failed to run cmake build target(s) '{}' for {}",
+                        joined, spec.package.name
+                    )
+                })?;
+                if !status.success() {
+                    anyhow::bail!("cmake test target(s) '{}' failed", joined);
+                }
+            } else {
+                crate::log_info!("Skipping tests: no build.flags.make_test_target(s) for cmake");
+            }
+        }
+
         crate::source::hooks::run_post_compile_commands(spec, &actual_src, destdir)?;
         state.mark_done(BuildStep::PostCompileDone)?;
     } else {
-        println!("Skipping cmake build and post-compile hooks (already done)");
+        crate::log_info!("Skipping cmake build and post-compile hooks (already done)");
     }
 
     if !state.is_done(BuildStep::PostInstallDone) {
         // Run cmake install with fakeroot if not root
-        println!(
+        crate::log_info!(
             "Running cmake install{}...",
             if fakeroot::is_root() {
                 ""
@@ -114,8 +164,18 @@ pub fn build(
             }
         );
 
+        let install_targets =
+            phase_targets(&flags.make_install_target, &flags.make_install_targets);
         let mut install_cmd = fakeroot::wrap_install_command("cmake", destdir);
-        install_cmd.arg("--install").arg(&build_dir);
+        if !install_targets.is_empty() {
+            install_cmd.arg("--build").arg(&build_dir);
+            install_cmd.arg("--target");
+            for target in &install_targets {
+                install_cmd.arg(target);
+            }
+        } else {
+            install_cmd.arg("--install").arg(&build_dir);
+        }
 
         let mut install_env = env_vars.clone();
         install_env.push((
@@ -128,13 +188,19 @@ pub fn build(
             .status()
             .with_context(|| format!("Failed to run cmake install for {}", spec.package.name))?;
         if !status.success() {
+            if !install_targets.is_empty() {
+                anyhow::bail!(
+                    "cmake install target(s) '{}' failed",
+                    install_targets.join(" ")
+                );
+            }
             anyhow::bail!("cmake install failed");
         }
 
         crate::source::hooks::run_post_install_commands(spec, &actual_src, destdir)?;
         state.mark_done(BuildStep::PostInstallDone)?;
     } else {
-        println!("Skipping cmake install and post-install hooks (already done)");
+        crate::log_info!("Skipping cmake install and post-install hooks (already done)");
     }
 
     Ok(())
@@ -159,6 +225,61 @@ fn expand_with_envs(input: &str, envs: &[(String, String)]) -> String {
         result = result.replace(&format!("${{{}}}", k), v);
     }
     expand_env_vars(&result)
+}
+
+fn nonempty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn phase_targets(single: &str, many: &[String]) -> Vec<String> {
+    let mut targets = Vec::new();
+    if let Some(target) = nonempty_trimmed(single) {
+        targets.push(target.to_string());
+    }
+    for target in many {
+        if let Some(target) = nonempty_trimmed(target) {
+            targets.push(target.to_string());
+        }
+    }
+    targets
+}
+
+fn cmake_generator_for_make_exec(make_exec: &str) -> Option<&'static str> {
+    let tool = Path::new(make_exec)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase())?;
+    if tool.contains("ninja") {
+        Some("Ninja")
+    } else if tool == "make"
+        || tool == "gmake"
+        || tool == "bmake"
+        || tool == "nmake"
+        || tool.ends_with("-make")
+        || tool.ends_with("make.exe")
+    {
+        Some("Unix Makefiles")
+    } else {
+        None
+    }
+}
+
+fn cmake_configure_flags_specify_generator(flags: &[String]) -> bool {
+    flags.iter().any(|flag| {
+        let trimmed = flag.trim();
+        trimmed == "-G"
+            || trimmed.starts_with("-G")
+            || trimmed == "--generator"
+            || trimmed.starts_with("--generator=")
+    })
+}
+
+fn cmake_configure_flags_set_make_program(flags: &[String]) -> bool {
+    flags.iter().any(|flag| {
+        let trimmed = flag.trim();
+        trimmed.starts_with("-DCMAKE_MAKE_PROGRAM=")
+    })
 }
 
 fn num_cpus() -> usize {
@@ -258,6 +379,50 @@ mod tests {
     }
 
     #[test]
+    fn test_phase_targets_merges_singular_and_plural() {
+        assert_eq!(
+            phase_targets("bootstrap", &["stage1".into(), "stage2".into()]),
+            vec![
+                "bootstrap".to_string(),
+                "stage1".to_string(),
+                "stage2".to_string()
+            ]
+        );
+        assert!(phase_targets("", &[]).is_empty());
+    }
+
+    #[test]
+    fn test_cmake_generator_for_make_exec_detects_ninja_and_make() {
+        assert_eq!(cmake_generator_for_make_exec("ninja"), Some("Ninja"));
+        assert_eq!(
+            cmake_generator_for_make_exec("/usr/bin/gmake"),
+            Some("Unix Makefiles")
+        );
+        assert_eq!(cmake_generator_for_make_exec("samurai"), None);
+    }
+
+    #[test]
+    fn test_cmake_configure_flag_detectors() {
+        assert!(cmake_configure_flags_specify_generator(&[
+            "-G".to_string(),
+            "Ninja".to_string()
+        ]));
+        assert!(cmake_configure_flags_specify_generator(&[
+            "--generator=Unix Makefiles".to_string()
+        ]));
+        assert!(!cmake_configure_flags_specify_generator(&[
+            "-DCMAKE_BUILD_TYPE=Release".to_string()
+        ]));
+
+        assert!(cmake_configure_flags_set_make_program(&[
+            "-DCMAKE_MAKE_PROGRAM=/usr/bin/ninja".to_string()
+        ]));
+        assert!(!cmake_configure_flags_set_make_program(&[
+            "-DCMAKE_C_COMPILER=clang".to_string()
+        ]));
+    }
+
+    #[test]
     fn resolve_actual_src_prefers_srcdir_then_specdir_and_handles_absolute() {
         let tmp = tempdir().unwrap();
         let src_root = tmp.path().join("srcroot");
@@ -291,6 +456,8 @@ mod tests {
                 },
             },
             dependencies: Default::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: spec_dir.clone(),
         };
 

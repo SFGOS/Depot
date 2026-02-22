@@ -83,7 +83,7 @@ impl PackageIndex {
             }
         }
 
-        println!(
+        crate::log_info!(
             "Indexed {} packages ({} provides)",
             index.by_name.len(),
             index.by_provides.len()
@@ -102,8 +102,8 @@ impl PackageIndex {
         // Then try by provides
         if let Some(paths) = self.by_provides.get(name) {
             if paths.len() > 1 {
-                eprintln!(
-                    "Warning: Multiple packages provide '{}': {:?}",
+                crate::log_warn!(
+                    "Multiple packages provide '{}': {:?}",
                     name,
                     paths
                         .iter()

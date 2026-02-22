@@ -73,8 +73,10 @@ pub fn build(
         crate::builder::set_env_var(&mut env_vars, "RUSTUP_TOOLCHAIN", "stable");
     }
 
+    hooks::run_post_configure_commands(spec, src_dir, destdir)?;
+
     // Run cargo build
-    println!(
+    crate::log_info!(
         "Running cargo build ({})...",
         if is_release { "release" } else { "debug" }
     );
@@ -110,7 +112,7 @@ pub fn build(
     hooks::run_post_compile_commands(spec, src_dir, destdir)?;
 
     // Install binaries to destdir
-    println!("Installing binaries to DESTDIR...");
+    crate::log_info!("Installing binaries to DESTDIR...");
 
     // Determine target directory
     let target_dir = if let Some(ref t) = target {
@@ -160,7 +162,7 @@ pub fn build(
                     .is_some()
                 {
                     let dest = bin_dir.join(&*file_name);
-                    println!("  Installing: {}", file_name);
+                    crate::log_info!("  Installing: {}", file_name);
                     fs::copy(&path, &dest).with_context(|| {
                         format!("Failed to copy {} to {}", path.display(), dest.display())
                     })?;

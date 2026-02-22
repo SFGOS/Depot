@@ -24,11 +24,11 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
 
     // Check if already cached and verified
     if dest_path.exists() && verify_checksum(&dest_path, &source.sha256)? {
-        println!("Using cached source: {}", dest_path.display());
+        crate::log_info!("Using cached source: {}", dest_path.display());
         return Ok(dest_path);
     }
 
-    println!("Fetching: {}", url);
+    crate::log_info!("Fetching: {}", url);
 
     // Parse URL early so we can handle non-HTTP schemes (FTP support)
     let parsed_url = Url::parse(&url).with_context(|| format!("Invalid URL: {}", url))?;
@@ -165,7 +165,7 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
         if !seen_alts.insert(alt.clone()) {
             bail!("Mirror retry loop detected for URL: {}", alt);
         }
-        println!("Retrying download from mirror: {}", alt);
+        crate::log_info!("Retrying download from mirror: {}", alt);
         fs::remove_file(&dest_path).ok();
 
         // If mirror URL is FTP -> use suppaftp; otherwise use HTTP retry.
@@ -280,7 +280,7 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
         bail!("Checksum verification failed for {}", filename);
     }
 
-    println!("Checksum verified: {}", filename);
+    crate::log_info!("Checksum verified: {}", filename);
     Ok(dest_path)
 }
 

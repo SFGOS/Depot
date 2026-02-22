@@ -3,9 +3,11 @@
 use crate::cross::CrossConfig;
 use crate::fakeroot;
 use crate::package::PackageSpec;
+use crate::source::hooks;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 pub fn build(
     spec: &PackageSpec,
@@ -20,6 +22,8 @@ pub fn build(
     fs::create_dir_all(destdir)?;
 
     let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
+    let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
+    shell_helpers.apply_to_env_vars(&mut env_vars);
 
     // For custom builds, look for a build.sh script in the source directory
     let build_script = src_dir.join("build.sh");
@@ -44,7 +48,7 @@ pub fn build(
             perms.set_mode(0o755);
             fs::set_permissions(&build_script, perms)?;
         }
-        println!("Using build.sh from spec dir: {}", spec_build.display());
+        crate::log_info!("Using build.sh from spec dir: {}", spec_build.display());
     }
 
     if !build_script.exists() {
@@ -57,8 +61,15 @@ pub fn build(
     use crate::builder::state::{BuildStep, StateTracker};
     let mut state = StateTracker::new(src_dir)?;
 
+    if !state.is_done(BuildStep::Configured) {
+        hooks::run_post_configure_commands(spec, src_dir, destdir)?;
+        state.mark_done(BuildStep::Configured)?;
+    } else {
+        crate::log_info!("Skipping post-configure hooks (already done)");
+    }
+
     if !state.is_done(BuildStep::PostInstallDone) {
-        println!(
+        crate::log_info!(
             "Running custom build script{}...",
             if fakeroot::is_root() {
                 ""
@@ -75,9 +86,17 @@ pub fn build(
             src_dir.to_path_buf()
         };
 
-        // Use POSIX `sh` (more likely to be available in minimal/chroot environments)
-        let mut cmd = fakeroot::wrap_install_command("sh", destdir);
-        cmd.current_dir(&build_dir);
+        crate::builder::set_env_var(
+            &mut env_vars,
+            "DESTDIR",
+            destdir.to_string_lossy().into_owned(),
+        );
+        crate::builder::set_env_var(
+            &mut env_vars,
+            "DEPOT_PRIMARY_DESTDIR",
+            destdir.to_string_lossy().into_owned(),
+        );
+        add_output_destdir_envs(spec, destdir, &mut env_vars);
 
         // Ensure build script path is absolute for when we are in a sub-build-dir
         let abs_build_script = if build_script.is_absolute() {
@@ -85,13 +104,19 @@ pub fn build(
         } else {
             std::env::current_dir()?.join(&build_script)
         };
-        cmd.arg(&abs_build_script);
 
-        crate::builder::set_env_var(
-            &mut env_vars,
-            "DESTDIR",
-            destdir.to_string_lossy().into_owned(),
-        );
+        // Use POSIX `sh` (more likely to be available in minimal/chroot environments)
+        let mut cmd = if custom_function_mode_enabled(&abs_build_script)? {
+            crate::log_info!(
+                "Using custom build.sh function mode (per-output install functions enabled)"
+            );
+            build_function_mode_command(spec, destdir, &abs_build_script)?
+        } else {
+            let mut cmd = fakeroot::wrap_install_command("sh", destdir);
+            cmd.arg(&abs_build_script);
+            cmd
+        };
+        cmd.current_dir(&build_dir);
 
         crate::builder::prepare_command(&mut cmd, &env_vars);
 
@@ -109,10 +134,106 @@ pub fn build(
         }
         state.mark_done(BuildStep::PostInstallDone)?;
     } else {
-        println!("Skipping custom build script (already done)");
+        crate::log_info!("Skipping custom build script (already done)");
     }
 
     Ok(())
+}
+
+fn add_output_destdir_envs(
+    spec: &PackageSpec,
+    destdir: &Path,
+    env_vars: &mut crate::builder::EnvVars,
+) {
+    for out in spec.outputs() {
+        let out_destdir = if out.name == spec.package.name {
+            destdir.to_path_buf()
+        } else {
+            crate::staging::output_staging_dir(destdir, &out.name)
+        };
+        let suffix = crate::shell_helpers::shell_ident_suffix(&out.name);
+        crate::builder::set_env_var(
+            env_vars,
+            &format!("DEPOT_SUBDESTDIR_{suffix}"),
+            out_destdir.to_string_lossy().into_owned(),
+        );
+    }
+}
+
+fn custom_function_mode_enabled(build_script: &Path) -> Result<bool> {
+    let contents = fs::read_to_string(build_script)
+        .with_context(|| format!("Failed to read build script: {}", build_script.display()))?;
+    Ok(contents.contains("depot_build()")
+        || contents.contains("depot_install()")
+        || contents.contains("depot_install_")
+        || contents.contains("install_"))
+}
+
+fn build_function_mode_command(
+    spec: &PackageSpec,
+    destdir: &Path,
+    build_script: &Path,
+) -> Result<Command> {
+    let mut wrapper = String::new();
+    wrapper.push_str("set -eu\n");
+    wrapper.push_str(". \"$1\"\n");
+    wrapper.push_str("if command -v depot_build >/dev/null 2>&1; then depot_build;\n");
+    wrapper.push_str("elif command -v build >/dev/null 2>&1; then build;\n");
+    wrapper.push_str("fi\n");
+
+    let primary = &spec.package.name;
+    for out in spec.outputs() {
+        let out_destdir = if out.name == *primary {
+            destdir.to_path_buf()
+        } else {
+            crate::staging::output_staging_dir(destdir, &out.name)
+        };
+        let fn_suffix = shell_fn_suffix(&out.name);
+        let q_name = sh_single_quote(&out.name);
+        let q_dest = sh_single_quote(&out_destdir.to_string_lossy());
+
+        wrapper.push_str(&format!(
+            "DEPOT_OUTPUT_NAME='{q_name}'; DEPOT_OUTPUT_DESTDIR='{q_dest}'; DESTDIR=\"$DEPOT_OUTPUT_DESTDIR\"; export DEPOT_OUTPUT_NAME DEPOT_OUTPUT_DESTDIR DESTDIR\n"
+        ));
+        wrapper.push_str(&format!(
+            "if command -v depot_install_{fn_suffix} >/dev/null 2>&1; then depot_install_{fn_suffix};\n"
+        ));
+        wrapper.push_str(&format!(
+            "elif command -v install_{fn_suffix} >/dev/null 2>&1; then install_{fn_suffix};\n"
+        ));
+        if out.name == *primary {
+            wrapper
+                .push_str("elif command -v depot_install >/dev/null 2>&1; then depot_install;\n");
+            wrapper.push_str("elif command -v install >/dev/null 2>&1; then install;\n");
+        }
+        wrapper.push_str("fi\n");
+    }
+
+    let mut cmd = fakeroot::wrap_install_command("sh", destdir);
+    cmd.arg("-c").arg(wrapper).arg("sh").arg(build_script);
+    Ok(cmd)
+}
+
+fn shell_fn_suffix(pkg_name: &str) -> String {
+    let mut out = String::with_capacity(pkg_name.len().max(1));
+    for ch in pkg_name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    if out.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+fn sh_single_quote(s: &str) -> String {
+    s.replace('\'', "'\"'\"'")
 }
 
 #[cfg(test)]
@@ -146,6 +267,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: std::path::PathBuf::from("."),
         }
     }
@@ -186,6 +309,58 @@ mod tests {
         let _ = build(&spec, tmp_src.path(), tmp_dest.path(), None, true)?;
         // If we reached here, build() succeeded and build.sh was copied into src
         assert!(tmp_src.path().join("build.sh").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_function_mode_uses_per_output_destdirs() -> Result<()> {
+        let tmp_src = tempdir()?;
+        let tmp_dest = tempdir()?;
+
+        let build_sh = tmp_src.path().join("build.sh");
+        std::fs::write(
+            &build_sh,
+            r#"#!/bin/sh
+depot_build() {
+  :
+}
+depot_install() {
+  mkdir -p "$DESTDIR/usr/share"
+  echo primary > "$DESTDIR/usr/share/primary.txt"
+}
+depot_install_dev_pkg() {
+  mkdir -p "$DESTDIR/usr/include"
+  echo header > "$DESTDIR/usr/include/dev.h"
+}
+"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&build_sh)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&build_sh, perms)?;
+        }
+
+        let mut spec = mk_spec("demo", "1.0");
+        spec.packages.push(crate::package::PackageInfo {
+            name: "dev-pkg".into(),
+            version: "1.0".into(),
+            revision: 1,
+            description: "d".into(),
+            homepage: "h".into(),
+            license: vec!["MIT".into()],
+        });
+
+        build(&spec, tmp_src.path(), tmp_dest.path(), None, true)?;
+
+        assert!(tmp_dest.path().join("usr/share/primary.txt").exists());
+        assert!(
+            tmp_dest
+                .path()
+                .join(".depot/outputs/dev-pkg/usr/include/dev.h")
+                .exists()
+        );
         Ok(())
     }
 }

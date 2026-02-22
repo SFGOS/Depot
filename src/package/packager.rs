@@ -8,6 +8,14 @@ use std::path::{Path, PathBuf};
 use tar::Builder;
 use zstd::stream::write::Encoder;
 
+fn is_internal_staging_rel_path(rel_path: &Path) -> bool {
+    let s = rel_path.to_string_lossy();
+    let p = s.trim_start_matches('/');
+    p == crate::staging::INTERNAL_DEPOT_DIR
+        || p.strip_prefix(crate::staging::INTERNAL_DEPOT_DIR)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 fn license_value(licenses: &[String]) -> toml::Value {
     if licenses.len() == 1 {
         toml::Value::String(licenses[0].clone())
@@ -41,7 +49,7 @@ impl Packager {
         let filename = self.spec.package_filename(arch);
         let output_path = output_dir.join(&filename);
 
-        println!("Creating package {}...", filename);
+        crate::log_info!("Creating package {}...", filename);
 
         // Generate .files.yaml
         self.generate_files_yaml()?;
@@ -78,6 +86,9 @@ impl Packager {
             if rel_path.as_os_str().is_empty() {
                 continue;
             }
+            if is_internal_staging_rel_path(rel_path) {
+                continue;
+            }
 
             let file_type = entry.file_type();
             if file_type.is_dir() {
@@ -101,7 +112,7 @@ impl Packager {
         let encoder = tar.into_inner()?;
         encoder.finish()?;
 
-        println!("Created package: {}", output_path.display());
+        crate::log_info!("Created package: {}", output_path.display());
         Ok(output_path)
     }
 
@@ -222,6 +233,9 @@ impl Packager {
             let path = entry.path();
             let file_type = entry.file_type()?;
             let relative = path.strip_prefix(base)?.to_string_lossy().to_string();
+            if is_internal_staging_rel_path(Path::new(&relative)) {
+                continue;
+            }
 
             if file_type.is_dir() {
                 self.collect_files(base, &path, files)?;
@@ -264,6 +278,8 @@ mod tests {
                     flags: BuildFlags::default(),
                 },
                 dependencies: Dependencies::default(),
+                package_alternatives: Default::default(),
+                package_dependencies: Default::default(),
                 spec_dir: PathBuf::from("."),
             },
             destdir,
@@ -287,6 +303,23 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.contains(&"usr/bin/foo".to_string()));
         assert!(files.contains(&"etc/config".to_string()));
+    }
+
+    #[test]
+    fn test_collect_files_skips_internal_output_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+        fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        fs::create_dir_all(dest.join(".depot/outputs/clang/usr/bin")).unwrap();
+        fs::write(dest.join("usr/bin/foo"), "x").unwrap();
+        fs::write(dest.join(".depot/outputs/clang/usr/bin/clang"), "x").unwrap();
+
+        let packager = mk_packager(dest.to_path_buf());
+        let mut files = Vec::new();
+        packager.collect_files(dest, dest, &mut files).unwrap();
+
+        assert!(files.contains(&"usr/bin/foo".to_string()));
+        assert!(!files.iter().any(|f| f.starts_with(".depot/outputs/")));
     }
 
     #[test]

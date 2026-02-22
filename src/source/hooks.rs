@@ -50,13 +50,13 @@ fn apply_patches(
         )
     })?;
 
-    println!("Applying {} patch(es)...", source.patches.len());
+    crate::log_info!("Applying {} patch(es)...", source.patches.len());
 
     for p in &source.patches {
         let p = spec.expand_vars(p);
         let patch_path = resolve_patch_path(spec, &p, &patch_cache_dir)?;
 
-        println!("  patch: {}", patch_path.display());
+        crate::log_info!("  patch: {}", patch_path.display());
 
         // Apply with patch(1). Keep it simple: -p1 is the common case.
         let status = Command::new("patch")
@@ -80,14 +80,14 @@ fn run_post_extract_commands(spec: &PackageSpec, source: &Source, src_dir: &Path
         return Ok(());
     }
 
-    println!(
+    crate::log_info!(
         "Running {} post-extract command(s)...",
         source.post_extract.len()
     );
 
     for cmd in &source.post_extract {
         let cmd = spec.expand_vars(cmd);
-        println!("  post_extract: {}", cmd);
+        crate::log_info!("  post_extract: {}", cmd);
 
         // Use a shell for convenience; this is a package manager, so specs are trusted input.
         let status = Command::new("sh")
@@ -107,32 +107,75 @@ fn run_post_extract_commands(spec: &PackageSpec, source: &Source, src_dir: &Path
 }
 
 /// Run post-compile commands (after make, before make install).
-pub fn run_post_compile_commands(spec: &PackageSpec, src_dir: &Path, destdir: &Path) -> Result<()> {
-    let commands = &spec.build.flags.post_compile;
+pub fn run_post_configure_commands(
+    spec: &PackageSpec,
+    src_dir: &Path,
+    destdir: &Path,
+) -> Result<()> {
+    let commands = &spec.build.flags.post_configure;
     if commands.is_empty() {
         return Ok(());
     }
 
-    println!("Running {} post-compile command(s)...", commands.len());
+    crate::log_info!("Running {} post-configure command(s)...", commands.len());
+    let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
 
     for cmd in commands {
-        let cmd = spec.expand_vars(cmd);
-        println!("  post_compile: {}", cmd);
+        let cmd_str = spec.expand_vars(cmd);
+        crate::log_info!("  post_configure: {}", cmd_str);
 
-        let status = Command::new("sh")
-            .current_dir(src_dir)
+        let mut shell_cmd = Command::new("sh");
+        shell_cmd.current_dir(src_dir);
+        shell_helpers.apply_to_command(&mut shell_cmd);
+        let status = shell_cmd
             .env("DEPOT_SPECDIR", &spec.spec_dir)
             .env("DESTDIR", destdir)
             .env("DEPOT_ROOTFS", &spec.build.flags.rootfs)
             .env("CC", &spec.build.flags.cc)
             .env("AR", &spec.build.flags.ar)
             .arg("-c")
-            .arg(&cmd)
+            .arg(&cmd_str)
             .status()
-            .with_context(|| format!("Failed to run post_compile command: {}", cmd))?;
+            .with_context(|| format!("Failed to run post_configure command: {}", cmd_str))?;
 
         if !status.success() {
-            bail!("post_compile command failed: {}", cmd);
+            bail!("post_configure command failed: {}", cmd_str);
+        }
+    }
+
+    Ok(())
+}
+
+/// Run post-compile commands (after make, before make install).
+pub fn run_post_compile_commands(spec: &PackageSpec, src_dir: &Path, destdir: &Path) -> Result<()> {
+    let commands = &spec.build.flags.post_compile;
+    if commands.is_empty() {
+        return Ok(());
+    }
+
+    crate::log_info!("Running {} post-compile command(s)...", commands.len());
+    let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
+
+    for cmd in commands {
+        let cmd_str = spec.expand_vars(cmd);
+        crate::log_info!("  post_compile: {}", cmd_str);
+
+        let mut shell_cmd = Command::new("sh");
+        shell_cmd.current_dir(src_dir);
+        shell_helpers.apply_to_command(&mut shell_cmd);
+        let status = shell_cmd
+            .env("DEPOT_SPECDIR", &spec.spec_dir)
+            .env("DESTDIR", destdir)
+            .env("DEPOT_ROOTFS", &spec.build.flags.rootfs)
+            .env("CC", &spec.build.flags.cc)
+            .env("AR", &spec.build.flags.ar)
+            .arg("-c")
+            .arg(&cmd_str)
+            .status()
+            .with_context(|| format!("Failed to run post_compile command: {}", cmd_str))?;
+
+        if !status.success() {
+            bail!("post_compile command failed: {}", cmd_str);
         }
     }
 
@@ -146,26 +189,29 @@ pub fn run_post_install_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
         return Ok(());
     }
 
-    println!("Running {} post-install command(s)...", commands.len());
+    crate::log_info!("Running {} post-install command(s)...", commands.len());
+    let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
 
     for cmd in commands {
-        let cmd = spec.expand_vars(cmd);
-        println!("  post_install: {}", cmd);
+        let cmd_str = spec.expand_vars(cmd);
+        crate::log_info!("  post_install: {}", cmd_str);
 
-        let status = Command::new("sh")
-            .current_dir(src_dir)
+        let mut shell_cmd = Command::new("sh");
+        shell_cmd.current_dir(src_dir);
+        shell_helpers.apply_to_command(&mut shell_cmd);
+        let status = shell_cmd
             .env("DEPOT_SPECDIR", &spec.spec_dir)
             .env("DESTDIR", destdir)
             .env("DEPOT_ROOTFS", &spec.build.flags.rootfs)
             .env("CC", &spec.build.flags.cc)
             .env("AR", &spec.build.flags.ar)
             .arg("-c")
-            .arg(&cmd)
+            .arg(&cmd_str)
             .status()
-            .with_context(|| format!("Failed to run post_install command: {}", cmd))?;
+            .with_context(|| format!("Failed to run post_install command: {}", cmd_str))?;
 
         if !status.success() {
-            bail!("post_install command failed: {}", cmd);
+            bail!("post_install command failed: {}", cmd_str);
         }
     }
 
@@ -240,7 +286,7 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_patch_path;
+    use super::{resolve_patch_path, run_post_install_commands};
     use crate::package::{
         Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source,
     };
@@ -270,6 +316,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: spec_dir.to_path_buf(),
         }
     }
@@ -307,5 +355,29 @@ mod tests {
         let url = "https://example.com/fix.patch";
         let resolved = resolve_patch_path(&spec, url, &patch_cache_dir).unwrap();
         assert_eq!(resolved, cached);
+    }
+
+    #[test]
+    fn post_install_commands_can_haul_into_output_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec_dir = tmp.path().join("spec");
+        let src_dir = tmp.path().join("src");
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/lib")).unwrap();
+        std::fs::write(destdir.join("usr/lib/libLLVM.so.1"), "llvm").unwrap();
+
+        let mut spec = dummy_spec(&spec_dir);
+        spec.build.flags.post_install = vec!["haul llvm-libs 'usr/lib/libLLVM*.so*'".into()];
+
+        run_post_install_commands(&spec, &src_dir, &destdir).unwrap();
+
+        assert!(!destdir.join("usr/lib/libLLVM.so.1").exists());
+        assert!(
+            destdir
+                .join(".depot/outputs/llvm-libs/usr/lib/libLLVM.so.1")
+                .exists()
+        );
     }
 }

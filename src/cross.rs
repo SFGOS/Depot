@@ -57,12 +57,12 @@ impl CrossConfig {
         let readelf = find_tool(prefix, &["readelf", "llvm-readelf"], false)
             .unwrap_or_else(|_| format!("{}-readelf", prefix));
 
-        println!("Cross-compilation tools discovered:");
-        println!("  CC:      {}", cc);
-        println!("  CXX:     {}", cxx);
-        println!("  AR:      {}", ar);
-        println!("  RANLIB:  {}", ranlib);
-        println!("  STRIP:   {}", strip);
+        crate::log_info!("Cross-compilation tools discovered:");
+        crate::log_info!("  CC:      {}", cc);
+        crate::log_info!("  CXX:     {}", cxx);
+        crate::log_info!("  AR:      {}", ar);
+        crate::log_info!("  RANLIB:  {}", ranlib);
+        crate::log_info!("  STRIP:   {}", strip);
 
         Ok(Self {
             prefix: prefix.to_string(),

@@ -35,7 +35,7 @@ pub fn extract_archive(
         .and_then(|n| n.to_str())
         .unwrap_or("");
 
-    println!("Extracting: {}", filename);
+    crate::log_info!("Extracting: {}", filename);
 
     if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
         extract_tar_gz(archive_path, &extract_path)?;
@@ -70,7 +70,7 @@ pub fn extract_archive(
         );
     }
 
-    println!("Extracted to: {}", extract_path.display());
+    crate::log_info!("Extracted to: {}", extract_path.display());
     Ok(extract_path)
 }
 

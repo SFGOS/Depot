@@ -17,6 +17,7 @@ impl fmt::Display for BuildType {
             BuildType::CMake => write!(f, "CMake"),
             BuildType::Meson => write!(f, "Meson"),
             BuildType::Custom => write!(f, "Custom"),
+            BuildType::Python => write!(f, "Python"),
             BuildType::Rust => write!(f, "Rust"),
             BuildType::Makefile => write!(f, "Makefile"),
             BuildType::Bin => write!(f, "Binary installer"),
@@ -177,8 +178,8 @@ fn expand_known_package_vars(input: &str, name: &str, version: &str) -> String {
 }
 
 pub fn create_interactive() -> Result<PackageSpec> {
-    println!("Interactive Package Specification Creator");
-    println!("-----------------------------------------");
+    crate::log_info!("Interactive Package Specification Creator");
+    crate::log_info!("-----------------------------------------");
 
     // Ask early whether this is a GNU project so we can pre-fill homepage and
     // avoid repeating the same question later for autotools sources.
@@ -237,6 +238,7 @@ pub fn create_interactive() -> Result<PackageSpec> {
         BuildType::CMake,
         BuildType::Meson,
         BuildType::Makefile,
+        BuildType::Python,
         BuildType::Rust,
         BuildType::Custom,
         BuildType::Bin,
@@ -409,6 +411,22 @@ pub fn create_interactive() -> Result<PackageSpec> {
     }
 
     if show_advanced && matches!(build_type, BuildType::Autotools) {
+        flags.configure_file = prompt_optional_text(
+            "Configure script path (optional):",
+            "Relative to source root, e.g. build-aux/configure",
+        )?;
+        flags.make_dirs = prompt_repeating_list(
+            "Make dir (build phase)",
+            "Relative to build dir, e.g. lib, libelf (empty = build root)",
+        )?;
+        flags.make_test_dirs = prompt_repeating_list(
+            "Make dir (test phase)",
+            "Relative to build dir, e.g. tests (empty = build root)",
+        )?;
+        flags.make_install_dirs = prompt_repeating_list(
+            "Make dir (install phase)",
+            "Relative to build dir, e.g. lib, apps (empty = build root)",
+        )?;
         flags.skip_tests = Confirm::new("Skip automatic tests (make check/test)?")
             .with_help_message(
                 "If enabled, Depot will not auto-run detected Autotools test targets",
@@ -418,7 +436,7 @@ pub fn create_interactive() -> Result<PackageSpec> {
     }
 
     if matches!(build_type, BuildType::Makefile) {
-        println!("Define Makefile build and install commands.");
+        crate::log_info!("Define Makefile build and install commands.");
         flags.makefile_commands = prompt_repeating_list(
             "makefile build command",
             "Examples: make -j$(nproc), make all",
@@ -467,6 +485,10 @@ pub fn create_interactive() -> Result<PackageSpec> {
     }
 
     if show_advanced {
+        flags.post_configure = prompt_repeating_list(
+            "post_configure command",
+            "Runs after configure/setup, before build",
+        )?;
         flags.post_compile =
             prompt_repeating_list("post_compile command", "Runs after build, before install")?;
         flags.post_install =
@@ -501,6 +523,8 @@ pub fn create_interactive() -> Result<PackageSpec> {
             runtime: runtime_deps,
             test: test_deps,
         },
+        package_alternatives: Default::default(),
+        package_dependencies: Default::default(),
         spec_dir: PathBuf::from("."),
     })
 }
@@ -596,6 +620,7 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
         BuildType::CMake => "cmake",
         BuildType::Meson => "meson",
         BuildType::Custom => "custom",
+        BuildType::Python => "python",
         BuildType::Rust => "rust",
         BuildType::Makefile => "makefile",
         BuildType::Bin => "bin",
@@ -655,6 +680,15 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
     if spec.build.flags.no_flags != defaults.no_flags {
         flags_tbl.insert("no_flags".into(), Value::Boolean(spec.build.flags.no_flags));
     }
+    if spec.build.flags.no_strip != defaults.no_strip {
+        flags_tbl.insert("no_strip".into(), Value::Boolean(spec.build.flags.no_strip));
+    }
+    if spec.build.flags.no_compress_man != defaults.no_compress_man {
+        flags_tbl.insert(
+            "no_compress_man".into(),
+            Value::Boolean(spec.build.flags.no_compress_man),
+        );
+    }
     if spec.build.flags.skip_tests != defaults.skip_tests {
         flags_tbl.insert(
             "skip_tests".into(),
@@ -672,6 +706,12 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
                     .map(|s| Value::String(s.clone()))
                     .collect(),
             ),
+        );
+    }
+    if !spec.build.flags.configure_file.is_empty() {
+        flags_tbl.insert(
+            "configure_file".into(),
+            Value::String(spec.build.flags.configure_file.clone()),
         );
     }
     if spec.build.flags.prefix != defaults.prefix {
@@ -723,6 +763,44 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             ),
         );
     }
+    if !spec.build.flags.make_exec.is_empty() {
+        flags_tbl.insert(
+            "make_exec".into(),
+            Value::String(spec.build.flags.make_exec.clone()),
+        );
+    }
+    if !spec.build.flags.make_target.is_empty() {
+        flags_tbl.insert(
+            "make_target".into(),
+            Value::String(spec.build.flags.make_target.clone()),
+        );
+    }
+    if !spec.build.flags.make_targets.is_empty() {
+        flags_tbl.insert(
+            "make_targets".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .make_targets
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !spec.build.flags.make_dirs.is_empty() {
+        flags_tbl.insert(
+            "make_dirs".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .make_dirs
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if !spec.build.flags.make_test_vars.is_empty() {
         flags_tbl.insert(
             "make_test_vars".into(),
@@ -736,6 +814,38 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             ),
         );
     }
+    if !spec.build.flags.make_test_target.is_empty() {
+        flags_tbl.insert(
+            "make_test_target".into(),
+            Value::String(spec.build.flags.make_test_target.clone()),
+        );
+    }
+    if !spec.build.flags.make_test_targets.is_empty() {
+        flags_tbl.insert(
+            "make_test_targets".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .make_test_targets
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !spec.build.flags.make_test_dirs.is_empty() {
+        flags_tbl.insert(
+            "make_test_dirs".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .make_test_dirs
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if !spec.build.flags.make_install_vars.is_empty() {
         flags_tbl.insert(
             "make_install_vars".into(),
@@ -743,6 +853,38 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
                 spec.build
                     .flags
                     .make_install_vars
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !spec.build.flags.make_install_target.is_empty() {
+        flags_tbl.insert(
+            "make_install_target".into(),
+            Value::String(spec.build.flags.make_install_target.clone()),
+        );
+    }
+    if !spec.build.flags.make_install_targets.is_empty() {
+        flags_tbl.insert(
+            "make_install_targets".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .make_install_targets
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !spec.build.flags.make_install_dirs.is_empty() {
+        flags_tbl.insert(
+            "make_install_dirs".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .make_install_dirs
                     .iter()
                     .map(|s| Value::String(s.clone()))
                     .collect(),
@@ -769,6 +911,19 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
                 spec.build
                     .flags
                     .post_compile
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !spec.build.flags.post_configure.is_empty() {
+        flags_tbl.insert(
+            "post_configure".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .post_configure
                     .iter()
                     .map(|s| Value::String(s.clone()))
                     .collect(),
@@ -949,6 +1104,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         };
 
@@ -996,6 +1153,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         };
 
@@ -1030,6 +1189,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         };
 
@@ -1044,6 +1205,8 @@ mod tests {
         let mut flags = BuildFlags::default();
         flags.source_subdir = "project/subdir".into();
         flags.configure = vec!["--disable-static".into(), "--enable-foo".into()];
+        flags.configure_file = "build-aux/configure".into();
+        flags.post_configure = vec!["./configure-helper.sh".into()];
         flags.post_compile = vec!["make check".into()];
         flags.post_install = vec!["strip $DESTDIR/usr/bin/foo".into()];
         flags.makefile_commands = vec!["make".into()];
@@ -1053,10 +1216,15 @@ mod tests {
         flags.target = "x86_64-unknown-linux-gnu".into();
         flags.keep = vec!["etc/locale.gen".into()];
         flags.no_flags = true;
+        flags.no_strip = true;
+        flags.no_compress_man = true;
         flags.skip_tests = true;
         flags.make_vars = vec!["V=1".into()];
+        flags.make_dirs = vec!["lib".into(), "libelf".into()];
         flags.make_test_vars = vec!["TESTS=unit".into()];
+        flags.make_test_dirs = vec!["tests".into()];
         flags.make_install_vars = vec!["STRIPPROG=true".into()];
+        flags.make_install_dirs = vec!["lib".into(), "apps".into()];
 
         let spec = PackageSpec {
             package: PackageInfo {
@@ -1082,12 +1250,16 @@ mod tests {
                 flags,
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         };
 
         let toml = spec_to_minimal_toml(&spec).unwrap();
         assert!(toml.contains("source_subdir = \"project/subdir\""));
         assert!(toml.contains("configure = ["));
+        assert!(toml.contains("configure_file = \"build-aux/configure\""));
+        assert!(toml.contains("post_configure = ["));
         assert!(toml.contains("post_compile = ["));
         assert!(toml.contains("post_install = ["));
         assert!(toml.contains("makefile_commands = ["));
@@ -1098,10 +1270,15 @@ mod tests {
         assert!(toml.contains("keep = ["));
         assert!(toml.contains("\"etc/locale.gen\""));
         assert!(toml.contains("no_flags = true"));
+        assert!(toml.contains("no_strip = true"));
+        assert!(toml.contains("no_compress_man = true"));
         assert!(toml.contains("skip_tests = true"));
         assert!(toml.contains("make_vars = ["));
+        assert!(toml.contains("make_dirs = ["));
         assert!(toml.contains("make_test_vars = ["));
+        assert!(toml.contains("make_test_dirs = ["));
         assert!(toml.contains("make_install_vars = ["));
+        assert!(toml.contains("make_install_dirs = ["));
         assert!(toml.contains("patches = ["));
         assert!(toml.contains("post_extract = ["));
     }
@@ -1132,6 +1309,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         };
 
@@ -1169,6 +1348,8 @@ mod tests {
                 runtime: vec![],
                 test: vec!["python".into(), "bats".into()],
             },
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         };
 

@@ -25,12 +25,44 @@ pub fn copy_manual_sources(spec: &PackageSpec, cache_dir: &Path, build_dir: &Pat
     }
 
     fs::create_dir_all(build_dir)?;
-    println!("Copying {} manual source(s)...", spec.manual_sources.len());
+    let manual_entry_count: usize = spec
+        .manual_sources
+        .iter()
+        .map(|m| {
+            usize::from(m.file.as_ref().is_some_and(|s| !s.trim().is_empty()))
+                + m.files.iter().filter(|s| !s.trim().is_empty()).count()
+                + usize::from(m.url.as_ref().is_some_and(|s| !s.trim().is_empty()))
+                + m.urls.iter().filter(|s| !s.trim().is_empty()).count()
+        })
+        .sum();
+    crate::log_info!("Copying {} manual source(s)...", manual_entry_count);
 
     for manual in &spec.manual_sources {
-        let (source_path, source_label, default_dest): (PathBuf, String, String) =
-            if let Some(file) = manual.file.as_ref() {
-                let file = spec.expand_vars(file);
+        let mut local_entries: Vec<String> = Vec::new();
+        if let Some(file) = manual.file.as_ref() {
+            if !file.trim().is_empty() {
+                local_entries.push(file.clone());
+            }
+        }
+        local_entries.extend(
+            manual
+                .files
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .cloned(),
+        );
+
+        let mut url_entries: Vec<String> = Vec::new();
+        if let Some(url) = manual.url.as_ref() {
+            if !url.trim().is_empty() {
+                url_entries.push(url.clone());
+            }
+        }
+        url_entries.extend(manual.urls.iter().filter(|s| !s.trim().is_empty()).cloned());
+
+        if !local_entries.is_empty() {
+            for raw_file in local_entries {
+                let file = spec.expand_vars(&raw_file);
                 let src_path = spec.spec_dir.join(&file);
                 if !src_path.exists() {
                     bail!(
@@ -40,76 +72,102 @@ pub fn copy_manual_sources(spec: &PackageSpec, cache_dir: &Path, build_dir: &Pat
                     );
                 }
 
-                // Verify checksum if provided.
                 if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip")
                     && !verify_file_hash(&src_path, expected_hash)?
                 {
                     bail!("Checksum mismatch for {}: expected {}", file, expected_hash);
                 }
 
-                (src_path, file.clone(), file)
-            } else if let Some(url_raw) = manual.url.as_ref() {
-                let expanded_url = spec.expand_vars(url_raw);
+                let default_dest = file.clone();
+                copy_manual_source_file(spec, build_dir, &src_path, &file, manual, &default_dest)?;
+            }
+            continue;
+        }
+
+        if !url_entries.is_empty() {
+            for raw_url in url_entries {
+                let expanded_url = spec.expand_vars(&raw_url);
                 let parsed = Url::parse(&expanded_url)
                     .with_context(|| format!("Invalid URL: {}", expanded_url))?;
 
-                if parsed.scheme() == "file" {
-                    let src_path = parsed
-                        .to_file_path()
-                        .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", expanded_url))?;
-                    if !src_path.exists() {
-                        bail!("Manual source file URL not found: {}", src_path.display());
-                    }
-                    if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip")
-                        && !verify_file_hash(&src_path, expected_hash)?
-                    {
-                        bail!(
-                            "Checksum mismatch for {}: expected {}",
-                            expanded_url,
-                            expected_hash
-                        );
-                    }
-                    let default_dest = fetcher::derive_filename_from_url(&expanded_url);
-                    (src_path, expanded_url, default_dest)
-                } else {
-                    let source = crate::package::Source {
-                        url: expanded_url.clone(),
-                        sha256: manual.sha256.clone().unwrap_or_else(|| "skip".to_string()),
-                        extract_dir: "manual-source".to_string(),
-                        patches: Vec::new(),
-                        post_extract: Vec::new(),
+                let (source_path, source_label, default_dest): (PathBuf, String, String) =
+                    if parsed.scheme() == "file" {
+                        let src_path = parsed
+                            .to_file_path()
+                            .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", expanded_url))?;
+                        if !src_path.exists() {
+                            bail!("Manual source file URL not found: {}", src_path.display());
+                        }
+                        if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip")
+                            && !verify_file_hash(&src_path, expected_hash)?
+                        {
+                            bail!(
+                                "Checksum mismatch for {}: expected {}",
+                                expanded_url,
+                                expected_hash
+                            );
+                        }
+                        let default_dest = fetcher::derive_filename_from_url(&expanded_url);
+                        (src_path, expanded_url, default_dest)
+                    } else {
+                        let source = crate::package::Source {
+                            url: expanded_url.clone(),
+                            sha256: manual.sha256.clone().unwrap_or_else(|| "skip".to_string()),
+                            extract_dir: "manual-source".to_string(),
+                            patches: Vec::new(),
+                            post_extract: Vec::new(),
+                        };
+                        let fetched =
+                            fetcher::fetch_archive(spec, &source, &cache_dir.join("manual"))?;
+                        let default_dest = fetcher::derive_filename_from_url(&expanded_url);
+                        (fetched, expanded_url, default_dest)
                     };
-                    let fetched = fetcher::fetch_archive(spec, &source, &cache_dir.join("manual"))?;
-                    let default_dest = fetcher::derive_filename_from_url(&expanded_url);
-                    (fetched, expanded_url, default_dest)
-                }
-            } else {
-                bail!("Manual source must define either 'file' or 'url'");
-            };
 
-        // Determine destination
-        let dest_name = if let Some(dest) = manual.dest.as_ref() {
-            spec.expand_vars(dest)
-        } else {
-            default_dest
-        };
-        let dest_path = build_dir.join(&dest_name);
-
-        // Create parent directories if needed
-        if let Some(parent) = dest_path.parent() {
-            fs::create_dir_all(parent)?;
+                copy_manual_source_file(
+                    spec,
+                    build_dir,
+                    &source_path,
+                    &source_label,
+                    manual,
+                    &default_dest,
+                )?;
+            }
+            continue;
         }
 
-        println!("  {} -> {}", source_label, dest_path.display());
-        fs::copy(&source_path, &dest_path).with_context(|| {
-            format!(
-                "Failed to copy {} to {}",
-                source_path.display(),
-                dest_path.display()
-            )
-        })?;
+        bail!("Manual source must define one of 'file', 'files', 'url', or 'urls'");
     }
 
+    Ok(())
+}
+
+fn copy_manual_source_file(
+    spec: &PackageSpec,
+    build_dir: &Path,
+    source_path: &Path,
+    source_label: &str,
+    manual: &crate::package::ManualSource,
+    default_dest: &str,
+) -> Result<()> {
+    let dest_name = if let Some(dest) = manual.dest.as_ref() {
+        spec.expand_vars(dest)
+    } else {
+        default_dest.to_string()
+    };
+    let dest_path = build_dir.join(&dest_name);
+
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    crate::log_info!("  {} -> {}", source_label, dest_path.display());
+    fs::copy(source_path, &dest_path).with_context(|| {
+        format!(
+            "Failed to copy {} to {}",
+            source_path.display(),
+            dest_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -122,7 +180,7 @@ fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
 
     let exp = expected.trim();
     if exp.eq_ignore_ascii_case("skip") {
-        println!("Checksum verification skipped");
+        crate::log_info!("Checksum verification skipped");
         return Ok(true);
     }
 
@@ -250,7 +308,7 @@ fn prepare_one(
             if dst.exists() {
                 // If it exists and has a state file, assume we are resuming
                 if dst.join(".depot_state").exists() {
-                    println!(
+                    crate::log_info!(
                         "Resuming build in existing source directory: {}",
                         dst.display()
                     );
@@ -265,7 +323,7 @@ fn prepare_one(
             let src_dir = build_dir.join(&extract_dir_name);
             if src_dir.exists() {
                 if src_dir.join(".depot_state").exists() {
-                    println!(
+                    crate::log_info!(
                         "Resuming build in existing source directory: {}",
                         src_dir.display()
                     );
@@ -288,7 +346,7 @@ fn prepare_one(
     if let Some((base, rev)) = split_git_url(&url) {
         let checkout_dir = build_dir.join(&extract_dir_name);
         if checkout_dir.exists() && checkout_dir.join(".depot_state").exists() {
-            println!(
+            crate::log_info!(
                 "Resuming build in existing git directory: {}",
                 checkout_dir.display()
             );
@@ -307,7 +365,7 @@ fn prepare_one(
 
     let src_dir = build_dir.join(&extract_dir_name);
     if src_dir.exists() && src_dir.join(".depot_state").exists() {
-        println!(
+        crate::log_info!(
             "Resuming build in existing source directory: {}",
             src_dir.display()
         );
@@ -406,6 +464,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir,
         }
     }
@@ -435,6 +495,48 @@ mod tests {
         let (base, rev) = split_git_url("https://example.com/repo.git#").unwrap();
         assert_eq!(base, "https://example.com/repo.git");
         assert_eq!(rev, "HEAD");
+    }
+
+    #[test]
+    fn split_git_url_accepts_expanded_tag_or_hash_revision() {
+        let spec = PackageSpec {
+            package: PackageInfo {
+                name: "json".into(),
+                version: "3.11.3".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: vec![Source {
+                url: "https://github.com/nlohmann/json.git#v$version".into(),
+                sha256: "skip".into(),
+                extract_dir: "json-$version".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+            }],
+            build: Build {
+                build_type: BuildType::Custom,
+                flags: BuildFlags::default(),
+            },
+            dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+
+        let expanded = spec.expand_vars(&spec.source[0].url);
+        let (base, rev) = split_git_url(&expanded).unwrap();
+        assert_eq!(base, "https://github.com/nlohmann/json.git");
+        assert_eq!(rev, "v3.11.3");
+
+        let (base, rev) =
+            split_git_url("https://github.com/nlohmann/json.git#0123456789abcdef").unwrap();
+        assert_eq!(base, "https://github.com/nlohmann/json.git");
+        assert_eq!(rev, "0123456789abcdef");
     }
 
     #[test]
@@ -489,7 +591,9 @@ mod tests {
             spec_dir.clone(),
             vec![ManualSource {
                 file: Some("manual.patch".into()),
+                files: Vec::new(),
                 url: None,
+                urls: Vec::new(),
                 sha256: None,
                 dest: None,
             }],
@@ -517,7 +621,9 @@ mod tests {
             spec_dir,
             vec![ManualSource {
                 file: None,
+                files: Vec::new(),
                 url: Some(url),
+                urls: Vec::new(),
                 sha256: Some("skip".into()),
                 dest: Some("assets/manual.txt".into()),
             }],
@@ -527,6 +633,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(build_dir.join("assets/manual.txt")).unwrap(),
             "remote-data"
+        );
+    }
+
+    #[test]
+    fn copy_manual_sources_multi_files_in_one_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec_dir = tmp.path().join("spec");
+        let cache_dir = tmp.path().join("cache");
+        let build_dir = tmp.path().join("build");
+        std::fs::create_dir_all(spec_dir.join("pam")).unwrap();
+        std::fs::write(spec_dir.join("pam/other"), "other").unwrap();
+        std::fs::write(spec_dir.join("pam/system-auth"), "auth").unwrap();
+
+        let spec = mk_spec_with_manuals(
+            spec_dir.clone(),
+            vec![ManualSource {
+                file: None,
+                files: vec!["pam/other".into(), "pam/system-auth".into()],
+                url: None,
+                urls: Vec::new(),
+                sha256: None,
+                dest: None,
+            }],
+        );
+
+        copy_manual_sources(&spec, &cache_dir, &build_dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(build_dir.join("pam/other")).unwrap(),
+            "other"
+        );
+        assert_eq!(
+            std::fs::read_to_string(build_dir.join("pam/system-auth")).unwrap(),
+            "auth"
         );
     }
 }

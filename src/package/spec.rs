@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -27,6 +28,20 @@ pub struct PackageSpec {
     pub build: Build,
     #[serde(default)]
     pub dependencies: Dependencies,
+    /// Optional per-output alternatives/provides overrides keyed by package name.
+    ///
+    /// Example:
+    /// [package_alternatives.clang]
+    /// provides = ["cc", "c++", "gcc"]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub package_alternatives: BTreeMap<String, Alternatives>,
+    /// Optional per-output dependency overrides keyed by package name.
+    ///
+    /// Example:
+    /// [package_dependencies.clang]
+    /// runtime = ["llvm-libs", "llvm-libgcc"]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub package_dependencies: BTreeMap<String, Dependencies>,
 
     /// Directory containing the spec file (used to resolve relative paths such as patches).
     #[serde(skip)]
@@ -71,21 +86,41 @@ impl PackageSpec {
                 .as_ref()
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false);
+            let file_count = manual.files.iter().filter(|s| !s.trim().is_empty()).count();
+            let url_count = manual.urls.iter().filter(|s| !s.trim().is_empty()).count();
+            let local_count = usize::from(has_file) + file_count;
+            let remote_count = usize::from(has_url) + url_count;
 
-            match (has_file, has_url) {
-                (true, false) | (false, true) => {}
-                (false, false) => {
-                    anyhow::bail!(
-                        "manual_sources[{}] must specify exactly one of 'file' or 'url'",
-                        idx
-                    );
-                }
-                (true, true) => {
-                    anyhow::bail!(
-                        "manual_sources[{}] cannot specify both 'file' and 'url'",
-                        idx
-                    );
-                }
+            if local_count == 0 && remote_count == 0 {
+                anyhow::bail!(
+                    "manual_sources[{}] must specify one of 'file', 'files', 'url', or 'urls'",
+                    idx
+                );
+            }
+            if local_count > 0 && remote_count > 0 {
+                anyhow::bail!(
+                    "manual_sources[{}] cannot mix local ('file'/'files') and remote ('url'/'urls') entries",
+                    idx
+                );
+            }
+            if (local_count > 1 || remote_count > 1)
+                && manual.dest.as_ref().is_some_and(|d| !d.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "manual_sources[{}] cannot use 'dest' with multiple entries in one block",
+                    idx
+                );
+            }
+            if (local_count > 1 || remote_count > 1)
+                && manual
+                    .sha256
+                    .as_ref()
+                    .is_some_and(|h| !h.trim().is_empty() && h.trim() != "skip")
+            {
+                anyhow::bail!(
+                    "manual_sources[{}] cannot use one 'sha256' for multiple entries in one block",
+                    idx
+                );
             }
         }
         Ok(())
@@ -111,6 +146,26 @@ impl PackageSpec {
         v.push(self.package.clone());
         v.extend(self.packages.clone());
         v
+    }
+
+    /// Return dependencies for a specific output package name.
+    ///
+    /// If no per-output override exists, returns the top-level dependencies.
+    pub fn dependencies_for_output(&self, pkg_name: &str) -> Dependencies {
+        self.package_dependencies
+            .get(pkg_name)
+            .cloned()
+            .unwrap_or_else(|| self.dependencies.clone())
+    }
+
+    /// Return alternatives/provides for a specific output package name.
+    ///
+    /// If no per-output override exists, returns the top-level alternatives.
+    pub fn alternatives_for_output(&self, pkg_name: &str) -> Alternatives {
+        self.package_alternatives
+            .get(pkg_name)
+            .cloned()
+            .unwrap_or_else(|| self.alternatives.clone())
     }
 
     /// Apply system configuration overrides and appends
@@ -220,6 +275,40 @@ impl PackageSpec {
                             s.split_whitespace().map(String::from).collect();
                     }
                 }
+                "make_exec" | "make-exec" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.make_exec = s.to_string();
+                    }
+                }
+                "make_target" | "make-target" | "make_build_target" | "make-build-target" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.make_target = s.to_string();
+                    }
+                }
+                "make_targets" | "make-targets" | "make_build_targets" | "make-build-targets" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.make_targets = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.make_targets =
+                            s.split_whitespace().map(String::from).collect();
+                    }
+                }
+                "make_dirs" | "make-dirs" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.make_dirs = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.make_dirs =
+                            s.split_whitespace().map(String::from).collect();
+                    }
+                }
                 "make_test_vars" | "make-test-vars" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.make_test_vars = arr
@@ -232,6 +321,35 @@ impl PackageSpec {
                             s.split_whitespace().map(String::from).collect();
                     }
                 }
+                "make_test_target" | "make-test-target" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.make_test_target = s.to_string();
+                    }
+                }
+                "make_test_targets" | "make-test-targets" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.make_test_targets = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.make_test_targets =
+                            s.split_whitespace().map(String::from).collect();
+                    }
+                }
+                "make_test_dirs" | "make-test-dirs" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.make_test_dirs = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.make_test_dirs =
+                            s.split_whitespace().map(String::from).collect();
+                    }
+                }
                 "make_install_vars" | "make-install-vars" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.make_install_vars = arr
@@ -241,6 +359,35 @@ impl PackageSpec {
                             .collect();
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.make_install_vars =
+                            s.split_whitespace().map(String::from).collect();
+                    }
+                }
+                "make_install_target" | "make-install-target" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.make_install_target = s.to_string();
+                    }
+                }
+                "make_install_targets" | "make-install-targets" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.make_install_targets = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.make_install_targets =
+                            s.split_whitespace().map(String::from).collect();
+                    }
+                }
+                "make_install_dirs" | "make-install-dirs" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.make_install_dirs = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.make_install_dirs =
                             s.split_whitespace().map(String::from).collect();
                     }
                 }
@@ -262,9 +409,60 @@ impl PackageSpec {
                         self.build.flags.no_flags = b;
                     }
                 }
+                "no_strip" | "no-strip" => {
+                    if let Some(b) = v.as_bool() {
+                        self.build.flags.no_strip = b;
+                    }
+                }
+                "no_compress_man"
+                | "no-compress-man"
+                | "no_compress_manpages"
+                | "no-compress-manpages" => {
+                    if let Some(b) = v.as_bool() {
+                        self.build.flags.no_compress_man = b;
+                    }
+                }
                 "skip_tests" | "skip-tests" => {
                     if let Some(b) = v.as_bool() {
                         self.build.flags.skip_tests = b;
+                    }
+                }
+                "configure_file" | "configure-file" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.configure_file = s.to_string();
+                    }
+                }
+                "post_configure" | "post-configure" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.post_configure = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_configure = vec![s.to_string()];
+                    }
+                }
+                "post_compile" | "post-compile" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.post_compile = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_compile = vec![s.to_string()];
+                    }
+                }
+                "post_install" | "post-install" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.post_install = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_install = vec![s.to_string()];
                     }
                 }
                 // Add more fields as needed
@@ -320,6 +518,47 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.configure.push(s.to_string());
+                    }
+                }
+            }
+            "configure_file" | "configure-file" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.configure_file = s.to_string();
+                }
+            }
+            "post_configure" | "post-configure" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .post_configure
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_configure.push(s.to_string());
+                    }
+                }
+            }
+            "post_compile" | "post-compile" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .post_compile
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_compile.push(s.to_string());
+                    }
+                }
+            }
+            "post_install" | "post-install" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .post_install
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_install.push(s.to_string());
                     }
                 }
             }
@@ -392,6 +631,46 @@ impl PackageSpec {
                     }
                 }
             }
+            "make_exec" | "make-exec" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.make_exec = s.to_string();
+                }
+            }
+            "make_target" | "make-target" | "make_build_target" | "make-build-target" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.make_target = s.to_string();
+                }
+            }
+            "make_targets" | "make-targets" | "make_build_targets" | "make-build-targets" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .make_targets
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build
+                            .flags
+                            .make_targets
+                            .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
+            "make_dirs" | "make-dirs" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .make_dirs
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build
+                            .flags
+                            .make_dirs
+                            .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
             "make_test_vars" | "make-test-vars" => {
                 for v in values {
                     if let Some(arr) = v.as_array() {
@@ -407,6 +686,41 @@ impl PackageSpec {
                     }
                 }
             }
+            "make_test_target" | "make-test-target" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.make_test_target = s.to_string();
+                }
+            }
+            "make_test_targets" | "make-test-targets" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .make_test_targets
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build
+                            .flags
+                            .make_test_targets
+                            .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
+            "make_test_dirs" | "make-test-dirs" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .make_test_dirs
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build
+                            .flags
+                            .make_test_dirs
+                            .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
             "make_install_vars" | "make-install-vars" => {
                 for v in values {
                     if let Some(arr) = v.as_array() {
@@ -418,6 +732,41 @@ impl PackageSpec {
                         self.build
                             .flags
                             .make_install_vars
+                            .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
+            "make_install_target" | "make-install-target" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.make_install_target = s.to_string();
+                }
+            }
+            "make_install_targets" | "make-install-targets" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .make_install_targets
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build
+                            .flags
+                            .make_install_targets
+                            .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
+            "make_install_dirs" | "make-install-dirs" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .make_install_dirs
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build
+                            .flags
+                            .make_install_dirs
                             .extend(s.split_whitespace().map(String::from));
                     }
                 }
@@ -441,6 +790,19 @@ impl PackageSpec {
             "no_flags" | "no-flags" => {
                 if let Some(b) = values.last().and_then(|v| v.as_bool()) {
                     self.build.flags.no_flags = b;
+                }
+            }
+            "no_strip" | "no-strip" => {
+                if let Some(b) = values.last().and_then(|v| v.as_bool()) {
+                    self.build.flags.no_strip = b;
+                }
+            }
+            "no_compress_man"
+            | "no-compress-man"
+            | "no_compress_manpages"
+            | "no-compress-manpages" => {
+                if let Some(b) = values.last().and_then(|v| v.as_bool()) {
+                    self.build.flags.no_compress_man = b;
                 }
             }
             "skip_tests" | "skip-tests" => {
@@ -530,6 +892,136 @@ type = "custom"
         assert_eq!(spec.sources().len(), 2);
         assert_eq!(spec.sources()[0].extract_dir, "foo");
         assert_eq!(spec.sources()[1].extract_dir, "bar");
+    }
+
+    #[test]
+    fn parse_package_dependencies_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "llvm"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/llvm.tar.gz"
+sha256 = "skip"
+extract_dir = "llvm"
+
+[build]
+type = "custom"
+
+[dependencies]
+runtime = ["base"]
+
+[package_dependencies.clang]
+runtime = ["llvm-libs", "llvm-libgcc"]
+
+[package_dependencies.llvm-libs]
+runtime = ["llvm-libgcc", "zstd"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.dependencies_for_output("llvm").runtime,
+            vec!["base".to_string()]
+        );
+        assert_eq!(
+            spec.dependencies_for_output("clang").runtime,
+            vec!["llvm-libs".to_string(), "llvm-libgcc".to_string()]
+        );
+        assert_eq!(
+            spec.dependencies_for_output("llvm-libs").runtime,
+            vec!["llvm-libgcc".to_string(), "zstd".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_package_alternatives_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "llvm"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/llvm.tar.gz"
+sha256 = "skip"
+extract_dir = "llvm"
+
+[build]
+type = "custom"
+
+[alternatives]
+provides = ["toolchain"]
+
+[package_alternatives.clang]
+provides = ["cc", "c++", "gcc"]
+
+[package_alternatives.llvm]
+provides = ["binutils"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.alternatives_for_output("llvm").provides,
+            vec!["binutils".to_string()]
+        );
+        assert_eq!(
+            spec.alternatives_for_output("clang").provides,
+            vec!["cc".to_string(), "c++".to_string(), "gcc".to_string()]
+        );
+        assert_eq!(
+            spec.alternatives_for_output("other").provides,
+            vec!["toolchain".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_python_build_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "python"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert!(matches!(spec.build.build_type, BuildType::Python));
     }
 
     #[test]
@@ -652,7 +1144,10 @@ type = "custom"
         .unwrap();
 
         let err = PackageSpec::from_file(&path).expect_err("spec should be rejected");
-        assert!(err.to_string().contains("exactly one of 'file' or 'url'"));
+        assert!(
+            err.to_string()
+                .contains("must specify one of 'file', 'files', 'url', or 'urls'")
+        );
     }
 
     #[test]
@@ -683,8 +1178,38 @@ type = "custom"
         let err = PackageSpec::from_file(&path).expect_err("spec should be rejected");
         assert!(
             err.to_string()
-                .contains("cannot specify both 'file' and 'url'")
+                .contains("cannot mix local ('file'/'files') and remote ('url'/'urls') entries")
         );
+    }
+
+    #[test]
+    fn parse_manual_source_with_files_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[[manual_sources]]
+files = ["other", "system-auth"]
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.manual_sources.len(), 1);
+        assert_eq!(spec.manual_sources[0].files, vec!["other", "system-auth"]);
+        assert!(spec.manual_sources[0].urls.is_empty());
     }
 
     #[test]
@@ -700,9 +1225,16 @@ cc = "my-cc"
 cflags = ["-O2"]
 passthrough_env = ["RUSTFLAGS"]
 make_vars = ["V=1"]
+make_dirs = ["lib"]
+make_test_dirs = ["tests"]
+make_install_dirs = ["lib"]
 no_flags = true
+no_strip = true
+no_compress_man = true
 skip_tests = true
 keep = ["etc/locale.gen"]
+configure_file = "configure.gnu"
+post_configure = ["echo configured"]
 "#,
         )
         .unwrap();
@@ -724,6 +1256,14 @@ keep = ["etc/locale.gen"]
             )])],
         );
         config.appends.insert(
+            "build.flags.no_strip".to_string(),
+            vec![toml::Value::Boolean(false)],
+        );
+        config.appends.insert(
+            "build.flags.no_compress_man".to_string(),
+            vec![toml::Value::Boolean(false)],
+        );
+        config.appends.insert(
             "build.flags.passthrough_env".to_string(),
             vec![toml::Value::String("CARGO_HOME".to_string())],
         );
@@ -732,8 +1272,28 @@ keep = ["etc/locale.gen"]
             vec![toml::Value::String("TESTS=smoke".to_string())],
         );
         config.appends.insert(
+            "build.flags.make_dirs".to_string(),
+            vec![toml::Value::String("libelf".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.make_test_dirs".to_string(),
+            vec![toml::Value::String("fuzz".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.make_install_dirs".to_string(),
+            vec![toml::Value::String("tools".to_string())],
+        );
+        config.appends.insert(
             "build.flags.make_install_vars".to_string(),
             vec![toml::Value::String("DESTDIR=/tmp/pkg".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.configure_file".to_string(),
+            vec![toml::Value::String("build-aux/configure".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.post_configure".to_string(),
+            vec![toml::Value::String("touch configured.stamp".to_string())],
         );
 
         spec.apply_config(&config);
@@ -749,6 +1309,8 @@ keep = ["etc/locale.gen"]
                 .contains(&"opt-level=3".to_string())
         );
         assert!(spec.build.flags.no_flags);
+        assert!(!spec.build.flags.no_strip);
+        assert!(!spec.build.flags.no_compress_man);
         assert!(
             spec.build
                 .flags
@@ -768,6 +1330,8 @@ keep = ["etc/locale.gen"]
                 .contains(&"CARGO_HOME".to_string())
         );
         assert!(spec.build.flags.make_vars.contains(&"V=1".to_string()));
+        assert!(spec.build.flags.make_dirs.contains(&"lib".to_string()));
+        assert!(spec.build.flags.make_dirs.contains(&"libelf".to_string()));
         assert!(spec.build.flags.skip_tests);
         assert!(
             spec.build
@@ -778,8 +1342,45 @@ keep = ["etc/locale.gen"]
         assert!(
             spec.build
                 .flags
+                .make_test_dirs
+                .contains(&"tests".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .make_test_dirs
+                .contains(&"fuzz".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
                 .make_install_vars
                 .contains(&"DESTDIR=/tmp/pkg".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .make_install_dirs
+                .contains(&"lib".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .make_install_dirs
+                .contains(&"tools".to_string())
+        );
+        assert_eq!(spec.build.flags.configure_file, "build-aux/configure");
+        assert!(
+            spec.build
+                .flags
+                .post_configure
+                .contains(&"echo configured".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .post_configure
+                .contains(&"touch configured.stamp".to_string())
         );
     }
 
@@ -814,6 +1415,41 @@ no_flags = true
 
         let spec = PackageSpec::from_file(&path).unwrap();
         assert!(spec.build.flags.no_flags);
+    }
+
+    #[test]
+    fn parse_no_strip_and_no_compress_man_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+no_strip = true
+no-compress-man = true
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert!(spec.build.flags.no_strip);
+        assert!(spec.build.flags.no_compress_man);
     }
 
     #[test]
@@ -913,6 +1549,75 @@ type = "autotools"
 
         let spec = PackageSpec::from_file(&path).unwrap();
         assert!(spec.build.flags.skip_tests);
+    }
+
+    #[test]
+    fn parse_configure_file_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "autotools"
+
+[build.flags]
+configure_file = "build-aux/configure"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.build.flags.configure_file, "build-aux/configure");
+    }
+
+    #[test]
+    fn parse_post_configure_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "cmake"
+
+[build.flags]
+post_configure = ["cmake -L . > cmake-options.txt"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.build.flags.post_configure,
+            vec!["cmake -L . > cmake-options.txt".to_string()]
+        );
     }
 
     #[test]
@@ -1049,8 +1754,18 @@ type = "autotools"
 
 [build.flags]
 make_vars = ["V=1", "CC=clang"]
+make_exec = "ninja"
+make_target = "bootstrap"
+make_targets = ["stage1", "stage2"]
+make_dirs = ["lib", "libelf"]
 make_test_vars = ["TESTS=unit"]
+make_test_target = "test"
+make_test_targets = ["test-unit", "test-integration"]
+make_test_dirs = ["tests"]
 make_install_vars = ["STRIPPROG=true"]
+make_install_target = "install/strip"
+make_install_targets = ["install-runtime", "install-devel"]
+make_install_dirs = ["lib", "apps"]
 "#,
         )
         .unwrap();
@@ -1060,13 +1775,41 @@ make_install_vars = ["STRIPPROG=true"]
             spec.build.flags.make_vars,
             vec!["V=1".to_string(), "CC=clang".to_string()]
         );
+        assert_eq!(spec.build.flags.make_exec, "ninja");
+        assert_eq!(spec.build.flags.make_target, "bootstrap");
+        assert_eq!(
+            spec.build.flags.make_targets,
+            vec!["stage1".to_string(), "stage2".to_string()]
+        );
+        assert_eq!(
+            spec.build.flags.make_dirs,
+            vec!["lib".to_string(), "libelf".to_string()]
+        );
         assert_eq!(
             spec.build.flags.make_test_vars,
             vec!["TESTS=unit".to_string()]
         );
+        assert_eq!(spec.build.flags.make_test_target, "test".to_string());
+        assert_eq!(
+            spec.build.flags.make_test_targets,
+            vec!["test-unit".to_string(), "test-integration".to_string()]
+        );
+        assert_eq!(spec.build.flags.make_test_dirs, vec!["tests".to_string()]);
         assert_eq!(
             spec.build.flags.make_install_vars,
             vec!["STRIPPROG=true".to_string()]
+        );
+        assert_eq!(
+            spec.build.flags.make_install_target,
+            "install/strip".to_string()
+        );
+        assert_eq!(
+            spec.build.flags.make_install_targets,
+            vec!["install-runtime".to_string(), "install-devel".to_string()]
+        );
+        assert_eq!(
+            spec.build.flags.make_install_dirs,
+            vec!["lib".to_string(), "apps".to_string()]
         );
     }
 
@@ -1188,6 +1931,8 @@ type = "custom"
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         }
     }
@@ -1313,9 +2058,15 @@ pub struct ManualSource {
     /// Filename in the spec directory (local manual source mode).
     #[serde(default)]
     pub file: Option<String>,
+    /// Multiple filenames in the spec directory (local manual source mode).
+    #[serde(default)]
+    pub files: Vec<String>,
     /// Remote URL to fetch (remote manual source mode).
     #[serde(default)]
     pub url: Option<String>,
+    /// Multiple remote URLs to fetch (remote manual source mode).
+    #[serde(default)]
+    pub urls: Vec<String>,
     /// Checksum (optional, use "skip" to bypass verification).
     #[serde(default)]
     pub sha256: Option<String>,
@@ -1362,6 +2113,7 @@ pub enum BuildType {
     CMake,
     Meson,
     Custom,
+    Python,
     Rust,
     Makefile,
     Bin,
@@ -1380,11 +2132,25 @@ pub struct BuildFlags {
     /// Disable exporting CFLAGS/CXXFLAGS/LDFLAGS for this package build.
     #[serde(default, alias = "no-flags")]
     pub no_flags: bool,
+    /// Disable automatic stripping of ELF files during staging.
+    #[serde(default, alias = "no-strip")]
+    pub no_strip: bool,
+    /// Disable automatic zstd compression of man pages during staging.
+    #[serde(
+        default,
+        alias = "no-compress-man",
+        alias = "no_compress_manpages",
+        alias = "no-compress-manpages"
+    )]
+    pub no_compress_man: bool,
     /// Skip automatic build-system test execution (e.g. Autotools `make check`/`make test`).
     #[serde(default, alias = "skip-tests")]
     pub skip_tests: bool,
     #[serde(default)]
     pub configure: Vec<String>,
+    /// Autotools configure script path, relative to source root or absolute.
+    #[serde(default, alias = "configure-file")]
+    pub configure_file: String,
     /// C compiler
     #[serde(default = "default_cc")]
     pub cc: String,
@@ -1401,11 +2167,14 @@ pub struct BuildFlags {
     #[serde(default = "default_rootfs")]
     #[allow(dead_code)]
     pub rootfs: String,
-    /// Commands to run after compile (after make, before make install)
-    #[serde(default)]
+    /// Commands to run after configure/setup step, before compile/build step.
+    #[serde(default, alias = "post-configure")]
+    pub post_configure: Vec<String>,
+    /// Commands to run after compile (after make, before make install).
+    #[serde(default, alias = "post-compile")]
     pub post_compile: Vec<String>,
     /// Commands to run after install (after make install)
-    #[serde(default)]
+    #[serde(default, alias = "post-install")]
     pub post_install: Vec<String>,
 
     /// Specific commands for 'makefile' build type
@@ -1438,6 +2207,33 @@ pub struct BuildFlags {
         deserialize_with = "deserialize_string_or_array"
     )]
     pub make_vars: Vec<String>,
+    /// Make-like executable for build/test/install phases (default: `make`), e.g. `ninja`.
+    #[serde(default, alias = "make-exec")]
+    pub make_exec: String,
+    /// Target for the compile/build phase (e.g. `all`, `bootstrap`).
+    #[serde(
+        default,
+        alias = "make-target",
+        alias = "make_build_target",
+        alias = "make-build-target"
+    )]
+    pub make_target: String,
+    /// Targets for the compile/build phase (e.g. `["all", "bootstrap"]`).
+    #[serde(
+        default,
+        alias = "make-targets",
+        alias = "make_build_targets",
+        alias = "make-build-targets",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub make_targets: Vec<String>,
+    /// Subdirectories (relative to build directory) where `make` should run.
+    #[serde(
+        default,
+        alias = "make-dirs",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub make_dirs: Vec<String>,
     /// Variable overrides passed directly to `make check` / `make test`.
     #[serde(
         default,
@@ -1445,6 +2241,23 @@ pub struct BuildFlags {
         deserialize_with = "deserialize_string_or_array"
     )]
     pub make_test_vars: Vec<String>,
+    /// Target for the test phase, passed to the make-like executable.
+    #[serde(default, alias = "make-test-target")]
+    pub make_test_target: String,
+    /// Targets for the test phase, passed to the make-like executable.
+    #[serde(
+        default,
+        alias = "make-test-targets",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub make_test_targets: Vec<String>,
+    /// Subdirectories (relative to build directory) where test targets should run.
+    #[serde(
+        default,
+        alias = "make-test-dirs",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub make_test_dirs: Vec<String>,
     /// Variable overrides passed directly to `make install`.
     #[serde(
         default,
@@ -1452,6 +2265,23 @@ pub struct BuildFlags {
         deserialize_with = "deserialize_string_or_array"
     )]
     pub make_install_vars: Vec<String>,
+    /// Target for the install phase (default: `install`).
+    #[serde(default, alias = "make-install-target")]
+    pub make_install_target: String,
+    /// Targets for the install phase.
+    #[serde(
+        default,
+        alias = "make-install-targets",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub make_install_targets: Vec<String>,
+    /// Subdirectories (relative to build directory) where `make install` should run.
+    #[serde(
+        default,
+        alias = "make-install-dirs",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub make_install_dirs: Vec<String>,
     /// Additional host environment variable names to export unchanged to build commands.
     /// Example: ["RUSTFLAGS", "CARGO_HOME"].
     #[serde(
@@ -1501,13 +2331,17 @@ impl Default for BuildFlags {
             ldflags: Vec::new(),
             keep: Vec::new(),
             no_flags: false,
+            no_strip: false,
+            no_compress_man: false,
             skip_tests: false,
             configure: Vec::new(),
+            configure_file: String::new(),
             cc: default_cc(),
             cxx: default_cxx(),
             ar: default_ar(),
             libc: String::new(),
             rootfs: default_rootfs(),
+            post_configure: Vec::new(),
             post_compile: Vec::new(),
             post_install: Vec::new(),
             makefile_commands: Vec::new(),
@@ -1517,8 +2351,18 @@ impl Default for BuildFlags {
             cbuild: String::new(),
             carch: default_carch(),
             make_vars: Vec::new(),
+            make_exec: String::new(),
+            make_target: String::new(),
+            make_targets: Vec::new(),
+            make_dirs: Vec::new(),
             make_test_vars: Vec::new(),
+            make_test_target: String::new(),
+            make_test_targets: Vec::new(),
+            make_test_dirs: Vec::new(),
             make_install_vars: Vec::new(),
+            make_install_target: String::new(),
+            make_install_targets: Vec::new(),
+            make_install_dirs: Vec::new(),
             passthrough_env: Vec::new(),
             profile: default_profile(),
             target: String::new(),

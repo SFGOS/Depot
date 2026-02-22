@@ -117,15 +117,17 @@ pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> R
                 let disk_path = rootfs.join(f);
                 if disk_path.exists() {
                     let _ = std::fs::remove_file(&disk_path);
-                    println!(
+                    crate::log_info!(
                         "Auto-removed conflicting path: {} (was owned by {})",
-                        f, owner
+                        f,
+                        owner
                     );
                 }
             } else {
-                println!(
+                crate::log_info!(
                     "Auto-cleared DB ownership for path: {} (previously owned by {})",
-                    f, owner
+                    f,
+                    owner
                 );
             }
         }
@@ -149,7 +151,7 @@ pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> R
 
     tx.commit()?;
 
-    println!(
+    crate::log_info!(
         "Registered {} files and {} directories in database",
         manifest.files.len(),
         manifest.directories.len()
@@ -226,7 +228,7 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
         let path = rootfs.join(file);
         match fs::remove_file(&path) {
             Ok(()) => {
-                println!("  Removed file: {}", file);
+                crate::log_info!("  Removed file: {}", file);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Already gone, keep going.
@@ -255,14 +257,14 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
         )?;
 
         if other_owners > 0 {
-            println!("  Keeping directory (owned by other package): {}", dir);
+            crate::log_info!("  Keeping directory (owned by other package): {}", dir);
             continue;
         }
 
         // Try to remove (will fail if not empty, which is fine)
         match fs::remove_dir(&path) {
             Ok(()) => {
-                println!("  Removed directory: {}", dir);
+                crate::log_info!("  Removed directory: {}", dir);
                 dirs_removed += 1;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -270,7 +272,7 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
             }
             Err(e) if e.raw_os_error() == Some(39) || e.raw_os_error() == Some(66) => {
                 // ENOTEMPTY (39 on Linux, 66 on macOS) - directory not empty
-                println!("  Keeping directory (not empty): {}", dir);
+                crate::log_info!("  Keeping directory (not empty): {}", dir);
             }
             Err(_) => {
                 // Other errors (permission, etc.) - just skip silently
@@ -290,16 +292,16 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
     )?;
     conn.execute("DELETE FROM packages WHERE id = ?1", params![pkg_id])?;
 
-    println!(
+    crate::log_info!(
         "Removed {} files and {} directories",
         files.len(),
         dirs_removed
     );
 
     if !removal_errors.is_empty() {
-        eprintln!("Warning: failed to remove some paths:");
+        crate::log_warn!("Failed to remove some paths:");
         for err in removal_errors {
-            eprintln!("  {}", err);
+            crate::log_warn!("  {}", err);
         }
     }
     Ok(())
@@ -321,10 +323,10 @@ pub fn show_package_info(db_path: &Path, name: &str) -> Result<()> {
         )
         .context(format!("Package '{}' not found", name))?;
 
-    println!("Package: {} v{}-{}", name, version, revision);
-    println!("Description: {}", description);
-    println!("Homepage: {}", homepage);
-    println!("License: {}", license);
+    crate::log_info!("Package: {} v{}-{}", name, version, revision);
+    crate::log_info!("Description: {}", description);
+    crate::log_info!("Homepage: {}", homepage);
+    crate::log_info!("License: {}", license);
 
     // Count files
     let file_count: i64 = conn.query_row(
@@ -333,7 +335,7 @@ pub fn show_package_info(db_path: &Path, name: &str) -> Result<()> {
         |row| row.get(0),
     )?;
 
-    println!("Files: {}", file_count);
+    crate::log_info!("Files: {}", file_count);
 
     Ok(())
 }
@@ -341,7 +343,7 @@ pub fn show_package_info(db_path: &Path, name: &str) -> Result<()> {
 /// List all installed packages
 pub fn list_packages(db_path: &Path) -> Result<()> {
     if !db_path.exists() {
-        println!("No packages installed.");
+        crate::log_info!("No packages installed.");
         return Ok(());
     }
 
@@ -352,12 +354,12 @@ pub fn list_packages(db_path: &Path) -> Result<()> {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
 
-    println!("{:<30} VERSION", "PACKAGE");
-    println!("{}", "-".repeat(50));
+    crate::log_info!("{:<30} VERSION", "PACKAGE");
+    crate::log_info!("{}", "-".repeat(50));
 
     for pkg in packages {
         let (name, version) = pkg?;
-        println!("{:<30} {}", name, version);
+        crate::log_info!("{:<30} {}", name, version);
     }
 
     Ok(())
@@ -494,6 +496,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         }
     }

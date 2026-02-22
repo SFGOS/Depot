@@ -43,7 +43,7 @@ pub fn checkout(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid mirror path"))?;
 
-    println!("Cloning git source into {}...", checkout_dir.display());
+    crate::log_info!("Cloning git source into {}...", checkout_dir.display());
     Repository::clone(mirror_url, checkout_dir)
         .with_context(|| format!("Failed to clone from mirror for {}", url))?;
 
@@ -62,7 +62,7 @@ fn mirror_key(url: &str) -> String {
 
 fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str) -> Result<()> {
     if !mirror_dir.exists() {
-        println!("Cloning git mirror for {} ({})...", pkgname, url);
+        crate::log_info!("Cloning git mirror for {} ({})...", pkgname, url);
         let mut fo = FetchOptions::new();
         fo.remote_callbacks(remote_callbacks());
         let mut builder = git2::build::RepoBuilder::new();

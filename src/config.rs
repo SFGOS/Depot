@@ -74,7 +74,7 @@ impl Config {
         };
 
         if let Err(e) = config.load_system(&abs_rootfs) {
-            eprintln!("Warning: Failed to load system config: {}", e);
+            crate::log_warn!("Failed to load system config: {}", e);
         }
 
         config

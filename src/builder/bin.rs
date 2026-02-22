@@ -18,7 +18,7 @@ pub fn build(
     _cross: Option<&CrossConfig>,
     _export_compiler_flags: bool,
 ) -> Result<()> {
-    println!(
+    crate::log_info!(
         "Binary install: copying files from {} to {} (pkg type={})",
         src_dir.display(),
         destdir.display(),
@@ -87,6 +87,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: std::path::PathBuf::from("."),
         }
     }

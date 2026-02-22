@@ -9,6 +9,14 @@ use std::process::Command;
 use walkdir::WalkDir;
 
 const STAGED_SCRIPTS_DIR: &str = "scripts";
+const ALL_HOOKS: [Hook; 6] = [
+    Hook::PreInstall,
+    Hook::PostInstall,
+    Hook::PreUpdate,
+    Hook::PostUpdate,
+    Hook::PreRemove,
+    Hook::PostRemove,
+];
 
 /// Lifecycle hook names supported by Depot package scripts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,15 +62,23 @@ impl Hook {
         }
     }
 
-    fn candidate_names(self) -> [String; 4] {
+    fn candidate_names(self) -> [String; 6] {
         let canonical = self.canonical_name();
         let dashed = canonical.replace('_', "-");
+        let compact = canonical.replace('_', "");
         [
             canonical.to_string(),
             format!("{}.sh", canonical),
             dashed.clone(),
             format!("{}.sh", dashed),
+            compact.clone(),
+            format!("{}.sh", compact),
         ]
+    }
+
+    fn legacy_root_candidate_names(self) -> [String; 2] {
+        let compact = self.canonical_name().replace('_', "");
+        [compact.clone(), format!("{}.sh", compact)]
     }
 }
 
@@ -81,17 +97,24 @@ pub fn installed_scripts_dir(rootfs: &Path, pkg_name: &str) -> PathBuf {
 
 /// Copy optional scripts from `<specdir>/scripts` into `<destdir>/scripts`.
 ///
+/// Also stages legacy root hook files (for example `postinstall.sh`) into their
+/// canonical names under `<destdir>/scripts`.
+///
 /// Returns `true` if scripts were found and staged.
 pub fn stage_scripts_from_spec_dir(spec: &PackageSpec, destdir: &Path) -> Result<bool> {
     let source_dir = spec.spec_dir.join(STAGED_SCRIPTS_DIR);
-    if !source_dir.exists() {
-        return Ok(false);
-    }
-    if !source_dir.is_dir() {
+    let has_scripts_dir = if source_dir.exists() { true } else { false };
+
+    if has_scripts_dir && !source_dir.is_dir() {
         bail!(
             "Scripts path exists but is not a directory: {}",
             source_dir.display()
         );
+    }
+
+    let legacy_hooks = collect_legacy_root_hooks(&spec.spec_dir)?;
+    if !has_scripts_dir && legacy_hooks.is_empty() {
+        return Ok(false);
     }
 
     let staged_dir = staged_scripts_dir(destdir);
@@ -104,8 +127,12 @@ pub fn stage_scripts_from_spec_dir(spec: &PackageSpec, destdir: &Path) -> Result
         })?;
     }
 
-    copy_tree(&source_dir, &staged_dir)
-        .with_context(|| format!("Failed to stage scripts from {}", source_dir.display()))?;
+    if has_scripts_dir {
+        copy_tree(&source_dir, &staged_dir)
+            .with_context(|| format!("Failed to stage scripts from {}", source_dir.display()))?;
+    }
+
+    stage_legacy_root_hooks(&legacy_hooks, &staged_dir)?;
 
     Ok(true)
 }
@@ -180,7 +207,7 @@ pub fn run_hook_if_present(
         return Ok(false);
     };
 
-    println!(
+    crate::log_info!(
         "Running lifecycle hook {}: {}",
         hook.canonical_name(),
         script_path.display()
@@ -216,7 +243,7 @@ fn run_script_with_rootfs_context(
             .arg(rootfs)
             .arg("/bin/sh")
             .arg("-c")
-            .arg("cd / && exec \"$1\"")
+            .arg("cd / && exec /bin/sh \"$1\"")
             .arg("sh")
             .arg(rel_script)
             .env("DEPOT_PACKAGE", pkg_name)
@@ -303,6 +330,100 @@ fn resolve_hook_script(script_dir: &Path, hook: Hook) -> Result<Option<PathBuf>>
     }
 
     Ok(found.into_iter().next())
+}
+
+fn collect_legacy_root_hooks(spec_dir: &Path) -> Result<Vec<(Hook, PathBuf)>> {
+    let mut found = Vec::new();
+
+    for hook in ALL_HOOKS {
+        let mut hook_matches = Vec::new();
+        for candidate in hook.legacy_root_candidate_names() {
+            let path = spec_dir.join(candidate);
+            let metadata = match path.symlink_metadata() {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("Failed to inspect legacy hook script: {}", path.display())
+                    });
+                }
+            };
+
+            let file_type = metadata.file_type();
+            if !file_type.is_file() && !file_type.is_symlink() {
+                bail!(
+                    "Legacy lifecycle hook candidate exists but is not a file: {}",
+                    path.display()
+                );
+            }
+
+            hook_matches.push(path);
+        }
+
+        if hook_matches.len() > 1 {
+            let names = hook_matches
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "Ambiguous legacy lifecycle hook '{}': multiple script candidates found: {}",
+                hook.canonical_name(),
+                names
+            );
+        }
+
+        if let Some(path) = hook_matches.into_iter().next() {
+            found.push((hook, path));
+        }
+    }
+
+    Ok(found)
+}
+
+fn stage_legacy_root_hooks(legacy_hooks: &[(Hook, PathBuf)], staged_dir: &Path) -> Result<()> {
+    if legacy_hooks.is_empty() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(staged_dir)
+        .with_context(|| format!("Failed to create directory: {}", staged_dir.display()))?;
+
+    for (hook, src_path) in legacy_hooks {
+        let dst_path = staged_dir.join(hook.canonical_name());
+        if dst_path.exists() {
+            bail!(
+                "Lifecycle hook '{}' is defined more than once (legacy root hook conflicts with scripts/ entry): {}",
+                hook.canonical_name(),
+                dst_path.display()
+            );
+        }
+
+        let metadata = src_path.symlink_metadata().with_context(|| {
+            format!(
+                "Failed to inspect legacy hook script: {}",
+                src_path.display()
+            )
+        })?;
+
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(src_path)
+                .with_context(|| format!("Failed to read symlink: {}", src_path.display()))?;
+            std::os::unix::fs::symlink(target, &dst_path)
+                .with_context(|| format!("Failed to create symlink: {}", dst_path.display()))?;
+        } else {
+            fs::copy(src_path, &dst_path).with_context(|| {
+                format!(
+                    "Failed to copy legacy hook '{}' to '{}'",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+            ensure_executable(&dst_path)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn safe_rel_path(rel: &Path) -> Result<PathBuf> {
@@ -477,6 +598,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: spec_dir.to_path_buf(),
         }
     }
@@ -526,6 +649,28 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(rootfs.join("hook.out")).unwrap(),
             "install:pre:foo\n"
+        );
+    }
+
+    #[test]
+    fn run_hook_if_present_accepts_compact_script_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scripts = tmp.path().join("scripts");
+        let rootfs = tmp.path().join("root");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        std::fs::write(
+            scripts.join("postinstall.sh"),
+            "echo compact > \"$DEPOT_ROOTFS/hook.out\"\n",
+        )
+        .unwrap();
+
+        let ran = run_hook_if_present(&scripts, Hook::PostInstall, &rootfs, "foo").unwrap();
+        assert!(ran);
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("hook.out")).unwrap(),
+            "compact\n"
         );
     }
 
@@ -589,5 +734,29 @@ mod tests {
             sync_staged_scripts_to_rootfs(&staged.join("scripts"), &rootfs, "foo").unwrap();
         assert!(!has_scripts);
         assert!(!installed_scripts_dir(&rootfs, "foo").exists());
+    }
+
+    #[test]
+    fn stage_scripts_from_spec_dir_stages_legacy_root_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec_dir = tmp.path().join("spec");
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::create_dir_all(&destdir).unwrap();
+
+        std::fs::write(spec_dir.join("postinstall.sh"), "echo post").unwrap();
+
+        let spec = mk_spec(&spec_dir);
+        let staged = stage_scripts_from_spec_dir(&spec, &destdir).unwrap();
+        assert!(staged);
+        assert!(destdir.join("scripts/post_install").exists());
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(destdir.join("scripts/post_install"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0);
+        }
     }
 }

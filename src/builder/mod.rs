@@ -6,6 +6,7 @@ mod cmake;
 mod custom;
 mod makefile;
 mod meson;
+mod python;
 mod rust;
 pub mod state;
 
@@ -123,11 +124,15 @@ pub fn standard_build_env(
 pub fn prepare_command(cmd: &mut Command, env_vars: &EnvVars) {
     cmd.env_clear();
     // Preserve essential environment variables
-    for var in &["PATH", "LANG", "HOME", "SHELL", "DESTDIR", "DEPOT_ROOTFS"] {
+    for var in &["PATH", "LANG", "HOME", "DESTDIR", "DEPOT_ROOTFS"] {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);
         }
     }
+    // Use a deterministic POSIX shell for build tooling. Inheriting an
+    // interactive shell (e.g. zsh) can make Autotools-generated scripts
+    // produce non-reproducible or incompatible shell fragments.
+    cmd.env("SHELL", "/bin/sh");
     // Set requested environment variables
     for (key, val) in env_vars {
         cmd.env(key, val);
@@ -143,12 +148,13 @@ pub fn build(
     export_compiler_flags: bool,
 ) -> Result<()> {
     if let Some(cc) = cross {
-        println!(
+        crate::log_info!(
             "Cross-compiling for {} with {:?}...",
-            cc.prefix, spec.build.build_type
+            cc.prefix,
+            spec.build.build_type
         );
     } else {
-        println!("Building with {:?}...", spec.build.build_type);
+        crate::log_info!("Building with {:?}...", spec.build.build_type);
     }
 
     // Clean destdir to prevent stale files/directories (e.g., directories where symlinks should be)
@@ -163,6 +169,7 @@ pub fn build(
         BuildType::CMake => cmake::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Meson => meson::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Custom => custom::build(spec, src_dir, destdir, cross, export_compiler_flags),
+        BuildType::Python => python::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Rust => rust::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Bin => bin::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Makefile => {
@@ -206,6 +213,8 @@ mod tests {
                 flags,
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         }
     }
@@ -219,6 +228,7 @@ mod tests {
         unsafe {
             std::env::set_var("PATH", "/usr/bin");
             std::env::set_var("HOME", "/home/test");
+            std::env::set_var("SHELL", "/bin/zsh");
             std::env::set_var("DEPOT_ROOTFS", "/my/rootfs");
         }
 
@@ -228,6 +238,10 @@ mod tests {
         assert!(envs.get(OsStr::new("PATH")).is_some());
         assert!(envs.get(OsStr::new("HOME")).is_some());
         assert!(envs.get(OsStr::new("FORBIDDEN")).is_none());
+        assert_eq!(
+            envs.get(OsStr::new("SHELL")),
+            Some(&Some(std::ffi::OsString::from("/bin/sh").as_os_str()))
+        );
         assert_eq!(
             envs.get(OsStr::new("MYVAR")),
             Some(&Some(std::ffi::OsString::from("myval").as_os_str()))

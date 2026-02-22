@@ -10,8 +10,10 @@ mod fakeroot;
 mod index;
 mod install;
 mod package;
+mod shell_helpers;
 mod source;
 mod staging;
+mod ui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -37,24 +39,30 @@ fn clean_build_workspace(config: &config::Config) -> Result<()> {
         fs::remove_dir_all(&config.build_dir).with_context(|| {
             format!("Failed to clean build dir: {}", config.build_dir.display())
         })?;
-        println!("Cleaned build workspace: {}", config.build_dir.display());
+        ui::success(format!(
+            "Cleaned build workspace: {}",
+            config.build_dir.display()
+        ));
     }
     Ok(())
 }
 
 fn warn_if_running_as_root_for_build(command: &str, rootfs: &Path) {
     if crate::fakeroot::is_root() {
-        eprintln!(
-            "\x1b[33mWARNING: Running '{}' as root is discouraged.\x1b[0m",
-            command
+        ui::warn(format!("Running '{}' as root is discouraged.", command));
+        ui::warn(
+            "A misconfigured build environment or malicious/buggy build file can overwrite or delete critical system files.",
         );
-        eprintln!(
-            "\x1b[33mA misconfigured build environment or malicious/buggy build file can overwrite or delete critical system files.\x1b[0m"
-        );
-        eprintln!(
-            "\x1b[33mRecommendation: use a non-root build user and only install as root.\x1b[0m"
-        );
-        eprintln!("\x1b[33mCurrent rootfs target: {}\x1b[0m", rootfs.display());
+        ui::warn("Recommendation: use a non-root build user and only install as root.");
+        ui::warn(format!("Current rootfs target: {}", rootfs.display()));
+    }
+}
+
+fn output_destdir_for(base_destdir: &Path, primary_pkg: &str, output_pkg: &str) -> PathBuf {
+    if output_pkg == primary_pkg {
+        base_destdir.to_path_buf()
+    } else {
+        staging::output_staging_dir(base_destdir, output_pkg)
     }
 }
 
@@ -114,13 +122,9 @@ fn install_staged_to_rootfs(
         &pkg_spec.build.flags.keep,
     )?;
 
-    for out in pkg_spec.outputs() {
-        let mut spec_for_out = pkg_spec.clone();
-        spec_for_out.package = out;
-        if let Err(e) = db::register_package(&db_path, &spec_for_out, destdir) {
-            let _ = tx.rollback();
-            return Err(e);
-        }
+    if let Err(e) = db::register_package(&db_path, pkg_spec, destdir) {
+        let _ = tx.rollback();
+        return Err(e);
     }
     tx.commit()?;
 
@@ -273,7 +277,7 @@ fn main() -> Result<()> {
             // try to locate a spec under configured repo dir or local packages/.
             if !spec_path.exists() {
                 let name = spec_path.to_string_lossy().to_string();
-                println!("Looking up package '{}' in local indexes...", name);
+                ui::info(format!("Looking up package '{}' in local indexes...", name));
                 let pkg_index =
                     index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
                 if let Some(found) = pkg_index.find(&name) {
@@ -281,12 +285,12 @@ fn main() -> Result<()> {
                 }
             }
 
-            println!("Installing package from: {}", spec_path.display());
+            ui::info(format!("Installing package from: {}", spec_path.display()));
 
             let (pkg_spec, staging_dir): (package::PackageSpec, Option<tempfile::TempDir>) =
                 if spec_path.to_string_lossy().ends_with(".tar.zst") {
                     // Install from archive
-                    println!("Detected package archive: {}", spec_path.display());
+                    ui::info(format!("Detected package archive: {}", spec_path.display()));
                     let tmp_dir = tempfile::TempDir::new()?;
                     let extract_dir = tmp_dir.path().to_path_buf();
 
@@ -383,6 +387,8 @@ fn main() -> Result<()> {
                                 Vec::new()
                             },
                         },
+                        package_alternatives: Default::default(),
+                        package_dependencies: Default::default(),
                         spec_dir: PathBuf::from("."),
                     };
 
@@ -402,10 +408,10 @@ fn main() -> Result<()> {
                     (pkg_spec, None)
                 };
 
-            println!(
+            ui::info(format!(
                 "Package: {} v{}-{}",
                 pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
-            );
+            ));
 
             // Ensure database directory exists
             std::fs::create_dir_all(&config.db_dir).with_context(|| {
@@ -454,14 +460,8 @@ fn main() -> Result<()> {
                         );
                     }
 
-                    println!("\nMissing dependencies: {}", missing.join(", "));
-                    println!("Do you want to attempt to install them? [Y/n] ");
-
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    let input = input.trim().to_lowercase();
-
-                    if input == "y" || input == "yes" || input.is_empty() {
+                    ui::warn(format!("Missing dependencies: {}", missing.join(", ")));
+                    if ui::prompt_yes_no("Attempt to install them now?", true)? {
                         // Build package index for fast lookups
                         let pkg_index = index::PackageIndex::build_with_repo_dir(Some(
                             config.repo_clone_dir.clone(),
@@ -480,7 +480,7 @@ fn main() -> Result<()> {
                             let candidate = pkg_index.find(&dep);
 
                             if let Some(dep_spec_path) = candidate {
-                                println!("Installing dependency: {}...", dep);
+                                ui::info(format!("Installing dependency: {}...", dep));
 
                                 let mut cmd = std::process::Command::new(std::env::current_exe()?);
                                 cmd.arg("-r").arg(&cli.rootfs);
@@ -516,21 +516,13 @@ fn main() -> Result<()> {
                     }
                 }
 
-                // Enforce build dependencies (runtime deps are warnings only if not installed/prompt declined)
+                // Enforce required dependencies before building/installing.
                 deps::require_build_deps(&pkg_spec, &db_path)?;
+                deps::require_runtime_deps(&pkg_spec, &db_path)?;
                 if needs_test_deps {
                     deps::require_test_deps(&pkg_spec, &db_path)?;
                 }
             }
-
-            // Ensure database directory exists
-            std::fs::create_dir_all(&config.db_dir).with_context(|| {
-                format!(
-                    "Failed to create database directory: {}",
-                    config.db_dir.display()
-                )
-            })?;
-            let db_path = config.db_dir.join("packages.db");
 
             let destdir = if let Some(dir) = &staging_dir {
                 dir.path().to_path_buf()
@@ -569,34 +561,28 @@ fn main() -> Result<()> {
             staging::process(&destdir, &pkg_spec)?;
 
             // 5-6. Install/update to rootfs and register in DB
-            install_staged_to_rootfs(&pkg_spec, &destdir, &cli.rootfs, &config)?;
+            for out in pkg_spec.outputs() {
+                let mut spec_for_out = pkg_spec.clone();
+                let output_name = out.name.clone();
+                spec_for_out.package = out;
+                spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
+                spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
+                let out_destdir =
+                    output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
+                install_staged_to_rootfs(&spec_for_out, &out_destdir, &cli.rootfs, &config)?;
 
-            // 7. Check runtime dependencies (warn only)
-            if !cli.no_deps {
-                let missing_runtime = deps::check_runtime_deps(&pkg_spec, &db_path)?;
-                if !missing_runtime.is_empty() {
-                    eprintln!(
-                        "\x1b[33mWarning: Missing runtime dependencies: {}\x1b[0m",
-                        missing_runtime.join(", ")
-                    );
-                    eprintln!(
-                        "\x1b[33mContinuing without runtime deps; binaries may not run correctly.\x1b[0m"
-                    );
-                    eprintln!("\x1b[33mUse --no-deps to suppress this warning.\x1b[0m");
-                }
+                ui::success(format!(
+                    "Successfully installed {} v{}",
+                    spec_for_out.package.name, spec_for_out.package.version
+                ));
             }
-
-            println!(
-                "Successfully installed {} v{}",
-                pkg_spec.package.name, pkg_spec.package.version
-            );
 
             if cli.clean {
                 clean_build_workspace(&config)?;
             }
         }
         Commands::Remove { package } => {
-            println!("Removing package: {}", package);
+            ui::info(format!("Removing package: {}", package));
             let config = config::Config::for_rootfs(&cli.rootfs);
             let db_path = config.db_dir.join("packages.db");
             let script_dir = install::scripts::installed_scripts_dir(&cli.rootfs, &package);
@@ -616,7 +602,7 @@ fn main() -> Result<()> {
             let cleanup_scripts = install::scripts::remove_installed_scripts(&cli.rootfs, &package);
             post_remove?;
             cleanup_scripts?;
-            println!("Successfully removed {}", package);
+            ui::success(format!("Successfully removed {}", package));
         }
         Commands::Build {
             spec_pos,
@@ -625,7 +611,7 @@ fn main() -> Result<()> {
         } => {
             warn_if_running_as_root_for_build("build", &cli.rootfs);
             let spec_path = spec.or(spec_pos).context("No spec file provided")?;
-            println!("Building package from: {}", spec_path.display());
+            ui::info(format!("Building package from: {}", spec_path.display()));
             let mut pkg_spec = package::PackageSpec::from_file(&spec_path)?;
 
             let config = config::Config::for_rootfs(&cli.rootfs);
@@ -687,23 +673,37 @@ fn main() -> Result<()> {
             let mut created_files = Vec::new();
             for out in pkg_spec.outputs() {
                 let mut spec_for_out = pkg_spec.clone();
+                let output_name = out.name.clone();
                 spec_for_out.package = out;
+                spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
+                spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
+                let out_destdir =
+                    output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
                 let packager =
-                    package::Packager::new(spec_for_out.clone(), destdir.clone(), config.clone());
+                    package::Packager::new(spec_for_out.clone(), out_destdir, config.clone());
                 let pkg_file = packager.create_package(Path::new("."), arch)?;
                 created_files.push(pkg_file);
             }
 
             for f in &created_files {
-                println!("Build complete. Package created: {}", f.display());
+                ui::success(format!("Build complete. Package created: {}", f.display()));
             }
 
             if install {
-                install_staged_to_rootfs(&pkg_spec, &destdir, &cli.rootfs, &config)?;
-                println!(
-                    "Successfully installed {} v{}",
-                    pkg_spec.package.name, pkg_spec.package.version
-                );
+                for out in pkg_spec.outputs() {
+                    let mut spec_for_out = pkg_spec.clone();
+                    let output_name = out.name.clone();
+                    spec_for_out.package = out;
+                    spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
+                    spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
+                    let out_destdir =
+                        output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
+                    install_staged_to_rootfs(&spec_for_out, &out_destdir, &cli.rootfs, &config)?;
+                    ui::success(format!(
+                        "Successfully installed {} v{}",
+                        spec_for_out.package.name, spec_for_out.package.version
+                    ));
+                }
             }
 
             if cli.clean {
@@ -736,7 +736,10 @@ fn main() -> Result<()> {
             RepoCommands::Create { dir } => {
                 let repo = db::repo::RepoManager::new(dir);
                 let db_path = repo.create_repo_db()?;
-                println!("Created repository database: {}", db_path.display());
+                ui::success(format!(
+                    "Created repository database: {}",
+                    db_path.display()
+                ));
             }
             RepoCommands::Sync => {
                 // Only root may run sync
@@ -745,19 +748,19 @@ fn main() -> Result<()> {
                 }
                 let config = config::Config::for_rootfs(&cli.rootfs);
                 if config.mirrors.is_empty() {
-                    println!("No mirrors configured in /etc/depot.d/mirrors.toml");
+                    ui::info("No mirrors configured in /etc/depot.d/mirrors.toml");
                 } else {
                     db::repo::sync_mirrors(&config.repo_clone_dir, &config.mirrors)?;
-                    println!(
+                    ui::success(format!(
                         "Mirrors synchronized into {}",
                         config.repo_clone_dir.display()
-                    );
+                    ));
                 }
             }
             RepoCommands::Status => {
                 let config = config::Config::for_rootfs(&cli.rootfs);
                 if config.mirrors.is_empty() {
-                    println!("No mirrors configured in /etc/depot.d/mirrors.toml");
+                    ui::info("No mirrors configured in /etc/depot.d/mirrors.toml");
                 } else {
                     db::repo::mirrors_status(&config.repo_clone_dir, &config.mirrors)?;
                 }
@@ -786,19 +789,17 @@ fn main() -> Result<()> {
                 output.unwrap_or_else(|| PathBuf::from(format!("{}.toml", spec.package.name)));
 
             if output_path.exists() {
-                println!(
-                    "Warning: File {} already exists. Overwrite? [y/N]",
-                    output_path.display()
-                );
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
+                ui::warn(format!("File {} already exists.", output_path.display()));
+                if !ui::prompt_yes_no("Overwrite it?", false)? {
                     anyhow::bail!("Aborted");
                 }
             }
 
             fs::write(&output_path, toml_string)?;
-            println!("Package specification saved to {}", output_path.display());
+            ui::success(format!(
+                "Package specification saved to {}",
+                output_path.display()
+            ));
         }
     }
 

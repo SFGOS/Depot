@@ -94,7 +94,7 @@ impl RepoManager {
     }
 
     fn index_package(&self, conn: &mut Connection, pkg_path: &Path) -> Result<()> {
-        println!("Indexing package {}...", pkg_path.display());
+        crate::log_info!("Indexing package {}...", pkg_path.display());
 
         let filename = pkg_path.file_name().unwrap().to_string_lossy();
         let size = pkg_path.metadata()?.len();
@@ -238,7 +238,7 @@ pub fn sync_mirrors(
     for (name, url) in mirrors {
         let target = base.join(name);
         if !target.exists() {
-            println!("Cloning mirror '{}' -> {}", name, target.display());
+            crate::log_info!("Cloning mirror '{}' -> {}", name, target.display());
 
             // Use git2 RepoBuilder to clone
             let mut cb = RemoteCallbacks::new();
@@ -256,7 +256,7 @@ pub fn sync_mirrors(
                 .clone(url, &target)
                 .with_context(|| format!("Failed to clone {}", url))?;
         } else {
-            println!("Updating mirror '{}' in {}", name, target.display());
+            crate::log_info!("Updating mirror '{}' in {}", name, target.display());
             // Open repository and fetch updates
             let repo = Repository::open(&target)
                 .with_context(|| format!("Failed to open repository at {}", target.display()))?;
@@ -310,15 +310,15 @@ pub fn mirrors_status(
 
     let base = repo_dir.to_path_buf();
     if !base.exists() {
-        println!("Repo base directory does not exist: {}", base.display());
+        crate::log_info!("Repo base directory does not exist: {}", base.display());
         return Ok(());
     }
 
     for (name, _url) in mirrors {
         let target = base.join(name);
-        println!("--- {} ---", name);
+        crate::log_info!("--- {} ---", name);
         if !target.exists() {
-            println!("Not cloned: {}", target.display());
+            crate::log_info!("Not cloned: {}", target.display());
             continue;
         }
 
@@ -350,7 +350,7 @@ pub fn mirrors_status(
                 let statuses = match repo.statuses(None) {
                     Ok(s) => s,
                     Err(_) => {
-                        println!("Warning: failed to read status for {}", target.display());
+                        crate::log_warn!("Failed to read status for {}", target.display());
                         continue;
                     }
                 };
@@ -360,16 +360,16 @@ pub fn mirrors_status(
                     )
                 });
 
-                println!("Path: {}", target.display());
-                println!("Branch/HEAD: {}", branch);
-                println!("HEAD OID: {}", short);
+                crate::log_info!("Path: {}", target.display());
+                crate::log_info!("Branch/HEAD: {}", branch);
+                crate::log_info!("HEAD OID: {}", short);
                 if !commit_time.is_empty() {
-                    println!("Latest commit time (epoch): {}", commit_time);
+                    crate::log_info!("Latest commit time (epoch): {}", commit_time);
                 }
-                println!("Dirty: {}", if dirty { "yes" } else { "no" });
+                crate::log_info!("Dirty: {}", if dirty { "yes" } else { "no" });
             }
             Err(e) => {
-                println!("Failed to open repo at {}: {}", target.display(), e);
+                crate::log_info!("Failed to open repo at {}: {}", target.display(), e);
             }
         }
     }

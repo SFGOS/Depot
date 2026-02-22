@@ -26,12 +26,19 @@ pub fn build(
         );
     }
 
+    if !state.is_done(BuildStep::Configured) {
+        crate::source::hooks::run_post_configure_commands(spec, src_dir, destdir)?;
+        state.mark_done(BuildStep::Configured)?;
+    } else {
+        crate::log_info!("Skipping post-configure hooks (already done)");
+    }
+
     if !state.is_done(BuildStep::PostCompileDone) {
-        println!("Running makefile build commands...");
+        crate::log_info!("Running makefile build commands...");
 
         for cmd_str in &spec.build.flags.makefile_commands {
             let cmd_str = spec.expand_vars(cmd_str);
-            println!("  Executing: {}", cmd_str);
+            crate::log_info!("  Executing: {}", cmd_str);
 
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(&cmd_str);
@@ -49,12 +56,12 @@ pub fn build(
         crate::source::hooks::run_post_compile_commands(spec, src_dir, destdir)?;
         state.mark_done(BuildStep::PostCompileDone)?;
     } else {
-        println!("Skipping makefile build commands (already done)");
+        crate::log_info!("Skipping makefile build commands (already done)");
     }
 
     if !state.is_done(BuildStep::PostInstallDone) {
         // Run install commands with fakeroot
-        println!(
+        crate::log_info!(
             "Running makefile install commands{}...",
             if crate::fakeroot::is_root() {
                 ""
@@ -65,7 +72,7 @@ pub fn build(
 
         for cmd_str in &spec.build.flags.makefile_install_commands {
             let cmd_str = spec.expand_vars(cmd_str);
-            println!("  Executing: {}", cmd_str);
+            crate::log_info!("  Executing: {}", cmd_str);
 
             // We need to run each command under fakeroot
             let mut cmd = crate::fakeroot::wrap_install_command("sh", destdir);
@@ -90,7 +97,7 @@ pub fn build(
         crate::source::hooks::run_post_install_commands(spec, src_dir, destdir)?;
         state.mark_done(BuildStep::PostInstallDone)?;
     } else {
-        println!("Skipping makefile install commands (already done)");
+        crate::log_info!("Skipping makefile install commands (already done)");
     }
 
     Ok(())
@@ -128,6 +135,8 @@ mod tests {
                 flags: BuildFlags::default(),
             },
             dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
             spec_dir: std::path::PathBuf::from("."),
         }
     }
