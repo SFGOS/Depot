@@ -21,6 +21,7 @@ impl fmt::Display for BuildType {
             BuildType::Rust => write!(f, "Rust"),
             BuildType::Makefile => write!(f, "Makefile"),
             BuildType::Bin => write!(f, "Binary installer"),
+            BuildType::Meta => write!(f, "Metapackage"),
         }
     }
 }
@@ -624,6 +625,7 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
         BuildType::Rust => "rust",
         BuildType::Makefile => "makefile",
         BuildType::Bin => "bin",
+        BuildType::Meta => "meta",
     };
     build_tbl.insert("type".into(), Value::String(build_type.to_string()));
 

@@ -226,6 +226,12 @@ pub fn build(
         BuildType::Python => python::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Rust => rust::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Bin => bin::build(spec, src_dir, destdir, cross, export_compiler_flags),
+        BuildType::Meta => {
+            // Metapackages are metadata-only; create an empty staging root and let
+            // packaging/installation metadata carry dependencies.
+            std::fs::create_dir_all(destdir)?;
+            Ok(())
+        }
         BuildType::Makefile => {
             makefile::build(spec, src_dir, destdir, cross, export_compiler_flags)
         }

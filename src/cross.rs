@@ -208,11 +208,11 @@ fn find_tool(prefix: &str, suffixes: &[&str], required: bool) -> Result<String> 
     for suffix in suffixes {
         let tool_name = format!("{}-{}", prefix, suffix);
         // Use `which` to resolve to an absolute path (so callers get a usable path)
-        if let Ok(output) = Command::new("which").arg(&tool_name).output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                return Ok(path);
-            }
+        if let Ok(output) = Command::new("which").arg(&tool_name).output()
+            && output.status.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Ok(path);
         }
     }
 

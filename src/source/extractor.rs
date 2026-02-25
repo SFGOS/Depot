@@ -112,9 +112,9 @@ fn extract_tar_gz(path: &Path, dest: &Path) -> Result<()> {
             // preserve the top-level folder (move the directory itself under dest)
             fs::create_dir_all(dest)?;
             let dest_top = dest.join(top_name);
-            if fs::rename(&top[0].path(), &dest_top).is_err() {
+            if fs::rename(top[0].path(), &dest_top).is_err() {
                 copy_dir_recursive_local(&top[0].path(), &dest_top)?;
-                fs::remove_dir_all(&top[0].path())?;
+                fs::remove_dir_all(top[0].path())?;
             }
         }
     } else {
@@ -157,9 +157,9 @@ fn extract_tar_xz(path: &Path, dest: &Path) -> Result<()> {
             // preserve the top-level folder (move the directory itself under dest)
             fs::create_dir_all(dest)?;
             let dest_top = dest.join(top_name);
-            if fs::rename(&top[0].path(), &dest_top).is_err() {
+            if fs::rename(top[0].path(), &dest_top).is_err() {
                 copy_dir_recursive_local(&top[0].path(), &dest_top)?;
-                fs::remove_dir_all(&top[0].path())?;
+                fs::remove_dir_all(top[0].path())?;
             }
         }
     } else {
@@ -202,9 +202,9 @@ fn extract_tar_bz2(path: &Path, dest: &Path) -> Result<()> {
             // preserve the top-level folder (move the directory itself under dest)
             fs::create_dir_all(dest)?;
             let dest_top = dest.join(top_name);
-            if fs::rename(&top[0].path(), &dest_top).is_err() {
+            if fs::rename(top[0].path(), &dest_top).is_err() {
                 copy_dir_recursive_local(&top[0].path(), &dest_top)?;
-                fs::remove_dir_all(&top[0].path())?;
+                fs::remove_dir_all(top[0].path())?;
             }
         }
     } else {
@@ -246,9 +246,9 @@ fn extract_tar(path: &Path, dest: &Path) -> Result<()> {
             // preserve the top-level folder (move the directory itself under dest)
             fs::create_dir_all(dest)?;
             let dest_top = dest.join(top_name);
-            if fs::rename(&top[0].path(), &dest_top).is_err() {
+            if fs::rename(top[0].path(), &dest_top).is_err() {
                 copy_dir_recursive_local(&top[0].path(), &dest_top)?;
-                fs::remove_dir_all(&top[0].path())?;
+                fs::remove_dir_all(top[0].path())?;
             }
         }
     } else {
@@ -290,9 +290,9 @@ fn extract_zip(path: &Path, dest: &Path) -> Result<()> {
             // preserve the top-level folder (move the directory itself under dest)
             fs::create_dir_all(dest)?;
             let dest_top = dest.join(top_name);
-            if fs::rename(&top[0].path(), &dest_top).is_err() {
+            if fs::rename(top[0].path(), &dest_top).is_err() {
                 copy_dir_recursive_local(&top[0].path(), &dest_top)?;
-                fs::remove_dir_all(&top[0].path())?;
+                fs::remove_dir_all(top[0].path())?;
             }
         }
     } else {
@@ -335,9 +335,9 @@ fn extract_tar_zst(path: &Path, dest: &Path) -> Result<()> {
             // preserve the top-level folder (move the directory itself under dest)
             fs::create_dir_all(dest)?;
             let dest_top = dest.join(top_name);
-            if fs::rename(&top[0].path(), &dest_top).is_err() {
+            if fs::rename(top[0].path(), &dest_top).is_err() {
                 copy_dir_recursive_local(&top[0].path(), &dest_top)?;
-                fs::remove_dir_all(&top[0].path())?;
+                fs::remove_dir_all(top[0].path())?;
             }
         }
     } else {

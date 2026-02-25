@@ -39,10 +39,10 @@ pub fn copy_manual_sources(spec: &PackageSpec, cache_dir: &Path, build_dir: &Pat
 
     for manual in &spec.manual_sources {
         let mut local_entries: Vec<String> = Vec::new();
-        if let Some(file) = manual.file.as_ref() {
-            if !file.trim().is_empty() {
-                local_entries.push(file.clone());
-            }
+        if let Some(file) = manual.file.as_ref()
+            && !file.trim().is_empty()
+        {
+            local_entries.push(file.clone());
         }
         local_entries.extend(
             manual
@@ -53,10 +53,10 @@ pub fn copy_manual_sources(spec: &PackageSpec, cache_dir: &Path, build_dir: &Pat
         );
 
         let mut url_entries: Vec<String> = Vec::new();
-        if let Some(url) = manual.url.as_ref() {
-            if !url.trim().is_empty() {
-                url_entries.push(url.clone());
-            }
+        if let Some(url) = manual.url.as_ref()
+            && !url.trim().is_empty()
+        {
+            url_entries.push(url.clone());
         }
         url_entries.extend(manual.urls.iter().filter(|s| !s.trim().is_empty()).cloned());
 

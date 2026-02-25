@@ -83,13 +83,13 @@ pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> R
             params![file],
             |row| row.get(0),
         );
-        if let Ok(owner) = owner_res {
-            if owner != spec.package.name {
-                if is_auto_removable_path(file) {
-                    auto_conflicts.push((file.clone(), owner));
-                } else {
-                    fatal_conflicts.push((file.clone(), owner));
-                }
+        if let Ok(owner) = owner_res
+            && owner != spec.package.name
+        {
+            if is_auto_removable_path(file) {
+                auto_conflicts.push((file.clone(), owner));
+            } else {
+                fatal_conflicts.push((file.clone(), owner));
             }
         }
     }

@@ -113,7 +113,9 @@ pub fn build(
             build_function_mode_command(spec, destdir, &abs_build_script)?
         } else {
             let mut cmd = fakeroot::wrap_install_command("sh", destdir);
-            cmd.arg(&abs_build_script);
+            // Run custom scripts with `-e` so command failures stop the build immediately
+            // instead of being masked by later shell commands.
+            cmd.arg("-e").arg(&abs_build_script);
             cmd
         };
         cmd.current_dir(&build_dir);
@@ -419,6 +421,34 @@ depot_install() {
 
         let err = build(&spec, tmp_src.path(), tmp_dest.path(), None, true)
             .expect_err("missing per-output install handler should fail");
+        assert!(err.to_string().contains("Custom build script failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_non_function_mode_stops_on_first_command_failure() -> Result<()> {
+        let tmp_src = tempdir()?;
+        let tmp_dest = tempdir()?;
+
+        let build_sh = tmp_src.path().join("build.sh");
+        std::fs::write(
+            &build_sh,
+            r#"#!/bin/sh
+false
+exit 0
+"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&build_sh)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&build_sh, perms)?;
+        }
+
+        let spec = mk_spec("custom-fail-fast", "1.0");
+        let err = build(&spec, tmp_src.path(), tmp_dest.path(), None, true)
+            .expect_err("non-function custom scripts should fail when a command fails");
         assert!(err.to_string().contains("Custom build script failed"));
         Ok(())
     }

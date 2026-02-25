@@ -1019,11 +1019,11 @@ pub fn sync_mirrors(
                 .with_context(|| format!("Failed to fetch updates for {}", url))?;
 
             // Try to fast-forward HEAD to origin/HEAD by resetting to FETCH_HEAD if present
-            if let Ok(fetch_head) = repo.find_reference("FETCH_HEAD") {
-                if let Some(oid) = fetch_head.target() {
-                    let obj = repo.find_object(oid, None)?;
-                    repo.reset(&obj, ResetType::Hard, None)?;
-                }
+            if let Ok(fetch_head) = repo.find_reference("FETCH_HEAD")
+                && let Some(oid) = fetch_head.target()
+            {
+                let obj = repo.find_object(oid, None)?;
+                repo.reset(&obj, ResetType::Hard, None)?;
             }
         }
 
@@ -1055,7 +1055,7 @@ pub fn mirrors_status(
         return Ok(());
     }
 
-    for (name, _url) in mirrors {
+    for name in mirrors.keys() {
         let target = base.join(name);
         crate::log_info!("--- {} ---", name);
         if !target.exists() {
@@ -1080,11 +1080,11 @@ pub fn mirrors_status(
 
                 // Commit time (seconds since epoch) if available
                 let mut commit_time = String::new();
-                if let Some(oid) = oid {
-                    if let Ok(commit) = repo.find_commit(oid) {
-                        let t = commit.time().seconds();
-                        commit_time = format!("{}", t);
-                    }
+                if let Some(oid) = oid
+                    && let Ok(commit) = repo.find_commit(oid)
+                {
+                    let t = commit.time().seconds();
+                    commit_time = format!("{}", t);
                 }
 
                 // Dirty status

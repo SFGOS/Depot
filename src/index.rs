@@ -46,34 +46,9 @@ impl PackageIndex {
                 if let Ok(files) = fs::read_dir(&dir) {
                     for file in files.flatten() {
                         let path = file.path();
-                        if path.extension().map(|e| e == "toml").unwrap_or(false) {
-                            if let Ok(spec) = PackageSpec::from_file(&path) {
-                                index
-                                    .by_name
-                                    .insert(spec.package.name.clone(), path.clone());
-                                for provided in &spec.alternatives.provides {
-                                    index
-                                        .by_provides
-                                        .entry(provided.clone())
-                                        .or_default()
-                                        .push(path.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Also scan system mirrors under provided repo_dir (or default)
-        let sys_dir = repo_dir.unwrap_or_else(|| PathBuf::from("/usr/src/depot"));
-
-        if sys_dir.exists() {
-            for entry in walkdir::WalkDir::new(&sys_dir).min_depth(1).max_depth(5) {
-                if let Ok(entry) = entry {
-                    let path = entry.path().to_path_buf();
-                    if path.extension().map(|e| e == "toml").unwrap_or(false) {
-                        if let Ok(spec) = PackageSpec::from_file(&path) {
+                        if path.extension().map(|e| e == "toml").unwrap_or(false)
+                            && let Ok(spec) = PackageSpec::from_file(&path)
+                        {
                             index
                                 .by_name
                                 .insert(spec.package.name.clone(), path.clone());
@@ -85,6 +60,34 @@ impl PackageIndex {
                                     .push(path.clone());
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Also scan system mirrors under provided repo_dir (or default)
+        let sys_dir = repo_dir.unwrap_or_else(|| PathBuf::from("/usr/src/depot"));
+
+        if sys_dir.exists() {
+            for entry in walkdir::WalkDir::new(&sys_dir)
+                .min_depth(1)
+                .max_depth(5)
+                .into_iter()
+                .flatten()
+            {
+                let path = entry.path().to_path_buf();
+                if path.extension().map(|e| e == "toml").unwrap_or(false)
+                    && let Ok(spec) = PackageSpec::from_file(&path)
+                {
+                    index
+                        .by_name
+                        .insert(spec.package.name.clone(), path.clone());
+                    for provided in &spec.alternatives.provides {
+                        index
+                            .by_provides
+                            .entry(provided.clone())
+                            .or_default()
+                            .push(path.clone());
                     }
                 }
             }

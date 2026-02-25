@@ -29,19 +29,11 @@ fn resolve_rootfs_base(rootfs: &Path) -> PathBuf {
 }
 
 /// Global repo behavior settings loaded from `repos.toml`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RepoSettings {
     /// Prefer binary repos over source repos when both can satisfy a request.
     #[serde(default)]
     pub prefer_binary: bool,
-}
-
-impl Default for RepoSettings {
-    fn default() -> Self {
-        Self {
-            prefer_binary: false,
-        }
-    }
 }
 
 /// Source repository configuration entry loaded from `repos.toml`.
@@ -425,13 +417,13 @@ impl Config {
         }
 
         // Allow overriding repo clone dir via [repo] clone_dir in depot.toml
-        if let Some(repo_table) = self.build_overrides.get("repo").and_then(|v| v.as_table()) {
-            if let Some(clone_val) = repo_table.get("clone_dir").and_then(|v| v.as_str()) {
-                let p = PathBuf::from(clone_val);
-                // If relative path, make it relative to rootfs
-                let repo_dir = if p.is_absolute() { p } else { rootfs.join(p) };
-                self.repo_clone_dir = repo_dir;
-            }
+        if let Some(repo_table) = self.build_overrides.get("repo").and_then(|v| v.as_table())
+            && let Some(clone_val) = repo_table.get("clone_dir").and_then(|v| v.as_str())
+        {
+            let p = PathBuf::from(clone_val);
+            // If relative path, make it relative to rootfs
+            let repo_dir = if p.is_absolute() { p } else { rootfs.join(p) };
+            self.repo_clone_dir = repo_dir;
         }
 
         Ok(())

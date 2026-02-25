@@ -103,7 +103,7 @@ pub fn installed_scripts_dir(rootfs: &Path, pkg_name: &str) -> PathBuf {
 /// Returns `true` if scripts were found and staged.
 pub fn stage_scripts_from_spec_dir(spec: &PackageSpec, destdir: &Path) -> Result<bool> {
     let source_dir = spec.spec_dir.join(STAGED_SCRIPTS_DIR);
-    let has_scripts_dir = if source_dir.exists() { true } else { false };
+    let has_scripts_dir = source_dir.exists();
 
     if has_scripts_dir && !source_dir.is_dir() {
         bail!(

@@ -601,8 +601,10 @@ impl<'a> Resolver<'a> {
 
 fn source_deps_for_install(spec: &PackageSpec) -> Vec<String> {
     let mut deps_all = Vec::new();
-    for dep in &spec.dependencies.build {
-        push_unique(&mut deps_all, dep.clone());
+    if !spec.is_metapackage() {
+        for dep in &spec.dependencies.build {
+            push_unique(&mut deps_all, dep.clone());
+        }
     }
     for dep in &spec.dependencies.runtime {
         push_unique(&mut deps_all, dep.clone());

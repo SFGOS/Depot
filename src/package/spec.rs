@@ -70,9 +70,11 @@ impl PackageSpec {
             .unwrap_or_else(|| PathBuf::from("."));
         spec.apply_spec_appends(&appends)?;
 
-        // Require at least one source (remote or manual)
-        if spec.source.is_empty() && spec.manual_sources.is_empty() {
-            anyhow::bail!("Package must have at least one source or manual_sources entry");
+        // Require at least one source (remote or manual) unless this is a metapackage.
+        if spec.source.is_empty() && spec.manual_sources.is_empty() && !spec.is_metapackage() {
+            anyhow::bail!(
+                "Package must have at least one source or manual_sources entry (except build.type = \"meta\")"
+            );
         }
         spec.validate_manual_sources()?;
 
@@ -165,6 +167,11 @@ impl PackageSpec {
 
     pub fn sources(&self) -> &[Source] {
         &self.source
+    }
+
+    /// Returns true when this spec is a metadata-only package that exists to pull dependencies.
+    pub fn is_metapackage(&self) -> bool {
+        matches!(self.build.build_type, BuildType::Meta)
     }
 
     /// Return all package outputs this spec will produce (primary + any extras)
@@ -1200,6 +1207,37 @@ type = "custom"
         .unwrap();
 
         assert!(PackageSpec::from_file(&path).is_err());
+    }
+
+    #[test]
+    fn parse_allows_metapackage_without_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo-meta"
+version = "1.0"
+description = "metapackage"
+homepage = "https://example.com"
+license = "MIT"
+
+[build]
+type = "meta"
+
+[dependencies]
+runtime = ["foo", "bar"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert!(spec.source.is_empty());
+        assert!(spec.manual_sources.is_empty());
+        assert!(spec.is_metapackage());
+        assert_eq!(spec.dependencies.runtime, vec!["foo", "bar"]);
     }
 
     #[test]
@@ -2297,6 +2335,7 @@ pub enum BuildType {
     Rust,
     Makefile,
     Bin,
+    Meta,
 }
 
 /// Build flags and toolchain configuration
