@@ -82,7 +82,7 @@ pub fn build(
             cmake_cmd.arg(&expanded);
         }
 
-        crate::builder::prepare_command(&mut cmake_cmd, &env_vars);
+        crate::builder::prepare_tool_command(&mut cmake_cmd, &env_vars);
 
         let status = cmake_cmd.status().context("Failed to run cmake")?;
         if !status.success() {
@@ -109,7 +109,7 @@ pub fn build(
             }
         }
 
-        crate::builder::prepare_command(&mut build_cmd, &env_vars);
+        crate::builder::prepare_tool_command(&mut build_cmd, &env_vars);
 
         let status = build_cmd
             .status()
@@ -131,7 +131,7 @@ pub fn build(
                 for target in &test_targets {
                     test_cmd.arg(target);
                 }
-                crate::builder::prepare_command(&mut test_cmd, &env_vars);
+                crate::builder::prepare_tool_command(&mut test_cmd, &env_vars);
 
                 let status = test_cmd.status().with_context(|| {
                     format!(
@@ -182,7 +182,7 @@ pub fn build(
             "DESTDIR".to_string(),
             destdir.to_string_lossy().into_owned(),
         ));
-        crate::builder::prepare_command(&mut install_cmd, &install_env);
+        crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
 
         let status = install_cmd
             .status()

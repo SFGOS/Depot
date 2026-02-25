@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 6 ]; then
+    echo "usage: $0 <cargo> <src_root> <build_root> <profile> <release_flag> <output>" >&2
+    exit 2
+fi
+
+cargo_bin="$1"
+src_root="$2"
+build_root="$3"
+profile="$4"
+release_flag="$5"
+output="$6"
+
+cargo_home="$build_root/cargo-home"
+cargo_target_dir="$build_root/cargo-target"
+
+mkdir -p "$cargo_home" "$cargo_target_dir"
+
+export CARGO_HOME="$cargo_home"
+export CARGO_TARGET_DIR="$cargo_target_dir"
+
+if [ "$release_flag" = "1" ]; then
+    "$cargo_bin" build --locked --manifest-path "$src_root/Cargo.toml" --release
+else
+    "$cargo_bin" build --locked --manifest-path "$src_root/Cargo.toml"
+fi
+
+src_bin="$cargo_target_dir/$profile/depot"
+if [ ! -f "$src_bin" ]; then
+    echo "cargo build finished but binary not found: $src_bin" >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "$output")"
+cp "$src_bin" "$output"
+chmod 0755 "$output"

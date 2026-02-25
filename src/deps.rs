@@ -78,6 +78,11 @@ fn parse_dep(dep: &str) -> ParsedDep<'_> {
     }
 }
 
+/// Return the dependency name portion without any version/operator suffix.
+pub fn dep_name(dep: &str) -> &str {
+    parse_dep(dep).name
+}
+
 /// Compare two version strings using semver if possible, fallback to string compare
 fn compare_versions(installed: &str, required: &str, op: VersionOp) -> bool {
     // Try semver comparison first
@@ -132,6 +137,17 @@ fn is_dep_satisfied(
         // Package might be provided by an alternative, accept it
         Ok(provides.contains(parsed.name))
     }
+}
+
+/// Check whether a dependency expression is satisfied by the installed package DB.
+pub fn is_dep_satisfied_in_db(dep: &str, db_path: &Path) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+
+    let installed = db::get_installed_packages(db_path)?;
+    let provides = db::get_all_provides(db_path)?;
+    is_dep_satisfied(dep, &installed, &provides, db_path)
 }
 
 /// Check if all build dependencies are satisfied

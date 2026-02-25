@@ -1,9 +1,11 @@
 //! Git source support via libgit2 (git2 crate)
 
 use anyhow::{Context, Result};
-use git2::{Cred, FetchOptions, Oid, RemoteCallbacks, Repository};
+use git2::{Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository};
+use inquire::Password;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
 /// Checkout a repository URL at a specific revision into `checkout_dir`.
@@ -115,15 +117,144 @@ fn checkout_rev(repo: &Repository, rev: &str) -> Result<()> {
 
 fn remote_callbacks() -> RemoteCallbacks<'static> {
     let mut callbacks = RemoteCallbacks::new();
+    let mut credential_state = CredentialState::default();
 
-    // Try SSH agent / default key locations.
-    callbacks.credentials(|_url, username_from_url, _allowed| {
-        if let Some(name) = username_from_url {
-            Cred::ssh_key_from_agent(name)
-        } else {
-            Cred::default()
-        }
+    callbacks.credentials(move |url, username_from_url, allowed| {
+        credential_state.provide(url, username_from_url, allowed)
     });
 
     callbacks
+}
+
+#[derive(Default)]
+struct CredentialState {
+    username: Option<String>,
+    prompted_userpass: bool,
+}
+
+impl CredentialState {
+    fn provide(
+        &mut self,
+        url: &str,
+        username_from_url: Option<&str>,
+        allowed: CredentialType,
+    ) -> std::result::Result<Cred, git2::Error> {
+        if allowed.contains(CredentialType::USERNAME)
+            && !allowed.intersects(
+                CredentialType::SSH_KEY
+                    | CredentialType::USER_PASS_PLAINTEXT
+                    | CredentialType::DEFAULT,
+            )
+        {
+            let username = self.username(url, username_from_url)?;
+            return Cred::username(&username);
+        }
+
+        if allowed.contains(CredentialType::SSH_KEY) {
+            let ssh_username = username_from_url
+                .or(self.username.as_deref())
+                .unwrap_or("git");
+            if let Ok(cred) = Cred::ssh_key_from_agent(ssh_username) {
+                return Ok(cred);
+            }
+        }
+
+        if allowed.contains(CredentialType::DEFAULT)
+            && let Ok(cred) = Cred::default()
+        {
+            return Ok(cred);
+        }
+
+        if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
+            let (username, password) = self.userpass(url, username_from_url)?;
+            return Cred::userpass_plaintext(&username, &password);
+        }
+
+        if allowed.contains(CredentialType::USERNAME) {
+            let username = self.username(url, username_from_url)?;
+            return Cred::username(&username);
+        }
+
+        Err(git2::Error::from_str(
+            "Unsupported authentication method requested by git remote",
+        ))
+    }
+
+    fn username(
+        &mut self,
+        url: &str,
+        username_from_url: Option<&str>,
+    ) -> std::result::Result<String, git2::Error> {
+        if let Some(username) = username_from_url
+            && !username.trim().is_empty()
+        {
+            let username = username.trim().to_string();
+            self.username.get_or_insert_with(|| username.clone());
+            return Ok(username);
+        }
+        if let Some(username) = self.username.as_ref() {
+            return Ok(username.clone());
+        }
+
+        ensure_prompt_terminal(url)?;
+        crate::log_warn!("Git remote requires credentials: {}", url);
+
+        let mut input = String::new();
+        loop {
+            print!("Git username for {}: ", url);
+            io::stdout()
+                .flush()
+                .map_err(|e| git2::Error::from_str(&format!("Failed to flush prompt: {e}")))?;
+            input.clear();
+            io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| git2::Error::from_str(&format!("Failed to read username: {e}")))?;
+            let trimmed = input.trim();
+            if !trimmed.is_empty() {
+                let username = trimmed.to_string();
+                self.username = Some(username.clone());
+                return Ok(username);
+            }
+            crate::log_warn!("Username cannot be empty.");
+        }
+    }
+
+    fn userpass(
+        &mut self,
+        url: &str,
+        username_from_url: Option<&str>,
+    ) -> std::result::Result<(String, String), git2::Error> {
+        if self.prompted_userpass {
+            return Err(git2::Error::from_str(
+                "Git credentials were rejected by the remote",
+            ));
+        }
+
+        let username = self.username(url, username_from_url)?;
+        ensure_prompt_terminal(url)?;
+        self.prompted_userpass = true;
+
+        let prompt = format!("Git password/token for {} ({}):", url, username);
+        let password = Password::new(&prompt)
+            .without_confirmation()
+            .prompt()
+            .map_err(|e| {
+                git2::Error::from_str(&format!("Failed to read git password/token: {e}"))
+            })?;
+        if password.is_empty() {
+            return Err(git2::Error::from_str("Git password/token cannot be empty"));
+        }
+
+        Ok((username, password))
+    }
+}
+
+fn ensure_prompt_terminal(url: &str) -> std::result::Result<(), git2::Error> {
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        return Ok(());
+    }
+
+    Err(git2::Error::from_str(&format!(
+        "Authentication required for {url}, but no interactive terminal is available"
+    )))
 }

@@ -1,7 +1,7 @@
 Contrib: example system and user configuration files for Depot
 
 Place these files on your system to provide sensible defaults and examples
-for `/etc/depot.toml`, `/etc/depot.d/build.toml`, or user-level configs.
+for `/etc/depot.toml`, `/etc/depot.d/*.toml`, or user-level configs.
 
 Recommended installation:
 
@@ -18,3 +18,5 @@ Notes
  - These files are examples only. Review and adapt to your distribution and
    security policies before deploying.
  - The config loader supports append syntax (e.g. `cflags += ["-g"]`).
+ - `contrib/depot.d/repos.toml` shows the new source/binary repo configuration
+   format used by `depot repo ...` commands.

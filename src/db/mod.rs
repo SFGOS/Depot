@@ -751,3 +751,33 @@ pub fn get_package_version(db_path: &Path, name: &str) -> Result<Option<String>>
         .ok();
     Ok(version)
 }
+
+/// Find the installed package that owns a filesystem path from the local DB.
+pub fn owns_path(db_path: &Path, path: &Path) -> Result<Option<String>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let normalized = path
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .trim_start_matches("./")
+        .to_string();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+
+    let conn = Connection::open(db_path)?;
+    let owner = conn
+        .query_row(
+            "SELECT p.name
+             FROM files f
+             JOIN packages p ON p.id = f.package_id
+             WHERE f.path = ?1
+             LIMIT 1",
+            params![normalized],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(owner)
+}

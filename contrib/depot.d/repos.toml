@@ -1,0 +1,26 @@
+[settings]
+prefer_binary = true
+
+[source.vertex]
+url = "https://gitlab.com/vertex-linux/packages.git"
+enabled = true
+priority = 50
+subdirs = ["core", "extra"]
+
+[binary.core]
+url = "https://repo.sfgos.net/core"
+enabled = true
+priority = 10
+repo_db = "repo.db.zst"
+
+[binary.core.arch.x86_64]
+enabled = true
+
+[binary.extra]
+url = "https://repo.sfgos.net/extra"
+enabled = true
+priority = 20
+repo_db = "repo.db.zst"
+
+[binary.extra.arch.x86_64]
+enabled = true

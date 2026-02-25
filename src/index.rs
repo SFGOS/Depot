@@ -16,11 +16,18 @@ pub struct PackageIndex {
     by_provides: HashMap<String, Vec<PathBuf>>,
 }
 
+/// Source package search result from `PackageIndex`.
+#[derive(Debug, Clone)]
+pub struct SourceSearchHit {
+    pub name: String,
+    pub path: PathBuf,
+    pub provides: Vec<String>,
+}
+
 impl PackageIndex {
     /// Build index by scanning packages/*/*.toml and configured repo dir.
     ///
     /// Use `build_with_repo_dir` to provide an explicit repo dir.
-
     /// Build index scanning the local `packages/` directory and an optional
     /// system repo dir (e.g., /usr/src/depot). If `repo_dir` is None, the
     /// default `/usr/src/depot` is used.
@@ -115,5 +122,41 @@ impl PackageIndex {
         }
 
         None
+    }
+
+    /// Return all source specs that provide the requested feature/package name.
+    pub fn find_providers(&self, name: &str) -> Vec<PathBuf> {
+        self.by_provides.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Search indexed specs by package name or provided feature.
+    pub fn search(&self, query: &str) -> Vec<SourceSearchHit> {
+        let q = query.to_ascii_lowercase();
+        let mut provides_by_path: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        for (provided, paths) in &self.by_provides {
+            for path in paths {
+                provides_by_path
+                    .entry(path.clone())
+                    .or_default()
+                    .push(provided.clone());
+            }
+        }
+
+        let mut hits = Vec::new();
+        for (name, path) in &self.by_name {
+            let provides = provides_by_path.remove(path).unwrap_or_default();
+            let name_match = name.to_ascii_lowercase().contains(&q);
+            let provides_match = provides.iter().any(|p| p.to_ascii_lowercase().contains(&q));
+            if name_match || provides_match {
+                hits.push(SourceSearchHit {
+                    name: name.clone(),
+                    path: path.clone(),
+                    provides,
+                });
+            }
+        }
+
+        hits.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+        hits
     }
 }

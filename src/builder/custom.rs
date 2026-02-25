@@ -118,7 +118,7 @@ pub fn build(
         };
         cmd.current_dir(&build_dir);
 
-        crate::builder::prepare_command(&mut cmd, &env_vars);
+        crate::builder::prepare_tool_command(&mut cmd, &env_vars);
 
         // Run the command and include the OS error on spawn failures for clearer diagnostics
         let status = cmd.status().map_err(|e| {
@@ -176,9 +176,16 @@ fn build_function_mode_command(
 ) -> Result<Command> {
     let mut wrapper = String::new();
     wrapper.push_str("set -eu\n");
+    wrapper.push_str("depot_has_function() {\n");
+    wrapper.push_str("    case \"$(type \"$1\" 2>/dev/null || :)\" in\n");
+    wrapper.push_str("        *function*) return 0 ;;\n");
+    wrapper.push_str("        *) return 1 ;;\n");
+    wrapper.push_str("    esac\n");
+    wrapper.push_str("}\n");
+    wrapper.push_str("depot_build_ran=0\n");
     wrapper.push_str(". \"$1\"\n");
-    wrapper.push_str("if command -v depot_build >/dev/null 2>&1; then depot_build;\n");
-    wrapper.push_str("elif command -v build >/dev/null 2>&1; then build;\n");
+    wrapper.push_str("if depot_has_function depot_build; then depot_build; depot_build_ran=1;\n");
+    wrapper.push_str("elif depot_has_function build; then build; depot_build_ran=1;\n");
     wrapper.push_str("fi\n");
 
     let primary = &spec.package.name;
@@ -195,17 +202,27 @@ fn build_function_mode_command(
         wrapper.push_str(&format!(
             "DEPOT_OUTPUT_NAME='{q_name}'; DEPOT_OUTPUT_DESTDIR='{q_dest}'; DESTDIR=\"$DEPOT_OUTPUT_DESTDIR\"; export DEPOT_OUTPUT_NAME DEPOT_OUTPUT_DESTDIR DESTDIR\n"
         ));
+        wrapper.push_str("depot_output_installed=0\n");
         wrapper.push_str(&format!(
-            "if command -v depot_install_{fn_suffix} >/dev/null 2>&1; then depot_install_{fn_suffix};\n"
+            "if depot_has_function depot_install_{fn_suffix}; then depot_install_{fn_suffix}; depot_output_installed=1;\n"
         ));
         wrapper.push_str(&format!(
-            "elif command -v install_{fn_suffix} >/dev/null 2>&1; then install_{fn_suffix};\n"
+            "elif depot_has_function install_{fn_suffix}; then install_{fn_suffix}; depot_output_installed=1;\n"
         ));
         if out.name == *primary {
             wrapper
-                .push_str("elif command -v depot_install >/dev/null 2>&1; then depot_install;\n");
-            wrapper.push_str("elif command -v install >/dev/null 2>&1; then install;\n");
+                .push_str("elif depot_has_function depot_install; then depot_install; depot_output_installed=1;\n");
+            wrapper.push_str(
+                "elif depot_has_function install; then install; depot_output_installed=1;\n",
+            );
+            wrapper.push_str("elif [ \"$depot_build_ran\" = 1 ]; then depot_output_installed=1;\n");
         }
+        wrapper.push_str("fi\n");
+        wrapper.push_str("if [ \"$depot_output_installed\" != 1 ]; then\n");
+        wrapper.push_str(
+            "    echo \"depot: missing install handler for output '$DEPOT_OUTPUT_NAME' in custom function mode\" >&2\n",
+        );
+        wrapper.push_str("    exit 1\n");
         wrapper.push_str("fi\n");
     }
 
@@ -361,6 +378,48 @@ depot_install_dev_pkg() {
                 .join(".depot/outputs/dev-pkg/usr/include/dev.h")
                 .exists()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_function_mode_errors_when_output_handler_missing() -> Result<()> {
+        let tmp_src = tempdir()?;
+        let tmp_dest = tempdir()?;
+
+        let build_sh = tmp_src.path().join("build.sh");
+        std::fs::write(
+            &build_sh,
+            r#"#!/bin/sh
+depot_build() {
+  :
+}
+depot_install() {
+  mkdir -p "$DESTDIR/usr/share"
+  echo primary > "$DESTDIR/usr/share/primary.txt"
+}
+"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&build_sh)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&build_sh, perms)?;
+        }
+
+        let mut spec = mk_spec("demo", "1.0");
+        spec.packages.push(crate::package::PackageInfo {
+            name: "dev-pkg".into(),
+            version: "1.0".into(),
+            revision: 1,
+            description: "d".into(),
+            homepage: "h".into(),
+            license: vec!["MIT".into()],
+        });
+
+        let err = build(&spec, tmp_src.path(), tmp_dest.path(), None, true)
+            .expect_err("missing per-output install handler should fail");
+        assert!(err.to_string().contains("Custom build script failed"));
         Ok(())
     }
 }

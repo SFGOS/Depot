@@ -43,7 +43,7 @@ pub fn build(
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(&cmd_str);
             cmd.current_dir(src_dir);
-            crate::builder::prepare_command(&mut cmd, &env_vars);
+            crate::builder::prepare_tool_command(&mut cmd, &env_vars);
 
             let status = cmd
                 .status()
@@ -84,7 +84,7 @@ pub fn build(
                 "DESTDIR".to_string(),
                 destdir.to_string_lossy().into_owned(),
             ));
-            crate::builder::prepare_command(&mut cmd, &install_env);
+            crate::builder::prepare_tool_command(&mut cmd, &install_env);
 
             let status = cmd
                 .status()

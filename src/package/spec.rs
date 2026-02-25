@@ -58,12 +58,17 @@ impl PackageSpec {
 
         let content = fs::read_to_string(&abs_path)
             .with_context(|| format!("Failed to read package spec: {}", abs_path.display()))?;
-        let mut spec: PackageSpec = toml::from_str(&content)
+        let (base_content, appends) =
+            preprocess_spec_toml_appends(&content).with_context(|| {
+                format!("Failed to preprocess package spec: {}", abs_path.display())
+            })?;
+        let mut spec: PackageSpec = toml::from_str(&base_content)
             .with_context(|| format!("Failed to parse package spec: {}", abs_path.display()))?;
         spec.spec_dir = abs_path
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
+        spec.apply_spec_appends(&appends)?;
 
         // Require at least one source (remote or manual)
         if spec.source.is_empty() && spec.manual_sources.is_empty() {
@@ -72,6 +77,28 @@ impl PackageSpec {
         spec.validate_manual_sources()?;
 
         Ok(spec)
+    }
+
+    fn apply_spec_appends(
+        &mut self,
+        appends: &std::collections::HashMap<String, Vec<toml::Value>>,
+    ) -> Result<()> {
+        for (key, values) in appends {
+            if let Some(subkey) = key.strip_prefix("build.flags.") {
+                self.apply_append(subkey, values);
+                continue;
+            }
+            if let Some(subkey) = key.strip_prefix("flags.") {
+                self.apply_append(subkey, values);
+                continue;
+            }
+            if !key.contains('.') {
+                self.apply_append(key, values);
+                continue;
+            }
+            anyhow::bail!("Unsupported '+=' key in package spec: {}", key);
+        }
+        Ok(())
     }
 
     fn validate_manual_sources(&self) -> Result<()> {
@@ -204,6 +231,17 @@ impl PackageSpec {
                             .collect();
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.cflags = vec![s.to_string()];
+                    }
+                }
+                "cxxflags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.cxxflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.cxxflags = vec![s.to_string()];
                     }
                 }
                 "ldflags" => {
@@ -482,6 +520,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.cflags.push(s.to_string());
+                    }
+                }
+            }
+            "cxxflags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .cxxflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.cxxflags.push(s.to_string());
                     }
                 }
             }
@@ -813,6 +863,74 @@ impl PackageSpec {
             _ => {}
         }
     }
+}
+
+fn preprocess_spec_toml_appends(
+    input: &str,
+) -> Result<(String, std::collections::HashMap<String, Vec<toml::Value>>)> {
+    let mut base_text = String::new();
+    let mut appends = std::collections::HashMap::new();
+    let mut current_table: Option<String> = None;
+    let mut in_array_table = false;
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("[[") && trimmed.ends_with("]]") && trimmed.len() >= 4 {
+            current_table = Some(trimmed[2..trimmed.len() - 2].trim().to_string());
+            in_array_table = true;
+            base_text.push_str(line);
+            base_text.push('\n');
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+            current_table = Some(trimmed[1..trimmed.len() - 1].trim().to_string());
+            in_array_table = false;
+            base_text.push_str(line);
+            base_text.push('\n');
+            continue;
+        }
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            base_text.push_str(line);
+            base_text.push('\n');
+            continue;
+        }
+
+        if let Some(plus_idx) = trimmed.find("+=") {
+            if in_array_table {
+                anyhow::bail!(
+                    "'+=' is not supported inside array-of-table sections ({})",
+                    current_table.as_deref().unwrap_or("")
+                );
+            }
+            let key = trimmed[..plus_idx].trim();
+            let val_str = trimmed[plus_idx + 2..].trim();
+            let val: toml::Value = toml::from_str::<toml::Value>(&format!("v = {}", val_str))
+                .context("Failed to parse append value")?
+                .get("v")
+                .cloned()
+                .unwrap();
+
+            let full_key = if key.contains('.') {
+                key.to_string()
+            } else if let Some(table) = current_table.as_deref() {
+                format!("{}.{}", table, key)
+            } else {
+                key.to_string()
+            };
+
+            appends.entry(full_key).or_insert_with(Vec::new).push(val);
+            // Preserve line numbering for parser diagnostics.
+            base_text.push('\n');
+            continue;
+        }
+
+        base_text.push_str(line);
+        base_text.push('\n');
+    }
+
+    Ok((base_text, appends))
 }
 
 #[cfg(test)]
@@ -1223,6 +1341,7 @@ type = "custom"
 [flags]
 cc = "my-cc"
 cflags = ["-O2"]
+cxxflags = ["-O2", "-pipe"]
 passthrough_env = ["RUSTFLAGS"]
 make_vars = ["V=1"]
 make_dirs = ["lib"]
@@ -1241,6 +1360,10 @@ post_configure = ["echo configured"]
         config.appends.insert(
             "build.flags.cflags".to_string(),
             vec![toml::Value::String("-g".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.cxxflags".to_string(),
+            vec![toml::Value::String("-stdlib=libc++".to_string())],
         );
         config.appends.insert(
             "build.flags.rustflags".to_string(),
@@ -1301,6 +1424,14 @@ post_configure = ["echo configured"]
         assert_eq!(spec.build.flags.cc, "my-cc");
         assert!(spec.build.flags.cflags.contains(&"-O2".to_string()));
         assert!(spec.build.flags.cflags.contains(&"-g".to_string()));
+        assert!(spec.build.flags.cxxflags.contains(&"-O2".to_string()));
+        assert!(spec.build.flags.cxxflags.contains(&"-pipe".to_string()));
+        assert!(
+            spec.build
+                .flags
+                .cxxflags
+                .contains(&"-stdlib=libc++".to_string())
+        );
         assert!(spec.build.flags.rustflags.contains(&"-C".to_string()));
         assert!(
             spec.build
@@ -1657,6 +1788,51 @@ keep = ["etc/locale.gen", "etc/resolv.conf"]
     }
 
     #[test]
+    fn parse_build_flags_appends_from_spec_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+cxxflags = ["-O2"]
+cxxflags += [ "-Wno-gnu-statement-expression-from-macro-expansion" ]
+ldflags += "-Wl,--as-needed"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.build.flags.cxxflags,
+            vec![
+                "-O2".to_string(),
+                "-Wno-gnu-statement-expression-from-macro-expansion".to_string()
+            ]
+        );
+        assert_eq!(
+            spec.build.flags.ldflags,
+            vec!["-Wl,--as-needed".to_string()]
+        );
+    }
+
+    #[test]
     fn parse_passthrough_env_from_spec() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -1829,8 +2005,12 @@ cbuild = "x86_64-pc-linux-gnu"
             .unwrap(),
             package_overrides: toml::Value::Table(toml::map::Map::new()),
             appends: std::collections::HashMap::new(),
+            repo_settings: crate::config::RepoSettings::default(),
+            source_repos: std::collections::BTreeMap::new(),
+            binary_repos: std::collections::BTreeMap::new(),
             mirrors: std::collections::HashMap::new(),
             repo_clone_dir: PathBuf::from("/tmp"),
+            package_cache_dir: PathBuf::from("/tmp"),
         };
 
         spec.apply_config(&config);
@@ -2124,6 +2304,9 @@ pub enum BuildType {
 pub struct BuildFlags {
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub cflags: Vec<String>,
+    /// Extra flags exported to `CXXFLAGS`.
+    #[serde(default, deserialize_with = "deserialize_string_or_array")]
+    pub cxxflags: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub ldflags: Vec<String>,
     /// Keep existing files and install package-provided replacement as `<path>.depotnew`.
@@ -2328,6 +2511,7 @@ impl Default for BuildFlags {
     fn default() -> Self {
         BuildFlags {
             cflags: Vec::new(),
+            cxxflags: Vec::new(),
             ldflags: Vec::new(),
             keep: Vec::new(),
             no_flags: false,

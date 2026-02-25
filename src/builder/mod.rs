@@ -13,8 +13,9 @@ pub mod state;
 use crate::cross::CrossConfig;
 use crate::package::{BuildType, PackageSpec};
 use anyhow::Result;
+use std::ffi::OsString;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub type EnvVars = Vec<(String, String)>;
 
@@ -40,6 +41,9 @@ pub fn standard_build_env(
     if include_compiler_env && export_compiler_flags {
         if !flags.cflags.is_empty() {
             set_env_var(&mut env_vars, "CFLAGS", flags.cflags.join(" "));
+        }
+        if !flags.cxxflags.is_empty() {
+            set_env_var(&mut env_vars, "CXXFLAGS", flags.cxxflags.join(" "));
         }
 
         let ldflags = if !flags.ldflags.is_empty() || !flags.libc.is_empty() {
@@ -123,8 +127,29 @@ pub fn standard_build_env(
 /// Prepare a Command with a hermetic environment and some essential variables preserved.
 pub fn prepare_command(cmd: &mut Command, env_vars: &EnvVars) {
     cmd.env_clear();
+
+    if let Some(path) = sanitized_build_path() {
+        cmd.env("PATH", path);
+    }
+
     // Preserve essential environment variables
-    for var in &["PATH", "LANG", "HOME", "DESTDIR", "DEPOT_ROOTFS"] {
+    for var in &[
+        "LANG",
+        "HOME",
+        "DESTDIR",
+        "DEPOT_ROOTFS",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "RUSTUP_TOOLCHAIN",
+        "RUSTC",
+        "RUSTDOC",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "FORCE_COLOR",
+    ] {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);
         }
@@ -137,6 +162,35 @@ pub fn prepare_command(cmd: &mut Command, env_vars: &EnvVars) {
     for (key, val) in env_vars {
         cmd.env(key, val);
     }
+}
+
+fn sanitized_build_path() -> Option<OsString> {
+    use std::path::PathBuf;
+
+    let mut parts: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|raw| std::env::split_paths(&raw).collect())
+        .unwrap_or_default();
+
+    for dir in ["/bin", "/usr/bin", "/sbin", "/usr/sbin"] {
+        let path = PathBuf::from(dir);
+        if path.exists() && !parts.iter().any(|p| p == &path) {
+            parts.push(path);
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    std::env::join_paths(parts).ok()
+}
+
+/// Prepare a Command for interactive tool execution with live terminal output.
+pub fn prepare_tool_command(cmd: &mut Command, env_vars: &EnvVars) {
+    prepare_command(cmd, env_vars);
+    cmd.stdin(Stdio::inherit());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
 }
 
 /// Build a package using the appropriate build system
@@ -230,6 +284,8 @@ mod tests {
             std::env::set_var("HOME", "/home/test");
             std::env::set_var("SHELL", "/bin/zsh");
             std::env::set_var("DEPOT_ROOTFS", "/my/rootfs");
+            std::env::set_var("TERM", "xterm-256color");
+            std::env::set_var("CLICOLOR_FORCE", "1");
         }
 
         prepare_command(&mut cmd, &vec![("MYVAR".to_string(), "myval".to_string())]);
@@ -251,6 +307,16 @@ mod tests {
             envs.get(OsStr::new("DEPOT_ROOTFS")),
             Some(&Some(std::ffi::OsString::from("/my/rootfs").as_os_str()))
         );
+        assert_eq!(
+            envs.get(OsStr::new("TERM")),
+            Some(&Some(
+                std::ffi::OsString::from("xterm-256color").as_os_str()
+            ))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("CLICOLOR_FORCE")),
+            Some(&Some(std::ffi::OsString::from("1").as_os_str()))
+        );
     }
 
     #[test]
@@ -268,13 +334,43 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_command_preserves_rust_toolchain_homes() {
+        let mut cmd = std::process::Command::new("ls");
+        unsafe {
+            std::env::set_var("CARGO_HOME", "/var/cache/cargo-home");
+            std::env::set_var("RUSTUP_HOME", "/var/cache/rustup-home");
+        }
+        prepare_command(&mut cmd, &Vec::new());
+        let envs: HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(
+            envs.get(OsStr::new("CARGO_HOME")),
+            Some(&Some(
+                std::ffi::OsString::from("/var/cache/cargo-home").as_os_str()
+            ))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("RUSTUP_HOME")),
+            Some(&Some(
+                std::ffi::OsString::from("/var/cache/rustup-home").as_os_str()
+            ))
+        );
+    }
+
+    #[test]
     fn test_standard_build_env_respects_export_compiler_flags_toggle() {
-        let spec = mk_spec(vec!["-O2"], vec!["-Wl,--as-needed"]);
+        let mut spec = mk_spec(vec!["-O2"], vec!["-Wl,--as-needed"]);
+        spec.build.flags.cxxflags = vec!["-O2".into(), "-fno-exceptions".into()];
 
         let enabled = standard_build_env(&spec, None, true, true);
         assert!(
             enabled.iter().any(|(k, v)| k == "CFLAGS" && v == "-O2"),
             "expected CFLAGS to be exported when enabled"
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|(k, v)| k == "CXXFLAGS" && v == "-O2 -fno-exceptions"),
+            "expected CXXFLAGS to be exported when enabled"
         );
         assert!(
             enabled
@@ -303,6 +399,10 @@ mod tests {
         assert!(
             !disabled_env.iter().any(|(k, _)| k == "CFLAGS"),
             "expected CFLAGS to be omitted when no_flags is set in spec"
+        );
+        assert!(
+            !disabled_env.iter().any(|(k, _)| k == "CXXFLAGS"),
+            "expected CXXFLAGS to be omitted when no_flags is set in spec"
         );
         assert!(
             !disabled_env.iter().any(|(k, _)| k == "LDFLAGS"),

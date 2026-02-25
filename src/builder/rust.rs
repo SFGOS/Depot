@@ -99,7 +99,7 @@ pub fn build(
     }
 
     // Set environment
-    crate::builder::prepare_command(&mut cargo_cmd, &env_vars);
+    crate::builder::prepare_tool_command(&mut cargo_cmd, &env_vars);
 
     let status = cargo_cmd
         .status()

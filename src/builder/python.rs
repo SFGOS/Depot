@@ -245,7 +245,7 @@ fn build_wheel_setup_py(
         .arg("bdist_wheel")
         .arg("--dist-dir")
         .arg(dist_dir);
-    crate::builder::prepare_command(&mut cmd, &env_vars.to_vec());
+    crate::builder::prepare_tool_command(&mut cmd, &env_vars.to_vec());
 
     let status = cmd
         .status()

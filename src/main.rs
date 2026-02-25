@@ -9,14 +9,17 @@ mod deps;
 mod fakeroot;
 mod index;
 mod install;
+mod locking;
 mod package;
+mod planner;
 mod shell_helpers;
+mod signing;
 mod source;
 mod staging;
 mod ui;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -153,6 +156,434 @@ fn install_staged_to_rootfs(
     Ok(())
 }
 
+fn repo_kind_label(kind: RepoKindArg) -> &'static str {
+    match kind {
+        RepoKindArg::Source => "source",
+        RepoKindArg::Binary => "binary",
+    }
+}
+
+fn resolve_repo_kind_for_name(
+    repos: &config::RepoConfigFile,
+    name: &str,
+    kind: Option<RepoKindArg>,
+) -> Result<RepoKindArg> {
+    if let Some(kind) = kind {
+        return Ok(kind);
+    }
+
+    let in_source = repos.source.contains_key(name);
+    let in_binary = repos.binary.contains_key(name);
+    match (in_source, in_binary) {
+        (true, false) => Ok(RepoKindArg::Source),
+        (false, true) => Ok(RepoKindArg::Binary),
+        (true, true) => anyhow::bail!(
+            "Repo '{}' exists as both source and binary; rerun with --kind source|binary",
+            name
+        ),
+        (false, false) => anyhow::bail!("Repo '{}' not found in repos.toml", name),
+    }
+}
+
+fn print_repo_list(config: &config::Config) {
+    if config.source_repos.is_empty() && config.binary_repos.is_empty() {
+        ui::info("No repos configured in /etc/depot.d/repos.toml");
+        if !config.mirrors.is_empty() {
+            ui::info("Legacy mirrors.toml entries are loaded as source repos at runtime.");
+        }
+        return;
+    }
+
+    ui::info(format!(
+        "Repo settings: prefer_binary={}",
+        config.repo_settings.prefer_binary
+    ));
+
+    if config.source_repos.is_empty() {
+        ui::info("Source repos: none");
+    } else {
+        ui::info("Source repos:");
+        for (name, repo) in &config.source_repos {
+            let subdirs = if repo.subdirs.is_empty() {
+                "(all)".to_string()
+            } else {
+                repo.subdirs.join(", ")
+            };
+            ui::info(format!(
+                "  {} [{}] priority={} subdirs={} url={}",
+                name,
+                if repo.enabled { "enabled" } else { "disabled" },
+                repo.priority,
+                subdirs,
+                repo.url
+            ));
+        }
+    }
+
+    if config.binary_repos.is_empty() {
+        ui::info("Binary repos: none");
+    } else {
+        ui::info("Binary repos:");
+        let host_arch = std::env::consts::ARCH;
+        for (name, repo) in &config.binary_repos {
+            let arch_keys = if repo.arch.is_empty() {
+                "(any)".to_string()
+            } else {
+                repo.arch.keys().cloned().collect::<Vec<_>>().join(",")
+            };
+            ui::info(format!(
+                "  {} [{}] priority={} arches={} host_match={} repo_db={}{} url={}",
+                name,
+                if repo.enabled { "enabled" } else { "disabled" },
+                repo.priority,
+                arch_keys,
+                if repo.supports_arch(host_arch) {
+                    "yes"
+                } else {
+                    "no"
+                },
+                repo.repo_db,
+                if repo.allow_unsigned {
+                    " allow_unsigned=true"
+                } else {
+                    ""
+                },
+                repo.url
+            ));
+        }
+    }
+}
+
+fn selected_source_repos(
+    config: &config::Config,
+    name: Option<&str>,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut mirrors = config.enabled_source_mirror_map();
+    if let Some(name) = name {
+        if let Some(url) = mirrors.remove(name) {
+            let mut only = std::collections::HashMap::new();
+            only.insert(name.to_string(), url);
+            return Ok(only);
+        }
+        anyhow::bail!("Enabled source repo '{}' not found", name);
+    }
+    Ok(mirrors)
+}
+
+fn source_search_hit_allowed(config: &config::Config, hit: &index::SourceSearchHit) -> bool {
+    let path = &hit.path;
+
+    if path.starts_with(Path::new("packages")) {
+        return true;
+    }
+
+    if config.source_repos.is_empty() {
+        return true;
+    }
+
+    for (repo_name, repo) in &config.source_repos {
+        if !repo.enabled {
+            continue;
+        }
+        let repo_root = config.repo_clone_dir.join(repo_name);
+        if repo.subdirs.is_empty() {
+            if path.starts_with(&repo_root) {
+                return true;
+            }
+        } else {
+            for subdir in &repo.subdirs {
+                if path.starts_with(repo_root.join(subdir)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn source_hit_origin(config: &config::Config, path: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(&config.repo_clone_dir)
+        && let Some(first) = rel.components().next()
+    {
+        return format!("source:{}", first.as_os_str().to_string_lossy());
+    }
+    "source:local".to_string()
+}
+
+fn run_search_command(
+    query: &str,
+    files: bool,
+    config: &config::Config,
+    rootfs: &Path,
+) -> Result<()> {
+    let mut any = false;
+    let host_arch = std::env::consts::ARCH;
+
+    let pkg_index = index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
+    let source_hits: Vec<_> = pkg_index
+        .search(query)
+        .into_iter()
+        .filter(|hit| source_search_hit_allowed(config, hit))
+        .collect();
+    if !source_hits.is_empty() {
+        any = true;
+        ui::info("Source matches:");
+        for hit in source_hits {
+            let provides = if hit.provides.is_empty() {
+                String::new()
+            } else {
+                format!(" provides={}", hit.provides.join(","))
+            };
+            ui::info(format!(
+                "  {} [{}] {}{}",
+                hit.name,
+                source_hit_origin(config, &hit.path),
+                hit.path.display(),
+                provides
+            ));
+        }
+    }
+
+    let mut binary_repos: Vec<_> = config
+        .binary_repos
+        .iter()
+        .filter(|(_, repo)| repo.enabled && repo.supports_arch(host_arch))
+        .collect();
+    binary_repos.sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
+
+    if !binary_repos.is_empty() {
+        ui::info("Binary matches:");
+    }
+    let mut binary_hits_total = 0usize;
+    for (name, repo) in binary_repos {
+        match db::repo::search_binary_repo(name, repo, rootfs, &config.package_cache_dir, query) {
+            Ok(hits) => {
+                for hit in hits {
+                    any = true;
+                    binary_hits_total += 1;
+                    let provides = if hit.provides.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" provides={}", hit.provides.join(","))
+                    };
+                    ui::info(format!(
+                        "  {} [binary:{}] {}-{} size={} file={}{}{}",
+                        hit.name,
+                        hit.repo_name,
+                        hit.version,
+                        hit.revision,
+                        hit.size,
+                        hit.filename,
+                        hit.description
+                            .as_ref()
+                            .map(|d| format!(" desc={}", d))
+                            .unwrap_or_default(),
+                        provides
+                    ));
+                }
+            }
+            Err(e) => crate::log_warn!("Binary repo '{}': {}", name, e),
+        }
+    }
+    if !config.binary_repos.is_empty() && binary_hits_total == 0 {
+        ui::info("  (no binary matches)");
+    }
+
+    if files && !config.binary_repos.is_empty() {
+        ui::info("Binary file matches:");
+        let mut file_hits_total = 0usize;
+        let mut binary_repos: Vec<_> = config
+            .binary_repos
+            .iter()
+            .filter(|(_, repo)| repo.enabled && repo.supports_arch(host_arch))
+            .collect();
+        binary_repos.sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
+        for (name, repo) in binary_repos {
+            match db::repo::search_binary_repo_files(
+                name,
+                repo,
+                rootfs,
+                &config.package_cache_dir,
+                query,
+            ) {
+                Ok(hits) => {
+                    for hit in hits {
+                        any = true;
+                        file_hits_total += 1;
+                        ui::info(format!(
+                            "  {} [binary:{}] {}-{} size={} owns={}",
+                            hit.package_name,
+                            hit.repo_name,
+                            hit.version,
+                            hit.revision,
+                            hit.size,
+                            hit.path
+                        ));
+                    }
+                }
+                Err(e) => crate::log_warn!("Binary repo '{}': {}", name, e),
+            }
+        }
+        if file_hits_total == 0 {
+            ui::info("  (no binary file matches)");
+        }
+    }
+
+    if !any {
+        ui::warn(format!("No matches found for '{}'", query));
+    }
+    Ok(())
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn print_plan_summary(plan: &planner::ExecutionPlan) {
+    let summary = plan.summary();
+    ui::info(format!(
+        "Plan summary: packages={} actions={} (binary_install={}, source_build_install={}, skip_installed={}) known_download={}",
+        summary.total_packages,
+        summary.binary_installs + summary.source_build_installs,
+        summary.binary_installs,
+        summary.source_build_installs,
+        summary.skipped_installed,
+        human_bytes(summary.known_download_bytes)
+    ));
+    for step in &plan.steps {
+        let (action, origin) = match &step.action {
+            planner::PlanAction::SkipInstalled => ("skip", "installed".to_string()),
+            planner::PlanAction::BuildAndInstall => match &step.origin {
+                planner::PlanOrigin::Source {
+                    path,
+                    local_sibling,
+                } => (
+                    "build+install",
+                    if *local_sibling {
+                        format!("source:local-sibling ({})", path.display())
+                    } else {
+                        format!("source ({})", path.display())
+                    },
+                ),
+                _ => ("build+install", "source".to_string()),
+            },
+            planner::PlanAction::InstallBinary => match &step.origin {
+                planner::PlanOrigin::Binary { repo_name, record } => (
+                    "install",
+                    format!(
+                        "binary:{} {}-{} size={}",
+                        repo_name,
+                        record.version,
+                        record.revision,
+                        human_bytes(record.size)
+                    ),
+                ),
+                _ => ("install", "binary".to_string()),
+            },
+        };
+        ui::info(format!("  {} [{}] {}", step.package, action, origin));
+    }
+}
+
+fn execute_install_plan_with_child_commands(
+    plan: &planner::ExecutionPlan,
+    rootfs: &Path,
+    no_flags: bool,
+    cross_prefix: Option<&str>,
+    clean: bool,
+    dry_run: bool,
+    config: &config::Config,
+) -> Result<()> {
+    let summary = plan.summary();
+    if summary.source_build_installs > 0
+        && !ui::prompt_yes_no(
+            &format!(
+                "Plan will build {} package(s) from source before install. Continue?",
+                summary.source_build_installs
+            ),
+            true,
+        )?
+    {
+        anyhow::bail!("Aborted");
+    }
+
+    if plan.actionable_steps().next().is_none() {
+        ui::info("Nothing to do.");
+        return Ok(());
+    }
+
+    if !ui::prompt_yes_no("Proceed with executing install plan?", true)? {
+        anyhow::bail!("Aborted");
+    }
+
+    if dry_run {
+        ui::info("Dry run enabled, no install/build actions executed.");
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().context("Failed to locate depot executable")?;
+
+    for step in plan.actionable_steps() {
+        let input_path = match &step.origin {
+            planner::PlanOrigin::Source { path, .. } => path.clone(),
+            planner::PlanOrigin::Binary { repo_name, record } => {
+                let repo_cfg = config
+                    .binary_repos
+                    .get(repo_name)
+                    .with_context(|| format!("Binary repo '{}' not found in config", repo_name))?;
+                db::repo::fetch_binary_package_archive(
+                    repo_name,
+                    repo_cfg,
+                    record,
+                    &config.package_cache_dir,
+                )?
+            }
+            planner::PlanOrigin::Installed => continue,
+        };
+
+        ui::info(format!(
+            "Executing planned step: {} ({})",
+            step.package,
+            input_path.display()
+        ));
+
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("-r").arg(rootfs);
+        cmd.arg("--no-deps");
+        cmd.arg("--yes");
+        if no_flags {
+            cmd.arg("--no-flags");
+        }
+        if let Some(p) = cross_prefix {
+            cmd.arg("--cross-prefix").arg(p);
+        }
+        if clean {
+            cmd.arg("--clean");
+        }
+        cmd.arg("install").arg(input_path);
+
+        let status = cmd
+            .status()
+            .context("Failed to spawn planned install step")?;
+        if !status.success() {
+            anyhow::bail!("Planned install step for '{}' failed", step.package);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "Depot")]
 #[command(about = "Depot - Source-based package manager for Linux", long_about = None)]
@@ -184,6 +615,14 @@ struct Cli {
     /// Clean build workspace after successful install/build
     #[arg(long, global = true)]
     clean: bool,
+
+    /// Automatically answer yes to prompts and pick the default provider choice
+    #[arg(long, short = 'y', global = true)]
+    yes: bool,
+
+    /// Show what would happen without performing builds/installs
+    #[arg(long, global = true)]
+    dry_run: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -225,8 +664,26 @@ enum Commands {
         /// Path to package spec or installed package name
         package: String,
     },
+    /// Search configured source and binary repos by package name or provides
+    Search {
+        /// Search query
+        query: String,
+        /// Search repository file lists (binary repo metadata) by path substring
+        #[arg(long)]
+        files: bool,
+    },
+    /// Show which installed package owns a filesystem path
+    Owns {
+        /// Path to query (absolute or relative to rootfs)
+        path: PathBuf,
+    },
     /// List installed packages
     List,
+    /// Create a detached minisign signature for a .zst file
+    Sign {
+        /// Path to the .zst file to sign
+        file: PathBuf,
+    },
     /// Repository management
     Repo {
         #[command(subcommand)]
@@ -252,12 +709,83 @@ enum RepoCommands {
     },
     /// Sync git mirrors configured in /etc/depot.d/mirrors.toml into /usr/src/depot
     Sync,
+    /// Sync source repos configured in /etc/depot.d/repos.toml into /usr/src/depot
+    Update {
+        /// Update only one source repo by name
+        name: Option<String>,
+    },
+    /// List configured source and binary repos
+    List,
+    /// Add or update a repo entry in /etc/depot.d/repos.toml
+    Add {
+        /// Repo name (e.g. vertex)
+        name: String,
+        /// Source git URL or binary repo base URL
+        url: String,
+        /// Repo kind
+        #[arg(long, value_enum, default_value_t = RepoKindArg::Source)]
+        kind: RepoKindArg,
+        /// Optional source repo subdirectory to index (repeatable)
+        #[arg(long = "subdir")]
+        subdirs: Vec<String>,
+        /// Repo priority (lower = higher priority)
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        /// Add repo as disabled
+        #[arg(long)]
+        disabled: bool,
+        /// Binary repo architecture table entry to add/update (defaults to this machine's arch)
+        #[arg(long)]
+        arch: Option<String>,
+        /// Binary repo DB filename/path (relative to repo URL)
+        #[arg(long = "repo-db", default_value = "repo.db.zst")]
+        repo_db: String,
+        /// Allow unsigned repo metadata for this binary repo
+        #[arg(long)]
+        allow_unsigned: bool,
+    },
+    /// Remove a repo entry from /etc/depot.d/repos.toml
+    Remove {
+        /// Repo name
+        name: String,
+        /// Repo kind (auto-detect if unique)
+        #[arg(long)]
+        kind: Option<RepoKindArg>,
+    },
+    /// Enable a repo entry in /etc/depot.d/repos.toml
+    Enable {
+        /// Repo name
+        name: String,
+        /// Repo kind (auto-detect if unique)
+        #[arg(long)]
+        kind: Option<RepoKindArg>,
+    },
+    /// Disable a repo entry in /etc/depot.d/repos.toml
+    Disable {
+        /// Repo name
+        name: String,
+        /// Repo kind (auto-detect if unique)
+        #[arg(long)]
+        kind: Option<RepoKindArg>,
+    },
+    /// Query binary repo metadata for the package that owns a file path
+    Owns {
+        /// Path to query (absolute or relative install path)
+        path: PathBuf,
+    },
     /// Show status of configured git mirrors
     Status,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RepoKindArg {
+    Source,
+    Binary,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    ui::set_assume_yes(cli.yes);
 
     match cli.command {
         Commands::Install {
@@ -269,6 +797,55 @@ fn main() -> Result<()> {
 
             // Load configuration early so we can use the configured repo clone dir
             let config = config::Config::for_rootfs(&cli.rootfs);
+
+            if !cli.no_deps {
+                let request_path_like = spec_path.exists();
+                let is_archive_request = request_path_like
+                    && spec_path
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .ends_with(".tar.zst");
+                if !is_archive_request {
+                    let target = if request_path_like {
+                        planner::InstallTarget::SpecPath(spec_path.clone())
+                    } else {
+                        planner::InstallTarget::PackageName(spec_path.to_string_lossy().to_string())
+                    };
+                    let local_sibling_root = spec_path
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .map(Path::to_path_buf);
+                    let plan = planner::build_install_plan(
+                        &config,
+                        &cli.rootfs,
+                        target,
+                        planner::PlannerOptions {
+                            assume_yes: cli.yes,
+                            prefer_binary: config.repo_settings.prefer_binary,
+                            local_sibling_root,
+                        },
+                    )?;
+                    print_plan_summary(&plan);
+                    execute_install_plan_with_child_commands(
+                        &plan,
+                        &cli.rootfs,
+                        cli.no_flags,
+                        cli.cross_prefix.as_deref(),
+                        cli.clean,
+                        cli.dry_run,
+                        &config,
+                    )?;
+                    if cli.clean {
+                        clean_build_workspace(&config)?;
+                    }
+                    return Ok(());
+                }
+            }
+
+            let mut install_lock = locking::open_lock(&config)?;
+            let install_lock_path = locking::lock_path(&config);
+            let _install_lock_guard =
+                locking::try_write(&mut install_lock, &install_lock_path, "install")?;
 
             // Repo clone dir is available via `config.repo_clone_dir` and
             // is passed explicitly to index builders below.
@@ -282,6 +859,54 @@ fn main() -> Result<()> {
                     index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
                 if let Some(found) = pkg_index.find(&name) {
                     spec_path = found;
+                } else {
+                    let host_arch = std::env::consts::ARCH;
+                    let mut binary_repos: Vec<_> = config
+                        .binary_repos
+                        .iter()
+                        .filter(|(_, repo)| repo.enabled && repo.supports_arch(host_arch))
+                        .collect();
+                    binary_repos
+                        .sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
+
+                    for (repo_name, repo_cfg) in binary_repos {
+                        match db::repo::find_binary_repo_package(
+                            repo_name,
+                            repo_cfg,
+                            &cli.rootfs,
+                            &config.package_cache_dir,
+                            &name,
+                        ) {
+                            Ok(Some(rec)) => {
+                                let archive = db::repo::fetch_binary_package_archive(
+                                    repo_name,
+                                    repo_cfg,
+                                    &rec,
+                                    &config.package_cache_dir,
+                                )?;
+                                ui::info(format!(
+                                    "Resolved '{}' from binary repo '{}' as {}-{} (package {}) ({} bytes){} -> {}",
+                                    name,
+                                    repo_name,
+                                    rec.version,
+                                    rec.revision,
+                                    rec.name,
+                                    rec.size,
+                                    rec.description
+                                        .as_ref()
+                                        .map(|d| format!(" [{}]", d))
+                                        .unwrap_or_default(),
+                                    archive.display()
+                                ));
+                                spec_path = archive;
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                crate::log_warn!("Binary repo '{}': {}", repo_name, e);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -412,6 +1037,23 @@ fn main() -> Result<()> {
                 "Package: {} v{}-{}",
                 pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
             ));
+
+            if cli.dry_run {
+                ui::info("Dry run enabled, stopping before install/build work.");
+                return Ok(());
+            }
+
+            if !ui::prompt_yes_no(
+                &format!(
+                    "Proceed with install for {} v{}-{}?",
+                    pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
+                ),
+                true,
+            )? {
+                anyhow::bail!("Aborted");
+            }
+
+            // TODO(snapper): create pre-install snapshot before install work starts.
 
             // Ensure database directory exists
             std::fs::create_dir_all(&config.db_dir).with_context(|| {
@@ -575,6 +1217,7 @@ fn main() -> Result<()> {
                     "Successfully installed {} v{}",
                     spec_for_out.package.name, spec_for_out.package.version
                 ));
+                // TODO(snapper): create post-install snapshot after install commit succeeds.
             }
 
             if cli.clean {
@@ -584,6 +1227,10 @@ fn main() -> Result<()> {
         Commands::Remove { package } => {
             ui::info(format!("Removing package: {}", package));
             let config = config::Config::for_rootfs(&cli.rootfs);
+            let mut remove_lock = locking::open_lock(&config)?;
+            let remove_lock_path = locking::lock_path(&config);
+            let _remove_lock_guard =
+                locking::try_write(&mut remove_lock, &remove_lock_path, "remove")?;
             let db_path = config.db_dir.join("packages.db");
             let script_dir = install::scripts::installed_scripts_dir(&cli.rootfs, &package);
             let _ = install::scripts::run_hook_if_present(
@@ -633,12 +1280,80 @@ fn main() -> Result<()> {
                 let needs_test_deps =
                     matches!(pkg_spec.build.build_type, package::BuildType::Autotools);
                 deps::print_dep_status(&pkg_spec, &db_path)?;
+                let mut missing = deps::check_build_deps(&pkg_spec, &db_path)?;
+                if needs_test_deps {
+                    for dep in deps::check_test_deps(&pkg_spec, &db_path)? {
+                        if !missing.contains(&dep) {
+                            missing.push(dep);
+                        }
+                    }
+                }
+                if !missing.is_empty() {
+                    ui::warn(format!(
+                        "Missing build dependencies: {}",
+                        missing.join(", ")
+                    ));
+                    let local_sibling_root = spec_path
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .map(Path::to_path_buf);
+                    let dep_plan = planner::build_dependency_install_plan(
+                        &config,
+                        &cli.rootfs,
+                        &missing,
+                        planner::PlannerOptions {
+                            assume_yes: cli.yes,
+                            prefer_binary: config.repo_settings.prefer_binary,
+                            local_sibling_root,
+                        },
+                    )?;
+                    print_plan_summary(&dep_plan);
+                    if !ui::prompt_yes_no("Install missing build dependencies first?", true)? {
+                        anyhow::bail!("Aborted");
+                    }
+                    if cli.dry_run {
+                        ui::info("Dry run enabled, stopping before dependency installation/build.");
+                        return Ok(());
+                    }
+                    execute_install_plan_with_child_commands(
+                        &dep_plan,
+                        &cli.rootfs,
+                        cli.no_flags,
+                        cli.cross_prefix.as_deref(),
+                        cli.clean,
+                        cli.dry_run,
+                        &config,
+                    )?;
+                }
                 deps::require_build_deps(&pkg_spec, &db_path)?;
                 if needs_test_deps {
                     deps::require_test_deps(&pkg_spec, &db_path)?;
                 }
+            } else if cli.dry_run {
+                ui::info("Dry run enabled, stopping before build.");
+                return Ok(());
             }
 
+            let mut build_lock = locking::open_lock(&config)?;
+            let build_lock_path = locking::lock_path(&config);
+            let _build_lock_guard = locking::try_write(&mut build_lock, &build_lock_path, "build")?;
+
+            if !ui::prompt_yes_no(
+                &format!(
+                    "Proceed with build for {} v{}-{}?",
+                    pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
+                ),
+                true,
+            )? {
+                anyhow::bail!("Aborted");
+            }
+
+            if cli.dry_run {
+                ui::info("Dry run enabled, stopping before fetch/build.");
+                return Ok(());
+            }
+
+            // TODO(snapper): create pre-build snapshot before fetch/build starts.
             let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
 
             let destdir = config
@@ -682,14 +1397,26 @@ fn main() -> Result<()> {
                 let packager =
                     package::Packager::new(spec_for_out.clone(), out_destdir, config.clone());
                 let pkg_file = packager.create_package(Path::new("."), arch)?;
+                if let Some(sig_path) =
+                    signing::auto_sign_zst_file_detached(&cli.rootfs, &pkg_file)?
+                {
+                    ui::success(format!(
+                        "Created detached signature: {}",
+                        sig_path.display()
+                    ));
+                }
                 created_files.push(pkg_file);
             }
 
             for f in &created_files {
                 ui::success(format!("Build complete. Package created: {}", f.display()));
             }
+            // TODO(snapper): create post-build snapshot after package build completes.
 
             if install {
+                if !ui::prompt_yes_no("Install built package(s) to rootfs now?", true)? {
+                    anyhow::bail!("Aborted");
+                }
                 for out in pkg_spec.outputs() {
                     let mut spec_for_out = pkg_spec.clone();
                     let output_name = out.name.clone();
@@ -703,6 +1430,7 @@ fn main() -> Result<()> {
                         "Successfully installed {} v{}",
                         spec_for_out.package.name, spec_for_out.package.version
                     ));
+                    // TODO(snapper): create post-install snapshot after --install commit succeeds.
                 }
             }
 
@@ -714,63 +1442,427 @@ fn main() -> Result<()> {
             // Try as file first, then as installed package name
             let path = PathBuf::from(&package);
             if path.exists() {
+                let config = config::Config::for_rootfs(&cli.rootfs);
+                let info_lock = locking::open_lock(&config)?;
+                let info_lock_path = locking::lock_path(&config);
+                let _info_lock_guard = locking::try_read(&info_lock, &info_lock_path, "info")?;
                 let pkg_spec = package::PackageSpec::from_file(&path)?;
                 println!("{}", pkg_spec);
 
                 // Also show dependency status
-                let config = config::Config::for_rootfs(&cli.rootfs);
                 let db_path = config.db_dir.join("packages.db");
                 deps::print_dep_status(&pkg_spec, &db_path)?;
             } else {
                 let config = config::Config::for_rootfs(&cli.rootfs);
+                let info_lock = locking::open_lock(&config)?;
+                let info_lock_path = locking::lock_path(&config);
+                let _info_lock_guard = locking::try_read(&info_lock, &info_lock_path, "info")?;
                 let db_path = config.db_dir.join("packages.db");
                 db::show_package_info(&db_path, &package)?;
             }
         }
+        Commands::Search { query, files } => {
+            let config = config::Config::for_rootfs(&cli.rootfs);
+            let search_lock = locking::open_lock(&config)?;
+            let search_lock_path = locking::lock_path(&config);
+            let _search_lock_guard = locking::try_read(&search_lock, &search_lock_path, "search")?;
+            run_search_command(&query, files, &config, &cli.rootfs)?;
+        }
+        Commands::Owns { path } => {
+            let config = config::Config::for_rootfs(&cli.rootfs);
+            let owns_lock = locking::open_lock(&config)?;
+            let owns_lock_path = locking::lock_path(&config);
+            let _owns_lock_guard = locking::try_read(&owns_lock, &owns_lock_path, "owns")?;
+            let db_path = config.db_dir.join("packages.db");
+            match db::owns_path(&db_path, &path)? {
+                Some(owner) => ui::info(format!("{} is owned by {}", path.display(), owner)),
+                None => ui::warn(format!("No installed package owns {}", path.display())),
+            }
+        }
         Commands::List => {
             let config = config::Config::for_rootfs(&cli.rootfs);
+            let list_lock = locking::open_lock(&config)?;
+            let list_lock_path = locking::lock_path(&config);
+            let _list_lock_guard = locking::try_read(&list_lock, &list_lock_path, "list")?;
             let db_path = config.db_dir.join("packages.db");
             db::list_packages(&db_path)?;
         }
+        Commands::Sign { file } => {
+            let sig_path = signing::sign_zst_file_detached(&cli.rootfs, &file)?;
+            ui::success(format!(
+                "Created detached signature: {}",
+                sig_path.display()
+            ));
+        }
         Commands::Repo { command } => match command {
             RepoCommands::Create { dir } => {
+                let cfg = config::Config::for_rootfs(&cli.rootfs);
+                let mut repo_lock = locking::open_lock(&cfg)?;
+                let repo_lock_path = locking::lock_path(&cfg);
+                let _repo_lock_guard =
+                    locking::try_write(&mut repo_lock, &repo_lock_path, "repo create")?;
                 let repo = db::repo::RepoManager::new(dir);
                 let db_path = repo.create_repo_db()?;
+                if let Some(sig_path) = signing::auto_sign_zst_file_detached(&cli.rootfs, &db_path)?
+                {
+                    ui::success(format!(
+                        "Created detached signature: {}",
+                        sig_path.display()
+                    ));
+                }
                 ui::success(format!(
                     "Created repository database: {}",
                     db_path.display()
                 ));
             }
             RepoCommands::Sync => {
+                let cfg = config::Config::for_rootfs(&cli.rootfs);
+                let mut repo_lock = locking::open_lock(&cfg)?;
+                let repo_lock_path = locking::lock_path(&cfg);
+                let _repo_lock_guard =
+                    locking::try_write(&mut repo_lock, &repo_lock_path, "repo sync")?;
                 // Only root may run sync
                 if !crate::fakeroot::is_root() {
                     anyhow::bail!("The 'repo sync' command must be run as root");
                 }
-                let config = config::Config::for_rootfs(&cli.rootfs);
-                if config.mirrors.is_empty() {
-                    ui::info("No mirrors configured in /etc/depot.d/mirrors.toml");
+                let config = cfg;
+                let mirrors = config.enabled_source_mirror_map();
+                if mirrors.is_empty() {
+                    ui::info("No enabled source repos configured");
                 } else {
-                    db::repo::sync_mirrors(&config.repo_clone_dir, &config.mirrors)?;
+                    db::repo::sync_mirrors(&config.repo_clone_dir, &mirrors)?;
                     ui::success(format!(
-                        "Mirrors synchronized into {}",
+                        "Source repos synchronized into {}",
                         config.repo_clone_dir.display()
+                    ));
+                }
+            }
+            RepoCommands::Update { name } => {
+                let cfg = config::Config::for_rootfs(&cli.rootfs);
+                let mut repo_lock = locking::open_lock(&cfg)?;
+                let repo_lock_path = locking::lock_path(&cfg);
+                let _repo_lock_guard =
+                    locking::try_write(&mut repo_lock, &repo_lock_path, "repo update")?;
+                if !crate::fakeroot::is_root() {
+                    anyhow::bail!("The 'repo update' command must be run as root");
+                }
+                let config = cfg;
+                let mirrors = selected_source_repos(&config, name.as_deref())?;
+                if mirrors.is_empty() {
+                    ui::info("No enabled source repos configured");
+                } else {
+                    db::repo::sync_mirrors(&config.repo_clone_dir, &mirrors)?;
+                    if let Some(name) = name {
+                        ui::success(format!(
+                            "Source repo '{}' synchronized into {}",
+                            name,
+                            config.repo_clone_dir.display()
+                        ));
+                    } else {
+                        ui::success(format!(
+                            "Source repos synchronized into {}",
+                            config.repo_clone_dir.display()
+                        ));
+                    }
+                }
+            }
+            RepoCommands::List => {
+                let config = config::Config::for_rootfs(&cli.rootfs);
+                let repo_lock = locking::open_lock(&config)?;
+                let repo_lock_path = locking::lock_path(&config);
+                let _repo_lock_guard = locking::try_read(&repo_lock, &repo_lock_path, "repo list")?;
+                print_repo_list(&config);
+            }
+            RepoCommands::Add {
+                name,
+                url,
+                kind,
+                subdirs,
+                priority,
+                disabled,
+                arch,
+                repo_db,
+                allow_unsigned,
+            } => {
+                let cfg = config::Config::for_rootfs(&cli.rootfs);
+                let mut repo_lock = locking::open_lock(&cfg)?;
+                let repo_lock_path = locking::lock_path(&cfg);
+                let _repo_lock_guard =
+                    locking::try_write(&mut repo_lock, &repo_lock_path, "repo add")?;
+                let mut repos = config::load_repos_config_file(&cli.rootfs)?;
+                match kind {
+                    RepoKindArg::Source => {
+                        if let Some(existing) = repos.source.get(&name)
+                            && (existing.url != url
+                                || existing.subdirs != subdirs
+                                || existing.priority != priority
+                                || existing.enabled == disabled)
+                            && !ui::prompt_yes_no(
+                                &format!("Source repo '{}' already exists. Overwrite it?", name),
+                                false,
+                            )?
+                        {
+                            anyhow::bail!("Aborted");
+                        }
+                        repos.source.insert(
+                            name.clone(),
+                            config::SourceRepo {
+                                url,
+                                enabled: !disabled,
+                                priority,
+                                subdirs,
+                            },
+                        );
+                    }
+                    RepoKindArg::Binary => {
+                        let arch_name = arch.unwrap_or_else(|| std::env::consts::ARCH.to_string());
+                        let mut candidate = repos.binary.get(&name).cloned().unwrap_or_default();
+                        candidate.url = url.clone();
+                        candidate.enabled = !disabled;
+                        candidate.priority = priority;
+                        candidate.repo_db = repo_db.clone();
+                        candidate.allow_unsigned = allow_unsigned;
+                        candidate.arch.entry(arch_name.clone()).or_default().enabled = true;
+
+                        if let Some(existing) = repos.binary.get(&name)
+                            && (*existing != candidate)
+                            && !ui::prompt_yes_no(
+                                &format!("Binary repo '{}' already exists. Overwrite it?", name),
+                                false,
+                            )?
+                        {
+                            anyhow::bail!("Aborted");
+                        }
+                        repos.binary.insert(name.clone(), candidate);
+                    }
+                }
+                let path = config::save_repos_config_file(&cli.rootfs, &repos)?;
+                ui::success(format!(
+                    "Saved {} repo '{}' to {}",
+                    repo_kind_label(kind),
+                    name,
+                    path.display()
+                ));
+            }
+            RepoCommands::Remove { name, kind } => {
+                let cfg = config::Config::for_rootfs(&cli.rootfs);
+                let mut repo_lock = locking::open_lock(&cfg)?;
+                let repo_lock_path = locking::lock_path(&cfg);
+                let _repo_lock_guard =
+                    locking::try_write(&mut repo_lock, &repo_lock_path, "repo remove")?;
+                let mut repos = config::load_repos_config_file(&cli.rootfs)?;
+                let kind = resolve_repo_kind_for_name(&repos, &name, kind)?;
+                if !ui::prompt_yes_no(
+                    &format!("Remove {} repo '{}'?", repo_kind_label(kind), name),
+                    false,
+                )? {
+                    anyhow::bail!("Aborted");
+                }
+
+                match kind {
+                    RepoKindArg::Source => {
+                        repos.source.remove(&name);
+                    }
+                    RepoKindArg::Binary => {
+                        repos.binary.remove(&name);
+                    }
+                }
+                let path = config::save_repos_config_file(&cli.rootfs, &repos)?;
+                ui::success(format!(
+                    "Removed {} repo '{}' from {}",
+                    repo_kind_label(kind),
+                    name,
+                    path.display()
+                ));
+            }
+            RepoCommands::Enable { name, kind } => {
+                let cfg = config::Config::for_rootfs(&cli.rootfs);
+                let mut repo_lock = locking::open_lock(&cfg)?;
+                let repo_lock_path = locking::lock_path(&cfg);
+                let _repo_lock_guard =
+                    locking::try_write(&mut repo_lock, &repo_lock_path, "repo enable")?;
+                let mut repos = config::load_repos_config_file(&cli.rootfs)?;
+                let kind = resolve_repo_kind_for_name(&repos, &name, kind)?;
+                match kind {
+                    RepoKindArg::Source => {
+                        let repo = repos
+                            .source
+                            .get_mut(&name)
+                            .with_context(|| format!("Source repo '{}' not found", name))?;
+                        if repo.enabled {
+                            ui::info(format!("Source repo '{}' is already enabled", name));
+                        } else {
+                            repo.enabled = true;
+                            let path = config::save_repos_config_file(&cli.rootfs, &repos)?;
+                            ui::success(format!(
+                                "Enabled source repo '{}' in {}",
+                                name,
+                                path.display()
+                            ));
+                        }
+                    }
+                    RepoKindArg::Binary => {
+                        let repo = repos
+                            .binary
+                            .get_mut(&name)
+                            .with_context(|| format!("Binary repo '{}' not found", name))?;
+                        if repo.enabled {
+                            ui::info(format!("Binary repo '{}' is already enabled", name));
+                        } else {
+                            repo.enabled = true;
+                            let path = config::save_repos_config_file(&cli.rootfs, &repos)?;
+                            ui::success(format!(
+                                "Enabled binary repo '{}' in {}",
+                                name,
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+            RepoCommands::Disable { name, kind } => {
+                let cfg = config::Config::for_rootfs(&cli.rootfs);
+                let mut repo_lock = locking::open_lock(&cfg)?;
+                let repo_lock_path = locking::lock_path(&cfg);
+                let _repo_lock_guard =
+                    locking::try_write(&mut repo_lock, &repo_lock_path, "repo disable")?;
+                let mut repos = config::load_repos_config_file(&cli.rootfs)?;
+                let kind = resolve_repo_kind_for_name(&repos, &name, kind)?;
+                if !ui::prompt_yes_no(
+                    &format!("Disable {} repo '{}'?", repo_kind_label(kind), name),
+                    true,
+                )? {
+                    anyhow::bail!("Aborted");
+                }
+                match kind {
+                    RepoKindArg::Source => {
+                        let repo = repos
+                            .source
+                            .get_mut(&name)
+                            .with_context(|| format!("Source repo '{}' not found", name))?;
+                        repo.enabled = false;
+                    }
+                    RepoKindArg::Binary => {
+                        let repo = repos
+                            .binary
+                            .get_mut(&name)
+                            .with_context(|| format!("Binary repo '{}' not found", name))?;
+                        repo.enabled = false;
+                    }
+                }
+                let path = config::save_repos_config_file(&cli.rootfs, &repos)?;
+                ui::success(format!(
+                    "Disabled {} repo '{}' in {}",
+                    repo_kind_label(kind),
+                    name,
+                    path.display()
+                ));
+            }
+            RepoCommands::Owns { path } => {
+                let config = config::Config::for_rootfs(&cli.rootfs);
+                let repo_lock = locking::open_lock(&config)?;
+                let repo_lock_path = locking::lock_path(&config);
+                let _repo_lock_guard = locking::try_read(&repo_lock, &repo_lock_path, "repo owns")?;
+                let host_arch = std::env::consts::ARCH;
+                let mut any = false;
+                let mut binary_repos: Vec<_> = config
+                    .binary_repos
+                    .iter()
+                    .filter(|(_, repo)| repo.enabled && repo.supports_arch(host_arch))
+                    .collect();
+                binary_repos
+                    .sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
+
+                for (name, repo) in binary_repos {
+                    match db::repo::binary_repo_owns_path(
+                        name,
+                        repo,
+                        &cli.rootfs,
+                        &config.package_cache_dir,
+                        &path.to_string_lossy(),
+                    ) {
+                        Ok(hits) => {
+                            for hit in hits {
+                                any = true;
+                                ui::info(format!(
+                                    "{} [binary:{}] {}-{} size={} owns={}",
+                                    hit.package_name,
+                                    hit.repo_name,
+                                    hit.version,
+                                    hit.revision,
+                                    hit.size,
+                                    hit.path
+                                ));
+                            }
+                        }
+                        Err(e) => crate::log_warn!("Binary repo '{}': {}", name, e),
+                    }
+                }
+                if !any {
+                    ui::warn(format!(
+                        "No binary repo metadata entry owns {}",
+                        path.display()
                     ));
                 }
             }
             RepoCommands::Status => {
                 let config = config::Config::for_rootfs(&cli.rootfs);
-                if config.mirrors.is_empty() {
-                    ui::info("No mirrors configured in /etc/depot.d/mirrors.toml");
+                let repo_lock = locking::open_lock(&config)?;
+                let repo_lock_path = locking::lock_path(&config);
+                let _repo_lock_guard =
+                    locking::try_read(&repo_lock, &repo_lock_path, "repo status")?;
+                let mirrors = config.enabled_source_mirror_map();
+                if mirrors.is_empty() {
+                    ui::info("No enabled source repos configured");
                 } else {
-                    db::repo::mirrors_status(&config.repo_clone_dir, &config.mirrors)?;
+                    db::repo::mirrors_status(&config.repo_clone_dir, &mirrors)?;
+                }
+                if config.binary_repos.is_empty() {
+                    ui::info("No binary repos configured");
+                } else {
+                    ui::info("Binary repo configuration:");
+                    let host_arch = std::env::consts::ARCH;
+                    for (name, repo) in &config.binary_repos {
+                        let arch_keys = if repo.arch.is_empty() {
+                            "(any)".to_string()
+                        } else {
+                            repo.arch.keys().cloned().collect::<Vec<_>>().join(",")
+                        };
+                        ui::info(format!(
+                            "  {} [{}] url={} repo_db={} arches={} host_match={}",
+                            name,
+                            if repo.enabled { "enabled" } else { "disabled" },
+                            repo.url,
+                            repo.repo_db,
+                            arch_keys,
+                            if repo.supports_arch(host_arch) {
+                                "yes"
+                            } else {
+                                "no"
+                            }
+                        ));
+                    }
                 }
             }
         },
         Commands::Config => {
             let config = config::Config::for_rootfs(&cli.rootfs);
+            let config_lock = locking::open_lock(&config)?;
+            let config_lock_path = locking::lock_path(&config);
+            let _config_lock_guard = locking::try_read(&config_lock, &config_lock_path, "config")?;
             println!("Cache Directory: {}", config.cache_dir.display());
+            println!(
+                "Package Cache Directory: {}",
+                config.package_cache_dir.display()
+            );
             println!("Build Directory: {}", config.build_dir.display());
             println!("Database Directory: {}", config.db_dir.display());
+            println!("Repo Clone Directory: {}", config.repo_clone_dir.display());
+            println!(
+                "Configured Repos: {} source, {} binary",
+                config.source_repos.len(),
+                config.binary_repos.len()
+            );
             println!("\nBuild Overrides: {}", config.build_overrides);
             println!("Package Overrides: {}", config.package_overrides);
             if !config.appends.is_empty() {

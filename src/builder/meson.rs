@@ -51,7 +51,7 @@ pub fn build(
             meson_cmd.arg(arg);
         }
 
-        crate::builder::prepare_command(&mut meson_cmd, &env_vars);
+        crate::builder::prepare_tool_command(&mut meson_cmd, &env_vars);
 
         let status = meson_cmd.status().context("Failed to run meson setup")?;
         if !status.success() {
@@ -71,7 +71,7 @@ pub fn build(
         ninja_cmd.current_dir(&build_dir);
         ninja_cmd.arg("-j").arg(num_cpus().to_string());
 
-        crate::builder::prepare_command(&mut ninja_cmd, &env_vars);
+        crate::builder::prepare_tool_command(&mut ninja_cmd, &env_vars);
 
         let status = ninja_cmd
             .status()
@@ -106,7 +106,7 @@ pub fn build(
             "DESTDIR".to_string(),
             destdir.to_string_lossy().into_owned(),
         ));
-        crate::builder::prepare_command(&mut install_cmd, &install_env);
+        crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
 
         let status = install_cmd
             .status()

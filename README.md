@@ -1,6 +1,6 @@
 # depot
 
-Depot is a source-based package manager for Linux, designed for Linux. It focuses on reproducibility, atomic installations, and ease of cross-compilation.
+Depot is a source-based package manager designed for Linux. It focuses on reproducibility, atomic installations, and ease of cross-compilation.
 
 ## Features
 
@@ -36,10 +36,18 @@ depot install zlib-1.2.11-1-x86_64.depot.pkg.tar.zst
 ## Command Reference
 
 - `install <SPEC_OR_ARCHIVE>`: Build and install a package.
+  - Resolves a full dependency plan first (binary repos and/or source specs), then executes in dependency order.
+  - Use `--yes` for non-interactive confirmation/provider selection.
+  - Use `--dry-run` to print the plan without performing work.
 - `remove <PACKAGE>`: Remove an installed package.
 - `build <SPEC>`: Build a package and create an archive without installing.
+  - Resolves and offers to install missing build/test dependencies before fetching/building.
 - `info <PACKAGE_OR_SPEC>`: Show information about a package.
+- `search <QUERY>`: Search enabled source/binary repos by package name and provided features.
+  - Use `--files` to search binary repo metadata file lists.
+- `owns <PATH>`: Show which installed package owns a path.
 - `list`: List all installed packages.
+- `repo owns <PATH>`: Query binary repo metadata for path ownership.
 - `repo create [DIR]`: Create a repository database from a directory of packages.
 - `config`: Show current configuration and overrides.
 

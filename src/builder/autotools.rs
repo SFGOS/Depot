@@ -60,7 +60,7 @@ pub fn build(
         let mut configure_cmd = Command::new(&configure_path);
         configure_cmd.current_dir(&build_dir);
 
-        crate::builder::prepare_command(&mut configure_cmd, &env_vars);
+        crate::builder::prepare_tool_command(&mut configure_cmd, &env_vars);
 
         configure_cmd.arg(format!("--prefix={}", flags.prefix));
 
@@ -143,7 +143,7 @@ pub fn build(
                 make_cmd.arg(target);
             }
 
-            crate::builder::prepare_command(&mut make_cmd, &env_vars);
+            crate::builder::prepare_tool_command(&mut make_cmd, &env_vars);
 
             let status = make_cmd.status().with_context(|| {
                 format!("Failed to run {} in {}", make_exec, make_dir.display())
@@ -194,7 +194,7 @@ pub fn build(
                     for test_target in &test_targets {
                         test_cmd.arg(test_target);
                     }
-                    crate::builder::prepare_command(&mut test_cmd, &env_vars);
+                    crate::builder::prepare_tool_command(&mut test_cmd, &env_vars);
 
                     let test_targets_display = test_targets.join(" ");
                     let status = test_cmd.status().with_context(|| {
@@ -305,7 +305,7 @@ pub fn build(
                 "DESTDIR".to_string(),
                 destdir.to_string_lossy().into_owned(),
             ));
-            crate::builder::prepare_command(&mut install_cmd, &install_env);
+            crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
 
             let status = install_cmd.status().with_context(|| {
                 format!(

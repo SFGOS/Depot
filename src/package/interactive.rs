@@ -651,6 +651,19 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             ),
         );
     }
+    if !spec.build.flags.cxxflags.is_empty() {
+        flags_tbl.insert(
+            "cxxflags".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .cxxflags
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if !spec.build.flags.ldflags.is_empty() {
         flags_tbl.insert(
             "ldflags".into(),
@@ -1213,6 +1226,7 @@ mod tests {
         flags.makefile_install_commands = vec!["make DESTDIR=$DESTDIR install".into()];
         flags.cargs = vec!["--locked".into()];
         flags.rustflags = vec!["-Ctarget-cpu=native".into()];
+        flags.cxxflags = vec!["-O2".into(), "-fno-rtti".into()];
         flags.target = "x86_64-unknown-linux-gnu".into();
         flags.keep = vec!["etc/locale.gen".into()];
         flags.no_flags = true;
@@ -1266,6 +1280,7 @@ mod tests {
         assert!(toml.contains("makefile_install_commands = ["));
         assert!(toml.contains("cargs = ["));
         assert!(toml.contains("rustflags = ["));
+        assert!(toml.contains("cxxflags = ["));
         assert!(toml.contains("target = \"x86_64-unknown-linux-gnu\""));
         assert!(toml.contains("keep = ["));
         assert!(toml.contains("\"etc/locale.gen\""));

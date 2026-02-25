@@ -219,7 +219,7 @@ fn auto_strip_elf_files(destdir: &Path) -> Result<usize> {
         }
 
         let status = Command::new("strip")
-            .arg("--strip-unneeded")
+            .arg("--strip-debug")
             .arg(path)
             .status()
             .with_context(|| {
@@ -278,7 +278,7 @@ fn compress_manpages_zstd(destdir: &Path) -> Result<usize> {
         let out_file = fs::File::create(&tmp_path)
             .with_context(|| format!("Failed to create {}", tmp_path.display()))?;
 
-        let mut encoder = zstd::stream::write::Encoder::new(out_file, 22)
+        let mut encoder = zstd::stream::write::Encoder::new(out_file, 19)
             .with_context(|| format!("Failed to start zstd encoder for {}", path.display()))?;
         io::copy(&mut input, &mut encoder)
             .with_context(|| format!("Failed to compress {}", path.display()))?;

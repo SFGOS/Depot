@@ -2,6 +2,9 @@
 
 use anyhow::{Context, Result};
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static ASSUME_YES: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 enum Stream {
@@ -88,7 +91,17 @@ fn parse_yes_no_input(input: &str, default_yes: bool) -> Option<bool> {
     }
 }
 
+/// Configure global prompt behavior for the current process.
+pub fn set_assume_yes(assume_yes: bool) {
+    ASSUME_YES.store(assume_yes, Ordering::Relaxed);
+}
+
 pub fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
+    if ASSUME_YES.load(Ordering::Relaxed) {
+        info(format!("{} [auto-yes]", prompt));
+        return Ok(true);
+    }
+
     let default_hint = if default_yes { "Y/n" } else { "y/N" };
     loop {
         print!(
@@ -111,6 +124,59 @@ pub fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
         }
 
         warn("Please answer with 'y' or 'n'.");
+    }
+}
+
+/// Prompt the user to choose one option by index.
+pub fn prompt_select_index(prompt: &str, options: &[String], default_idx: usize) -> Result<usize> {
+    if options.is_empty() {
+        anyhow::bail!("No options available for selection");
+    }
+    let default_idx = default_idx.min(options.len() - 1);
+    if ASSUME_YES.load(Ordering::Relaxed) {
+        info(format!(
+            "{} [auto-select {}: {}]",
+            prompt,
+            default_idx + 1,
+            options[default_idx]
+        ));
+        return Ok(default_idx);
+    }
+
+    loop {
+        println!("{} {}", label(Stream::Stdout, "?", "35"), prompt);
+        for (idx, option) in options.iter().enumerate() {
+            println!(
+                "  {} {}{}",
+                idx + 1,
+                option,
+                if idx == default_idx { " [default]" } else { "" }
+            );
+        }
+        print!(
+            "{} Select an option [1-{}] (default {}): ",
+            label(Stream::Stdout, "?", "35"),
+            options.len(),
+            default_idx + 1
+        );
+        io::stdout()
+            .flush()
+            .context("Failed to flush prompt to stdout")?;
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("Failed to read user input from stdin")?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(default_idx);
+        }
+        if let Ok(num) = trimmed.parse::<usize>()
+            && (1..=options.len()).contains(&num)
+        {
+            return Ok(num - 1);
+        }
+        warn("Please enter a valid option number.");
     }
 }
 
