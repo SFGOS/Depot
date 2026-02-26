@@ -1,5 +1,6 @@
 use crate::package::{
-    Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source,
+    Alternatives, Build, BuildFlags, BuildType, Dependencies, ManualSource, PackageInfo,
+    PackageSpec, Source,
 };
 use anyhow::{Context, Result};
 use inquire::{Confirm, Select, Text};
@@ -146,6 +147,99 @@ fn prompt_optional_text(prompt: &str, help: &str) -> Result<String> {
         .to_string())
 }
 
+fn prompt_manual_sources() -> Result<Vec<ManualSource>> {
+    let mut out = Vec::new();
+    loop {
+        let add = Confirm::new("Add a manual source?")
+            .with_help_message(
+                "Use for local files (keys, patches, configs) or direct URLs copied into the build dir",
+            )
+            .with_default(out.is_empty())
+            .prompt()?;
+        if !add {
+            break;
+        }
+
+        let modes = vec!["Local file(s)", "Remote URL(s)"];
+        let mode = Select::new("Manual source mode:", modes)
+            .with_help_message("Local files are resolved relative to the spec directory")
+            .prompt()?;
+
+        let mut manual = ManualSource {
+            file: None,
+            files: Vec::new(),
+            url: None,
+            urls: Vec::new(),
+            sha256: None,
+            dest: None,
+        };
+
+        let entries = if mode == "Local file(s)" {
+            prompt_repeating_list(
+                "Manual source file",
+                "Path relative to spec dir, e.g. depot.pub, keys/repo.pub",
+            )?
+        } else {
+            prompt_repeating_list(
+                "Manual source URL",
+                "Supports http(s), ftp, and file:// URLs",
+            )?
+        };
+
+        if entries.is_empty() {
+            crate::log_warn!("Manual source block skipped (no entries provided).");
+            continue;
+        }
+
+        if mode == "Local file(s)" {
+            if entries.len() == 1 {
+                manual.file = Some(entries[0].clone());
+            } else {
+                manual.files = entries;
+            }
+        } else if entries.len() == 1 {
+            manual.url = Some(entries[0].clone());
+        } else {
+            manual.urls = entries;
+        }
+
+        let single_entry = matches!(
+            (
+                &manual.file,
+                manual.files.len(),
+                &manual.url,
+                manual.urls.len()
+            ),
+            (Some(_), 0, None, 0) | (None, 0, Some(_), 0)
+        );
+
+        if single_entry {
+            let checksum = prompt_optional_text(
+                "Manual source checksum (optional):",
+                "sha256:/sha512:/md5:, raw SHA256 hex, or 'skip' (empty omits field)",
+            )?;
+            if !checksum.is_empty() {
+                manual.sha256 = Some(checksum);
+            }
+
+            let dest = prompt_optional_text(
+                "Manual source destination (optional):",
+                "Path relative to build work dir (default derives from file/url name)",
+            )?;
+            if !dest.is_empty() {
+                manual.dest = Some(dest);
+            }
+        } else {
+            crate::log_info!(
+                "Multiple entries in one manual_sources block cannot use a shared checksum or dest; skipping those prompts."
+            );
+        }
+
+        out.push(manual);
+    }
+    Ok(out)
+}
+
 fn parse_license_list(input: &str) -> Vec<String> {
     input
         .split(',')
@@ -282,58 +376,79 @@ pub fn create_interactive() -> Result<PackageSpec> {
     };
 
     let mut sources = Vec::new();
+    let mut manual_sources = Vec::new();
     if !is_metapackage {
         let source_url = Text::new("Source URL:")
-            .with_help_message("URL to the source tarball or git repository")
+            .with_help_message(
+                "URL to the source tarball or git repository (supports file://; leave empty if you will add manual_sources later)",
+            )
             .with_default(gnu_source_default.as_str())
             .prompt()?;
 
         if source_url.trim().is_empty() {
-            anyhow::bail!("Source URL cannot be empty");
-        }
-
-        // Attempt to compute SHA256 automatically when online — use as the default if available.
-        let checksum_source_url = expand_known_package_vars(&source_url, &name, &version);
-        let computed_sha_default = match compute_sha256_for_url(&checksum_source_url) {
-            Ok(hex) => {
-                // Use raw hex as the default so pressing Enter accepts it
-                hex
+            crate::log_warn!(
+                "No source URL provided. Generated spec will omit [source]; add manual_sources or source entries before building (unless this becomes a metapackage)."
+            );
+            if Confirm::new("Add manual sources now?")
+                .with_help_message("Useful for keyrings/patch-only/custom packages")
+                .with_default(true)
+                .prompt()?
+            {
+                manual_sources = prompt_manual_sources()?;
             }
-            Err(_) => "skip".to_string(),
-        };
+        } else {
+            // Attempt to compute SHA256 automatically when online — use as the default if available.
+            let checksum_source_url = expand_known_package_vars(&source_url, &name, &version);
+            let computed_sha_default = match compute_sha256_for_url(&checksum_source_url) {
+                Ok(hex) => {
+                    // Use raw hex as the default so pressing Enter accepts it
+                    hex
+                }
+                Err(_) => "skip".to_string(),
+            };
 
-        let source_sha256 = Text::new("Source checksum:")
-            .with_help_message(
-                "Accepts sha256:, sha512:, md5:, or raw SHA256 hex (use 'skip' to bypass)",
-            )
-            .with_default(computed_sha_default.as_str())
-            .prompt()?;
+            let source_sha256 = Text::new("Source checksum:")
+                .with_help_message(
+                    "Accepts sha256:, sha512:, md5:, or raw SHA256 hex (use 'skip' to bypass)",
+                )
+                .with_default(computed_sha_default.as_str())
+                .prompt()?;
 
-        let extract_dir = Text::new("Extract Directory:")
-            .with_help_message("Directory created after extraction (supports $name, $version)")
-            .with_default("$name-$version")
-            .prompt()?;
+            let extract_dir = Text::new("Extract Directory:")
+                .with_help_message("Directory created after extraction (supports $name, $version)")
+                .with_default("$name-$version")
+                .prompt()?;
 
-        let mut source = Source {
-            url: source_url,
-            sha256: source_sha256,
-            extract_dir,
-            patches: Vec::new(),
-            post_extract: Vec::new(),
-        };
+            let mut source = Source {
+                url: source_url,
+                sha256: source_sha256,
+                extract_dir,
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+            };
 
-        if show_advanced {
-            source.patches = prompt_repeating_list(
-                "Patch path/URL",
-                "Patch file path (relative to spec dir) or direct URL",
-            )?;
-            source.post_extract = prompt_repeating_list(
-                "post_extract command",
-                "Runs in extracted source directory using sh -c",
-            )?;
+            if show_advanced {
+                source.patches = prompt_repeating_list(
+                    "Patch path/URL",
+                    "Patch file path (relative to spec dir) or direct URL",
+                )?;
+                source.post_extract = prompt_repeating_list(
+                    "post_extract command",
+                    "Runs in extracted source directory using sh -c",
+                )?;
+                if Confirm::new("Add manual sources?")
+                    .with_help_message(
+                        "Optional local files or URLs copied into the build dir before source fetching",
+                    )
+                    .with_default(false)
+                    .prompt()?
+                {
+                    manual_sources = prompt_manual_sources()?;
+                }
+            }
+
+            sources.push(source);
         }
-
-        sources.push(source);
     } else {
         crate::log_info!(
             "Metapackage selected: skipping source/build prompts. Define runtime dependencies to pull in."
@@ -537,7 +652,7 @@ pub fn create_interactive() -> Result<PackageSpec> {
         },
         packages: Vec::new(),
         alternatives: Alternatives::default(),
-        manual_sources: Vec::new(),
+        manual_sources,
         source: sources,
         build: Build { build_type, flags },
         dependencies: Dependencies {
@@ -601,6 +716,47 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             arr.push(Value::Table(pt));
         }
         root.insert("packages".into(), Value::Array(arr));
+    }
+
+    // manual sources
+    if !spec.manual_sources.is_empty() {
+        let mut arr = Vec::new();
+        for m in &spec.manual_sources {
+            let mut mt = Table::new();
+            if let Some(file) = m.file.as_ref().filter(|s| !s.trim().is_empty()) {
+                mt.insert("file".into(), Value::String(file.clone()));
+            }
+            if !m.files.is_empty() {
+                mt.insert(
+                    "files".into(),
+                    Value::Array(m.files.iter().map(|s| Value::String(s.clone())).collect()),
+                );
+            }
+            if let Some(url) = m.url.as_ref().filter(|s| !s.trim().is_empty()) {
+                mt.insert("url".into(), Value::String(url.clone()));
+            }
+            if !m.urls.is_empty() {
+                mt.insert(
+                    "urls".into(),
+                    Value::Array(m.urls.iter().map(|s| Value::String(s.clone())).collect()),
+                );
+            }
+            if let Some(sha256) = m.sha256.as_ref().filter(|s| {
+                let trimmed = s.trim();
+                !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("skip")
+            }) {
+                mt.insert("sha256".into(), Value::String(sha256.clone()));
+            }
+            if let Some(dest) = m.dest.as_ref().filter(|s| !s.trim().is_empty()) {
+                mt.insert("dest".into(), Value::String(dest.clone()));
+            }
+            if !mt.is_empty() {
+                arr.push(Value::Table(mt));
+            }
+        }
+        if !arr.is_empty() {
+            root.insert("manual_sources".into(), Value::Array(arr));
+        }
     }
 
     // sources
@@ -1112,7 +1268,9 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::package::{BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source};
+    use crate::package::{
+        BuildFlags, BuildType, Dependencies, ManualSource, PackageInfo, PackageSpec, Source,
+    };
 
     #[test]
     fn spec_to_minimal_toml_omits_defaults() {
@@ -1438,6 +1596,63 @@ mod tests {
 
         let val: toml::Value = toml::from_str(&toml).unwrap();
         assert!(val.get("source").is_none());
+    }
+
+    #[test]
+    fn spec_to_minimal_toml_includes_manual_sources() {
+        let spec = PackageSpec {
+            package: PackageInfo {
+                name: "vertex-keyring".into(),
+                version: "1.0.0".into(),
+                revision: 1,
+                description: "keyring".into(),
+                homepage: "https://www.vertexlinux.net".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Alternatives::default(),
+            manual_sources: vec![
+                ManualSource {
+                    file: Some("vertex.pub".into()),
+                    files: Vec::new(),
+                    url: None,
+                    urls: Vec::new(),
+                    sha256: None,
+                    dest: Some("usr/share/depot/keys/public/vertex.pub".into()),
+                },
+                ManualSource {
+                    file: None,
+                    files: Vec::new(),
+                    url: Some("file:///tmp/vertex.minisig".into()),
+                    urls: Vec::new(),
+                    sha256: Some("skip".into()),
+                    dest: Some("usr/share/depot/keys/sign/vertex.minisig".into()),
+                },
+            ],
+            source: Vec::new(),
+            build: Build {
+                build_type: BuildType::Custom,
+                flags: BuildFlags::default(),
+            },
+            dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+
+        let toml = spec_to_minimal_toml(&spec).unwrap();
+        assert!(toml.contains("[[manual_sources]]"));
+        assert!(toml.contains("file = \"vertex.pub\""));
+        assert!(toml.contains("url = \"file:///tmp/vertex.minisig\""));
+        assert!(toml.contains("dest = \"usr/share/depot/keys/public/vertex.pub\""));
+        assert!(!toml.contains("sha256 = \"skip\""));
+
+        let val: toml::Value = toml::from_str(&toml).unwrap();
+        let arr = val
+            .get("manual_sources")
+            .and_then(|v| v.as_array())
+            .expect("expected manual_sources array");
+        assert_eq!(arr.len(), 2);
     }
 
     #[test]

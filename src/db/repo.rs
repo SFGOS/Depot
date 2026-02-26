@@ -349,6 +349,51 @@ fn join_repo_url(base: &str, rel: &str) -> Result<String> {
         .to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileUrlCopyOutcome {
+    NotFileUrl,
+    Copied,
+    Missing,
+}
+
+fn copy_file_url_to_path(url: &str, dest: &Path) -> Result<FileUrlCopyOutcome> {
+    let parsed = match url::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(FileUrlCopyOutcome::NotFileUrl),
+    };
+    if parsed.scheme() != "file" {
+        return Ok(FileUrlCopyOutcome::NotFileUrl);
+    }
+
+    let src = parsed
+        .to_file_path()
+        .map_err(|_| anyhow::anyhow!("Invalid file:// URL: {}", url))?;
+    if !src.exists() {
+        return Ok(FileUrlCopyOutcome::Missing);
+    }
+    if !src.is_file() {
+        anyhow::bail!("file:// URL is not a file: {}", src.display());
+    }
+
+    fs::copy(&src, dest)
+        .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
+    Ok(FileUrlCopyOutcome::Copied)
+}
+
+fn normalize_git_mirror_url(url: &str) -> Result<String> {
+    let parsed = match url::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(url.to_string()),
+    };
+    if parsed.scheme() != "file" {
+        return Ok(url.to_string());
+    }
+    let path = parsed
+        .to_file_path()
+        .map_err(|_| anyhow::anyhow!("Invalid file:// mirror URL: {}", url))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn decompress_zstd_file(src: &Path, dst: &Path) -> Result<()> {
     let mut input =
         fs::File::open(src).with_context(|| format!("Failed to open {}", src.display()))?;
@@ -413,61 +458,97 @@ pub fn fetch_binary_repo_db(
     let client = reqwest::blocking::Client::builder()
         .build()
         .context("Failed to build HTTP client for binary repo fetch")?;
-    let resp = client
-        .get(&repo_db_url)
-        .send()
-        .with_context(|| format!("Failed to fetch {}", repo_db_url))?;
-
-    if !resp.status().is_success() {
-        if repo_db_sqlite.exists() {
-            crate::log_warn!(
-                "Failed to refresh binary repo '{}' (HTTP {}), using cached DB",
-                repo_name,
-                resp.status()
-            );
-            return Ok(repo_db_sqlite);
+    match copy_file_url_to_path(&repo_db_url, &tmp_zst)? {
+        FileUrlCopyOutcome::Copied => {}
+        FileUrlCopyOutcome::Missing => {
+            if repo_db_sqlite.exists() {
+                crate::log_warn!(
+                    "Failed to refresh binary repo '{}' (missing local file), using cached DB: {}",
+                    repo_name,
+                    repo_db_url
+                );
+                return Ok(repo_db_sqlite);
+            }
+            anyhow::bail!("Failed to fetch {}: local file not found", repo_db_url);
         }
-        anyhow::bail!("Failed to fetch {}: HTTP {}", repo_db_url, resp.status());
+        FileUrlCopyOutcome::NotFileUrl => {
+            let resp = client
+                .get(&repo_db_url)
+                .send()
+                .with_context(|| format!("Failed to fetch {}", repo_db_url))?;
+
+            if !resp.status().is_success() {
+                if repo_db_sqlite.exists() {
+                    crate::log_warn!(
+                        "Failed to refresh binary repo '{}' (HTTP {}), using cached DB",
+                        repo_name,
+                        resp.status()
+                    );
+                    return Ok(repo_db_sqlite);
+                }
+                anyhow::bail!("Failed to fetch {}: HTTP {}", repo_db_url, resp.status());
+            }
+
+            let mut resp = resp;
+            let mut out = fs::File::create(&tmp_zst)
+                .with_context(|| format!("Failed to create {}", tmp_zst.display()))?;
+            std::io::copy(&mut resp, &mut out)
+                .with_context(|| format!("Failed to save {}", tmp_zst.display()))?;
+            out.flush()
+                .with_context(|| format!("Failed to flush {}", tmp_zst.display()))?;
+        }
     }
 
-    let mut resp = resp;
-    let mut out = fs::File::create(&tmp_zst)
-        .with_context(|| format!("Failed to create {}", tmp_zst.display()))?;
-    std::io::copy(&mut resp, &mut out)
-        .with_context(|| format!("Failed to save {}", tmp_zst.display()))?;
-    out.flush()
-        .with_context(|| format!("Failed to flush {}", tmp_zst.display()))?;
-
-    let sig_resp = client
-        .get(&repo_sig_url)
-        .send()
-        .with_context(|| format!("Failed to fetch {}", repo_sig_url))?;
-    let sig_downloaded = if sig_resp.status().is_success() {
-        let mut sig_resp = sig_resp;
-        let mut sig_out = fs::File::create(&tmp_sig)
-            .with_context(|| format!("Failed to create {}", tmp_sig.display()))?;
-        std::io::copy(&mut sig_resp, &mut sig_out)
-            .with_context(|| format!("Failed to save {}", tmp_sig.display()))?;
-        sig_out
-            .flush()
-            .with_context(|| format!("Failed to flush {}", tmp_sig.display()))?;
-        true
-    } else {
-        if !repo.allow_unsigned {
-            anyhow::bail!(
-                "Failed to fetch detached signature for binary repo '{}' (HTTP {}): {}",
+    let sig_downloaded = match copy_file_url_to_path(&repo_sig_url, &tmp_sig)? {
+        FileUrlCopyOutcome::Copied => true,
+        FileUrlCopyOutcome::Missing => {
+            if !repo.allow_unsigned {
+                anyhow::bail!(
+                    "Failed to fetch detached signature for binary repo '{}' (local file not found): {}",
+                    repo_name,
+                    repo_sig_url
+                );
+            }
+            crate::log_warn!(
+                "Binary repo '{}' has no detached signature (missing local file) for {}; allow_unsigned=true so continuing",
                 repo_name,
-                sig_resp.status(),
-                repo_sig_url
+                repo_db_url
             );
+            false
         }
-        crate::log_warn!(
-            "Binary repo '{}' has no detached signature (HTTP {}) for {}; allow_unsigned=true so continuing",
-            repo_name,
-            sig_resp.status(),
-            repo_db_url
-        );
-        false
+        FileUrlCopyOutcome::NotFileUrl => {
+            let sig_resp = client
+                .get(&repo_sig_url)
+                .send()
+                .with_context(|| format!("Failed to fetch {}", repo_sig_url))?;
+            if sig_resp.status().is_success() {
+                let mut sig_resp = sig_resp;
+                let mut sig_out = fs::File::create(&tmp_sig)
+                    .with_context(|| format!("Failed to create {}", tmp_sig.display()))?;
+                std::io::copy(&mut sig_resp, &mut sig_out)
+                    .with_context(|| format!("Failed to save {}", tmp_sig.display()))?;
+                sig_out
+                    .flush()
+                    .with_context(|| format!("Failed to flush {}", tmp_sig.display()))?;
+                true
+            } else {
+                if !repo.allow_unsigned {
+                    anyhow::bail!(
+                        "Failed to fetch detached signature for binary repo '{}' (HTTP {}): {}",
+                        repo_name,
+                        sig_resp.status(),
+                        repo_sig_url
+                    );
+                }
+                crate::log_warn!(
+                    "Binary repo '{}' has no detached signature (HTTP {}) for {}; allow_unsigned=true so continuing",
+                    repo_name,
+                    sig_resp.status(),
+                    repo_db_url
+                );
+                false
+            }
+        }
     };
 
     if sig_downloaded {
@@ -928,23 +1009,31 @@ pub fn fetch_binary_package_archive(
     let pkg_url = join_repo_url(base_url, &rec.filename)?;
     crate::log_info!("Fetching binary package: {}", pkg_url);
 
-    let client = reqwest::blocking::Client::builder()
-        .build()
-        .context("Failed to build HTTP client for binary package fetch")?;
-    let mut resp = client
-        .get(&pkg_url)
-        .send()
-        .with_context(|| format!("Failed to fetch {}", pkg_url))?;
-    if !resp.status().is_success() {
-        anyhow::bail!("Failed to fetch {}: HTTP {}", pkg_url, resp.status());
-    }
+    match copy_file_url_to_path(&pkg_url, &tmp_path)? {
+        FileUrlCopyOutcome::Copied => {}
+        FileUrlCopyOutcome::Missing => {
+            anyhow::bail!("Failed to fetch {}: local file not found", pkg_url);
+        }
+        FileUrlCopyOutcome::NotFileUrl => {
+            let client = reqwest::blocking::Client::builder()
+                .build()
+                .context("Failed to build HTTP client for binary package fetch")?;
+            let mut resp = client
+                .get(&pkg_url)
+                .send()
+                .with_context(|| format!("Failed to fetch {}", pkg_url))?;
+            if !resp.status().is_success() {
+                anyhow::bail!("Failed to fetch {}: HTTP {}", pkg_url, resp.status());
+            }
 
-    let mut out = fs::File::create(&tmp_path)
-        .with_context(|| format!("Failed to create {}", tmp_path.display()))?;
-    std::io::copy(&mut resp, &mut out)
-        .with_context(|| format!("Failed to save {}", tmp_path.display()))?;
-    out.flush()
-        .with_context(|| format!("Failed to flush {}", tmp_path.display()))?;
+            let mut out = fs::File::create(&tmp_path)
+                .with_context(|| format!("Failed to create {}", tmp_path.display()))?;
+            std::io::copy(&mut resp, &mut out)
+                .with_context(|| format!("Failed to save {}", tmp_path.display()))?;
+            out.flush()
+                .with_context(|| format!("Failed to flush {}", tmp_path.display()))?;
+        }
+    }
 
     verify_binary_package_record_checksums(&tmp_path, rec).with_context(|| {
         format!(
@@ -978,6 +1067,7 @@ pub fn sync_mirrors(
 
     for (name, url) in mirrors {
         let target = base.join(name);
+        let git_url = normalize_git_mirror_url(url)?;
         if !target.exists() {
             crate::log_info!("Cloning mirror '{}' -> {}", name, target.display());
 
@@ -994,7 +1084,7 @@ pub fn sync_mirrors(
             let mut builder = RepoBuilder::new();
             builder.fetch_options(fo);
             builder
-                .clone(url, &target)
+                .clone(&git_url, &target)
                 .with_context(|| format!("Failed to clone {}", url))?;
         } else {
             crate::log_info!("Updating mirror '{}' in {}", name, target.display());
@@ -1013,7 +1103,7 @@ pub fn sync_mirrors(
             // Fetch from origin
             let mut remote = repo
                 .find_remote("origin")
-                .or_else(|_| repo.remote_anonymous(url))?;
+                .or_else(|_| repo.remote_anonymous(&git_url))?;
             remote
                 .fetch(&["refs/heads/*:refs/remotes/origin/*"], Some(&mut fo), None)
                 .with_context(|| format!("Failed to fetch updates for {}", url))?;
@@ -1375,5 +1465,41 @@ license = ["MIT", "Apache-2.0"]
         };
 
         verify_binary_package_record_checksums(&pkg, &rec).unwrap();
+    }
+
+    #[test]
+    fn test_copy_file_url_to_path_supports_file_scheme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("repo.db.zst");
+        let dst = tmp.path().join("copy.zst");
+        fs::write(&src, b"repo-db").unwrap();
+
+        let url = format!("file://{}", src.display());
+        let outcome = copy_file_url_to_path(&url, &dst).unwrap();
+        assert_eq!(outcome, FileUrlCopyOutcome::Copied);
+        assert_eq!(fs::read(&dst).unwrap(), b"repo-db");
+    }
+
+    #[test]
+    fn test_copy_file_url_to_path_reports_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing.db.zst");
+        let dst = tmp.path().join("copy.zst");
+
+        let url = format!("file://{}", missing.display());
+        let outcome = copy_file_url_to_path(&url, &dst).unwrap();
+        assert_eq!(outcome, FileUrlCopyOutcome::Missing);
+        assert!(!dst.exists());
+    }
+
+    #[test]
+    fn test_normalize_git_mirror_url_converts_file_scheme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo.git");
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        let url = format!("file://{}", repo_dir.display());
+        let normalized = normalize_git_mirror_url(&url).unwrap();
+        assert_eq!(normalized, repo_dir.to_string_lossy());
     }
 }
