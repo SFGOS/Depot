@@ -184,8 +184,9 @@ fn build_lib32_companion_package(
     config: &config::Config,
     cross_config: Option<&cross::CrossConfig>,
     export_compiler_flags: bool,
+    force: bool,
 ) -> Result<Option<(package::PackageSpec, PathBuf)>> {
-    if !pkg_spec.build.flags.build_32 {
+    if !pkg_spec.build.flags.build_32 && !force {
         return Ok(None);
     }
     if pkg_spec.is_metapackage() {
@@ -197,7 +198,9 @@ fn build_lib32_companion_package(
     }
 
     crate::log_info!("Running separate lib32 build pass...");
-    let lib32_build_spec = make_lib32_build_spec(pkg_spec);
+    let mut lib32_input = pkg_spec.clone();
+    lib32_input.build.flags.build_32 = true;
+    let lib32_build_spec = make_lib32_build_spec(&lib32_input);
     let lib32_install_destdir = config
         .build_dir
         .join("destdir")
@@ -801,6 +804,10 @@ struct Cli {
     #[arg(long, global = true)]
     dry_run: bool,
 
+    /// Build/install only the lib32 companion package path (skip primary package output)
+    #[arg(long, global = true)]
+    lib32_only: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -1210,6 +1217,10 @@ fn main() -> Result<()> {
                     (pkg_spec, None)
                 };
 
+            if cli.lib32_only && staging_dir.is_some() {
+                anyhow::bail!("--lib32-only is only supported when installing from a package spec");
+            }
+
             ui::info(format!(
                 "Package: {} v{}-{}",
                 pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
@@ -1363,40 +1374,44 @@ fn main() -> Result<()> {
                     .join("destdir")
                     .join(&pkg_spec.package.name);
 
-                builder::build(
-                    &pkg_spec,
-                    &src_dir,
-                    &destdir,
-                    cross_config.as_ref(),
-                    !cli.no_flags,
-                )?;
+                if !cli.lib32_only {
+                    builder::build(
+                        &pkg_spec,
+                        &src_dir,
+                        &destdir,
+                        cross_config.as_ref(),
+                        !cli.no_flags,
+                    )?;
 
-                // 3.1 Copy license files into staged tree
-                staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
-                install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
+                    // 3.1 Copy license files into staged tree
+                    staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
+                    install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
+                }
 
                 destdir
             };
 
-            // 4. Stage (clean .la files, etc.)
-            staging::process(&destdir, &pkg_spec)?;
+            if !cli.lib32_only {
+                // 4. Stage (clean .la files, etc.)
+                staging::process(&destdir, &pkg_spec)?;
 
-            // 5-6. Install/update to rootfs and register in DB
-            for out in pkg_spec.outputs() {
-                let mut spec_for_out = pkg_spec.clone();
-                let output_name = out.name.clone();
-                spec_for_out.package = out;
-                spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
-                spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
-                let out_destdir =
-                    output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
-                install_staged_to_rootfs(&spec_for_out, &out_destdir, &cli.rootfs, &config)?;
+                // 5-6. Install/update to rootfs and register in DB
+                for out in pkg_spec.outputs() {
+                    let mut spec_for_out = pkg_spec.clone();
+                    let output_name = out.name.clone();
+                    spec_for_out.package = out;
+                    spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
+                    spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
+                    let out_destdir =
+                        output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
+                    install_staged_to_rootfs(&spec_for_out, &out_destdir, &cli.rootfs, &config)?;
 
-                ui::success(format!(
-                    "Successfully installed {} v{}",
-                    spec_for_out.package.name, spec_for_out.package.version
-                ));
-                // TODO(snapper): create post-install snapshot after install commit succeeds.
+                    ui::success(format!(
+                        "Successfully installed {} v{}",
+                        spec_for_out.package.name, spec_for_out.package.version
+                    ));
+                    // TODO(snapper): create post-install snapshot after install commit succeeds.
+                }
             }
 
             if let Some(src_dir) = built_src_dir.as_deref()
@@ -1406,6 +1421,7 @@ fn main() -> Result<()> {
                     &config,
                     cross_config.as_ref(),
                     !cli.no_flags,
+                    cli.lib32_only,
                 )?
             {
                 install_staged_to_rootfs(&lib32_spec, &lib32_destdir, &cli.rootfs, &config)?;
@@ -1561,18 +1577,21 @@ fn main() -> Result<()> {
                 .as_ref()
                 .map(|p| cross::CrossConfig::from_prefix(p))
                 .transpose()?;
-            builder::build(
-                &pkg_spec,
-                &src_dir,
-                &destdir,
-                cross_config.as_ref(),
-                !cli.no_flags,
-            )?;
+            if !cli.lib32_only {
+                builder::build(
+                    &pkg_spec,
+                    &src_dir,
+                    &destdir,
+                    cross_config.as_ref(),
+                    !cli.no_flags,
+                )?;
+            }
 
-            staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
-            install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
-
-            staging::process(&destdir, &pkg_spec)?;
+            if !cli.lib32_only {
+                staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
+                install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
+                staging::process(&destdir, &pkg_spec)?;
+            }
 
             // Create package archive(s) — support multiple outputs from a single spec.
             let arch = cli
@@ -1581,26 +1600,28 @@ fn main() -> Result<()> {
                 .unwrap_or(std::env::consts::ARCH);
 
             let mut created_files = Vec::new();
-            for out in pkg_spec.outputs() {
-                let mut spec_for_out = pkg_spec.clone();
-                let output_name = out.name.clone();
-                spec_for_out.package = out;
-                spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
-                spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
-                let out_destdir =
-                    output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
-                let packager =
-                    package::Packager::new(spec_for_out.clone(), out_destdir, config.clone());
-                let pkg_file = packager.create_package(Path::new("."), arch)?;
-                if let Some(sig_path) =
-                    signing::auto_sign_zst_file_detached(&cli.rootfs, &pkg_file)?
-                {
-                    ui::success(format!(
-                        "Created detached signature: {}",
-                        sig_path.display()
-                    ));
+            if !cli.lib32_only {
+                for out in pkg_spec.outputs() {
+                    let mut spec_for_out = pkg_spec.clone();
+                    let output_name = out.name.clone();
+                    spec_for_out.package = out;
+                    spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
+                    spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
+                    let out_destdir =
+                        output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
+                    let packager =
+                        package::Packager::new(spec_for_out.clone(), out_destdir, config.clone());
+                    let pkg_file = packager.create_package(Path::new("."), arch)?;
+                    if let Some(sig_path) =
+                        signing::auto_sign_zst_file_detached(&cli.rootfs, &pkg_file)?
+                    {
+                        ui::success(format!(
+                            "Created detached signature: {}",
+                            sig_path.display()
+                        ));
+                    }
+                    created_files.push(pkg_file);
                 }
-                created_files.push(pkg_file);
             }
 
             let mut lib32_install_bundle: Option<(package::PackageSpec, PathBuf)> = None;
@@ -1610,6 +1631,7 @@ fn main() -> Result<()> {
                 &config,
                 cross_config.as_ref(),
                 !cli.no_flags,
+                cli.lib32_only,
             )? {
                 let lib32_arch = lib32_arch_name(arch);
                 let packager = package::Packager::new(
@@ -1639,20 +1661,27 @@ fn main() -> Result<()> {
                 if !ui::prompt_yes_no("Install built package(s) to rootfs now?", true)? {
                     anyhow::bail!("Aborted");
                 }
-                for out in pkg_spec.outputs() {
-                    let mut spec_for_out = pkg_spec.clone();
-                    let output_name = out.name.clone();
-                    spec_for_out.package = out;
-                    spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
-                    spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
-                    let out_destdir =
-                        output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
-                    install_staged_to_rootfs(&spec_for_out, &out_destdir, &cli.rootfs, &config)?;
-                    ui::success(format!(
-                        "Successfully installed {} v{}",
-                        spec_for_out.package.name, spec_for_out.package.version
-                    ));
-                    // TODO(snapper): create post-install snapshot after --install commit succeeds.
+                if !cli.lib32_only {
+                    for out in pkg_spec.outputs() {
+                        let mut spec_for_out = pkg_spec.clone();
+                        let output_name = out.name.clone();
+                        spec_for_out.package = out;
+                        spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
+                        spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
+                        let out_destdir =
+                            output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
+                        install_staged_to_rootfs(
+                            &spec_for_out,
+                            &out_destdir,
+                            &cli.rootfs,
+                            &config,
+                        )?;
+                        ui::success(format!(
+                            "Successfully installed {} v{}",
+                            spec_for_out.package.name, spec_for_out.package.version
+                        ));
+                        // TODO(snapper): create post-install snapshot after --install commit succeeds.
+                    }
                 }
                 if let Some((lib32_spec, lib32_destdir)) = &lib32_install_bundle {
                     install_staged_to_rootfs(lib32_spec, lib32_destdir, &cli.rootfs, &config)?;
