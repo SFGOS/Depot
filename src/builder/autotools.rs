@@ -40,7 +40,10 @@ pub fn build(
     }
 
     use crate::builder::state::{BuildStep, StateTracker};
-    let mut state = StateTracker::new(&actual_src)?;
+    let mut state = StateTracker::new_with_namespace(
+        &actual_src,
+        spec.build.flags.lib32_variant.then_some("lib32"),
+    )?;
 
     // Run configure
     let build_dir = if let Some(dir) = &flags.build_dir {
@@ -78,7 +81,14 @@ pub fn build(
             Some(flags.chost.clone())
         } else {
             None
-        };
+        }
+        .map(|host| {
+            if flags.lib32_variant {
+                lib32_host_triple(&host)
+            } else {
+                host
+            }
+        });
 
         let requested_build = if cross.is_some() {
             CrossConfig::build_triple().ok()
@@ -101,6 +111,15 @@ pub fn build(
                 configure_cmd.arg(format!("--build={}", build));
             } else {
                 crate::log_info!("  configure does not support --build; skipping {}", build);
+            }
+        }
+
+        if flags.lib32_variant {
+            if !has_configure_option_prefix(&flags.configure, "--libdir") {
+                configure_cmd.arg("--libdir=/usr/lib32");
+            }
+            if !has_configure_option_prefix(&flags.configure, "--libexecdir") {
+                configure_cmd.arg("--libexecdir=/usr/lib32");
             }
         }
 
@@ -410,6 +429,18 @@ fn configure_supports_option(help_text: Option<&str>, option: &str, configure_fi
     help_text
         .map(|text| configure_help_supports_option(text, option))
         .unwrap_or(configure_file.trim().is_empty())
+}
+
+fn has_configure_option_prefix(args: &[String], option: &str) -> bool {
+    let with_eq = format!("{option}=");
+    args.iter().any(|arg| {
+        let trimmed = arg.trim();
+        trimmed == option || trimmed.starts_with(&with_eq)
+    })
+}
+
+fn lib32_host_triple(host: &str) -> String {
+    host.replace("x86_64", "i686")
 }
 
 fn find_autotools_test_target(build_dir: &Path) -> Result<Option<&'static str>> {

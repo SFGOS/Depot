@@ -12,7 +12,10 @@ pub fn build(
     cross: Option<&CrossConfig>,
     export_compiler_flags: bool,
 ) -> Result<()> {
-    let mut state = StateTracker::new(src_dir)?;
+    let mut state = StateTracker::new_with_namespace(
+        src_dir,
+        spec.build.flags.lib32_variant.then_some("lib32"),
+    )?;
     let flags = &spec.build.flags;
 
     let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);

@@ -240,6 +240,17 @@ impl PackageSpec {
                         self.build.flags.cflags = vec![s.to_string()];
                     }
                 }
+                "cflags-lib32" | "cflags_lib32" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.cflags_lib32 = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.cflags_lib32 = vec![s.to_string()];
+                    }
+                }
                 "cxxflags" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.cxxflags = arr
@@ -249,6 +260,17 @@ impl PackageSpec {
                             .collect();
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.cxxflags = vec![s.to_string()];
+                    }
+                }
+                "cxxflags-lib32" | "cxxflags_lib32" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.cxxflags_lib32 = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.cxxflags_lib32 = vec![s.to_string()];
                     }
                 }
                 "ldflags" => {
@@ -472,6 +494,22 @@ impl PackageSpec {
                         self.build.flags.skip_tests = b;
                     }
                 }
+                "build_32" | "build-32" => {
+                    if let Some(b) = toml_value_as_boolish(v) {
+                        self.build.flags.build_32 = b;
+                    }
+                }
+                "configure_lib32" | "configure-lib32" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.configure_lib32 = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.configure_lib32 = vec![s.to_string()];
+                    }
+                }
                 "configure_file" | "configure-file" => {
                     if let Some(s) = v.as_str() {
                         self.build.flags.configure_file = s.to_string();
@@ -510,6 +548,17 @@ impl PackageSpec {
                         self.build.flags.post_install = vec![s.to_string()];
                     }
                 }
+                "post_install_lib32" | "post_install-lib32" | "post-install-lib32" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.post_install_lib32 = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_install_lib32 = vec![s.to_string()];
+                    }
+                }
                 // Add more fields as needed
                 _ => {}
             }
@@ -530,6 +579,18 @@ impl PackageSpec {
                     }
                 }
             }
+            "cflags-lib32" | "cflags_lib32" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .cflags_lib32
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.cflags_lib32.push(s.to_string());
+                    }
+                }
+            }
             "cxxflags" => {
                 for v in values {
                     if let Some(arr) = v.as_array() {
@@ -539,6 +600,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.cxxflags.push(s.to_string());
+                    }
+                }
+            }
+            "cxxflags-lib32" | "cxxflags_lib32" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .cxxflags_lib32
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.cxxflags_lib32.push(s.to_string());
                     }
                 }
             }
@@ -575,6 +648,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.configure.push(s.to_string());
+                    }
+                }
+            }
+            "configure_lib32" | "configure-lib32" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .configure_lib32
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.configure_lib32.push(s.to_string());
                     }
                 }
             }
@@ -616,6 +701,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.post_install.push(s.to_string());
+                    }
+                }
+            }
+            "post_install_lib32" | "post_install-lib32" | "post-install-lib32" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .post_install_lib32
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_install_lib32.push(s.to_string());
                     }
                 }
             }
@@ -863,8 +960,13 @@ impl PackageSpec {
                 }
             }
             "skip_tests" | "skip-tests" => {
-                if let Some(b) = values.last().and_then(|v| v.as_bool()) {
+                if let Some(b) = values.last().and_then(toml_value_as_boolish) {
                     self.build.flags.skip_tests = b;
+                }
+            }
+            "build_32" | "build-32" => {
+                if let Some(b) = values.last().and_then(toml_value_as_boolish) {
+                    self.build.flags.build_32 = b;
                 }
             }
             _ => {}
@@ -1754,6 +1856,47 @@ configure_file = "build-aux/configure"
     }
 
     #[test]
+    fn parse_lib32_build_flags_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "autotools"
+
+[build.flags]
+"build-32" = "true"
+"CFLAGS-lib32" = ["-mstackrealign"]
+"CXXFLAGS-lib32" = ["-fno-rtti"]
+"configure-lib32" = ["--disable-static"]
+"post_install-lib32" = ["echo lib32"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert!(spec.build.flags.build_32);
+        assert_eq!(spec.build.flags.cflags_lib32, vec!["-mstackrealign"]);
+        assert_eq!(spec.build.flags.cxxflags_lib32, vec!["-fno-rtti"]);
+        assert_eq!(spec.build.flags.configure_lib32, vec!["--disable-static"]);
+        assert_eq!(spec.build.flags.post_install_lib32, vec!["echo lib32"]);
+    }
+
+    #[test]
     fn parse_post_configure_from_spec() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -2343,9 +2486,29 @@ pub enum BuildType {
 pub struct BuildFlags {
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub cflags: Vec<String>,
+    /// Extra flags exported to `CFLAGS` only for the lib32 build variant.
+    #[serde(
+        default,
+        alias = "cflags-lib32",
+        alias = "cflags_lib32",
+        alias = "CFLAGS-lib32",
+        alias = "CFLAGS_lib32",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub cflags_lib32: Vec<String>,
     /// Extra flags exported to `CXXFLAGS`.
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub cxxflags: Vec<String>,
+    /// Extra flags exported to `CXXFLAGS` only for the lib32 build variant.
+    #[serde(
+        default,
+        alias = "cxxflags-lib32",
+        alias = "cxxflags_lib32",
+        alias = "CXXFLAGS-lib32",
+        alias = "CXXFLAGS_lib32",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub cxxflags_lib32: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub ldflags: Vec<String>,
     /// Keep existing files and install package-provided replacement as `<path>.depotnew`.
@@ -2368,8 +2531,19 @@ pub struct BuildFlags {
     /// Skip automatic build-system test execution (e.g. Autotools `make check`/`make test`).
     #[serde(default, alias = "skip-tests")]
     pub skip_tests: bool,
+    /// Run an additional lib32 build pass and emit a `lib32-*` package.
+    #[serde(
+        default,
+        alias = "build-32",
+        alias = "build_32",
+        deserialize_with = "deserialize_boolish"
+    )]
+    pub build_32: bool,
     #[serde(default)]
     pub configure: Vec<String>,
+    /// Configure arguments used only for the lib32 build variant (replaces `configure` when set).
+    #[serde(default, alias = "configure-lib32", alias = "configure_lib32")]
+    pub configure_lib32: Vec<String>,
     /// Autotools configure script path, relative to source root or absolute.
     #[serde(default, alias = "configure-file")]
     pub configure_file: String,
@@ -2398,6 +2572,14 @@ pub struct BuildFlags {
     /// Commands to run after install (after make install)
     #[serde(default, alias = "post-install")]
     pub post_install: Vec<String>,
+    /// Commands to run after the lib32 install step (replaces `post_install` when set).
+    #[serde(
+        default,
+        alias = "post-install-lib32",
+        alias = "post_install-lib32",
+        alias = "post_install_lib32"
+    )]
+    pub post_install_lib32: Vec<String>,
 
     /// Specific commands for 'makefile' build type
     #[serde(default)]
@@ -2544,20 +2726,27 @@ pub struct BuildFlags {
     /// Binary package type when using BuildType::Bin (e.g. "deb")
     #[serde(default)]
     pub binary_type: String,
+    /// Internal runtime marker used to adjust builder behavior for the lib32 variant.
+    #[serde(skip)]
+    pub lib32_variant: bool,
 }
 
 impl Default for BuildFlags {
     fn default() -> Self {
         BuildFlags {
             cflags: Vec::new(),
+            cflags_lib32: Vec::new(),
             cxxflags: Vec::new(),
+            cxxflags_lib32: Vec::new(),
             ldflags: Vec::new(),
             keep: Vec::new(),
             no_flags: false,
             no_strip: false,
             no_compress_man: false,
             skip_tests: false,
+            build_32: false,
             configure: Vec::new(),
+            configure_lib32: Vec::new(),
             configure_file: String::new(),
             cc: default_cc(),
             cxx: default_cxx(),
@@ -2567,6 +2756,7 @@ impl Default for BuildFlags {
             post_configure: Vec::new(),
             post_compile: Vec::new(),
             post_install: Vec::new(),
+            post_install_lib32: Vec::new(),
             makefile_commands: Vec::new(),
             makefile_install_commands: Vec::new(),
             prefix: default_prefix(),
@@ -2595,6 +2785,7 @@ impl Default for BuildFlags {
             source_subdir: String::new(),
             build_dir: None,
             binary_type: String::new(),
+            lib32_variant: false,
         }
     }
 }
@@ -2617,6 +2808,44 @@ where
         Some(StringOrArray::Array(a)) => Ok(a),
         None => Ok(Vec::new()),
     }
+}
+
+fn deserialize_boolish<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Boolish {
+        Bool(bool),
+        String(String),
+    }
+
+    match Option::<Boolish>::deserialize(deserializer)? {
+        Some(Boolish::Bool(v)) => Ok(v),
+        Some(Boolish::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            other => Err(serde::de::Error::custom(format!(
+                "expected boolean string for lib32 flag, got '{}'",
+                other
+            ))),
+        },
+        None => Ok(false),
+    }
+}
+
+fn toml_value_as_boolish(value: &toml::Value) -> Option<bool> {
+    if let Some(b) = value.as_bool() {
+        return Some(b);
+    }
+    value
+        .as_str()
+        .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        })
 }
 
 fn default_cc() -> String {

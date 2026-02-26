@@ -86,10 +86,11 @@ impl CrossConfig {
 
     /// Get the build machine triple (native compiler)
     pub fn build_triple() -> Result<String> {
-        let output = Command::new("gcc")
+        let output = Command::new("cc")
             .arg("-dumpmachine")
             .output()
-            .or_else(|_| Command::new("cc").arg("-dumpmachine").output())
+            .or_else(|_| Command::new("clang").arg("-dumpmachine").output())
+            .or_else(|_| Command::new("gcc").arg("-dumpmachine").output())
             .context("Failed to determine build machine triple")?;
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())

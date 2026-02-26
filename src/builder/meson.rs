@@ -37,7 +37,10 @@ pub fn build(
     };
 
     use crate::builder::state::{BuildStep, StateTracker};
-    let mut state = StateTracker::new(&actual_src)?;
+    let mut state = StateTracker::new_with_namespace(
+        &actual_src,
+        spec.build.flags.lib32_variant.then_some("lib32"),
+    )?;
 
     // Run meson setup
     if !state.is_done(BuildStep::Configured) {

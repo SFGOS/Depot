@@ -59,7 +59,10 @@ pub fn build(
     }
 
     use crate::builder::state::{BuildStep, StateTracker};
-    let mut state = StateTracker::new(src_dir)?;
+    let mut state = StateTracker::new_with_namespace(
+        src_dir,
+        spec.build.flags.lib32_variant.then_some("lib32"),
+    )?;
 
     if !state.is_done(BuildStep::Configured) {
         hooks::run_post_configure_commands(spec, src_dir, destdir)?;

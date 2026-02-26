@@ -69,6 +69,173 @@ fn output_destdir_for(base_destdir: &Path, primary_pkg: &str, output_pkg: &str) 
     }
 }
 
+fn lib32_package_name(name: &str) -> String {
+    format!("lib32-{name}")
+}
+
+fn lib32_arch_name(arch: &str) -> String {
+    arch.replace("x86_64", "i686")
+}
+
+fn make_lib32_build_spec(base: &package::PackageSpec) -> package::PackageSpec {
+    let mut spec = base.clone();
+    let flags = &mut spec.build.flags;
+    flags.lib32_variant = true;
+
+    if !flags.cflags_lib32.is_empty() {
+        flags.cflags.extend(flags.cflags_lib32.clone());
+    }
+    if !flags.cxxflags_lib32.is_empty() {
+        flags.cxxflags.extend(flags.cxxflags_lib32.clone());
+    }
+    if !flags.configure_lib32.is_empty() {
+        flags.configure = flags.configure_lib32.clone();
+    }
+    if !flags.post_install_lib32.is_empty() {
+        flags.post_install = flags.post_install_lib32.clone();
+    }
+
+    flags.cc = format!("{} -m32", flags.cc.trim());
+    flags.cxx = format!("{} -m32", flags.cxx.trim());
+
+    spec
+}
+
+fn make_lib32_package_spec(base: &package::PackageSpec) -> package::PackageSpec {
+    let mut spec = base.clone();
+    spec.package.name = lib32_package_name(&base.package.name);
+    // The lib32 pass currently emits a single companion package from /usr/lib32.
+    spec.packages.clear();
+    spec
+}
+
+fn copy_tree_preserving_links(src: &Path, dst: &Path) -> Result<()> {
+    use walkdir::WalkDir;
+
+    fs::create_dir_all(dst)
+        .with_context(|| format!("Failed to create destination dir: {}", dst.display()))?;
+
+    for entry in WalkDir::new(src) {
+        let entry = entry?;
+        let rel = entry
+            .path()
+            .strip_prefix(src)
+            .with_context(|| format!("Failed to strip prefix: {}", src.display()))?;
+        let target = dst.join(rel);
+
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)
+                .with_context(|| format!("Failed to create dir: {}", target.display()))?;
+            continue;
+        }
+
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create dir: {}", parent.display()))?;
+        }
+
+        if entry.file_type().is_symlink() {
+            let link_target = fs::read_link(entry.path())
+                .with_context(|| format!("Failed to read symlink: {}", entry.path().display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs as unix_fs;
+                unix_fs::symlink(&link_target, &target).with_context(|| {
+                    format!(
+                        "Failed to create symlink {} -> {}",
+                        target.display(),
+                        link_target.display()
+                    )
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!(
+                    "Symlink-preserving lib32 staging copy is only supported on unix hosts"
+                );
+            }
+        } else {
+            fs::copy(entry.path(), &target).with_context(|| {
+                format!(
+                    "Failed to copy {} to {}",
+                    entry.path().display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_lib32_companion_package(
+    pkg_spec: &package::PackageSpec,
+    src_dir: &Path,
+    config: &config::Config,
+    cross_config: Option<&cross::CrossConfig>,
+    export_compiler_flags: bool,
+) -> Result<Option<(package::PackageSpec, PathBuf)>> {
+    if !pkg_spec.build.flags.build_32 {
+        return Ok(None);
+    }
+    if pkg_spec.is_metapackage() {
+        crate::log_warn!(
+            "Ignoring build.flags.build-32 for metapackage {}",
+            pkg_spec.package.name
+        );
+        return Ok(None);
+    }
+
+    crate::log_info!("Running separate lib32 build pass...");
+    let lib32_build_spec = make_lib32_build_spec(pkg_spec);
+    let lib32_install_destdir = config
+        .build_dir
+        .join("destdir")
+        .join(".lib32-build")
+        .join(&pkg_spec.package.name)
+        .join("lib32-dest");
+
+    builder::build(
+        &lib32_build_spec,
+        src_dir,
+        &lib32_install_destdir,
+        cross_config,
+        export_compiler_flags,
+    )?;
+
+    let lib32_src = lib32_install_destdir.join("usr/lib32");
+    if !lib32_src.exists() {
+        anyhow::bail!(
+            "lib32 build completed but did not install usr/lib32 into {}",
+            lib32_install_destdir.display()
+        );
+    }
+
+    let lib32_pkg_spec = make_lib32_package_spec(pkg_spec);
+    let lib32_destdir = config
+        .build_dir
+        .join("destdir")
+        .join(&lib32_pkg_spec.package.name);
+    if lib32_destdir.exists() {
+        fs::remove_dir_all(&lib32_destdir).with_context(|| {
+            format!("Failed to clean lib32 destdir: {}", lib32_destdir.display())
+        })?;
+    }
+    fs::create_dir_all(&lib32_destdir).with_context(|| {
+        format!(
+            "Failed to create lib32 destdir: {}",
+            lib32_destdir.display()
+        )
+    })?;
+
+    copy_tree_preserving_links(&lib32_src, &lib32_destdir.join("usr/lib32"))?;
+    staging::add_licenses(src_dir, &lib32_destdir, &lib32_pkg_spec.package.name)?;
+    install::scripts::stage_scripts_from_spec_dir(&lib32_pkg_spec, &lib32_destdir)?;
+    staging::process(&lib32_destdir, &lib32_pkg_spec)?;
+
+    Ok(Some((lib32_pkg_spec, lib32_destdir)))
+}
+
 fn install_staged_to_rootfs(
     pkg_spec: &package::PackageSpec,
     destdir: &Path,
@@ -1166,11 +1333,19 @@ fn main() -> Result<()> {
                 }
             }
 
+            let cross_config = cli
+                .cross_prefix
+                .as_ref()
+                .map(|p| cross::CrossConfig::from_prefix(p))
+                .transpose()?;
+            let mut built_src_dir: Option<PathBuf> = None;
+
             let destdir = if let Some(dir) = &staging_dir {
                 dir.path().to_path_buf()
             } else {
                 // 1-2. Fetch + extract sources (supports archives and git URL#rev)
                 let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
+                built_src_dir = Some(src_dir.clone());
 
                 // 3. Build
                 let destdir = config
@@ -1178,12 +1353,6 @@ fn main() -> Result<()> {
                     .join("destdir")
                     .join(&pkg_spec.package.name);
 
-                // Build with optional cross-compilation
-                let cross_config = cli
-                    .cross_prefix
-                    .as_ref()
-                    .map(|p| cross::CrossConfig::from_prefix(p))
-                    .transpose()?;
                 builder::build(
                     &pkg_spec,
                     &src_dir,
@@ -1218,6 +1387,22 @@ fn main() -> Result<()> {
                     spec_for_out.package.name, spec_for_out.package.version
                 ));
                 // TODO(snapper): create post-install snapshot after install commit succeeds.
+            }
+
+            if let Some(src_dir) = built_src_dir.as_deref()
+                && let Some((lib32_spec, lib32_destdir)) = build_lib32_companion_package(
+                    &pkg_spec,
+                    src_dir,
+                    &config,
+                    cross_config.as_ref(),
+                    !cli.no_flags,
+                )?
+            {
+                install_staged_to_rootfs(&lib32_spec, &lib32_destdir, &cli.rootfs, &config)?;
+                ui::success(format!(
+                    "Successfully installed {} v{}",
+                    lib32_spec.package.name, lib32_spec.package.version
+                ));
             }
 
             if cli.clean {
@@ -1408,6 +1593,33 @@ fn main() -> Result<()> {
                 created_files.push(pkg_file);
             }
 
+            let mut lib32_install_bundle: Option<(package::PackageSpec, PathBuf)> = None;
+            if let Some((lib32_spec, lib32_destdir)) = build_lib32_companion_package(
+                &pkg_spec,
+                &src_dir,
+                &config,
+                cross_config.as_ref(),
+                !cli.no_flags,
+            )? {
+                let lib32_arch = lib32_arch_name(arch);
+                let packager = package::Packager::new(
+                    lib32_spec.clone(),
+                    lib32_destdir.clone(),
+                    config.clone(),
+                );
+                let pkg_file = packager.create_package(Path::new("."), &lib32_arch)?;
+                if let Some(sig_path) =
+                    signing::auto_sign_zst_file_detached(&cli.rootfs, &pkg_file)?
+                {
+                    ui::success(format!(
+                        "Created detached signature: {}",
+                        sig_path.display()
+                    ));
+                }
+                created_files.push(pkg_file);
+                lib32_install_bundle = Some((lib32_spec, lib32_destdir));
+            }
+
             for f in &created_files {
                 ui::success(format!("Build complete. Package created: {}", f.display()));
             }
@@ -1431,6 +1643,13 @@ fn main() -> Result<()> {
                         spec_for_out.package.name, spec_for_out.package.version
                     ));
                     // TODO(snapper): create post-install snapshot after --install commit succeeds.
+                }
+                if let Some((lib32_spec, lib32_destdir)) = &lib32_install_bundle {
+                    install_staged_to_rootfs(lib32_spec, lib32_destdir, &cli.rootfs, &config)?;
+                    ui::success(format!(
+                        "Successfully installed {} v{}",
+                        lib32_spec.package.name, lib32_spec.package.version
+                    ));
                 }
             }
 

@@ -27,7 +27,15 @@ pub struct StateTracker {
 
 impl StateTracker {
     pub fn new(source_dir: &Path) -> Result<Self> {
-        let state_file = source_dir.join(".depot_state");
+        Self::new_with_namespace(source_dir, None)
+    }
+
+    pub fn new_with_namespace(source_dir: &Path, namespace: Option<&str>) -> Result<Self> {
+        let state_file = if let Some(ns) = namespace.and_then(normalize_state_namespace) {
+            source_dir.join(format!(".depot_state_{}", ns))
+        } else {
+            source_dir.join(".depot_state")
+        };
         let state = if state_file.exists() {
             let content = fs::read_to_string(&state_file)?;
             toml::from_str(&content).unwrap_or_default()
@@ -51,6 +59,25 @@ impl StateTracker {
         let content = toml::to_string_pretty(&self.state)?;
         fs::write(&self.state_file, content)?;
         Ok(())
+    }
+}
+
+fn normalize_state_namespace(namespace: &str) -> Option<String> {
+    let normalized: String = namespace
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = normalized.trim_matches('_');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 

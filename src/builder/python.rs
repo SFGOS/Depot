@@ -43,7 +43,10 @@ pub fn build(
     crate::builder::set_env_var(&mut env_vars, "PYTHONDONTWRITEBYTECODE", "1");
     crate::builder::set_env_var(&mut env_vars, "SETUPTOOLS_USE_DISTUTILS", "local");
 
-    let mut state = StateTracker::new(&actual_src)?;
+    let mut state = StateTracker::new_with_namespace(
+        &actual_src,
+        spec.build.flags.lib32_variant.then_some("lib32"),
+    )?;
     if !state.is_done(BuildStep::Configured) {
         hooks::run_post_configure_commands(spec, &actual_src, destdir)?;
         state.mark_done(BuildStep::Configured)?;
