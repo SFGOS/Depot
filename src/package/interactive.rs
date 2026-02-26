@@ -243,11 +243,13 @@ pub fn create_interactive() -> Result<PackageSpec> {
         BuildType::Rust,
         BuildType::Custom,
         BuildType::Bin,
+        BuildType::Meta,
     ];
 
     let build_type = Select::new("Build System:", build_types)
         .with_help_message("Select the build system used by the package (common choices)")
         .prompt()?;
+    let is_metapackage = matches!(build_type, BuildType::Meta);
 
     // If the build system is Autotools, offer a convenience prompt for GNU-hosted tarballs.
     let mut gnu_source_default = String::new();
@@ -268,232 +270,251 @@ pub fn create_interactive() -> Result<PackageSpec> {
     }
 
     // Ask whether to show advanced fields.
-    let show_advanced = Confirm::new("Show advanced options?")
-        .with_help_message("Includes source subdir, toolchain overrides, hooks, and build tuning")
-        .with_default(false)
-        .prompt()?;
+    let show_advanced = if is_metapackage {
+        false
+    } else {
+        Confirm::new("Show advanced options?")
+            .with_help_message(
+                "Includes source subdir, toolchain overrides, hooks, and build tuning",
+            )
+            .with_default(false)
+            .prompt()?
+    };
 
-    let source_url = Text::new("Source URL:")
-        .with_help_message("URL to the source tarball or git repository")
-        .with_default(gnu_source_default.as_str())
-        .prompt()?;
+    let mut sources = Vec::new();
+    if !is_metapackage {
+        let source_url = Text::new("Source URL:")
+            .with_help_message("URL to the source tarball or git repository")
+            .with_default(gnu_source_default.as_str())
+            .prompt()?;
 
-    if source_url.trim().is_empty() {
-        anyhow::bail!("Source URL cannot be empty");
-    }
-
-    // Attempt to compute SHA256 automatically when online — use as the default if available.
-    let checksum_source_url = expand_known_package_vars(&source_url, &name, &version);
-    let computed_sha_default = match compute_sha256_for_url(&checksum_source_url) {
-        Ok(hex) => {
-            // Use raw hex as the default so pressing Enter accepts it
-            hex
+        if source_url.trim().is_empty() {
+            anyhow::bail!("Source URL cannot be empty");
         }
-        Err(_) => "skip".to_string(),
-    };
 
-    let source_sha256 = Text::new("Source checksum:")
-        .with_help_message(
-            "Accepts sha256:, sha512:, md5:, or raw SHA256 hex (use 'skip' to bypass)",
-        )
-        .with_default(computed_sha_default.as_str())
-        .prompt()?;
+        // Attempt to compute SHA256 automatically when online — use as the default if available.
+        let checksum_source_url = expand_known_package_vars(&source_url, &name, &version);
+        let computed_sha_default = match compute_sha256_for_url(&checksum_source_url) {
+            Ok(hex) => {
+                // Use raw hex as the default so pressing Enter accepts it
+                hex
+            }
+            Err(_) => "skip".to_string(),
+        };
 
-    let extract_dir = Text::new("Extract Directory:")
-        .with_help_message("Directory created after extraction (supports $name, $version)")
-        .with_default("$name-$version")
-        .prompt()?;
+        let source_sha256 = Text::new("Source checksum:")
+            .with_help_message(
+                "Accepts sha256:, sha512:, md5:, or raw SHA256 hex (use 'skip' to bypass)",
+            )
+            .with_default(computed_sha_default.as_str())
+            .prompt()?;
 
-    let mut source = Source {
-        url: source_url,
-        sha256: source_sha256,
-        extract_dir,
-        patches: Vec::new(),
-        post_extract: Vec::new(),
-    };
+        let extract_dir = Text::new("Extract Directory:")
+            .with_help_message("Directory created after extraction (supports $name, $version)")
+            .with_default("$name-$version")
+            .prompt()?;
 
-    if show_advanced {
-        source.patches = prompt_repeating_list(
-            "Patch path/URL",
-            "Patch file path (relative to spec dir) or direct URL",
-        )?;
-        source.post_extract = prompt_repeating_list(
-            "post_extract command",
-            "Runs in extracted source directory using sh -c",
-        )?;
+        let mut source = Source {
+            url: source_url,
+            sha256: source_sha256,
+            extract_dir,
+            patches: Vec::new(),
+            post_extract: Vec::new(),
+        };
+
+        if show_advanced {
+            source.patches = prompt_repeating_list(
+                "Patch path/URL",
+                "Patch file path (relative to spec dir) or direct URL",
+            )?;
+            source.post_extract = prompt_repeating_list(
+                "post_extract command",
+                "Runs in extracted source directory using sh -c",
+            )?;
+        }
+
+        sources.push(source);
+    } else {
+        crate::log_info!(
+            "Metapackage selected: skipping source/build prompts. Define runtime dependencies to pull in."
+        );
     }
 
     let mut flags = BuildFlags::default();
-
-    if !matches!(build_type, BuildType::Bin) {
-        flags.prefix = Text::new("Install prefix:")
-            .with_help_message("Most packages should use /usr")
-            .with_default(flags.prefix.as_str())
-            .prompt()?;
-    }
-
-    let supports_separate_build_dir = matches!(
-        build_type,
-        BuildType::Autotools | BuildType::CMake | BuildType::Meson | BuildType::Custom
-    );
-    if supports_separate_build_dir {
-        let default_bdir = if matches!(build_type, BuildType::Meson) {
-            "builddir"
-        } else {
-            "build"
-        };
-        let default_enabled = matches!(build_type, BuildType::CMake | BuildType::Meson);
-        if Confirm::new("Use separate build directory?")
-            .with_help_message("Recommended for CMake/Meson and often useful for Autotools")
-            .with_default(default_enabled)
-            .prompt()?
-        {
-            flags.build_dir = Some(
-                Text::new("Build directory name:")
-                    .with_default(default_bdir)
-                    .prompt()?,
-            );
+    if !is_metapackage {
+        if !matches!(build_type, BuildType::Bin) {
+            flags.prefix = Text::new("Install prefix:")
+                .with_help_message("Most packages should use /usr")
+                .with_default(flags.prefix.as_str())
+                .prompt()?;
         }
-    }
 
-    if show_advanced {
-        flags.source_subdir = prompt_optional_text(
-            "Source subdirectory (optional):",
-            "Use for monorepos (e.g. llvm-project/clang, src)",
-        )?;
-        flags.cc = Text::new("CC:")
-            .with_help_message("C compiler")
-            .with_default(flags.cc.as_str())
-            .prompt()?;
-        flags.cxx = Text::new("CXX:")
-            .with_help_message("C++ compiler")
-            .with_default(flags.cxx.as_str())
-            .prompt()?;
-        flags.ar = Text::new("AR:")
-            .with_help_message("Archiver tool")
-            .with_default(flags.ar.as_str())
-            .prompt()?;
-        flags.chost = prompt_optional_text(
-            "CHOST target triple (optional):",
-            "Example: x86_64-sfg-linux-gnu",
-        )?;
-        flags.cbuild = prompt_optional_text(
-            "CBUILD build triple (optional):",
-            "Example: x86_64-pc-linux-gnu",
-        )?;
-        flags.carch = Text::new("CARCH:")
-            .with_help_message("CPU architecture short name")
-            .with_default(flags.carch.as_str())
-            .prompt()?;
-        flags.cflags = prompt_repeating_list(
-            "CFLAG",
-            "One flag per entry, e.g. -O2, -fPIC, -D_GNU_SOURCE",
-        )?;
-        flags.ldflags = prompt_repeating_list("LDFLAG", "One flag per entry, e.g. -Wl,-z,relro")?;
-    }
-
-    if matches!(
-        build_type,
-        BuildType::Autotools | BuildType::CMake | BuildType::Meson
-    ) {
-        let help = match build_type {
-            BuildType::Autotools => "Examples: --disable-static, --enable-nls, --with-zlib",
-            BuildType::CMake => "Examples: -DENABLE_TESTS=OFF, -DUSE_SYSTEM_LIBS=ON",
-            BuildType::Meson => "Examples: -Dtests=false, -Ddefault_library=static",
-            _ => "",
-        };
-        if Confirm::new("Add configure/setup options?")
-            .with_help_message("Adds entries to build.flags.configure")
-            .with_default(show_advanced)
-            .prompt()?
-        {
-            flags.configure = prompt_repeating_list("Configure option", help)?;
+        let supports_separate_build_dir = matches!(
+            build_type,
+            BuildType::Autotools | BuildType::CMake | BuildType::Meson | BuildType::Custom
+        );
+        if supports_separate_build_dir {
+            let default_bdir = if matches!(build_type, BuildType::Meson) {
+                "builddir"
+            } else {
+                "build"
+            };
+            let default_enabled = matches!(build_type, BuildType::CMake | BuildType::Meson);
+            if Confirm::new("Use separate build directory?")
+                .with_help_message("Recommended for CMake/Meson and often useful for Autotools")
+                .with_default(default_enabled)
+                .prompt()?
+            {
+                flags.build_dir = Some(
+                    Text::new("Build directory name:")
+                        .with_default(default_bdir)
+                        .prompt()?,
+                );
+            }
         }
-    }
 
-    if show_advanced && matches!(build_type, BuildType::Autotools) {
-        flags.configure_file = prompt_optional_text(
-            "Configure script path (optional):",
-            "Relative to source root, e.g. build-aux/configure",
-        )?;
-        flags.make_dirs = prompt_repeating_list(
-            "Make dir (build phase)",
-            "Relative to build dir, e.g. lib, libelf (empty = build root)",
-        )?;
-        flags.make_test_dirs = prompt_repeating_list(
-            "Make dir (test phase)",
-            "Relative to build dir, e.g. tests (empty = build root)",
-        )?;
-        flags.make_install_dirs = prompt_repeating_list(
-            "Make dir (install phase)",
-            "Relative to build dir, e.g. lib, apps (empty = build root)",
-        )?;
-        flags.skip_tests = Confirm::new("Skip automatic tests (make check/test)?")
-            .with_help_message(
-                "If enabled, Depot will not auto-run detected Autotools test targets",
-            )
-            .with_default(false)
-            .prompt()?;
-    }
-
-    if matches!(build_type, BuildType::Makefile) {
-        crate::log_info!("Define Makefile build and install commands.");
-        flags.makefile_commands = prompt_repeating_list(
-            "makefile build command",
-            "Examples: make -j$(nproc), make all",
-        )?;
-        if flags.makefile_commands.is_empty() {
-            anyhow::bail!("Makefile build type requires at least one build command");
-        }
-        flags.makefile_install_commands = prompt_repeating_list(
-            "makefile install command",
-            "Examples: make DESTDIR=$DESTDIR install",
-        )?;
-        if flags.makefile_install_commands.is_empty() {
-            anyhow::bail!("Makefile build type requires at least one install command");
-        }
-    }
-
-    if matches!(build_type, BuildType::Rust) {
-        let profiles = vec!["release", "debug"];
-        let profile = Select::new("Cargo profile:", profiles)
-            .with_help_message("Release is recommended for production packages")
-            .prompt()?;
-        flags.profile = profile.to_string();
-        flags.target = prompt_optional_text(
-            "Rust target triple (optional):",
-            "Example: x86_64-unknown-linux-gnu",
-        )?;
         if show_advanced {
-            flags.rustflags =
-                prompt_repeating_list("RUSTFLAG", "One flag per entry, e.g. -Ctarget-cpu=native")?;
-            flags.cargs = prompt_repeating_list(
-                "Extra cargo arg",
-                "Examples: --locked, --features, serde, --no-default-features",
+            flags.source_subdir = prompt_optional_text(
+                "Source subdirectory (optional):",
+                "Use for monorepos (e.g. llvm-project/clang, src)",
+            )?;
+            flags.cc = Text::new("CC:")
+                .with_help_message("C compiler")
+                .with_default(flags.cc.as_str())
+                .prompt()?;
+            flags.cxx = Text::new("CXX:")
+                .with_help_message("C++ compiler")
+                .with_default(flags.cxx.as_str())
+                .prompt()?;
+            flags.ar = Text::new("AR:")
+                .with_help_message("Archiver tool")
+                .with_default(flags.ar.as_str())
+                .prompt()?;
+            flags.chost = prompt_optional_text(
+                "CHOST target triple (optional):",
+                "Example: x86_64-sfg-linux-gnu",
+            )?;
+            flags.cbuild = prompt_optional_text(
+                "CBUILD build triple (optional):",
+                "Example: x86_64-pc-linux-gnu",
+            )?;
+            flags.carch = Text::new("CARCH:")
+                .with_help_message("CPU architecture short name")
+                .with_default(flags.carch.as_str())
+                .prompt()?;
+            flags.cflags = prompt_repeating_list(
+                "CFLAG",
+                "One flag per entry, e.g. -O2, -fPIC, -D_GNU_SOURCE",
+            )?;
+            flags.ldflags =
+                prompt_repeating_list("LDFLAG", "One flag per entry, e.g. -Wl,-z,relro")?;
+        }
+
+        if matches!(
+            build_type,
+            BuildType::Autotools | BuildType::CMake | BuildType::Meson
+        ) {
+            let help = match build_type {
+                BuildType::Autotools => "Examples: --disable-static, --enable-nls, --with-zlib",
+                BuildType::CMake => "Examples: -DENABLE_TESTS=OFF, -DUSE_SYSTEM_LIBS=ON",
+                BuildType::Meson => "Examples: -Dtests=false, -Ddefault_library=static",
+                _ => "",
+            };
+            if Confirm::new("Add configure/setup options?")
+                .with_help_message("Adds entries to build.flags.configure")
+                .with_default(show_advanced)
+                .prompt()?
+            {
+                flags.configure = prompt_repeating_list("Configure option", help)?;
+            }
+        }
+
+        if show_advanced && matches!(build_type, BuildType::Autotools) {
+            flags.configure_file = prompt_optional_text(
+                "Configure script path (optional):",
+                "Relative to source root, e.g. build-aux/configure",
+            )?;
+            flags.make_dirs = prompt_repeating_list(
+                "Make dir (build phase)",
+                "Relative to build dir, e.g. lib, libelf (empty = build root)",
+            )?;
+            flags.make_test_dirs = prompt_repeating_list(
+                "Make dir (test phase)",
+                "Relative to build dir, e.g. tests (empty = build root)",
+            )?;
+            flags.make_install_dirs = prompt_repeating_list(
+                "Make dir (install phase)",
+                "Relative to build dir, e.g. lib, apps (empty = build root)",
+            )?;
+            flags.skip_tests = Confirm::new("Skip automatic tests (make check/test)?")
+                .with_help_message(
+                    "If enabled, Depot will not auto-run detected Autotools test targets",
+                )
+                .with_default(false)
+                .prompt()?;
+        }
+
+        if matches!(build_type, BuildType::Makefile) {
+            crate::log_info!("Define Makefile build and install commands.");
+            flags.makefile_commands = prompt_repeating_list(
+                "makefile build command",
+                "Examples: make -j$(nproc), make all",
+            )?;
+            if flags.makefile_commands.is_empty() {
+                anyhow::bail!("Makefile build type requires at least one build command");
+            }
+            flags.makefile_install_commands = prompt_repeating_list(
+                "makefile install command",
+                "Examples: make DESTDIR=$DESTDIR install",
+            )?;
+            if flags.makefile_install_commands.is_empty() {
+                anyhow::bail!("Makefile build type requires at least one install command");
+            }
+        }
+
+        if matches!(build_type, BuildType::Rust) {
+            let profiles = vec!["release", "debug"];
+            let profile = Select::new("Cargo profile:", profiles)
+                .with_help_message("Release is recommended for production packages")
+                .prompt()?;
+            flags.profile = profile.to_string();
+            flags.target = prompt_optional_text(
+                "Rust target triple (optional):",
+                "Example: x86_64-unknown-linux-gnu",
+            )?;
+            if show_advanced {
+                flags.rustflags = prompt_repeating_list(
+                    "RUSTFLAG",
+                    "One flag per entry, e.g. -Ctarget-cpu=native",
+                )?;
+                flags.cargs = prompt_repeating_list(
+                    "Extra cargo arg",
+                    "Examples: --locked, --features, serde, --no-default-features",
+                )?;
+            }
+            flags.bindir = Text::new("Binary install dir:")
+                .with_help_message("Destination inside package image")
+                .with_default(flags.bindir.as_str())
+                .prompt()?;
+        }
+
+        if matches!(build_type, BuildType::Bin) {
+            flags.binary_type = prompt_optional_text(
+                "Binary type (optional):",
+                "Metadata only, e.g. deb, rpm, tarball",
             )?;
         }
-        flags.bindir = Text::new("Binary install dir:")
-            .with_help_message("Destination inside package image")
-            .with_default(flags.bindir.as_str())
-            .prompt()?;
-    }
 
-    if matches!(build_type, BuildType::Bin) {
-        flags.binary_type = prompt_optional_text(
-            "Binary type (optional):",
-            "Metadata only, e.g. deb, rpm, tarball",
-        )?;
-    }
-
-    if show_advanced {
-        flags.post_configure = prompt_repeating_list(
-            "post_configure command",
-            "Runs after configure/setup, before build",
-        )?;
-        flags.post_compile =
-            prompt_repeating_list("post_compile command", "Runs after build, before install")?;
-        flags.post_install =
-            prompt_repeating_list("post_install command", "Runs after install step")?;
+        if show_advanced {
+            flags.post_configure = prompt_repeating_list(
+                "post_configure command",
+                "Runs after configure/setup, before build",
+            )?;
+            flags.post_compile =
+                prompt_repeating_list("post_compile command", "Runs after build, before install")?;
+            flags.post_install =
+                prompt_repeating_list("post_install command", "Runs after install step")?;
+        }
     }
 
     let runtime_deps =
@@ -517,7 +538,7 @@ pub fn create_interactive() -> Result<PackageSpec> {
         packages: Vec::new(),
         alternatives: Alternatives::default(),
         manual_sources: Vec::new(),
-        source: vec![source],
+        source: sources,
         build: Build { build_type, flags },
         dependencies: Dependencies {
             build: build_deps,
@@ -1380,6 +1401,43 @@ mod tests {
         assert_eq!(test_deps.len(), 2);
         assert_eq!(test_deps[0].as_str(), Some("python"));
         assert_eq!(test_deps[1].as_str(), Some("bats"));
+    }
+
+    #[test]
+    fn spec_to_minimal_toml_supports_metapackage_without_sources() {
+        let spec = PackageSpec {
+            package: PackageInfo {
+                name: "foo-meta".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "Meta package".into(),
+                homepage: "".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: Build {
+                build_type: BuildType::Meta,
+                flags: BuildFlags::default(),
+            },
+            dependencies: Dependencies {
+                build: Vec::new(),
+                runtime: vec!["foo".into(), "bar".into()],
+                test: Vec::new(),
+            },
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+
+        let toml = spec_to_minimal_toml(&spec).unwrap();
+        assert!(toml.contains("type = \"meta\""));
+        assert!(!toml.contains("[[source]]"));
+
+        let val: toml::Value = toml::from_str(&toml).unwrap();
+        assert!(val.get("source").is_none());
     }
 
     #[test]
