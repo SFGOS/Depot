@@ -526,6 +526,17 @@ impl PackageSpec {
                         self.build.flags.post_configure = vec![s.to_string()];
                     }
                 }
+                "post_configure_lib32" | "post_configure-lib32" | "post-configure-lib32" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.post_configure_lib32 = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_configure_lib32 = vec![s.to_string()];
+                    }
+                }
                 "post_compile" | "post-compile" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.post_compile = arr
@@ -535,6 +546,17 @@ impl PackageSpec {
                             .collect();
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.post_compile = vec![s.to_string()];
+                    }
+                }
+                "post_compile_lib32" | "post_compile-lib32" | "post-compile-lib32" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.post_compile_lib32 = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_compile_lib32 = vec![s.to_string()];
                     }
                 }
                 "post_install" | "post-install" => {
@@ -680,6 +702,18 @@ impl PackageSpec {
                     }
                 }
             }
+            "post_configure_lib32" | "post_configure-lib32" | "post-configure-lib32" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .post_configure_lib32
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_configure_lib32.push(s.to_string());
+                    }
+                }
+            }
             "post_compile" | "post-compile" => {
                 for v in values {
                     if let Some(arr) = v.as_array() {
@@ -689,6 +723,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.post_compile.push(s.to_string());
+                    }
+                }
+            }
+            "post_compile_lib32" | "post_compile-lib32" | "post-compile-lib32" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .post_compile_lib32
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.post_compile_lib32.push(s.to_string());
                     }
                 }
             }
@@ -1883,6 +1929,8 @@ type = "autotools"
 "CFLAGS-lib32" = ["-mstackrealign"]
 "CXXFLAGS-lib32" = ["-fno-rtti"]
 "configure-lib32" = ["--disable-static"]
+"post_configure-lib32" = ["echo configured lib32"]
+"post_compile-lib32" = ["echo compiled lib32"]
 "post_install-lib32" = ["echo lib32"]
 "#,
         )
@@ -1893,6 +1941,14 @@ type = "autotools"
         assert_eq!(spec.build.flags.cflags_lib32, vec!["-mstackrealign"]);
         assert_eq!(spec.build.flags.cxxflags_lib32, vec!["-fno-rtti"]);
         assert_eq!(spec.build.flags.configure_lib32, vec!["--disable-static"]);
+        assert_eq!(
+            spec.build.flags.post_configure_lib32,
+            vec!["echo configured lib32"]
+        );
+        assert_eq!(
+            spec.build.flags.post_compile_lib32,
+            vec!["echo compiled lib32"]
+        );
         assert_eq!(spec.build.flags.post_install_lib32, vec!["echo lib32"]);
     }
 
@@ -2566,9 +2622,25 @@ pub struct BuildFlags {
     /// Commands to run after configure/setup step, before compile/build step.
     #[serde(default, alias = "post-configure")]
     pub post_configure: Vec<String>,
+    /// Commands to run after configure/setup for the lib32 build variant.
+    #[serde(
+        default,
+        alias = "post-configure-lib32",
+        alias = "post_configure-lib32",
+        alias = "post_configure_lib32"
+    )]
+    pub post_configure_lib32: Vec<String>,
     /// Commands to run after compile (after make, before make install).
     #[serde(default, alias = "post-compile")]
     pub post_compile: Vec<String>,
+    /// Commands to run after compile for the lib32 build variant.
+    #[serde(
+        default,
+        alias = "post-compile-lib32",
+        alias = "post_compile-lib32",
+        alias = "post_compile_lib32"
+    )]
+    pub post_compile_lib32: Vec<String>,
     /// Commands to run after install (after make install)
     #[serde(default, alias = "post-install")]
     pub post_install: Vec<String>,
@@ -2754,7 +2826,9 @@ impl Default for BuildFlags {
             libc: String::new(),
             rootfs: default_rootfs(),
             post_configure: Vec::new(),
+            post_configure_lib32: Vec::new(),
             post_compile: Vec::new(),
+            post_compile_lib32: Vec::new(),
             post_install: Vec::new(),
             post_install_lib32: Vec::new(),
             makefile_commands: Vec::new(),

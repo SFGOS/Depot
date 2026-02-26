@@ -76,6 +76,26 @@ impl Hook {
         ]
     }
 
+    fn lib32_candidate_names(self) -> Vec<String> {
+        let canonical = self.canonical_name();
+        let dashed = canonical.replace('_', "-");
+        let compact = canonical.replace('_', "");
+        vec![
+            format!("{canonical}-lib32"),
+            format!("{canonical}-lib32.sh"),
+            format!("{dashed}-lib32"),
+            format!("{dashed}-lib32.sh"),
+            format!("{compact}-lib32"),
+            format!("{compact}-lib32.sh"),
+            format!("lib32-{canonical}"),
+            format!("lib32-{canonical}.sh"),
+            format!("lib32-{dashed}"),
+            format!("lib32-{dashed}.sh"),
+            format!("lib32-{compact}"),
+            format!("lib32-{compact}.sh"),
+        ]
+    }
+
     fn legacy_root_candidate_names(self) -> [String; 2] {
         let compact = self.canonical_name().replace('_', "");
         [compact.clone(), format!("{}.sh", compact)]
@@ -203,7 +223,7 @@ pub fn run_hook_if_present(
     rootfs: &Path,
     pkg_name: &str,
 ) -> Result<bool> {
-    let Some(script_path) = resolve_hook_script(script_dir, hook)? else {
+    let Some(script_path) = resolve_hook_script(script_dir, hook, pkg_name)? else {
         return Ok(false);
     };
 
@@ -280,7 +300,7 @@ fn run_script_with_rootfs_context(
         })
 }
 
-fn resolve_hook_script(script_dir: &Path, hook: Hook) -> Result<Option<PathBuf>> {
+fn resolve_hook_script(script_dir: &Path, hook: Hook, pkg_name: &str) -> Result<Option<PathBuf>> {
     if !script_dir.exists() {
         return Ok(None);
     }
@@ -292,9 +312,29 @@ fn resolve_hook_script(script_dir: &Path, hook: Hook) -> Result<Option<PathBuf>>
         );
     }
 
+    if is_lib32_package(pkg_name) {
+        let label = format!("{} (lib32)", hook.canonical_name());
+        if let Some(path) =
+            resolve_hook_from_candidates(script_dir, &label, hook.lib32_candidate_names())?
+        {
+            return Ok(Some(path));
+        }
+    }
+
+    resolve_hook_from_candidates(script_dir, hook.canonical_name(), hook.candidate_names())
+}
+
+fn resolve_hook_from_candidates<I>(
+    script_dir: &Path,
+    hook_label: &str,
+    candidates: I,
+) -> Result<Option<PathBuf>>
+where
+    I: IntoIterator<Item = String>,
+{
     let mut found = Vec::new();
 
-    for candidate in hook.candidate_names() {
+    for candidate in candidates {
         let path = script_dir.join(&candidate);
         let metadata = match path.symlink_metadata() {
             Ok(meta) => meta,
@@ -324,12 +364,16 @@ fn resolve_hook_script(script_dir: &Path, hook: Hook) -> Result<Option<PathBuf>>
             .join(", ");
         bail!(
             "Ambiguous lifecycle hook '{}': multiple script candidates found: {}",
-            hook.canonical_name(),
+            hook_label,
             names
         );
     }
 
     Ok(found.into_iter().next())
+}
+
+fn is_lib32_package(pkg_name: &str) -> bool {
+    pkg_name.starts_with("lib32-")
 }
 
 fn collect_legacy_root_hooks(spec_dir: &Path) -> Result<Vec<(Hook, PathBuf)>> {
@@ -671,6 +715,33 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(rootfs.join("hook.out")).unwrap(),
             "compact\n"
+        );
+    }
+
+    #[test]
+    fn run_hook_if_present_prefers_lib32_specific_script_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scripts = tmp.path().join("scripts");
+        let rootfs = tmp.path().join("root");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        std::fs::write(
+            scripts.join("post_install"),
+            "echo generic > \"$DEPOT_ROOTFS/hook.out\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts.join("post_install-lib32"),
+            "echo lib32 > \"$DEPOT_ROOTFS/hook.out\"\n",
+        )
+        .unwrap();
+
+        let ran = run_hook_if_present(&scripts, Hook::PostInstall, &rootfs, "lib32-foo").unwrap();
+        assert!(ran);
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("hook.out")).unwrap(),
+            "lib32\n"
         );
     }
 

@@ -91,6 +91,12 @@ fn make_lib32_build_spec(base: &package::PackageSpec) -> package::PackageSpec {
     if !flags.configure_lib32.is_empty() {
         flags.configure = flags.configure_lib32.clone();
     }
+    if !flags.post_configure_lib32.is_empty() {
+        flags.post_configure = flags.post_configure_lib32.clone();
+    }
+    if !flags.post_compile_lib32.is_empty() {
+        flags.post_compile = flags.post_compile_lib32.clone();
+    }
     if !flags.post_install_lib32.is_empty() {
         flags.post_install = flags.post_install_lib32.clone();
     }
