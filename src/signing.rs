@@ -36,6 +36,13 @@ fn key_dir_candidates(rootfs: &Path, host_root: &Path, rel: &str) -> Vec<PathBuf
         .collect()
 }
 
+fn is_public_key_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("pub"))
+}
+
 fn pick_key_file(dir: &Path, is_public: bool) -> Result<Option<PathBuf>> {
     if !dir.exists() {
         return Ok(None);
@@ -90,6 +97,27 @@ fn pick_key_file(dir: &Path, is_public: bool) -> Result<Option<PathBuf>> {
     );
 }
 
+fn list_public_key_files_in_roots(rootfs: &Path, host_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for dir in key_dir_candidates(rootfs, host_root, PUBLIC_KEYS_DIR_REL) {
+        if !dir.exists() {
+            continue;
+        }
+        if !dir.is_dir() {
+            anyhow::bail!("Key path is not a directory: {}", dir.display());
+        }
+        let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+            .with_context(|| format!("Failed to read {}", dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| is_public_key_file(p))
+            .collect();
+        files.sort();
+        out.extend(files);
+    }
+    Ok(out)
+}
+
 fn locate_keys_in_roots(rootfs: &Path, host_root: &Path) -> Result<KeyLocations> {
     let mut keys = KeyLocations::default();
 
@@ -111,6 +139,16 @@ fn locate_keys_in_roots(rootfs: &Path, host_root: &Path) -> Result<KeyLocations>
 /// Locate public/signing keys by checking both `rootfs` and the host `/`.
 pub fn locate_keys(rootfs: &Path) -> Result<KeyLocations> {
     locate_keys_in_roots(rootfs, Path::new("/"))
+}
+
+/// Return the directory where trusted minisign public keys are stored under `rootfs`.
+pub fn trusted_public_keys_dir(rootfs: &Path) -> PathBuf {
+    rootfs.join(PUBLIC_KEYS_DIR_REL)
+}
+
+/// List all trusted minisign public keys found in `rootfs` and then the host `/`.
+pub fn list_trusted_public_keys(rootfs: &Path) -> Result<Vec<PathBuf>> {
+    list_public_key_files_in_roots(rootfs, Path::new("/"))
 }
 
 fn detached_sig_path(input: &Path) -> PathBuf {
@@ -222,18 +260,25 @@ fn verify_detached_with_key_paths(
     Ok(())
 }
 
+/// Verify a `.zst` file using a detached minisign signature and an explicit public key path.
+pub fn verify_zst_file_detached_with_public_key(
+    input: &Path,
+    sig_path: &Path,
+    public_key_path: &Path,
+) -> Result<()> {
+    let keys = KeyLocations {
+        public_key: Some(public_key_path.to_path_buf()),
+        signing_key: None,
+    };
+    verify_detached_with_key_paths(input, sig_path, &keys)
+}
+
 /// Sign a `.zst` file with a detached minisign signature written to `<file>.sig`.
 pub fn sign_zst_file_detached(rootfs: &Path, input: &Path) -> Result<PathBuf> {
     let keys = locate_keys(rootfs)?;
     let sig_path = detached_sig_path(input);
     sign_detached_with_key_paths(input, &sig_path, &keys)?;
     Ok(sig_path)
-}
-
-/// Verify a `.zst` file using a detached minisign signature.
-pub fn verify_zst_file_detached(rootfs: &Path, input: &Path, sig_path: &Path) -> Result<()> {
-    let keys = locate_keys(rootfs)?;
-    verify_detached_with_key_paths(input, sig_path, &keys)
 }
 
 /// Attempt to sign a `.zst` file using discovered keys; skip if no signing key exists.
@@ -306,15 +351,33 @@ mod tests {
         sign_detached_with_key_paths(&file, &sig_path, &keys)?;
         assert!(sig_path.exists());
 
-        let pk = PublicKey::from_file(pub_path)?;
+        let pk = PublicKey::from_file(&pub_path)?;
         let sig_box = SignatureBox::from_file(&sig_path)?;
         let mut reader = fs::File::open(&file)?;
         minisign::verify(&pk, &sig_box, &mut reader, true, false, false)
             .context("signature verification should succeed")?;
         verify_detached_with_key_paths(&file, &sig_path, &keys)?;
+        verify_zst_file_detached_with_public_key(&file, &sig_path, &pub_path)?;
 
         // Also make sure host/rootfs lookup path version works without touching /.
         let _ = locate_keys_in_roots(rootfs.path(), host.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn list_trusted_public_keys_finds_multiple_pub_files() -> Result<()> {
+        let rootfs = tempfile::tempdir()?;
+        let host = tempfile::tempdir()?;
+        let public_dir = rootfs.path().join(PUBLIC_KEYS_DIR_REL);
+        fs::create_dir_all(&public_dir)?;
+        fs::write(public_dir.join("a.pub"), b"dummy")?;
+        fs::write(public_dir.join("note.txt"), b"ignore")?;
+        fs::write(public_dir.join("b.pub"), b"dummy")?;
+
+        let found = list_public_key_files_in_roots(rootfs.path(), host.path())?;
+        assert_eq!(found.len(), 2);
+        assert!(found[0].ends_with("a.pub"));
+        assert!(found[1].ends_with("b.pub"));
         Ok(())
     }
 }

@@ -380,6 +380,323 @@ fn copy_file_url_to_path(url: &str, dest: &Path) -> Result<FileUrlCopyOutcome> {
     Ok(FileUrlCopyOutcome::Copied)
 }
 
+fn fetch_url_to_path(client: &reqwest::blocking::Client, url: &str, dest: &Path) -> Result<bool> {
+    match copy_file_url_to_path(url, dest)? {
+        FileUrlCopyOutcome::Copied => return Ok(true),
+        FileUrlCopyOutcome::Missing => return Ok(false),
+        FileUrlCopyOutcome::NotFileUrl => {}
+    }
+
+    let mut resp = client
+        .get(url)
+        .send()
+        .with_context(|| format!("Failed to fetch {}", url))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("Failed to fetch {}: HTTP {}", url, resp.status());
+    }
+
+    let mut out =
+        fs::File::create(dest).with_context(|| format!("Failed to create {}", dest.display()))?;
+    std::io::copy(&mut resp, &mut out)
+        .with_context(|| format!("Failed to save {}", dest.display()))?;
+    out.flush()
+        .with_context(|| format!("Failed to flush {}", dest.display()))?;
+    Ok(true)
+}
+
+fn extract_html_href_targets(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let lower_bytes = lower.as_bytes();
+    let html_bytes = html.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+
+    while i < lower_bytes.len() {
+        let Some(rel) = lower[i..].find("href") else {
+            break;
+        };
+        let mut j = i + rel + 4;
+        while j < lower_bytes.len() && lower_bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= lower_bytes.len() || lower_bytes[j] != b'=' {
+            i = j;
+            continue;
+        }
+        j += 1;
+        while j < lower_bytes.len() && lower_bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= lower_bytes.len() {
+            break;
+        }
+
+        let (start, end) = if lower_bytes[j] == b'"' || lower_bytes[j] == b'\'' {
+            let quote = lower_bytes[j];
+            let start = j + 1;
+            let mut k = start;
+            while k < lower_bytes.len() && lower_bytes[k] != quote {
+                k += 1;
+            }
+            (start, k)
+        } else {
+            let start = j;
+            let mut k = start;
+            while k < lower_bytes.len()
+                && !lower_bytes[k].is_ascii_whitespace()
+                && lower_bytes[k] != b'>'
+            {
+                k += 1;
+            }
+            (start, k)
+        };
+
+        if start < end && end <= html_bytes.len() {
+            out.push(String::from_utf8_lossy(&html_bytes[start..end]).to_string());
+        }
+        i = end.saturating_add(1);
+    }
+
+    out
+}
+
+fn list_repo_public_key_urls(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+) -> Result<Vec<(String, String)>> {
+    let parsed =
+        url::Url::parse(base_url).with_context(|| format!("Invalid repo URL: {base_url}"))?;
+    if parsed.scheme() == "file" {
+        let repo_dir = parsed
+            .to_file_path()
+            .map_err(|_| anyhow::anyhow!("Invalid file:// URL: {}", base_url))?;
+        let keys_dir = repo_dir.join("keys");
+        if !keys_dir.exists() {
+            return Ok(Vec::new());
+        }
+        if !keys_dir.is_dir() {
+            anyhow::bail!(
+                "Binary repo keys path is not a directory: {}",
+                keys_dir.display()
+            );
+        }
+
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&keys_dir)
+            .with_context(|| format!("Failed to read {}", keys_dir.display()))?
+        {
+            let path = entry?.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.to_ascii_lowercase().ends_with(".pub") {
+                continue;
+            }
+            let key_url = url::Url::from_file_path(&path)
+                .map_err(|_| anyhow::anyhow!("Failed to build file:// URL for {}", path.display()))?
+                .to_string();
+            out.push((name.to_string(), key_url));
+        }
+        out.sort();
+        out.dedup();
+        return Ok(out);
+    }
+
+    let keys_url = join_repo_url(base_url, "keys/")?;
+    let resp = client
+        .get(&keys_url)
+        .send()
+        .with_context(|| format!("Failed to fetch {}", keys_url))?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+    let body = resp
+        .text()
+        .with_context(|| format!("Failed to read {}", keys_url))?;
+    let keys_base = url::Url::parse(&keys_url)
+        .with_context(|| format!("Invalid repo keys URL: {}", keys_url))?;
+
+    let mut out = Vec::new();
+    for href in extract_html_href_targets(&body) {
+        if href.is_empty() || href.starts_with('#') || href.starts_with('?') {
+            continue;
+        }
+        let Ok(url) = keys_base.join(&href) else {
+            continue;
+        };
+        let Some(name) = url.path_segments().and_then(|mut s| s.next_back()) else {
+            continue;
+        };
+        if name.is_empty() || !name.to_ascii_lowercase().ends_with(".pub") {
+            continue;
+        }
+        out.push((name.to_string(), url.to_string()));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn verify_with_any_trusted_public_key(
+    rootfs: &Path,
+    input: &Path,
+    sig_path: &Path,
+) -> Result<PathBuf> {
+    let keys = crate::signing::list_trusted_public_keys(rootfs)?;
+    if keys.is_empty() {
+        anyhow::bail!("No trusted minisign public keys found in rootfs or host");
+    }
+
+    let mut last_failure: Option<(PathBuf, anyhow::Error)> = None;
+    for key_path in keys {
+        match crate::signing::verify_zst_file_detached_with_public_key(input, sig_path, &key_path) {
+            Ok(()) => return Ok(key_path),
+            Err(err) => last_failure = Some((key_path, err)),
+        }
+    }
+
+    let (key_path, err) = last_failure.expect("non-empty key list must produce a failure");
+    Err(err).with_context(|| {
+        format!(
+            "Detached signature verification failed with all trusted public keys (last tried {})",
+            key_path.display()
+        )
+    })
+}
+
+fn sanitize_filename_component(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => ch,
+            _ => '_',
+        })
+        .collect()
+}
+
+fn install_trusted_repo_public_key(
+    rootfs: &Path,
+    repo_name: &str,
+    source_key_path: &Path,
+    source_name: &str,
+) -> Result<PathBuf> {
+    let trusted_dir = crate::signing::trusted_public_keys_dir(rootfs);
+    fs::create_dir_all(&trusted_dir)
+        .with_context(|| format!("Failed to create {}", trusted_dir.display()))?;
+
+    let base_name = source_name
+        .split('/')
+        .next_back()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("repo.pub");
+    let base_name = sanitize_filename_component(base_name);
+    let repo_prefix = sanitize_filename_component(repo_name);
+
+    let source_bytes = fs::read(source_key_path)
+        .with_context(|| format!("Failed to read {}", source_key_path.display()))?;
+    let mut candidates = Vec::new();
+    candidates.push(trusted_dir.join(&base_name));
+    if !repo_prefix.is_empty() {
+        candidates.push(trusted_dir.join(format!("{}-{}", repo_prefix, base_name)));
+    }
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            let existing = fs::read(candidate)
+                .with_context(|| format!("Failed to read {}", candidate.display()))?;
+            if existing == source_bytes {
+                return Ok(candidate.clone());
+            }
+        } else {
+            fs::write(candidate, &source_bytes)
+                .with_context(|| format!("Failed to write {}", candidate.display()))?;
+            return Ok(candidate.clone());
+        }
+    }
+
+    for idx in 1usize.. {
+        let candidate = trusted_dir.join(format!("{}-{}.{}", repo_prefix, base_name, idx));
+        if candidate.exists() {
+            let existing = fs::read(&candidate)
+                .with_context(|| format!("Failed to read {}", candidate.display()))?;
+            if existing == source_bytes {
+                return Ok(candidate);
+            }
+            continue;
+        }
+        fs::write(&candidate, &source_bytes)
+            .with_context(|| format!("Failed to write {}", candidate.display()))?;
+        return Ok(candidate);
+    }
+
+    unreachable!("infinite loop returns on first available candidate")
+}
+
+fn try_trust_repo_public_key_for_repo_db(
+    repo_name: &str,
+    base_url: &str,
+    rootfs: &Path,
+    cache_dir: &Path,
+    client: &reqwest::blocking::Client,
+    repo_db_zst_path: &Path,
+    repo_db_sig_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let repo_keys = list_repo_public_key_urls(base_url, client)?;
+    if repo_keys.is_empty() {
+        return Ok(None);
+    }
+
+    let repo_keys_cache_dir = cache_dir.join("repo_keys");
+    fs::create_dir_all(&repo_keys_cache_dir)
+        .with_context(|| format!("Failed to create {}", repo_keys_cache_dir.display()))?;
+
+    for (key_name, key_url) in repo_keys {
+        let cache_name = sanitize_filename_component(&key_name);
+        let key_tmp_path = repo_keys_cache_dir.join(&cache_name);
+        if !fetch_url_to_path(client, &key_url, &key_tmp_path)? {
+            continue;
+        }
+
+        if crate::signing::verify_zst_file_detached_with_public_key(
+            repo_db_zst_path,
+            repo_db_sig_path,
+            &key_tmp_path,
+        )
+        .is_err()
+        {
+            continue;
+        }
+
+        let trusted_dir = crate::signing::trusted_public_keys_dir(rootfs);
+        let prompt = format!(
+            "Trust repo key '{}' from binary repo '{}' and copy it to {}?",
+            key_name,
+            repo_name,
+            trusted_dir.display()
+        );
+        if !crate::ui::prompt_yes_no(&prompt, false)? {
+            crate::log_warn!(
+                "Skipped trusting repo key '{}' for binary repo '{}'",
+                key_name,
+                repo_name
+            );
+            continue;
+        }
+
+        let installed =
+            install_trusted_repo_public_key(rootfs, repo_name, &key_tmp_path, &key_name)?;
+        return Ok(Some(installed));
+    }
+
+    Ok(None)
+}
+
 fn normalize_git_mirror_url(url: &str) -> Result<String> {
     let parsed = match url::Url::parse(url) {
         Ok(parsed) => parsed,
@@ -552,30 +869,44 @@ pub fn fetch_binary_repo_db(
     };
 
     if sig_downloaded {
-        let keys = crate::signing::locate_keys(rootfs)?;
-        if keys.public_key.is_none() {
-            if !repo.allow_unsigned {
+        let trusted_keys = crate::signing::list_trusted_public_keys(rootfs)?;
+        if trusted_keys.is_empty() {
+            if let Some(installed_key) = try_trust_repo_public_key_for_repo_db(
+                repo_name, base_url, rootfs, &cache_dir, &client, &tmp_zst, &tmp_sig,
+            )? {
+                crate::log_info!(
+                    "Trusted repo key for '{}' installed at {}",
+                    repo_name,
+                    installed_key.display()
+                );
+            } else if !repo.allow_unsigned {
                 anyhow::bail!(
-                    "No minisign public key found for verifying binary repo '{}' (checked rootfs and host)",
+                    "No trusted minisign public key found for binary repo '{}' and no trusted key was accepted from {}/keys/",
+                    repo_name,
+                    base_url.trim_end_matches('/')
+                );
+            } else {
+                crate::log_warn!(
+                    "No trusted minisign public key found; skipping verification for binary repo '{}' because allow_unsigned=true",
                     repo_name
                 );
             }
-            crate::log_warn!(
-                "No minisign public key found; skipping verification for binary repo '{}' because allow_unsigned=true",
-                repo_name
-            );
+        }
+
+        if crate::signing::list_trusted_public_keys(rootfs)?.is_empty() {
+            // No key was trusted/installed, and allow_unsigned=true already handled above.
         } else {
-            crate::signing::verify_zst_file_detached(rootfs, &tmp_zst, &tmp_sig).with_context(
-                || {
+            let verified_key = verify_with_any_trusted_public_key(rootfs, &tmp_zst, &tmp_sig)
+                .with_context(|| {
                     format!(
                         "Failed to verify detached signature for binary repo '{}'",
                         repo_name
                     )
-                },
-            )?;
+                })?;
             crate::log_info!(
-                "Verified detached signature for binary repo '{}'",
-                repo_name
+                "Verified detached signature for binary repo '{}' using {}",
+                repo_name,
+                verified_key.display()
             );
         }
     }
@@ -1490,6 +1821,43 @@ license = ["MIT", "Apache-2.0"]
         let outcome = copy_file_url_to_path(&url, &dst).unwrap();
         assert_eq!(outcome, FileUrlCopyOutcome::Missing);
         assert!(!dst.exists());
+    }
+
+    #[test]
+    fn test_extract_html_href_targets_parses_common_forms() {
+        let html = r#"
+            <html><body>
+              <a href="alpha.pub">alpha</a>
+              <a HREF='nested/beta.pub'>beta</a>
+              <a href=gamma.pub>gamma</a>
+              <a href="../">parent</a>
+            </body></html>
+        "#;
+        let hrefs = extract_html_href_targets(html);
+        assert!(hrefs.iter().any(|h| h == "alpha.pub"));
+        assert!(hrefs.iter().any(|h| h == "nested/beta.pub"));
+        assert!(hrefs.iter().any(|h| h == "gamma.pub"));
+        assert!(hrefs.iter().any(|h| h == "../"));
+    }
+
+    #[test]
+    fn test_list_repo_public_key_urls_reads_file_repo_keys_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let keys_dir = repo_dir.join("keys");
+        fs::create_dir_all(&keys_dir).unwrap();
+        fs::write(keys_dir.join("repo.pub"), b"pubkey").unwrap();
+        fs::write(keys_dir.join("ignore.txt"), b"nope").unwrap();
+        fs::create_dir_all(keys_dir.join("subdir")).unwrap();
+
+        let base_url = url::Url::from_directory_path(&repo_dir)
+            .expect("file URL")
+            .to_string();
+        let client = reqwest::blocking::Client::builder().build().unwrap();
+        let keys = list_repo_public_key_urls(&base_url, &client).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "repo.pub");
+        assert!(keys[0].1.ends_with("/repo.pub"));
     }
 
     #[test]
