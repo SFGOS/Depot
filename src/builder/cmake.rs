@@ -21,7 +21,11 @@ pub fn build(
     // Determine actual source directory (support source_subdir)
     let actual_src = resolve_actual_src(spec, src_dir)?;
 
-    let build_dir = actual_src.join("build");
+    let build_dir = if let Some(dir) = &flags.build_dir {
+        actual_src.join(dir)
+    } else {
+        actual_src.join("build")
+    };
 
     // Create directories
     fs::create_dir_all(&build_dir)?;

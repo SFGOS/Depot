@@ -97,6 +97,10 @@ fn make_lib32_build_spec(base: &package::PackageSpec) -> package::PackageSpec {
 
     flags.cc = format!("{} -m32", flags.cc.trim());
     flags.cxx = format!("{} -m32", flags.cxx.trim());
+    flags.build_dir = Some(match flags.build_dir.as_deref() {
+        Some(dir) if !dir.trim().is_empty() => format!("{}-lib32", dir.trim()),
+        _ => "build-lib32".to_string(),
+    });
 
     spec
 }
