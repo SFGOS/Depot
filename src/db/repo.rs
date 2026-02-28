@@ -5,6 +5,10 @@ use rusqlite::{Connection, params};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 use zstd::stream::write::Encoder;
 
 fn parse_license_text(metadata: &toml::Value) -> Option<String> {
@@ -26,6 +30,23 @@ fn parse_license_text(metadata: &toml::Value) -> Option<String> {
 
 pub struct RepoManager {
     pub repo_dir: PathBuf,
+}
+
+struct IndexedPackage {
+    name: String,
+    version: String,
+    revision: u32,
+    description: Option<String>,
+    homepage: Option<String>,
+    license: Option<String>,
+    filename: String,
+    size: u64,
+    sha256: String,
+    sha512: String,
+    provides: Vec<String>,
+    runtime_dependencies: Vec<String>,
+    optional_dependencies: Vec<String>,
+    archive_files: Vec<String>,
 }
 
 /// Search hit returned from a cached binary repository database.
@@ -89,13 +110,10 @@ impl RepoManager {
 
         self.init_repo_schema(&mut conn)?;
 
-        // Find all .depot.pkg.tar.zst files in repo_dir
-        for entry in fs::read_dir(&self.repo_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.to_string_lossy().ends_with(".depot.pkg.tar.zst") {
-                self.index_package(&mut conn, &path)?;
-            }
+        let package_paths = self.collect_repo_package_paths()?;
+        let indexed_packages = self.collect_indexed_packages_parallel(&package_paths)?;
+        for indexed in indexed_packages {
+            self.insert_indexed_package(&mut conn, indexed)?;
         }
 
         conn.close().map_err(|(_, e)| e)?;
@@ -107,6 +125,72 @@ impl RepoManager {
         fs::remove_file(&db_path)?;
 
         Ok(compressed_db_path)
+    }
+
+    fn collect_repo_package_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut package_paths = Vec::new();
+        for entry in fs::read_dir(&self.repo_dir)
+            .with_context(|| format!("Failed to read {}", self.repo_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() && path.to_string_lossy().ends_with(".depot.pkg.tar.zst") {
+                package_paths.push(path);
+            }
+        }
+        package_paths.sort();
+        Ok(package_paths)
+    }
+
+    fn collect_indexed_packages_parallel(
+        &self,
+        package_paths: &[PathBuf],
+    ) -> Result<Vec<IndexedPackage>> {
+        if package_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let worker_count = num_cpus().min(package_paths.len());
+        crate::log_info!(
+            "Using {} thread(s) to index {} package(s)...",
+            worker_count,
+            package_paths.len()
+        );
+
+        let next_index = AtomicUsize::new(0);
+        let mut indexed = std::thread::scope(|scope| -> Result<Vec<(usize, IndexedPackage)>> {
+            let (tx, rx) = mpsc::channel::<(usize, Result<IndexedPackage>)>();
+
+            for _ in 0..worker_count {
+                let tx = tx.clone();
+                let next_index = &next_index;
+                scope.spawn(move || {
+                    loop {
+                        let idx = next_index.fetch_add(1, Ordering::Relaxed);
+                        if idx >= package_paths.len() {
+                            break;
+                        }
+                        let result = self.read_indexed_package(&package_paths[idx]);
+                        if tx.send((idx, result)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+
+            let mut indexed = Vec::with_capacity(package_paths.len());
+            for _ in 0..package_paths.len() {
+                let (idx, result) = rx
+                    .recv()
+                    .context("Failed to receive package indexing result from worker")?;
+                indexed.push((idx, result?));
+            }
+            Ok(indexed)
+        })?;
+
+        indexed.sort_by_key(|(idx, _)| *idx);
+        Ok(indexed.into_iter().map(|(_, pkg)| pkg).collect())
     }
 
     fn init_repo_schema(&self, conn: &mut Connection) -> Result<()> {
@@ -150,10 +234,14 @@ impl RepoManager {
         Ok(())
     }
 
-    fn index_package(&self, conn: &mut Connection, pkg_path: &Path) -> Result<()> {
+    fn read_indexed_package(&self, pkg_path: &Path) -> Result<IndexedPackage> {
         crate::log_info!("Indexing package {}...", pkg_path.display());
 
-        let filename = pkg_path.file_name().unwrap().to_string_lossy();
+        let filename = pkg_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("Invalid package filename: {}", pkg_path.display()))?
+            .to_string();
         let size = pkg_path.metadata()?.len();
         let (sha256, sha512) = self.calculate_hashes(pkg_path)?;
 
@@ -263,6 +351,42 @@ impl RepoManager {
             version = name_parts[1].to_string();
             revision = name_parts[2].parse().unwrap_or(1);
         }
+
+        Ok(IndexedPackage {
+            name,
+            version,
+            revision,
+            description,
+            homepage,
+            license,
+            filename,
+            size,
+            sha256,
+            sha512,
+            provides,
+            runtime_dependencies,
+            optional_dependencies,
+            archive_files,
+        })
+    }
+
+    fn insert_indexed_package(&self, conn: &mut Connection, indexed: IndexedPackage) -> Result<()> {
+        let IndexedPackage {
+            name,
+            version,
+            revision,
+            description,
+            homepage,
+            license,
+            filename,
+            size,
+            sha256,
+            sha512,
+            provides,
+            runtime_dependencies,
+            optional_dependencies,
+            archive_files,
+        } = indexed;
 
         // Insert into database
         conn.execute(
@@ -1758,7 +1882,8 @@ optional = []
         let mut conn = Connection::open_in_memory().unwrap();
         let manager = RepoManager::new(repo_dir.to_path_buf());
         manager.init_repo_schema(&mut conn).unwrap();
-        manager.index_package(&mut conn, &pkg_path).unwrap();
+        let indexed = manager.read_indexed_package(&pkg_path).unwrap();
+        manager.insert_indexed_package(&mut conn, indexed).unwrap();
 
         let (name, version, revision, desc, home, lic, sha256, sha512): (
             String,
@@ -1832,7 +1957,8 @@ license = ["MIT", "Apache-2.0"]
         let mut conn = Connection::open_in_memory().unwrap();
         let manager = RepoManager::new(repo_dir.to_path_buf());
         manager.init_repo_schema(&mut conn).unwrap();
-        manager.index_package(&mut conn, &pkg_path).unwrap();
+        let indexed = manager.read_indexed_package(&pkg_path).unwrap();
+        manager.insert_indexed_package(&mut conn, indexed).unwrap();
 
         let lic: Option<String> = conn
             .query_row("SELECT license FROM packages", [], |r| r.get(0))
