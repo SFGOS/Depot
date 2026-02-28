@@ -746,6 +746,7 @@ mod tests {
                 extract_dir: "foo".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: Build {
                 build_type: BuildType::Autotools,

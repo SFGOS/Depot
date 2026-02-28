@@ -116,6 +116,7 @@ pub fn copy_manual_sources(spec: &PackageSpec, cache_dir: &Path, build_dir: &Pat
                             extract_dir: "manual-source".to_string(),
                             patches: Vec::new(),
                             post_extract: Vec::new(),
+                            cherry_pick: Vec::new(),
                         };
                         let fetched =
                             fetcher::fetch_archive(spec, &source, &cache_dir.join("manual"))?;
@@ -299,6 +300,11 @@ fn prepare_one(
 ) -> Result<PathBuf> {
     let url = spec.expand_vars(&source.url);
     let extract_dir_name = spec.expand_vars(&source.extract_dir);
+    let cherry_pick_revs: Vec<String> = source
+        .cherry_pick
+        .iter()
+        .map(|rev| spec.expand_vars(rev))
+        .collect();
 
     // Local file:// handling (directories or archives)
     if let Some(path_str) = url.strip_prefix("file://") {
@@ -358,9 +364,17 @@ fn prepare_one(
             &checkout_dir,
             &cache_dir.join("git"),
             &spec.package.name,
+            &cherry_pick_revs,
         )?;
         hooks::post_extract(spec, source, &checkout_dir, cache_dir)?;
         return Ok(checkout_dir);
+    }
+
+    if !source.cherry_pick.is_empty() {
+        bail!(
+            "source.cherry_pick is only supported for git sources (got URL: {})",
+            source.url
+        );
     }
 
     let src_dir = build_dir.join(&extract_dir_name);
@@ -458,6 +472,7 @@ mod tests {
                 extract_dir: "src".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: Build {
                 build_type: BuildType::Custom,
@@ -517,6 +532,7 @@ mod tests {
                 extract_dir: "json-$version".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: Build {
                 build_type: BuildType::Custom,
@@ -537,6 +553,23 @@ mod tests {
             split_git_url("https://github.com/nlohmann/json.git#0123456789abcdef").unwrap();
         assert_eq!(base, "https://github.com/nlohmann/json.git");
         assert_eq!(rev, "0123456789abcdef");
+    }
+
+    #[test]
+    fn prepare_one_rejects_cherry_pick_for_non_git_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        let build_dir = tmp.path().join("build");
+        let mut spec = mk_spec_with_manuals(PathBuf::from("."), Vec::new());
+        spec.source[0].url = "https://example.com/foo.tar.gz".into();
+        spec.source[0].cherry_pick = vec!["deadbeef".into()];
+
+        let err = prepare_one(&spec, &spec.source[0], &cache_dir, &build_dir)
+            .expect_err("non-git source with cherry_pick must be rejected");
+        assert!(
+            err.to_string()
+                .contains("source.cherry_pick is only supported for git sources")
+        );
     }
 
     #[test]

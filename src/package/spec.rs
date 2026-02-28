@@ -1153,6 +1153,7 @@ type = "custom"
         );
         assert!(spec.sources()[0].patches.is_empty());
         assert!(spec.sources()[0].post_extract.is_empty());
+        assert!(spec.sources()[0].cherry_pick.is_empty());
         assert_eq!(spec.spec_dir, tmp.path());
     }
 
@@ -1191,6 +1192,40 @@ type = "custom"
         assert_eq!(spec.sources().len(), 2);
         assert_eq!(spec.sources()[0].extract_dir, "foo");
         assert_eq!(spec.sources()[1].extract_dir, "bar");
+    }
+
+    #[test]
+    fn parse_git_source_with_cherry_pick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.git#main"
+sha256 = "skip"
+extract_dir = "foo"
+cherry_pick = ["deadbeef", "cafebabe"]
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.sources()[0].cherry_pick,
+            vec!["deadbeef".to_string(), "cafebabe".to_string()]
+        );
     }
 
     #[test]
@@ -2378,6 +2413,7 @@ type = "custom"
                 extract_dir: "e".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: Build {
                 build_type: BuildType::Custom,
@@ -2503,6 +2539,18 @@ pub struct Source {
     /// post_extract = ["autoreconf -fi"]
     #[serde(default)]
     pub post_extract: Vec<String>,
+
+    /// Optional list of git commit hashes/revs to cherry-pick after checkout.
+    ///
+    /// This is only valid for git sources (`*.git` URL or `url#rev` git form).
+    /// Example:
+    /// cherry_pick = ["a1b2c3d4", "deadbeef"]
+    #[serde(
+        default,
+        alias = "cherry-pick",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub cherry_pick: Vec<String>,
 }
 
 /// Manual source copied before standard source fetching.

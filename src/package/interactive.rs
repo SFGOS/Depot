@@ -425,6 +425,7 @@ pub fn create_interactive() -> Result<PackageSpec> {
                 extract_dir,
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             };
 
             if show_advanced {
@@ -787,6 +788,17 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
                         s.post_extract
                             .iter()
                             .map(|p| Value::String(p.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !s.cherry_pick.is_empty() {
+                st.insert(
+                    "cherry_pick".into(),
+                    Value::Array(
+                        s.cherry_pick
+                            .iter()
+                            .map(|rev| Value::String(rev.clone()))
                             .collect(),
                     ),
                 );
@@ -1316,6 +1328,7 @@ mod tests {
                 extract_dir: "foo-1.0".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: Build {
                 build_type: BuildType::Autotools,
@@ -1365,6 +1378,7 @@ mod tests {
                 extract_dir: "foo-1.0".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: Build {
                 build_type: BuildType::Autotools,
@@ -1401,6 +1415,7 @@ mod tests {
                 extract_dir: "foo-1.0".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: Build {
                 build_type: BuildType::Autotools,
@@ -1464,6 +1479,7 @@ mod tests {
                 extract_dir: "foo-1.0".into(),
                 patches: vec!["fix.patch".into()],
                 post_extract: vec!["autoreconf -fi".into()],
+                cherry_pick: Vec::new(),
             }],
             build: Build {
                 build_type: BuildType::Autotools,
@@ -1525,6 +1541,7 @@ mod tests {
                 extract_dir: "$name-$version".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: Build {
                 build_type: BuildType::Autotools,
@@ -1560,6 +1577,7 @@ mod tests {
                 extract_dir: "foo-1.0".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: Build {
                 build_type: BuildType::Autotools,

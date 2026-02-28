@@ -375,6 +375,7 @@ mod tests {
                 extract_dir: "foo".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: crate::package::Build {
                 build_type: crate::package::BuildType::Custom,
@@ -415,6 +416,7 @@ mod tests {
                 extract_dir: "foo".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: crate::package::Build {
                 build_type: crate::package::BuildType::Custom,
@@ -463,6 +465,7 @@ mod tests {
                 extract_dir: "foo".into(),
                 patches: Vec::new(),
                 post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
             }],
             build: crate::package::Build {
                 build_type: crate::package::BuildType::Custom,

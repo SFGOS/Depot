@@ -20,6 +20,7 @@ pub fn checkout(
     checkout_dir: &Path,
     git_cache_dir: &Path,
     pkgname: &str,
+    cherry_pick_revs: &[String],
 ) -> Result<()> {
     fs::create_dir_all(git_cache_dir).with_context(|| {
         format!(
@@ -51,6 +52,75 @@ pub fn checkout(
 
     let repo = Repository::open(checkout_dir)?;
     checkout_rev(&repo, rev).with_context(|| format!("Failed to checkout revision '{}'", rev))?;
+    apply_cherry_picks(&repo, cherry_pick_revs)?;
+
+    Ok(())
+}
+
+fn apply_cherry_picks(repo: &Repository, cherry_pick_revs: &[String]) -> Result<()> {
+    if cherry_pick_revs.is_empty() {
+        return Ok(());
+    }
+
+    crate::log_info!("Applying {} git cherry-pick(s)...", cherry_pick_revs.len());
+
+    for rev in cherry_pick_revs {
+        let rev = rev.trim();
+        if rev.is_empty() {
+            anyhow::bail!("Encountered empty entry in source.cherry_pick");
+        }
+
+        let obj = resolve_rev_object(repo, rev)
+            .with_context(|| format!("Could not resolve cherry-pick rev: {}", rev))?;
+        let commit = obj
+            .peel_to_commit()
+            .with_context(|| format!("Could not peel cherry-pick rev to commit: {}", rev))?;
+        repo.cherrypick(&commit, None)
+            .with_context(|| format!("Failed to cherry-pick rev: {}", rev))?;
+
+        let parent = repo
+            .head()
+            .with_context(|| format!("Failed to read HEAD during cherry-pick {}", rev))?
+            .peel_to_commit()
+            .with_context(|| format!("Failed to peel HEAD to commit during {}", rev))?;
+
+        let mut index = repo
+            .index()
+            .with_context(|| format!("Failed to open index after cherry-pick {}", rev))?;
+        if index.has_conflicts() {
+            anyhow::bail!("Cherry-pick produced conflicts for rev {}", rev);
+        }
+
+        let tree_id = index
+            .write_tree()
+            .with_context(|| format!("Failed to write tree after cherry-pick {}", rev))?;
+        let tree = repo
+            .find_tree(tree_id)
+            .with_context(|| format!("Failed to find tree after cherry-pick {}", rev))?;
+        let message = commit.summary().unwrap_or("cherry-pick");
+        let new_head = repo
+            .commit(
+                None,
+                &commit.author(),
+                &commit.committer(),
+                message,
+                &tree,
+                &[&parent],
+            )
+            .with_context(|| format!("Failed to create cherry-pick commit for rev {}", rev))?;
+        repo.set_head_detached(new_head)
+            .with_context(|| format!("Failed to update detached HEAD after cherry-pick {}", rev))?;
+
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout.force();
+        let obj = repo
+            .find_object(new_head, None)
+            .with_context(|| format!("Failed to resolve new HEAD after cherry-pick {}", rev))?;
+        repo.checkout_tree(&obj, Some(&mut checkout))
+            .with_context(|| format!("Failed to update worktree after cherry-pick {}", rev))?;
+
+        crate::log_info!("  cherry_pick: {}", rev);
+    }
 
     Ok(())
 }
@@ -352,8 +422,15 @@ mod tests {
         let tree_id = index.write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
         let sig = git2::Signature::now("depot-test", "depot@example.test").unwrap();
+        let mut parents = Vec::new();
+        if let Ok(head) = repo.head()
+            && let Some(oid) = head.target()
+        {
+            parents.push(repo.find_commit(oid).unwrap());
+        }
+        let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
 
-        repo.commit(Some("HEAD"), &sig, &sig, "test", &tree, &[])
+        repo.commit(Some("HEAD"), &sig, &sig, "test", &tree, &parent_refs)
             .unwrap()
     }
 
@@ -403,5 +480,44 @@ mod tests {
 
         checkout_rev(&repo, "feature").unwrap();
         assert_eq!(repo.head().unwrap().target().unwrap(), commit_oid);
+    }
+
+    #[test]
+    fn apply_cherry_picks_applies_commit_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("repo");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+
+        let base = commit_file(&repo, &workdir, "README", "base");
+        let picked = commit_file(&repo, &workdir, "README", "picked");
+
+        checkout_rev(&repo, &base.to_string()).unwrap();
+        apply_cherry_picks(&repo, &[picked.to_string()]).unwrap();
+
+        let head = repo.head().unwrap().target().unwrap();
+        assert_eq!(head, picked);
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("README")).unwrap(),
+            "picked"
+        );
+    }
+
+    #[test]
+    fn apply_cherry_picks_errors_for_unknown_rev() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("repo");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+
+        let base = commit_file(&repo, &workdir, "README", "base");
+        checkout_rev(&repo, &base.to_string()).unwrap();
+
+        let err = apply_cherry_picks(&repo, &["deadbeef".to_string()])
+            .expect_err("unknown cherry-pick rev should fail");
+        assert!(
+            err.to_string()
+                .contains("Could not resolve cherry-pick rev")
+        );
     }
 }
