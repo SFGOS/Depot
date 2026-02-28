@@ -1,7 +1,7 @@
 use crate::cli::{Cli, Commands, RepoCommands, RepoKindArg};
 use crate::{
-    builder, config, cross, db, deps, index, install, locking, package, planner, signing, source,
-    staging, ui,
+    builder, cli_assets, config, cross, db, deps, index, install, locking, package, planner,
+    signing, source, staging, ui,
 };
 use anyhow::{Context, Result};
 use std::fs;
@@ -1949,6 +1949,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
+        Commands::GenerateArtifacts { out_dir } => {
+            cli_assets::generate_cli_assets(&out_dir)?;
+            ui::success(format!("Generated CLI assets in {}", out_dir.display()));
+        }
         Commands::Config => {
             let config = config::Config::for_rootfs(&cli.rootfs);
             let config_lock = locking::open_lock(&config)?;

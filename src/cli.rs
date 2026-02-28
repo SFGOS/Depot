@@ -112,6 +112,13 @@ pub enum Commands {
     },
     /// Show current configuration
     Config,
+    /// Generate shell completion scripts and a man page into an output directory.
+    #[command(hide = true)]
+    GenerateArtifacts {
+        /// Output directory for generated files
+        #[arg(long, value_name = "DIR")]
+        out_dir: PathBuf,
+    },
     /// Create a new package specification interactively
     MakeSpec {
         /// Output file path (defaults to <name>.toml)

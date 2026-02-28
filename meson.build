@@ -125,3 +125,13 @@ install_data(
   'contrib/README.md',
   install_dir: join_paths(get_option('datadir'), 'doc', meson.project_name()),
 )
+
+meson.add_install_script(
+  sh,
+  join_paths(src_root, 'tools', 'meson', 'install-cli-assets.sh'),
+  join_paths(build_root, 'depot'),
+  join_paths(get_option('datadir'), 'bash-completion', 'completions'),
+  join_paths(get_option('datadir'), 'zsh', 'site-functions'),
+  join_paths(get_option('datadir'), 'fish', 'vendor_completions.d'),
+  join_paths(get_option('mandir'), 'man1'),
+)

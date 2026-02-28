@@ -19,6 +19,10 @@ Depot is a source-based package manager designed for Linux. It focuses on reprod
 cargo build --release
 ```
 
+When installing via Meson (`meson install`), Depot now generates and installs:
+- Shell completions for Bash, Zsh, and Fish
+- A `depot(1)` man page
+
 ### Installing a Package
 
 To install a package from a spec file:

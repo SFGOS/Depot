@@ -3,6 +3,7 @@
 
 mod builder;
 mod cli;
+mod cli_assets;
 mod commands;
 mod config;
 mod cross;
