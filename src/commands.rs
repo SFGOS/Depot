@@ -1591,12 +1591,14 @@ pub fn run(cli: Cli) -> Result<()> {
             let db_path = config.db_dir.join("packages.db");
             db::list_packages(&db_path)?;
         }
-        Commands::Sign { file } => {
-            let sig_path = signing::sign_zst_file_detached(&cli.rootfs, &file)?;
-            ui::success(format!(
-                "Created detached signature: {}",
-                sig_path.display()
-            ));
+        Commands::Sign { files } => {
+            let sig_paths = signing::sign_zst_files_detached(&cli.rootfs, &files)?;
+            for sig_path in sig_paths {
+                ui::success(format!(
+                    "Created detached signature: {}",
+                    sig_path.display()
+                ));
+            }
         }
         Commands::Repo { command } => match command {
             RepoCommands::Create { dir } => {

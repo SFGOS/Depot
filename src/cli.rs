@@ -102,8 +102,9 @@ pub enum Commands {
     List,
     /// Create a detached minisign signature for a .zst file
     Sign {
-        /// Path to the .zst file to sign
-        file: PathBuf,
+        /// One or more .zst files to sign
+        #[arg(value_name = "FILE", required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
     },
     /// Repository management
     Repo {

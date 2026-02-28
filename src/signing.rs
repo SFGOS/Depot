@@ -1,7 +1,7 @@
 //! Minisign-based detached signature helpers.
 
 use anyhow::{Context, Result};
-use minisign::{PublicKey, SecretKeyBox, SignatureBox};
+use minisign::{PublicKey, SecretKey, SecretKeyBox, SignatureBox};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -155,17 +155,12 @@ fn detached_sig_path(input: &Path) -> PathBuf {
     PathBuf::from(format!("{}.sig", input.display()))
 }
 
-fn sign_detached_with_key_paths(input: &Path, sig_path: &Path, keys: &KeyLocations) -> Result<()> {
-    if !input.exists() {
-        anyhow::bail!("File not found: {}", input.display());
-    }
-    if !is_zst_file(input) {
-        anyhow::bail!(
-            "Signing command currently only supports .zst files: {}",
-            input.display()
-        );
-    }
+struct SigningMaterial {
+    secret_key: SecretKey,
+    public_key: Option<PublicKey>,
+}
 
+fn load_signing_material(keys: &KeyLocations) -> Result<SigningMaterial> {
     let signing_key_path = keys.signing_key.as_ref().with_context(
         || "No minisign signing key found in /usr/share/depot/keys/sign (checked rootfs and host)",
     )?;
@@ -204,11 +199,32 @@ fn sign_detached_with_key_paths(input: &Path, sig_path: &Path, keys: &KeyLocatio
         None
     };
 
+    Ok(SigningMaterial {
+        secret_key,
+        public_key,
+    })
+}
+
+fn sign_detached_with_material(
+    input: &Path,
+    sig_path: &Path,
+    signing_material: &SigningMaterial,
+) -> Result<()> {
+    if !input.exists() {
+        anyhow::bail!("File not found: {}", input.display());
+    }
+    if !is_zst_file(input) {
+        anyhow::bail!(
+            "Signing command currently only supports .zst files: {}",
+            input.display()
+        );
+    }
+
     let file =
         fs::File::open(input).with_context(|| format!("Failed to open {}", input.display()))?;
     let sig = minisign::sign(
-        public_key.as_ref(),
-        &secret_key,
+        signing_material.public_key.as_ref(),
+        &signing_material.secret_key,
         file,
         None,
         Some(&format!("depot signature for {}", input.display())),
@@ -273,12 +289,23 @@ pub fn verify_zst_file_detached_with_public_key(
     verify_detached_with_key_paths(input, sig_path, &keys)
 }
 
-/// Sign a `.zst` file with a detached minisign signature written to `<file>.sig`.
-pub fn sign_zst_file_detached(rootfs: &Path, input: &Path) -> Result<PathBuf> {
+/// Sign one or more `.zst` files with detached minisign signatures written to `<file>.sig`.
+pub fn sign_zst_files_detached(rootfs: &Path, inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    if inputs.is_empty() {
+        anyhow::bail!("No input files provided for signing");
+    }
+
     let keys = locate_keys(rootfs)?;
-    let sig_path = detached_sig_path(input);
-    sign_detached_with_key_paths(input, &sig_path, &keys)?;
-    Ok(sig_path)
+    let signing_material = load_signing_material(&keys)?;
+    let mut sig_paths = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        let sig_path = detached_sig_path(input);
+        sign_detached_with_material(input, &sig_path, &signing_material)?;
+        sig_paths.push(sig_path);
+    }
+
+    Ok(sig_paths)
 }
 
 /// Attempt to sign a `.zst` file using discovered keys; skip if no signing key exists.
@@ -294,8 +321,9 @@ pub fn auto_sign_zst_file_detached(rootfs: &Path, input: &Path) -> Result<Option
         );
         return Ok(None);
     }
+    let signing_material = load_signing_material(&keys)?;
     let sig_path = detached_sig_path(input);
-    sign_detached_with_key_paths(input, &sig_path, &keys)?;
+    sign_detached_with_material(input, &sig_path, &signing_material)?;
     Ok(Some(sig_path))
 }
 
@@ -347,8 +375,9 @@ mod tests {
             public_key: Some(pub_path.clone()),
             signing_key: Some(sign_path.clone()),
         };
+        let signing_material = load_signing_material(&keys)?;
         let sig_path = PathBuf::from(format!("{}.sig", file.display()));
-        sign_detached_with_key_paths(&file, &sig_path, &keys)?;
+        sign_detached_with_material(&file, &sig_path, &signing_material)?;
         assert!(sig_path.exists());
 
         let pk = PublicKey::from_file(&pub_path)?;
@@ -361,6 +390,47 @@ mod tests {
 
         // Also make sure host/rootfs lookup path version works without touching /.
         let _ = locate_keys_in_roots(rootfs.path(), host.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn sign_zst_files_detached_signs_multiple_files() -> Result<()> {
+        let rootfs = tempfile::tempdir()?;
+        let first = rootfs.path().join("first.depot.pkg.tar.zst");
+        let second = rootfs.path().join("second.depot.pkg.tar.zst");
+
+        let mut first_file = fs::File::create(&first)?;
+        first_file.write_all(b"first payload")?;
+        first_file.flush()?;
+
+        let mut second_file = fs::File::create(&second)?;
+        second_file.write_all(b"second payload")?;
+        second_file.flush()?;
+
+        let (pub_path, _) = write_test_keys(rootfs.path())?;
+        let inputs = vec![first.clone(), second.clone()];
+        let sig_paths = sign_zst_files_detached(rootfs.path(), &inputs)?;
+
+        assert_eq!(sig_paths.len(), 2);
+        assert_eq!(
+            sig_paths[0],
+            PathBuf::from(format!("{}.sig", first.display()))
+        );
+        assert_eq!(
+            sig_paths[1],
+            PathBuf::from(format!("{}.sig", second.display()))
+        );
+        assert!(sig_paths[0].exists());
+        assert!(sig_paths[1].exists());
+
+        let pk = PublicKey::from_file(pub_path)?;
+        for (input, sig_path) in inputs.iter().zip(sig_paths.iter()) {
+            let sig_box = SignatureBox::from_file(sig_path)?;
+            let mut reader = fs::File::open(input)?;
+            minisign::verify(&pk, &sig_box, &mut reader, true, false, false)
+                .context("signature verification should succeed")?;
+        }
+
         Ok(())
     }
 
