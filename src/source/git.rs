@@ -97,11 +97,7 @@ fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str) -> Result<()> {
 }
 
 fn checkout_rev(repo: &Repository, rev: &str) -> Result<()> {
-    // Try a few reasonable ways to resolve the rev.
-    let obj = repo
-        .revparse_single(rev)
-        .or_else(|_| repo.revparse_single(&format!("refs/tags/{rev}")))
-        .or_else(|_| repo.revparse_single(&format!("refs/heads/{rev}")))
+    let obj = resolve_rev_object(repo, rev)
         .with_context(|| format!("Could not resolve git rev: {}", rev))?;
 
     // Peel tags to commit if needed.
@@ -111,8 +107,88 @@ fn checkout_rev(repo: &Repository, rev: &str) -> Result<()> {
 
     let oid: Oid = commit.id();
     repo.set_head_detached(oid)?;
-    repo.checkout_tree(commit.as_object(), None)?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force();
+    repo.checkout_tree(commit.as_object(), Some(&mut checkout))?;
     Ok(())
+}
+
+fn resolve_rev_object<'a>(repo: &'a Repository, rev: &str) -> Result<git2::Object<'a>> {
+    if let Ok(obj) = repo.revparse_single(rev) {
+        return Ok(obj);
+    }
+
+    if rev.eq_ignore_ascii_case("HEAD") {
+        if let Ok(obj) = repo.revparse_single("refs/remotes/origin/HEAD") {
+            return Ok(obj);
+        }
+        if let Ok(obj) = repo.revparse_single("origin/HEAD") {
+            return Ok(obj);
+        }
+        if let Ok(obj) = repo.revparse_single("FETCH_HEAD") {
+            return Ok(obj);
+        }
+
+        // Some mirror clones may not have a valid local HEAD but still have remote branch refs.
+        if let Some(obj) = resolve_remote_head_like(repo)? {
+            return Ok(obj);
+        }
+    } else {
+        if let Ok(obj) = repo.revparse_single(&format!("refs/tags/{rev}")) {
+            return Ok(obj);
+        }
+        if let Ok(obj) = repo.revparse_single(&format!("refs/heads/{rev}")) {
+            return Ok(obj);
+        }
+        if let Ok(obj) = repo.revparse_single(&format!("refs/remotes/origin/{rev}")) {
+            return Ok(obj);
+        }
+    }
+
+    if let Ok(oid) = Oid::from_str(rev)
+        && let Ok(obj) = repo.find_object(oid, None)
+    {
+        return Ok(obj);
+    }
+
+    anyhow::bail!("revspec not found")
+}
+
+fn resolve_remote_head_like<'a>(repo: &'a Repository) -> Result<Option<git2::Object<'a>>> {
+    let mut candidates: Vec<(String, Oid)> = Vec::new();
+    for reference_result in repo.references_glob("refs/remotes/origin/*")? {
+        let reference = reference_result?;
+        let Some(name) = reference.name() else {
+            continue;
+        };
+        if name == "refs/remotes/origin/HEAD" {
+            continue;
+        }
+        let Some(oid) = reference.target() else {
+            continue;
+        };
+        candidates.push((name.to_string(), oid));
+    }
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    // Prefer conventional default branches first, then deterministic lexical order.
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some((_, oid)) = candidates
+        .iter()
+        .find(|(name, _)| name == "refs/remotes/origin/main")
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|(name, _)| name == "refs/remotes/origin/master")
+        })
+    {
+        return Ok(Some(repo.find_object(*oid, None)?));
+    }
+
+    Ok(Some(repo.find_object(candidates[0].1, None)?))
 }
 
 fn remote_callbacks() -> RemoteCallbacks<'static> {
@@ -257,4 +333,75 @@ fn ensure_prompt_terminal(url: &str) -> std::result::Result<(), git2::Error> {
     Err(git2::Error::from_str(&format!(
         "Authentication required for {url}, but no interactive terminal is available"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn commit_file(repo: &Repository, workdir: &Path, rel: &str, data: &str) -> Oid {
+        let full_path = workdir.join(rel);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full_path, data).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(rel)).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("depot-test", "depot@example.test").unwrap();
+
+        repo.commit(Some("HEAD"), &sig, &sig, "test", &tree, &[])
+            .unwrap()
+    }
+
+    #[test]
+    fn checkout_rev_head_falls_back_to_remote_branch_when_local_head_is_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("repo");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+
+        let commit_oid = commit_file(&repo, &workdir, "README", "hello");
+        repo.reference(
+            "refs/remotes/origin/main",
+            commit_oid,
+            true,
+            "test setup: remote tracking ref",
+        )
+        .unwrap();
+        repo.reference_symbolic(
+            "HEAD",
+            "refs/heads/HEAD",
+            true,
+            "test setup: break local HEAD",
+        )
+        .unwrap();
+
+        checkout_rev(&repo, "HEAD").unwrap();
+        assert_eq!(repo.head_detached().unwrap(), true);
+        assert_eq!(repo.head().unwrap().target().unwrap(), commit_oid);
+    }
+
+    #[test]
+    fn checkout_rev_resolves_named_branch_from_remote_tracking_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("repo");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+
+        let commit_oid = commit_file(&repo, &workdir, "src/main.rs", "fn main() {}");
+        repo.reference(
+            "refs/remotes/origin/feature",
+            commit_oid,
+            true,
+            "test setup: remote feature branch",
+        )
+        .unwrap();
+
+        checkout_rev(&repo, "feature").unwrap();
+        assert_eq!(repo.head().unwrap().target().unwrap(), commit_oid);
+    }
 }
