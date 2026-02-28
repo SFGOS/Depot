@@ -55,6 +55,7 @@ depot install zlib-1.2.11-1-x86_64.depot.pkg.tar.zst
 - `list`: List all installed packages.
 - `repo owns <PATH>`: Query binary repo metadata for path ownership.
 - `repo create [DIR]`: Create a repository database from a directory of packages.
+- `repo index [DIR] [--subdir <NAME> ...]`: Create/update `depot-index.tsv` at a source repo root for fast source lookup.
 - `config`: Show current configuration and overrides.
 
 ## Package Specification

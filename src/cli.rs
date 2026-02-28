@@ -142,6 +142,15 @@ pub enum RepoCommands {
         /// Update only one source repo by name
         name: Option<String>,
     },
+    /// Create/update a source index at the root of a source repo
+    Index {
+        /// Source repository root directory
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// Optional subdirectory to scan (repeatable, e.g. --subdir core --subdir extra)
+        #[arg(long = "subdir")]
+        subdirs: Vec<String>,
+    },
     /// List configured source and binary repos
     List,
     /// Add or update a repo entry in /etc/depot.d/repos.toml

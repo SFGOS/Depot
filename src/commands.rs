@@ -1670,6 +1670,28 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            RepoCommands::Index { dir, subdirs } => {
+                let cfg = config::Config::for_rootfs(&cli.rootfs);
+                let mut repo_lock = locking::open_lock(&cfg)?;
+                let repo_lock_path = locking::lock_path(&cfg);
+                let _repo_lock_guard =
+                    locking::try_write(&mut repo_lock, &repo_lock_path, "repo index")?;
+                let stats = index::create_source_repo_index(&dir, &subdirs).with_context(|| {
+                    format!("Failed to create source index for {}", dir.display())
+                })?;
+                ui::success(format!(
+                    "Wrote source index: {}",
+                    stats.index_path.display()
+                ));
+                ui::info(format!(
+                    "Indexed {} spec(s) from {} TOML file(s): package rows={} provides rows={} ignored_toml={}",
+                    stats.specs_indexed,
+                    stats.toml_files_scanned,
+                    stats.package_rows,
+                    stats.provides_rows,
+                    stats.ignored_toml_files
+                ));
+            }
             RepoCommands::List => {
                 let config = config::Config::for_rootfs(&cli.rootfs);
                 let repo_lock = locking::open_lock(&config)?;
