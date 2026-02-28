@@ -3,10 +3,12 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256, Sha512};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
+    Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
     mpsc,
 };
@@ -554,6 +556,39 @@ enum FileUrlCopyOutcome {
     Missing,
 }
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct RepoDbFetchCacheKey {
+    repo_name: String,
+    base_url: String,
+    repo_db_rel: String,
+    rootfs: PathBuf,
+    package_cache_dir: PathBuf,
+}
+
+fn repo_db_fetch_cache() -> &'static Mutex<HashMap<RepoDbFetchCacheKey, PathBuf>> {
+    static CACHE: OnceLock<Mutex<HashMap<RepoDbFetchCacheKey, PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_cached_repo_db_path(cache_key: &RepoDbFetchCacheKey) -> Option<PathBuf> {
+    let mut cache = repo_db_fetch_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cached = cache.get(cache_key).cloned()?;
+    if cached.exists() {
+        return Some(cached);
+    }
+    cache.remove(cache_key);
+    None
+}
+
+fn remember_repo_db_path(cache_key: RepoDbFetchCacheKey, db_path: PathBuf) {
+    let mut cache = repo_db_fetch_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(cache_key, db_path);
+}
+
 fn copy_file_url_to_path(url: &str, dest: &Path) -> Result<FileUrlCopyOutcome> {
     let parsed = match url::Url::parse(url) {
         Ok(parsed) => parsed,
@@ -997,6 +1032,16 @@ pub fn fetch_binary_repo_db(
                 repo_name, machine_arch
             )
         })?;
+    let cache_key = RepoDbFetchCacheKey {
+        repo_name: repo_name.to_string(),
+        base_url: base_url.to_string(),
+        repo_db_rel: repo_db_rel.to_string(),
+        rootfs: rootfs.to_path_buf(),
+        package_cache_dir: package_cache_dir.to_path_buf(),
+    };
+    if let Some(cached_db_path) = get_cached_repo_db_path(&cache_key) {
+        return Ok(cached_db_path);
+    }
 
     let cache_dir = binary_repo_cache_dir(package_cache_dir, repo_name);
     fs::create_dir_all(&cache_dir)
@@ -1028,6 +1073,7 @@ pub fn fetch_binary_repo_db(
                     repo_name,
                     repo_db_url
                 );
+                remember_repo_db_path(cache_key.clone(), repo_db_sqlite.clone());
                 return Ok(repo_db_sqlite);
             }
             anyhow::bail!("Failed to fetch {}: local file not found", repo_db_url);
@@ -1045,6 +1091,7 @@ pub fn fetch_binary_repo_db(
                         repo_name,
                         resp.status()
                     );
+                    remember_repo_db_path(cache_key.clone(), repo_db_sqlite.clone());
                     return Ok(repo_db_sqlite);
                 }
                 anyhow::bail!("Failed to fetch {}: HTTP {}", repo_db_url, resp.status());
@@ -1198,6 +1245,7 @@ pub fn fetch_binary_repo_db(
     }
 
     decompress_zstd_file(&repo_db_zst, &repo_db_sqlite)?;
+    remember_repo_db_path(cache_key, repo_db_sqlite.clone());
     Ok(repo_db_sqlite)
 }
 
@@ -2345,6 +2393,27 @@ license = ["MIT", "Apache-2.0"]
         let outcome = copy_file_url_to_path(&url, &dst).unwrap();
         assert_eq!(outcome, FileUrlCopyOutcome::Missing);
         assert!(!dst.exists());
+    }
+
+    #[test]
+    fn test_repo_db_fetch_cache_roundtrip_and_prunes_stale_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("repo.db");
+        fs::write(&db_path, b"db").unwrap();
+
+        let key = RepoDbFetchCacheKey {
+            repo_name: "core".to_string(),
+            base_url: "https://repo.example.test/core".to_string(),
+            repo_db_rel: "repo.db.zst".to_string(),
+            rootfs: PathBuf::from("/tmp/rootfs-test"),
+            package_cache_dir: PathBuf::from("/tmp/pkg-cache-test"),
+        };
+
+        remember_repo_db_path(key.clone(), db_path.clone());
+        assert_eq!(get_cached_repo_db_path(&key), Some(db_path.clone()));
+
+        fs::remove_file(&db_path).unwrap();
+        assert_eq!(get_cached_repo_db_path(&key), None);
     }
 
     #[test]
