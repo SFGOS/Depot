@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256, Sha512};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,40 @@ fn parse_license_text(metadata: &toml::Value) -> Option<String> {
 
 pub struct RepoManager {
     pub repo_dir: PathBuf,
+}
+
+struct HashingReader<R> {
+    inner: R,
+    sha256: Sha256,
+    sha512: Sha512,
+}
+
+impl<R> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            sha256: Sha256::new(),
+            sha512: Sha512::new(),
+        }
+    }
+
+    fn finalize_hex(self) -> (String, String) {
+        (
+            format!("{:x}", self.sha256.finalize()),
+            format!("{:x}", self.sha512.finalize()),
+        )
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.sha256.update(&buf[..n]);
+            self.sha512.update(&buf[..n]);
+        }
+        Ok(n)
+    }
 }
 
 struct IndexedPackage {
@@ -108,13 +143,32 @@ impl RepoManager {
         let mut conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to create repo database at {}", db_path.display()))?;
 
+        self.configure_repo_build_pragmas(&mut conn)?;
         self.init_repo_schema(&mut conn)?;
 
         let package_paths = self.collect_repo_package_paths()?;
         let indexed_packages = self.collect_indexed_packages_parallel(&package_paths)?;
-        for indexed in indexed_packages {
-            self.insert_indexed_package(&mut conn, indexed)?;
+
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+            .context("Failed to begin repo DB write transaction")?;
+        let insert_result: Result<()> = (|| {
+            for indexed in indexed_packages {
+                self.insert_indexed_package(&mut conn, indexed)?;
+            }
+            Ok(())
+        })();
+        match insert_result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT;")
+                    .context("Failed to commit repo DB write transaction")?;
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(err);
+            }
         }
+
+        self.create_repo_indexes(&mut conn)?;
 
         conn.close().map_err(|(_, e)| e)?;
 
@@ -125,6 +179,19 @@ impl RepoManager {
         fs::remove_file(&db_path)?;
 
         Ok(compressed_db_path)
+    }
+
+    fn configure_repo_build_pragmas(&self, conn: &mut Connection) -> Result<()> {
+        // Speed-focused settings are scoped to this temporary repo DB build process.
+        conn.execute_batch(
+            "PRAGMA synchronous = OFF;
+             PRAGMA journal_mode = MEMORY;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA locking_mode = EXCLUSIVE;
+             PRAGMA cache_size = -200000;",
+        )
+        .context("Failed to apply SQLite build PRAGMAs for repo DB creation")?;
+        Ok(())
     }
 
     fn collect_repo_package_paths(&self) -> Result<Vec<PathBuf>> {
@@ -223,14 +290,21 @@ impl RepoManager {
                 package_id INTEGER,
                 path TEXT NOT NULL,
                 FOREIGN KEY(package_id) REFERENCES packages(id)
-            );
-            CREATE INDEX idx_packages_name ON packages(name);
-            CREATE INDEX idx_provides_name ON provides(name);
-            CREATE INDEX idx_dependencies_name ON dependencies(name);
-            CREATE INDEX idx_dependencies_kind ON dependencies(kind);
-            CREATE INDEX idx_repo_files_path ON files(path);",
+            );",
         )
         .context("Failed to initialize repo schema")?;
+        Ok(())
+    }
+
+    fn create_repo_indexes(&self, conn: &mut Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE INDEX idx_packages_name ON packages(name);
+             CREATE INDEX idx_provides_name ON provides(name);
+             CREATE INDEX idx_dependencies_name ON dependencies(name);
+             CREATE INDEX idx_dependencies_kind ON dependencies(kind);
+             CREATE INDEX idx_repo_files_path ON files(path);",
+        )
+        .context("Failed to create repo DB indexes")?;
         Ok(())
     }
 
@@ -242,13 +316,9 @@ impl RepoManager {
             .and_then(|name| name.to_str())
             .with_context(|| format!("Invalid package filename: {}", pkg_path.display()))?
             .to_string();
-        let size = pkg_path.metadata()?.len();
-        let (sha256, sha512) = self.calculate_hashes(pkg_path)?;
-
-        // Read .metadata.toml from archive
         let file = fs::File::open(pkg_path)?;
-        let zstd_decoder = zstd::stream::read::Decoder::new(file)?;
-        let mut archive = tar::Archive::new(zstd_decoder);
+        let size = file.metadata()?.len();
+        let mut hashing_reader = HashingReader::new(file);
 
         let mut name = String::new();
         let mut version = String::new();
@@ -261,82 +331,88 @@ impl RepoManager {
         let mut optional_dependencies = Vec::new();
         let mut archive_files = Vec::new();
 
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let path = entry.path()?;
-            let path_str = path.to_string_lossy().to_string();
-            if path_str == ".metadata.toml" {
-                let mut content = String::new();
-                use std::io::Read;
-                entry.read_to_string(&mut content)?;
-                let metadata: toml::Value = toml::from_str(&content).with_context(|| {
-                    format!("Failed to parse .metadata.toml in {}", pkg_path.display())
-                })?;
+        {
+            let zstd_decoder = zstd::stream::read::Decoder::new(&mut hashing_reader)?;
+            let mut archive = tar::Archive::new(zstd_decoder);
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?;
+                let path_str = path.to_string_lossy().to_string();
+                if path_str == ".metadata.toml" {
+                    let mut content = String::new();
+                    use std::io::Read;
+                    entry.read_to_string(&mut content)?;
+                    let metadata: toml::Value = toml::from_str(&content).with_context(|| {
+                        format!("Failed to parse .metadata.toml in {}", pkg_path.display())
+                    })?;
 
-                name = metadata
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                version = metadata
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                revision = metadata
-                    .get("revision")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(1) as u32;
-                description = metadata
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                homepage = metadata
-                    .get("homepage")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                license = parse_license_text(&metadata);
+                    name = metadata
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    version = metadata
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    revision = metadata
+                        .get("revision")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(1) as u32;
+                    description = metadata
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    homepage = metadata
+                        .get("homepage")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    license = parse_license_text(&metadata);
 
-                if let Some(provides_arr) = metadata.get("provides").and_then(|v| v.as_array()) {
-                    provides = provides_arr
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .map(String::from)
-                        .collect();
-                }
-                if let Some(runtime_arr) = metadata
-                    .get("dependencies")
-                    .and_then(|v| v.get("runtime"))
-                    .and_then(|v| v.as_array())
-                {
-                    runtime_dependencies = runtime_arr
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .map(String::from)
-                        .collect();
-                }
-                if let Some(optional_arr) = metadata
-                    .get("dependencies")
-                    .and_then(|v| v.get("optional"))
-                    .and_then(|v| v.as_array())
-                {
-                    optional_dependencies = optional_arr
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .map(String::from)
-                        .collect();
-                }
-                continue;
-            }
-
-            if entry.header().entry_type().is_file() {
-                let normalized = path_str.trim_start_matches("./").to_string();
-                if normalized == ".metadata.toml" {
+                    if let Some(provides_arr) = metadata.get("provides").and_then(|v| v.as_array())
+                    {
+                        provides = provides_arr
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(String::from)
+                            .collect();
+                    }
+                    if let Some(runtime_arr) = metadata
+                        .get("dependencies")
+                        .and_then(|v| v.get("runtime"))
+                        .and_then(|v| v.as_array())
+                    {
+                        runtime_dependencies = runtime_arr
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(String::from)
+                            .collect();
+                    }
+                    if let Some(optional_arr) = metadata
+                        .get("dependencies")
+                        .and_then(|v| v.get("optional"))
+                        .and_then(|v| v.as_array())
+                    {
+                        optional_dependencies = optional_arr
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(String::from)
+                            .collect();
+                    }
                     continue;
                 }
-                archive_files.push(normalized);
+
+                if entry.header().entry_type().is_file() {
+                    let normalized = path_str.trim_start_matches("./").to_string();
+                    if normalized == ".metadata.toml" {
+                        continue;
+                    }
+                    archive_files.push(normalized);
+                }
             }
         }
+        let (sha256, sha512) = hashing_reader.finalize_hex();
 
         if name.is_empty() {
             // Fallback for packages WITHOUT metadata (e.g. legacy or during transition)
@@ -437,26 +513,6 @@ impl RepoManager {
         }
 
         Ok(())
-    }
-
-    fn calculate_hashes(&self, path: &Path) -> Result<(String, String)> {
-        use sha2::{Digest, Sha256, Sha512};
-        let mut file = fs::File::open(path)?;
-        let mut sha256 = Sha256::new();
-        let mut sha512 = Sha512::new();
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            sha256.update(&buf[..n]);
-            sha512.update(&buf[..n]);
-        }
-        Ok((
-            format!("{:x}", sha256.finalize()),
-            format!("{:x}", sha512.finalize()),
-        ))
     }
 
     fn compress_db(&self, source: &Path, dest: &Path) -> Result<()> {
