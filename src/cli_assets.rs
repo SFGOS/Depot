@@ -17,7 +17,7 @@ pub fn generate_cli_assets(out_dir: &Path) -> Result<()> {
     generate_completion(out_dir, Shell::Bash, "depot.bash")?;
     generate_completion(out_dir, Shell::Zsh, "_depot")?;
     generate_completion(out_dir, Shell::Fish, "depot.fish")?;
-    generate_man_page(out_dir, "depot.1")?;
+    generate_man_pages(out_dir)?;
     Ok(())
 }
 
@@ -40,14 +40,9 @@ fn generate_completion(out_dir: &Path, shell: Shell, filename: &str) -> Result<(
     Ok(())
 }
 
-fn generate_man_page(out_dir: &Path, filename: &str) -> Result<()> {
-    let output_path = out_dir.join(filename);
-    let mut buffer = Vec::new();
-    clap_mangen::Man::new(command_for_generation())
-        .render(&mut buffer)
-        .context("Failed to render clap man page")?;
-    fs::write(&output_path, buffer)
-        .with_context(|| format!("Failed to write man page {}", output_path.display()))?;
+fn generate_man_pages(out_dir: &Path) -> Result<()> {
+    clap_mangen::generate_to(command_for_generation(), out_dir)
+        .context("Failed to generate clap man pages")?;
     Ok(())
 }
 
@@ -64,11 +59,17 @@ mod tests {
         let zsh = temp.path().join("_depot");
         let fish = temp.path().join("depot.fish");
         let man = temp.path().join("depot.1");
+        let man_pages = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "1"))
+            .count();
 
         assert!(bash.exists());
         assert!(zsh.exists());
         assert!(fish.exists());
         assert!(man.exists());
+        assert!(man_pages > 1);
         assert!(!std::fs::read_to_string(&man).unwrap().is_empty());
     }
 }
