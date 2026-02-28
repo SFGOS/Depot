@@ -12,12 +12,10 @@ ar = "0.9.0"
 bzip2 = "0.6.1"
 clap = { version = "4.5.60", features = ["derive"] }
 flate2 = "1.1.9"
-git2 = { version = "0.20.4", features = ["openssl-sys"] }
+git2 = "0.20.4"
 indicatif = "0.18.4"
-nix = { version = "0.31.1", features = ["user"] }
-reqwest = { version = "0.13.2", features = ["blocking", "native-tls"] }
+nix = { version = "0.31.2", features = ["user"] }
 rusqlite = "0.38.0"
-openssl-sys = "0.9.111"
 semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 yaml-rust2 = "0.11.0"
@@ -31,13 +29,14 @@ walkdir = "2.5.0"
 xz2 = "0.1.7"
 zip = "8.1.0"
 zstd = { version = "0.13.3", features = ["zstdmt"] }
-libz-sys = "1.1.24"
 inquire = "0.9.4"
 md5 = "0.8.0"
 suppaftp = "8.0.2"
 minisign = "0.8.0"
 petgraph = "0.8.3"
 fd-lock = "4.0.4"
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "native-tls"] }
+filetime = "0.2.27"
 
 [dev-dependencies]
 tempfile = "=3.25.0"

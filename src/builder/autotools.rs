@@ -65,11 +65,14 @@ pub fn build(
 
         crate::builder::prepare_tool_command(&mut configure_cmd, &env_vars);
 
-        configure_cmd.arg(format!("--prefix={}", flags.prefix));
-
         // Some projects use non-GNU configure scripts that reject --host/--build.
         // Probe support first and only add these options when advertised.
         let help_text = configure_help_text(&configure_path, &build_dir, &env_vars);
+        configure_cmd.arg(format!("--prefix={}", flags.prefix));
+        for default_dir_arg in default_configure_install_dirs(flags, help_text.as_deref()) {
+            configure_cmd.arg(default_dir_arg);
+        }
+
         let supports_host =
             configure_supports_option(help_text.as_deref(), "--host", &flags.configure_file);
         let supports_build =
@@ -111,15 +114,6 @@ pub fn build(
                 configure_cmd.arg(format!("--build={}", build));
             } else {
                 crate::log_info!("  configure does not support --build; skipping {}", build);
-            }
-        }
-
-        if flags.lib32_variant {
-            if !has_configure_option_prefix(&flags.configure, "--libdir") {
-                configure_cmd.arg("--libdir=/usr/lib32");
-            }
-            if !has_configure_option_prefix(&flags.configure, "--libexecdir") {
-                configure_cmd.arg("--libexecdir=/usr/lib32");
             }
         }
 
@@ -437,6 +431,41 @@ fn has_configure_option_prefix(args: &[String], option: &str) -> bool {
         let trimmed = arg.trim();
         trimmed == option || trimmed.starts_with(&with_eq)
     })
+}
+
+fn default_configure_install_dirs(
+    flags: &crate::package::BuildFlags,
+    help_text: Option<&str>,
+) -> Vec<String> {
+    let libdir = if flags.lib32_variant {
+        "/usr/lib32"
+    } else {
+        "/usr/lib"
+    };
+    let bindir = nonempty_trimmed(&flags.bindir).unwrap_or("/usr/bin");
+    let defaults = [
+        ("--bindir", bindir),
+        ("--sbindir", "/usr/bin"),
+        ("--libdir", libdir),
+        ("--libexecdir", libdir),
+        ("--sysconfdir", "/etc"),
+        ("--localstatedir", "/var"),
+        ("--sharedstatedir", "/var/lib"),
+        ("--includedir", "/usr/include"),
+        ("--datarootdir", "/usr/share"),
+        ("--datadir", "/usr/share"),
+        ("--mandir", "/usr/share/man"),
+        ("--infodir", "/usr/share/info"),
+    ];
+
+    defaults
+        .iter()
+        .filter(|(option, _)| {
+            help_text.is_some_and(|text| configure_help_supports_option(text, option))
+        })
+        .filter(|(option, _)| !has_configure_option_prefix(&flags.configure, option))
+        .map(|(option, value)| format!("{option}={value}"))
+        .collect()
 }
 
 fn lib32_host_triple(host: &str) -> String {
@@ -801,6 +830,72 @@ mod tests {
             "--host",
             "build-aux/Configure"
         ));
+    }
+
+    #[test]
+    fn test_default_configure_install_dirs_injects_expected_paths() {
+        let flags = BuildFlags::default();
+        let help = "\
+--bindir=DIR
+--sbindir=DIR
+--libdir=DIR
+--libexecdir=DIR
+--sysconfdir=DIR
+--localstatedir=DIR
+--sharedstatedir=DIR
+--includedir=DIR
+--datarootdir=DIR
+--datadir=DIR
+--mandir=DIR
+--infodir=DIR";
+        let args = default_configure_install_dirs(&flags, Some(help));
+        assert!(args.iter().any(|a| a == "--bindir=/usr/bin"));
+        assert!(args.iter().any(|a| a == "--sbindir=/usr/bin"));
+        assert!(args.iter().any(|a| a == "--libdir=/usr/lib"));
+        assert!(args.iter().any(|a| a == "--libexecdir=/usr/lib"));
+        assert!(args.iter().any(|a| a == "--sysconfdir=/etc"));
+        assert!(args.iter().any(|a| a == "--localstatedir=/var"));
+        assert!(args.iter().any(|a| a == "--sharedstatedir=/var/lib"));
+        assert!(args.iter().any(|a| a == "--includedir=/usr/include"));
+        assert!(args.iter().any(|a| a == "--datarootdir=/usr/share"));
+        assert!(args.iter().any(|a| a == "--datadir=/usr/share"));
+        assert!(args.iter().any(|a| a == "--mandir=/usr/share/man"));
+        assert!(args.iter().any(|a| a == "--infodir=/usr/share/info"));
+    }
+
+    #[test]
+    fn test_default_configure_install_dirs_respects_explicit_user_overrides() {
+        let mut flags = BuildFlags::default();
+        flags.configure = vec![
+            "--sbindir=/sbin".to_string(),
+            "--libdir=/custom/lib".to_string(),
+            "--datadir=/custom/share".to_string(),
+        ];
+        let help = "--bindir=DIR --sbindir=DIR --libdir=DIR --datadir=DIR";
+        let args = default_configure_install_dirs(&flags, Some(help));
+        assert!(!args.iter().any(|a| a.starts_with("--sbindir=")));
+        assert!(!args.iter().any(|a| a.starts_with("--libdir=")));
+        assert!(!args.iter().any(|a| a.starts_with("--datadir=")));
+        assert!(args.iter().any(|a| a == "--bindir=/usr/bin"));
+    }
+
+    #[test]
+    fn test_default_configure_install_dirs_lib32_uses_lib32_dirs() {
+        let help = "--libdir=DIR --libexecdir=DIR";
+        let flags = BuildFlags {
+            lib32_variant: true,
+            ..BuildFlags::default()
+        };
+        let args = default_configure_install_dirs(&flags, Some(help));
+        assert!(args.iter().any(|a| a == "--libdir=/usr/lib32"));
+        assert!(args.iter().any(|a| a == "--libexecdir=/usr/lib32"));
+    }
+
+    #[test]
+    fn test_default_configure_install_dirs_skips_when_not_advertised() {
+        let flags = BuildFlags::default();
+        let args = default_configure_install_dirs(&flags, Some("--prefix=PREFIX"));
+        assert!(args.is_empty());
     }
 
     #[test]

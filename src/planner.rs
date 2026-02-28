@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::db;
 use crate::deps;
 use crate::index::PackageIndex;
-use crate::package::{BuildType, PackageSpec};
+use crate::package::PackageSpec;
 use crate::ui;
 use anyhow::{Context, Result};
 use petgraph::algo::toposort;
@@ -601,16 +601,14 @@ impl<'a> Resolver<'a> {
 
 fn source_deps_for_install(spec: &PackageSpec) -> Vec<String> {
     let mut deps_all = Vec::new();
+    let local_provides = spec.local_dependency_provides();
     if !spec.is_metapackage() {
         for dep in &spec.dependencies.build {
             push_unique(&mut deps_all, dep.clone());
         }
     }
     for dep in &spec.dependencies.runtime {
-        push_unique(&mut deps_all, dep.clone());
-    }
-    if matches!(spec.build.build_type, BuildType::Autotools) {
-        for dep in &spec.dependencies.test {
+        if !local_provides.contains(deps::dep_name(dep)) {
             push_unique(&mut deps_all, dep.clone());
         }
     }
@@ -618,7 +616,9 @@ fn source_deps_for_install(spec: &PackageSpec) -> Vec<String> {
     for out in spec.outputs() {
         let deps = spec.dependencies_for_output(&out.name);
         for dep in deps.runtime {
-            push_unique(&mut deps_all, dep);
+            if !local_provides.contains(deps::dep_name(&dep)) {
+                push_unique(&mut deps_all, dep);
+            }
         }
     }
     deps_all
@@ -709,4 +709,89 @@ pub(crate) fn build_dependency_install_plan(
     opts: PlannerOptions,
 ) -> Result<ExecutionPlan> {
     Resolver::new(config, rootfs, opts).plan_for_deps(deps_to_install)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_deps_for_install;
+    use crate::package::{
+        Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source,
+    };
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn mk_spec() -> PackageSpec {
+        PackageSpec {
+            package: PackageInfo {
+                name: "foo".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: vec![PackageInfo {
+                name: "foo-libs".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            }],
+            alternatives: Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: vec![Source {
+                url: "https://example.test/foo.tar.gz".into(),
+                sha256: "skip".into(),
+                extract_dir: "foo".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+            }],
+            build: Build {
+                build_type: BuildType::Autotools,
+                flags: BuildFlags::default(),
+            },
+            dependencies: Dependencies {
+                build: vec!["make".into()],
+                runtime: vec!["foo-libs".into(), "zlib".into()],
+                test: vec!["bats".into()],
+                optional: vec!["docs-viewer".into()],
+            },
+            package_alternatives: BTreeMap::from([(
+                "foo-libs".into(),
+                Alternatives {
+                    provides: vec!["libfoo".into()],
+                    replaces: Vec::new(),
+                },
+            )]),
+            package_dependencies: BTreeMap::from([(
+                "foo".into(),
+                Dependencies {
+                    build: Vec::new(),
+                    runtime: vec!["foo-libs".into(), "libfoo".into(), "openssl".into()],
+                    test: Vec::new(),
+                    optional: Vec::new(),
+                },
+            )]),
+            spec_dir: PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn source_deps_for_install_excludes_local_runtime_outputs_and_provides() {
+        let spec = mk_spec();
+        let deps = source_deps_for_install(&spec);
+        assert!(deps.contains(&"make".to_string()));
+        assert!(deps.contains(&"zlib".to_string()));
+        assert!(deps.contains(&"openssl".to_string()));
+        assert!(!deps.contains(&"foo-libs".to_string()));
+        assert!(!deps.contains(&"libfoo".to_string()));
+    }
+
+    #[test]
+    fn source_deps_for_install_does_not_include_test_deps() {
+        let spec = mk_spec();
+        let deps = source_deps_for_install(&spec);
+        assert!(!deps.contains(&"bats".to_string()));
+    }
 }

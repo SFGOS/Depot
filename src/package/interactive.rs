@@ -640,6 +640,10 @@ pub fn create_interactive() -> Result<PackageSpec> {
         "Test dependency",
         "Package needed only for running package test suites",
     )?;
+    let optional_deps = prompt_repeating_list(
+        "Optional dependency",
+        "Package that enables optional runtime functionality",
+    )?;
 
     Ok(PackageSpec {
         package: PackageInfo {
@@ -659,6 +663,7 @@ pub fn create_interactive() -> Result<PackageSpec> {
             build: build_deps,
             runtime: runtime_deps,
             test: test_deps,
+            optional: optional_deps,
         },
         package_alternatives: Default::default(),
         package_dependencies: Default::default(),
@@ -874,6 +879,12 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
     }
     if spec.build.flags.no_strip != defaults.no_strip {
         flags_tbl.insert("no_strip".into(), Value::Boolean(spec.build.flags.no_strip));
+    }
+    if spec.build.flags.no_delete_static != defaults.no_delete_static {
+        flags_tbl.insert(
+            "no_delete_static".into(),
+            Value::Boolean(spec.build.flags.no_delete_static),
+        );
     }
     if spec.build.flags.no_compress_man != defaults.no_compress_man {
         flags_tbl.insert(
@@ -1221,6 +1232,7 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
     if !spec.dependencies.build.is_empty()
         || !spec.dependencies.runtime.is_empty()
         || !spec.dependencies.test.is_empty()
+        || !spec.dependencies.optional.is_empty()
     {
         let mut dep_tbl = Table::new();
         if !spec.dependencies.build.is_empty() {
@@ -1253,6 +1265,18 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
                 Value::Array(
                     spec.dependencies
                         .test
+                        .iter()
+                        .map(|s| Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if !spec.dependencies.optional.is_empty() {
+            dep_tbl.insert(
+                "optional".into(),
+                Value::Array(
+                    spec.dependencies
+                        .optional
                         .iter()
                         .map(|s| Value::String(s.clone()))
                         .collect(),
@@ -1412,6 +1436,7 @@ mod tests {
         flags.keep = vec!["etc/locale.gen".into()];
         flags.no_flags = true;
         flags.no_strip = true;
+        flags.no_delete_static = true;
         flags.no_compress_man = true;
         flags.skip_tests = true;
         flags.make_vars = vec!["V=1".into()];
@@ -1467,6 +1492,7 @@ mod tests {
         assert!(toml.contains("\"etc/locale.gen\""));
         assert!(toml.contains("no_flags = true"));
         assert!(toml.contains("no_strip = true"));
+        assert!(toml.contains("no_delete_static = true"));
         assert!(toml.contains("no_compress_man = true"));
         assert!(toml.contains("skip_tests = true"));
         assert!(toml.contains("make_vars = ["));
@@ -1515,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_to_minimal_toml_includes_test_dependencies() {
+    fn spec_to_minimal_toml_includes_test_and_optional_dependencies() {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
@@ -1543,6 +1569,7 @@ mod tests {
                 build: vec![],
                 runtime: vec![],
                 test: vec!["python".into(), "bats".into()],
+                optional: vec!["gtk-doc".into()],
             },
             package_alternatives: Default::default(),
             package_dependencies: Default::default(),
@@ -1559,6 +1586,13 @@ mod tests {
         assert_eq!(test_deps.len(), 2);
         assert_eq!(test_deps[0].as_str(), Some("python"));
         assert_eq!(test_deps[1].as_str(), Some("bats"));
+        let optional_deps = val
+            .get("dependencies")
+            .and_then(|d| d.get("optional"))
+            .and_then(|t| t.as_array())
+            .expect("expected dependencies.optional array");
+        assert_eq!(optional_deps.len(), 1);
+        assert_eq!(optional_deps[0].as_str(), Some("gtk-doc"));
     }
 
     #[test]
@@ -1584,6 +1618,7 @@ mod tests {
                 build: Vec::new(),
                 runtime: vec!["foo".into(), "bar".into()],
                 test: Vec::new(),
+                optional: Vec::new(),
             },
             package_alternatives: Default::default(),
             package_dependencies: Default::default(),

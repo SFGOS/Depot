@@ -2,6 +2,7 @@
 
 use crate::package::{PackageSpec, Source};
 use anyhow::{Context, Result, bail};
+use filetime::FileTime;
 use flate2::read::GzDecoder;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
@@ -605,17 +606,58 @@ fn move_dir_contents(src: &Path, dest: &Path) -> Result<()> {
         let entry = entry?;
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
+        let file_type = entry.file_type()?;
         if fs::rename(&src_path, &dest_path).is_err() {
             // fallback to copy-and-remove across filesystems
-            if src_path.is_dir() {
-                copy_dir_recursive_local(&src_path, &dest_path)?;
-                fs::remove_dir_all(&src_path)?;
-            } else {
-                fs::copy(&src_path, &dest_path)?;
-                fs::remove_file(&src_path)?;
-            }
+            copy_entry_fallback(&src_path, &dest_path, file_type)?;
         }
     }
+    Ok(())
+}
+
+fn copy_entry_fallback(src_path: &Path, dest_path: &Path, file_type: fs::FileType) -> Result<()> {
+    if file_type.is_dir() {
+        copy_dir_recursive_local(src_path, dest_path)?;
+        fs::remove_dir_all(src_path)?;
+    } else if file_type.is_symlink() {
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let link_target = fs::read_link(src_path)
+            .with_context(|| format!("Failed to read symlink {}", src_path.display()))?;
+        unix_fs::symlink(&link_target, dest_path).with_context(|| {
+            format!(
+                "Failed to create symlink {} -> {}",
+                dest_path.display(),
+                link_target.display()
+            )
+        })?;
+        fs::remove_file(src_path)?;
+    } else {
+        copy_file_preserve_metadata(src_path, dest_path)?;
+        fs::remove_file(src_path)?;
+    }
+    Ok(())
+}
+
+fn copy_file_preserve_metadata(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::copy(src, dst)
+        .with_context(|| format!("Failed to copy {} -> {}", src.display(), dst.display()))?;
+
+    let src_meta = fs::metadata(src)
+        .with_context(|| format!("Failed to read metadata for {}", src.display()))?;
+    fs::set_permissions(dst, src_meta.permissions())
+        .with_context(|| format!("Failed to set permissions for {}", dst.display()))?;
+
+    let atime = FileTime::from_last_access_time(&src_meta);
+    let mtime = FileTime::from_last_modification_time(&src_meta);
+    filetime::set_file_times(dst, atime, mtime)
+        .with_context(|| format!("Failed to preserve file timestamps for {}", dst.display()))?;
+
     Ok(())
 }
 
@@ -633,7 +675,7 @@ fn copy_dir_recursive_local(src: &Path, dst: &Path) -> Result<()> {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(entry.path(), &target)?;
+            copy_file_preserve_metadata(entry.path(), &target)?;
         }
     }
     Ok(())
@@ -643,6 +685,7 @@ fn copy_dir_recursive_local(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
 
     #[test]
@@ -688,6 +731,56 @@ mod tests {
         fs::create_dir_all(&extract_dir).unwrap();
         extract_deb(&deb_path, &extract_dir).unwrap();
         assert!(extract_dir.join("usr/bin/hello-deb").exists());
+    }
+
+    #[test]
+    fn copy_file_preserve_metadata_keeps_mtime() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::write(&src, b"hello").unwrap();
+
+        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(946684800); // 2000-01-01 UTC
+        let ts = FileTime::from_system_time(fixed);
+        filetime::set_file_times(&src, ts, ts).unwrap();
+
+        copy_file_preserve_metadata(&src, &dst).unwrap();
+        let src_meta = std::fs::metadata(&src).unwrap();
+        let dst_meta = std::fs::metadata(&dst).unwrap();
+        assert_eq!(
+            FileTime::from_last_modification_time(&dst_meta),
+            FileTime::from_last_modification_time(&src_meta)
+        );
+    }
+
+    #[test]
+    fn copy_entry_fallback_preserves_symlink_when_target_is_missing() {
+        let tmp = tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let dst_dir = tmp.path().join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+
+        let src_link = src_dir.join("RELEASE-NOTES");
+        std::os::unix::fs::symlink("doc/RelNotes/v1.47.3.txt", &src_link).unwrap();
+
+        // Simulate target already moved/removed before copying this symlink entry.
+        let src_target_dir = src_dir.join("doc");
+        std::fs::create_dir_all(src_target_dir.join("RelNotes")).unwrap();
+        std::fs::write(src_target_dir.join("RelNotes/v1.47.3.txt"), "notes").unwrap();
+        std::fs::remove_dir_all(&src_target_dir).unwrap();
+
+        let dst_link = dst_dir.join("RELEASE-NOTES");
+        let file_type = std::fs::symlink_metadata(&src_link).unwrap().file_type();
+        copy_entry_fallback(&src_link, &dst_link, file_type).unwrap();
+
+        assert!(std::fs::symlink_metadata(&src_link).is_err());
+        let dst_meta = std::fs::symlink_metadata(&dst_link).unwrap();
+        assert!(dst_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&dst_link).unwrap(),
+            PathBuf::from("doc/RelNotes/v1.47.3.txt")
+        );
     }
 
     fn write_cpio_newc_one_file(w: &mut Vec<u8>, name: &str, data: &[u8]) {

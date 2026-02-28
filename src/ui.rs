@@ -104,12 +104,7 @@ pub fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
 
     let default_hint = if default_yes { "Y/n" } else { "y/N" };
     loop {
-        print!(
-            "{} {} [{}] ",
-            label(Stream::Stdout, "?", "35"),
-            prompt,
-            default_hint
-        );
+        print!("{prompt} [{default_hint}]: ");
         io::stdout()
             .flush()
             .context("Failed to flush prompt to stdout")?;
@@ -123,8 +118,23 @@ pub fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
             return Ok(answer);
         }
 
-        warn("Please answer with 'y' or 'n'.");
+        warn("Invalid choice. Please answer with 'y' or 'n'.");
     }
+}
+
+/// Prompt for a package-oriented action with a Starpack-like layout.
+pub fn prompt_package_action(action: &str, packages: &[String], default_yes: bool) -> Result<bool> {
+    if packages.is_empty() {
+        return prompt_yes_no(
+            &format!("No packages were selected for {action}. Continue?"),
+            default_yes,
+        );
+    }
+
+    println!();
+    println!("The following packages will be processed for {}:", action);
+    println!("  {}", packages.join(" "));
+    prompt_yes_no("Proceed?", default_yes)
 }
 
 /// Prompt the user to choose one option by index.
@@ -144,18 +154,17 @@ pub fn prompt_select_index(prompt: &str, options: &[String], default_idx: usize)
     }
 
     loop {
-        println!("{} {}", label(Stream::Stdout, "?", "35"), prompt);
+        println!("{}:", prompt);
         for (idx, option) in options.iter().enumerate() {
             println!(
-                "  {} {}{}",
+                "  {}) {}{}",
                 idx + 1,
                 option,
                 if idx == default_idx { " [default]" } else { "" }
             );
         }
         print!(
-            "{} Select an option [1-{}] (default {}): ",
-            label(Stream::Stdout, "?", "35"),
+            "Choose option [1-{}] (Enter = {}): ",
             options.len(),
             default_idx + 1
         );
@@ -176,7 +185,10 @@ pub fn prompt_select_index(prompt: &str, options: &[String], default_idx: usize)
         {
             return Ok(num - 1);
         }
-        warn("Please enter a valid option number.");
+        warn(format!(
+            "Invalid choice. Please enter a number between 1 and {}.",
+            options.len()
+        ));
     }
 }
 

@@ -170,6 +170,7 @@ impl RepoManager {
         let mut license = None;
         let mut provides = Vec::new();
         let mut runtime_dependencies = Vec::new();
+        let mut optional_dependencies = Vec::new();
         let mut archive_files = Vec::new();
 
         for entry in archive.entries()? {
@@ -221,6 +222,17 @@ impl RepoManager {
                     .and_then(|v| v.as_array())
                 {
                     runtime_dependencies = runtime_arr
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(String::from)
+                        .collect();
+                }
+                if let Some(optional_arr) = metadata
+                    .get("dependencies")
+                    .and_then(|v| v.get("optional"))
+                    .and_then(|v| v.as_array())
+                {
+                    optional_dependencies = optional_arr
                         .iter()
                         .filter_map(|v| v.as_str())
                         .map(String::from)
@@ -283,6 +295,12 @@ impl RepoManager {
         for dep in runtime_dependencies {
             conn.execute(
                 "INSERT INTO dependencies (package_id, kind, name) VALUES (?1, 'runtime', ?2)",
+                params![package_id, dep],
+            )?;
+        }
+        for dep in optional_dependencies {
+            conn.execute(
+                "INSERT INTO dependencies (package_id, kind, name) VALUES (?1, 'optional', ?2)",
                 params![package_id, dep],
             )?;
         }
@@ -1304,11 +1322,84 @@ fn verify_binary_package_record_checksums(
     Ok(())
 }
 
-/// Download a binary package archive and verify it against checksums from the
-/// signed repository database metadata.
+fn fetch_binary_package_signature(
+    repo_name: &str,
+    repo: &crate::config::BinaryRepo,
+    client: &reqwest::blocking::Client,
+    sig_url: &str,
+    sig_path: &Path,
+) -> Result<bool> {
+    let found = fetch_url_to_path(client, sig_url, sig_path)?;
+    if !found {
+        if !repo.allow_unsigned {
+            anyhow::bail!(
+                "Failed to fetch detached signature for binary package in repo '{}' at {}",
+                repo_name,
+                sig_url
+            );
+        }
+        crate::log_warn!(
+            "Detached package signature missing for binary repo '{}' at {}; allow_unsigned=true so continuing",
+            repo_name,
+            sig_url
+        );
+    }
+    Ok(found)
+}
+
+fn verify_binary_package_signature(
+    repo_name: &str,
+    repo: &crate::config::BinaryRepo,
+    rootfs: &Path,
+    pkg_path: &Path,
+    sig_path: &Path,
+) -> Result<()> {
+    if !sig_path.exists() {
+        if repo.allow_unsigned {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Detached package signature required but missing for {}",
+            pkg_path.display()
+        );
+    }
+
+    let trusted_keys = crate::signing::list_trusted_public_keys(rootfs)?;
+    if trusted_keys.is_empty() {
+        if repo.allow_unsigned {
+            crate::log_warn!(
+                "No trusted minisign public key found; skipping package signature verification for binary repo '{}' because allow_unsigned=true",
+                repo_name
+            );
+            return Ok(());
+        }
+        anyhow::bail!(
+            "No trusted minisign public key found for detached package signature verification in binary repo '{}'",
+            repo_name
+        );
+    }
+
+    let verified_key = verify_with_any_trusted_public_key(rootfs, pkg_path, sig_path)
+        .with_context(|| {
+            format!(
+                "Failed to verify detached package signature for {}",
+                pkg_path.display()
+            )
+        })?;
+    crate::log_info!(
+        "Verified detached package signature for '{}' using {}",
+        pkg_path.display(),
+        verified_key.display()
+    );
+    Ok(())
+}
+
+/// Download a binary package archive and verify it against detached signatures
+/// and checksums from signed repository metadata.
 pub fn fetch_binary_package_archive(
     repo_name: &str,
     repo: &crate::config::BinaryRepo,
+    rootfs: &Path,
     rec: &BinaryRepoPackageRecord,
     package_cache_dir: &Path,
 ) -> Result<PathBuf> {
@@ -1324,7 +1415,15 @@ pub fn fetch_binary_package_archive(
     fs::create_dir_all(&cache_dir)
         .with_context(|| format!("Failed to create {}", cache_dir.display()))?;
     let dest_path = cache_dir.join(&rec.filename);
+    let dest_sig_path = cache_dir.join(format!("{}.sig", rec.filename));
     let tmp_path = cache_dir.join(format!("{}.tmp", rec.filename));
+    let tmp_sig_path = cache_dir.join(format!("{}.sig.tmp", rec.filename));
+    let pkg_url = join_repo_url(base_url, &rec.filename)?;
+    let sig_url = join_repo_url(base_url, &format!("{}.sig", rec.filename))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .context("Failed to build HTTP client for binary package fetch")?;
 
     if dest_path.exists() {
         verify_binary_package_record_checksums(&dest_path, rec).with_context(|| {
@@ -1333,11 +1432,32 @@ pub fn fetch_binary_package_archive(
                 dest_path.display()
             )
         })?;
+        if !dest_sig_path.exists() {
+            let sig_downloaded =
+                fetch_binary_package_signature(repo_name, repo, &client, &sig_url, &tmp_sig_path)?;
+            if sig_downloaded {
+                fs::rename(&tmp_sig_path, &dest_sig_path).with_context(|| {
+                    format!(
+                        "Failed to move {} to {}",
+                        tmp_sig_path.display(),
+                        dest_sig_path.display()
+                    )
+                })?;
+            } else {
+                let _ = fs::remove_file(&dest_sig_path);
+            }
+        }
+        verify_binary_package_signature(repo_name, repo, rootfs, &dest_path, &dest_sig_path)
+            .with_context(|| {
+                format!(
+                    "Cached binary package failed signature verification: {}",
+                    dest_path.display()
+                )
+            })?;
         crate::log_info!("Using cached binary package: {}", dest_path.display());
         return Ok(dest_path);
     }
 
-    let pkg_url = join_repo_url(base_url, &rec.filename)?;
     crate::log_info!("Fetching binary package: {}", pkg_url);
 
     match copy_file_url_to_path(&pkg_url, &tmp_path)? {
@@ -1346,9 +1466,6 @@ pub fn fetch_binary_package_archive(
             anyhow::bail!("Failed to fetch {}: local file not found", pkg_url);
         }
         FileUrlCopyOutcome::NotFileUrl => {
-            let client = reqwest::blocking::Client::builder()
-                .build()
-                .context("Failed to build HTTP client for binary package fetch")?;
             let mut resp = client
                 .get(&pkg_url)
                 .send()
@@ -1373,6 +1490,9 @@ pub fn fetch_binary_package_archive(
         )
     })?;
 
+    let sig_downloaded =
+        fetch_binary_package_signature(repo_name, repo, &client, &sig_url, &tmp_sig_path)?;
+
     fs::rename(&tmp_path, &dest_path).with_context(|| {
         format!(
             "Failed to move {} to {}",
@@ -1380,6 +1500,29 @@ pub fn fetch_binary_package_archive(
             dest_path.display()
         )
     })?;
+    if sig_downloaded {
+        fs::rename(&tmp_sig_path, &dest_sig_path).with_context(|| {
+            format!(
+                "Failed to move {} to {}",
+                tmp_sig_path.display(),
+                dest_sig_path.display()
+            )
+        })?;
+        if let Err(err) =
+            verify_binary_package_signature(repo_name, repo, rootfs, &dest_path, &dest_sig_path)
+        {
+            let _ = fs::remove_file(&dest_path);
+            let _ = fs::remove_file(&dest_sig_path);
+            return Err(err).with_context(|| {
+                format!(
+                    "Downloaded binary package failed signature verification: {}",
+                    rec.filename
+                )
+            });
+        }
+    } else {
+        let _ = fs::remove_file(&dest_sig_path);
+    }
     Ok(dest_path)
 }
 
@@ -1599,8 +1742,8 @@ license = "MIT"
 provides = ["test-feature"]
 
 [dependencies]
-build = []
 runtime = []
+optional = []
 "#;
         let mut header = tar::Header::new_gnu();
         header.set_path(".metadata.toml").unwrap();
@@ -1796,6 +1939,136 @@ license = ["MIT", "Apache-2.0"]
         };
 
         verify_binary_package_record_checksums(&pkg, &rec).unwrap();
+    }
+
+    fn test_record_for_payload(filename: &str, payload: &[u8]) -> BinaryRepoPackageRecord {
+        use sha2::{Digest, Sha256, Sha512};
+
+        let sha256 = {
+            let mut h = Sha256::new();
+            h.update(payload);
+            format!("{:x}", h.finalize())
+        };
+        let sha512 = {
+            let mut h = Sha512::new();
+            h.update(payload);
+            format!("{:x}", h.finalize())
+        };
+
+        BinaryRepoPackageRecord {
+            repo_name: "repo".into(),
+            name: "pkg".into(),
+            version: "1.0".into(),
+            revision: 1,
+            filename: filename.to_string(),
+            size: payload.len() as u64,
+            sha256,
+            sha512,
+            description: None,
+            provides: Vec::new(),
+            runtime_dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_fetch_binary_package_archive_requires_signature_when_unsigned_disallowed() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let filename = "pkg-1.0-1-x86_64.depot.pkg.tar.zst";
+        let payload = b"package payload";
+        std::fs::write(repo_dir.path().join(filename), payload).unwrap();
+
+        let rec = test_record_for_payload(filename, payload);
+        let repo_url = url::Url::from_directory_path(repo_dir.path())
+            .expect("file URL")
+            .to_string();
+        let repo_cfg = crate::config::BinaryRepo {
+            url: repo_url,
+            allow_unsigned: false,
+            ..Default::default()
+        };
+
+        let err =
+            fetch_binary_package_archive("repo", &repo_cfg, rootfs.path(), &rec, cache_dir.path())
+                .expect_err("missing detached signature should fail");
+        assert!(err.to_string().to_ascii_lowercase().contains("signature"));
+    }
+
+    #[test]
+    fn test_fetch_binary_package_archive_verifies_signature_and_checksum() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let trusted_dir = crate::signing::trusted_public_keys_dir(rootfs.path());
+        std::fs::create_dir_all(&trusted_dir).unwrap();
+
+        let keypair = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        std::fs::write(
+            trusted_dir.join("repo.pub"),
+            keypair.pk.to_box().unwrap().to_bytes(),
+        )
+        .unwrap();
+
+        let filename = "pkg-1.0-1-x86_64.depot.pkg.tar.zst";
+        let payload = b"signed package payload";
+        let package_path = repo_dir.path().join(filename);
+        std::fs::write(&package_path, payload).unwrap();
+
+        let sig = minisign::sign(
+            Some(&keypair.pk),
+            &keypair.sk,
+            std::fs::File::open(&package_path).unwrap(),
+            None,
+            Some("test signature"),
+        )
+        .unwrap();
+        std::fs::write(format!("{}.sig", package_path.display()), sig.to_bytes()).unwrap();
+
+        let rec = test_record_for_payload(filename, payload);
+        let repo_url = url::Url::from_directory_path(repo_dir.path())
+            .expect("file URL")
+            .to_string();
+        let repo_cfg = crate::config::BinaryRepo {
+            url: repo_url,
+            allow_unsigned: false,
+            ..Default::default()
+        };
+
+        let fetched =
+            fetch_binary_package_archive("repo", &repo_cfg, rootfs.path(), &rec, cache_dir.path())
+                .unwrap();
+        assert_eq!(std::fs::read(&fetched).unwrap(), payload);
+        assert!(PathBuf::from(format!("{}.sig", fetched.display())).exists());
+    }
+
+    #[test]
+    fn test_fetch_binary_package_archive_allows_missing_signature_when_configured() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let filename = "pkg-1.0-1-x86_64.depot.pkg.tar.zst";
+        let payload = b"unsigned package payload";
+        std::fs::write(repo_dir.path().join(filename), payload).unwrap();
+
+        let rec = test_record_for_payload(filename, payload);
+        let repo_url = url::Url::from_directory_path(repo_dir.path())
+            .expect("file URL")
+            .to_string();
+        let repo_cfg = crate::config::BinaryRepo {
+            url: repo_url,
+            allow_unsigned: true,
+            ..Default::default()
+        };
+
+        let fetched =
+            fetch_binary_package_archive("repo", &repo_cfg, rootfs.path(), &rec, cache_dir.path())
+                .unwrap();
+        assert_eq!(std::fs::read(&fetched).unwrap(), payload);
+        assert!(!PathBuf::from(format!("{}.sig", fetched.display())).exists());
     }
 
     #[test]

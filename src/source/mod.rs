@@ -247,7 +247,7 @@ fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
     }
 }
 
-/// Build a blocking reqwest HTTP client using the platform-default TLS backend.
+/// Build a blocking reqwest HTTP client using the configured Cargo TLS backend.
 /// Any error building the client is returned directly (no fallback).
 pub(crate) fn build_blocking_client(
     user_agent: &str,

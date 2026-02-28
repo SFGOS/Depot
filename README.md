@@ -39,9 +39,11 @@ depot install zlib-1.2.11-1-x86_64.depot.pkg.tar.zst
   - Resolves a full dependency plan first (binary repos and/or source specs), then executes in dependency order.
   - Use `--yes` for non-interactive confirmation/provider selection.
   - Use `--dry-run` to print the plan without performing work.
+  - Binary package installs verify both checksums and detached minisign signatures (`.sig`).
 - `remove <PACKAGE>`: Remove an installed package.
 - `build <SPEC>`: Build a package and create an archive without installing.
-  - Resolves and offers to install missing build/test dependencies before fetching/building.
+  - Resolves and offers to install missing build dependencies before fetching/building.
+  - Missing test dependencies automatically disable test execution for that build.
 - `info <PACKAGE_OR_SPEC>`: Show information about a package.
 - `search <QUERY>`: Search enabled source/binary repos by package name and provided features.
   - Use `--files` to search binary repo metadata file lists.
@@ -75,6 +77,7 @@ flags = { configure = ["--enable-feature"] }
 [dependencies]
 build = ["gcc", "make"]
 runtime = ["libc"]
+optional = ["bash-completion"]
 ```
 
 ## Configuration
@@ -83,3 +86,26 @@ Depot can be configured via `/etc/depot.d/` (or relative to the rootfs).
 
 - `/etc/depot.d/build.toml`: System-wide build overrides and flag appends.
 - `/etc/depot.d/package.toml`: Package-specific overrides.
+- `/etc/depot.d/hooks/*.toml`: Transaction hooks for `install`/`update`/`remove` pre/post phases.
+
+### Transaction Hooks
+
+Hook files are TOML and use Starpack-like sections:
+
+```toml
+[hook]
+name = "refresh-cache"
+
+[when]
+phase = "post"
+operation = ["install", "update"]
+packages = ["glibc", "linux*"]
+paths = ["usr/lib/*"]
+negation = ["usr/lib/debug/*"]
+
+[exec]
+command = "ldconfig"
+needs_paths = true
+```
+
+`needs_paths = true` passes affected paths to the command via stdin (newline-separated).

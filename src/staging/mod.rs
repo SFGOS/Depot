@@ -240,6 +240,28 @@ fn auto_strip_elf_files(destdir: &Path) -> Result<usize> {
     Ok(stripped)
 }
 
+fn auto_delete_static_archives(destdir: &Path) -> Result<usize> {
+    let mut removed = 0usize;
+    for entry in WalkDir::new(destdir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "a") {
+            continue;
+        }
+
+        fs::remove_file(path).with_context(|| {
+            format!(
+                "Failed to remove static library {} (disable with build.flags.no_delete_static = true)",
+                path.display()
+            )
+        })?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 fn compress_manpages_zstd(destdir: &Path) -> Result<usize> {
     crate::log_info!("Compressing man pages with zstd...");
     let mut man_files = Vec::new();
@@ -356,11 +378,11 @@ fn compress_manpages_zstd(destdir: &Path) -> Result<usize> {
     Ok(compressed)
 }
 
-/// Process staged files - remove .la files, strip binaries, etc.
+/// Process staged files - remove .la files/static libs, strip binaries, etc.
 pub fn process(destdir: &Path, spec: &PackageSpec) -> Result<()> {
     crate::log_info!("Processing staged files...");
 
-    let mut removed_count = 0;
+    let mut removed_la_count = 0;
 
     for entry in WalkDir::new(destdir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -369,12 +391,23 @@ pub fn process(destdir: &Path, spec: &PackageSpec) -> Result<()> {
         if path.extension().map(|e| e == "la").unwrap_or(false) {
             crate::log_info!("  Removing: {}", path.display());
             fs::remove_file(path)?;
-            removed_count += 1;
+            removed_la_count += 1;
         }
     }
 
-    if removed_count > 0 {
-        crate::log_info!("Removed {} .la file(s)", removed_count);
+    if removed_la_count > 0 {
+        crate::log_info!("Removed {} .la file(s)", removed_la_count);
+    }
+
+    if spec.build.flags.no_delete_static {
+        crate::log_info!(
+            "Skipping static library cleanup: disabled by build.flags.no_delete_static"
+        );
+    } else {
+        let removed_static = auto_delete_static_archives(destdir)?;
+        if removed_static > 0 {
+            crate::log_info!("Removed {} static library archive(s)", removed_static);
+        }
     }
 
     if spec.build.flags.no_strip {
@@ -736,6 +769,68 @@ pub fn install_atomic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::package::{Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec};
+
+    fn mk_spec_for_stage_processing() -> PackageSpec {
+        let mut flags = BuildFlags::default();
+        flags.no_strip = true;
+        flags.no_compress_man = true;
+        PackageSpec {
+            package: PackageInfo {
+                name: "foo".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Default::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: Build {
+                build_type: BuildType::Custom,
+                flags,
+            },
+            dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn process_removes_static_archives_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/lib")).unwrap();
+        std::fs::write(destdir.join("usr/lib/libfoo.a"), "static").unwrap();
+        std::fs::write(destdir.join("usr/lib/libfoo.la"), "libtool").unwrap();
+        std::fs::write(destdir.join("usr/lib/libfoo.so"), "shared").unwrap();
+
+        let spec = mk_spec_for_stage_processing();
+        process(&destdir, &spec).unwrap();
+
+        assert!(!destdir.join("usr/lib/libfoo.a").exists());
+        assert!(!destdir.join("usr/lib/libfoo.la").exists());
+        assert!(destdir.join("usr/lib/libfoo.so").exists());
+    }
+
+    #[test]
+    fn process_preserves_static_archives_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/lib")).unwrap();
+        std::fs::write(destdir.join("usr/lib/libfoo.a"), "static").unwrap();
+        std::fs::write(destdir.join("usr/lib/libfoo.la"), "libtool").unwrap();
+
+        let mut spec = mk_spec_for_stage_processing();
+        spec.build.flags.no_delete_static = true;
+        process(&destdir, &spec).unwrap();
+
+        assert!(destdir.join("usr/lib/libfoo.a").exists());
+        assert!(!destdir.join("usr/lib/libfoo.la").exists());
+    }
 
     #[test]
     fn add_licenses_copies_common_files() {

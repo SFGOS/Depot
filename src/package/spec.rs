@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -190,6 +190,22 @@ impl PackageSpec {
             .get(pkg_name)
             .cloned()
             .unwrap_or_else(|| self.dependencies.clone())
+    }
+
+    /// Return all package names/provided features produced by this spec.
+    ///
+    /// This includes all output package names and per-output `provides` entries.
+    pub fn local_dependency_provides(&self) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for output in self.outputs() {
+            let output_name = output.name.clone();
+            names.insert(output_name.clone());
+            let alternatives = self.alternatives_for_output(&output_name);
+            for provided in alternatives.provides {
+                names.insert(provided);
+            }
+        }
+        names
     }
 
     /// Return alternatives/provides for a specific output package name.
@@ -479,6 +495,11 @@ impl PackageSpec {
                 "no_strip" | "no-strip" => {
                     if let Some(b) = v.as_bool() {
                         self.build.flags.no_strip = b;
+                    }
+                }
+                "no_delete_static" | "no-delete-static" => {
+                    if let Some(b) = v.as_bool() {
+                        self.build.flags.no_delete_static = b;
                     }
                 }
                 "no_compress_man"
@@ -995,6 +1016,11 @@ impl PackageSpec {
             "no_strip" | "no-strip" => {
                 if let Some(b) = values.last().and_then(|v| v.as_bool()) {
                     self.build.flags.no_strip = b;
+                }
+            }
+            "no_delete_static" | "no-delete-static" => {
+                if let Some(b) = values.last().and_then(|v| v.as_bool()) {
+                    self.build.flags.no_delete_static = b;
                 }
             }
             "no_compress_man"
@@ -1535,6 +1561,7 @@ make_test_dirs = ["tests"]
 make_install_dirs = ["lib"]
 no_flags = true
 no_strip = true
+no_delete_static = true
 no_compress_man = true
 skip_tests = true
 keep = ["etc/locale.gen"]
@@ -1570,6 +1597,10 @@ post_configure = ["echo configured"]
         );
         config.appends.insert(
             "build.flags.no_compress_man".to_string(),
+            vec![toml::Value::Boolean(false)],
+        );
+        config.appends.insert(
+            "build.flags.no_delete_static".to_string(),
             vec![toml::Value::Boolean(false)],
         );
         config.appends.insert(
@@ -1627,6 +1658,7 @@ post_configure = ["echo configured"]
         );
         assert!(spec.build.flags.no_flags);
         assert!(!spec.build.flags.no_strip);
+        assert!(!spec.build.flags.no_delete_static);
         assert!(!spec.build.flags.no_compress_man);
         assert!(
             spec.build
@@ -1735,7 +1767,7 @@ no_flags = true
     }
 
     #[test]
-    fn parse_no_strip_and_no_compress_man_from_spec() {
+    fn parse_no_strip_no_delete_static_and_no_compress_man_from_spec() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
 
@@ -1759,6 +1791,7 @@ type = "custom"
 
 [build.flags]
 no_strip = true
+"no-delete-static" = true
 no-compress-man = true
 "#,
         )
@@ -1766,6 +1799,7 @@ no-compress-man = true
 
         let spec = PackageSpec::from_file(&path).unwrap();
         assert!(spec.build.flags.no_strip);
+        assert!(spec.build.flags.no_delete_static);
         assert!(spec.build.flags.no_compress_man);
     }
 
@@ -2128,10 +2162,11 @@ extract_dir = "foo"
 [build]
 type = "autotools"
 
-[dependencies]
-build = ["make"]
-test = ["python", "bats"]
-"#,
+	[dependencies]
+	build = ["make"]
+	test = ["python", "bats"]
+	optional = ["gtk-doc"]
+	"#,
         )
         .unwrap();
 
@@ -2140,6 +2175,7 @@ test = ["python", "bats"]
             spec.dependencies.test,
             vec!["python".to_string(), "bats".to_string()]
         );
+        assert_eq!(spec.dependencies.optional, vec!["gtk-doc".to_string()]);
     }
 
     #[test]
@@ -2576,6 +2612,14 @@ pub struct BuildFlags {
     /// Disable automatic stripping of ELF files during staging.
     #[serde(default, alias = "no-strip")]
     pub no_strip: bool,
+    /// Disable automatic deletion of static libraries (`*.a`) during staging.
+    #[serde(
+        default,
+        alias = "no-delete-static",
+        alias = "no_remove_static",
+        alias = "no-remove-static"
+    )]
+    pub no_delete_static: bool,
     /// Disable automatic zstd compression of man pages during staging.
     #[serde(
         default,
@@ -2814,6 +2858,7 @@ impl Default for BuildFlags {
             keep: Vec::new(),
             no_flags: false,
             no_strip: false,
+            no_delete_static: false,
             no_compress_man: false,
             skip_tests: false,
             build_32: false,
@@ -2981,4 +3026,7 @@ pub struct Dependencies {
     /// Dependencies required to run package test suites.
     #[serde(default)]
     pub test: Vec<String>,
+    /// Optional runtime integrations that enhance functionality when installed.
+    #[serde(default)]
+    pub optional: Vec<String>,
 }

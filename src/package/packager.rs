@@ -159,20 +159,9 @@ impl Packager {
             ),
         );
 
-        // Add dependencies if useful for repo indexing
-        let mut build_deps = toml::map::Map::new();
-        build_deps.insert(
-            "build".to_string(),
-            toml::Value::Array(
-                self.spec
-                    .dependencies
-                    .build
-                    .iter()
-                    .map(|s| toml::Value::String(s.clone()))
-                    .collect(),
-            ),
-        );
-        build_deps.insert(
+        // Add install-relevant dependency kinds for repo/runtime consumers.
+        let mut deps = toml::map::Map::new();
+        deps.insert(
             "runtime".to_string(),
             toml::Value::Array(
                 self.spec
@@ -183,18 +172,18 @@ impl Packager {
                     .collect(),
             ),
         );
-        build_deps.insert(
-            "test".to_string(),
+        deps.insert(
+            "optional".to_string(),
             toml::Value::Array(
                 self.spec
                     .dependencies
-                    .test
+                    .optional
                     .iter()
                     .map(|s| toml::Value::String(s.clone()))
                     .collect(),
             ),
         );
-        map.insert("dependencies".to_string(), toml::Value::Table(build_deps));
+        map.insert("dependencies".to_string(), toml::Value::Table(deps));
 
         let toml_str = toml::to_string(&toml::Value::Table(map))
             .context("Failed to serialize metadata to TOML")?;
@@ -357,9 +346,10 @@ mod tests {
         assert_eq!(val.get("license").and_then(|v| v.as_str()), Some("MIT"));
 
         let deps = val.get("dependencies").unwrap();
-        assert!(deps.get("build").unwrap().as_array().unwrap().is_empty());
         assert!(deps.get("runtime").unwrap().as_array().unwrap().is_empty());
-        assert!(deps.get("test").unwrap().as_array().unwrap().is_empty());
+        assert!(deps.get("optional").unwrap().as_array().unwrap().is_empty());
+        assert!(deps.get("build").is_none());
+        assert!(deps.get("test").is_none());
     }
 
     #[test]
