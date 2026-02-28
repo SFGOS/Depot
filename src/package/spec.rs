@@ -531,6 +531,17 @@ impl PackageSpec {
                         self.build.flags.configure_lib32 = vec![s.to_string()];
                     }
                 }
+                "config_setting" | "config_settings" | "config-setting" | "config-settings" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.config_settings = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.config_settings = vec![s.to_string()];
+                    }
+                }
                 "configure_file" | "configure-file" => {
                     if let Some(s) = v.as_str() {
                         self.build.flags.configure_file = s.to_string();
@@ -703,6 +714,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.configure_lib32.push(s.to_string());
+                    }
+                }
+            }
+            "config_setting" | "config_settings" | "config-setting" | "config-settings" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .config_settings
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.config_settings.push(s.to_string());
                     }
                 }
             }
@@ -1359,6 +1382,45 @@ type = "python"
     }
 
     #[test]
+    fn parse_python_config_settings_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "python"
+
+[build.flags]
+config-setting = ["editable_mode=compat", "setup-args=--plat-name=x86_64"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.build.flags.config_settings,
+            vec![
+                "editable_mode=compat".to_string(),
+                "setup-args=--plat-name=x86_64".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn parse_multiple_licenses() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -1601,6 +1663,7 @@ no_compress_man = true
 skip_tests = true
 keep = ["etc/locale.gen"]
 configure_file = "configure.gnu"
+config-setting = ["editable_mode=compat"]
 post_configure = ["echo configured"]
 "#,
         )
@@ -1665,6 +1728,12 @@ post_configure = ["echo configured"]
         config.appends.insert(
             "build.flags.configure_file".to_string(),
             vec![toml::Value::String("build-aux/configure".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.config-setting".to_string(),
+            vec![toml::Value::String(
+                "setup-args=--plat-name=x86_64".to_string(),
+            )],
         );
         config.appends.insert(
             "build.flags.post_configure".to_string(),
@@ -1754,6 +1823,18 @@ post_configure = ["echo configured"]
                 .contains(&"tools".to_string())
         );
         assert_eq!(spec.build.flags.configure_file, "build-aux/configure");
+        assert!(
+            spec.build
+                .flags
+                .config_settings
+                .contains(&"editable_mode=compat".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .config_settings
+                .contains(&"setup-args=--plat-name=x86_64".to_string())
+        );
         assert!(
             spec.build
                 .flags
@@ -2689,6 +2770,16 @@ pub struct BuildFlags {
     pub build_32: bool,
     #[serde(default)]
     pub configure: Vec<String>,
+    /// PEP 517 config settings for Python builds (each entry is `KEY=VALUE` or `KEY`).
+    #[serde(
+        default,
+        alias = "config-setting",
+        alias = "config-settings",
+        alias = "config_setting",
+        alias = "config_settings",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub config_settings: Vec<String>,
     /// Configure arguments used only for the lib32 build variant (replaces `configure` when set).
     #[serde(default, alias = "configure-lib32", alias = "configure_lib32")]
     pub configure_lib32: Vec<String>,
@@ -2911,6 +3002,7 @@ impl Default for BuildFlags {
             skip_tests: false,
             build_32: false,
             configure: Vec::new(),
+            config_settings: Vec::new(),
             configure_lib32: Vec::new(),
             configure_file: String::new(),
             cc: default_cc(),
@@ -2972,6 +3064,26 @@ where
 
     match Option::<StringOrArray>::deserialize(deserializer)? {
         Some(StringOrArray::String(s)) => Ok(s.split_whitespace().map(String::from).collect()),
+        Some(StringOrArray::Array(a)) => Ok(a),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn deserialize_string_or_array_no_split<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrArray {
+        String(String),
+        Array(Vec<String>),
+    }
+
+    match Option::<StringOrArray>::deserialize(deserializer)? {
+        Some(StringOrArray::String(s)) => Ok(vec![s]),
         Some(StringOrArray::Array(a)) => Ok(a),
         None => Ok(Vec::new()),
     }

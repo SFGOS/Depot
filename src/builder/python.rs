@@ -35,6 +35,7 @@ pub fn build(
 ) -> Result<()> {
     let flags = &spec.build.flags;
     let actual_src = resolve_actual_src(spec, src_dir)?;
+    let config_settings = normalize_pep517_config_settings(spec)?;
     fs::create_dir_all(destdir)
         .with_context(|| format!("Failed to create DESTDIR: {}", destdir.display()))?;
 
@@ -63,9 +64,14 @@ pub fn build(
 
         match detect_frontend(&actual_src)? {
             BuildFrontend::Pep517(cfg) => {
-                build_wheel_pep517(&actual_src, &dist_dir, &env_vars, &cfg)?
+                build_wheel_pep517(&actual_src, &dist_dir, &env_vars, &cfg, &config_settings)?
             }
             BuildFrontend::LegacySetupPy => {
+                if !config_settings.is_empty() {
+                    bail!(
+                        "build.flags.config_setting is only supported for PEP 517 builds (pyproject.toml)"
+                    );
+                }
                 build_wheel_setup_py(&actual_src, &dist_dir, &env_vars)?;
             }
         }
@@ -91,6 +97,39 @@ pub fn build(
     }
 
     Ok(())
+}
+
+fn normalize_pep517_config_settings(spec: &PackageSpec) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for raw in &spec.build.flags.config_settings {
+        let expanded = spec.expand_vars(raw);
+        let trimmed = expanded.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains('\n') || trimmed.contains('\r') {
+            bail!(
+                "Invalid build.flags.config_setting entry '{}': newlines are not allowed",
+                raw
+            );
+        }
+
+        let key = trimmed.split_once('=').map(|(k, _)| k).unwrap_or(trimmed);
+        let key = key.trim();
+        if key.is_empty() || key.chars().any(char::is_whitespace) {
+            bail!(
+                "Invalid build.flags.config_setting entry '{}'; expected KEY=VALUE or KEY",
+                raw
+            );
+        }
+
+        if let Some((_, value)) = trimmed.split_once('=') {
+            out.push(format!("{key}={value}"));
+        } else {
+            out.push(format!("{key}="));
+        }
+    }
+    Ok(out)
 }
 
 fn resolve_actual_src(spec: &PackageSpec, src_dir: &Path) -> Result<PathBuf> {
@@ -264,6 +303,7 @@ fn build_wheel_pep517(
     dist_dir: &Path,
     env_vars: &[(String, String)],
     cfg: &Pep517Config,
+    config_settings: &[String],
 ) -> Result<()> {
     crate::log_info!("Building wheel via PEP 517 backend {}...", cfg.backend);
 
@@ -283,6 +323,11 @@ fn build_wheel_pep517(
             .map(|p| p.to_string_lossy().to_string())
             .collect::<Vec<_>>()
             .join("\n"),
+    );
+    crate::builder::set_env_var(
+        &mut build_env,
+        "DEPOT_PY_CONFIG_SETTINGS",
+        config_settings.join("\n"),
     );
     crate::builder::prepare_command(&mut cmd, &build_env);
 
@@ -687,6 +732,20 @@ if object_path:
             backend = getattr(backend, attr)
 
 config_settings = {}
+for raw in [p for p in os.environ.get("DEPOT_PY_CONFIG_SETTINGS", "").splitlines() if p]:
+    key, _, value = raw.partition("=")
+    key = key.strip()
+    if not key:
+        raise RuntimeError(f"Invalid DEPOT_PY_CONFIG_SETTINGS entry: {raw!r}")
+    existing = config_settings.get(key)
+    if existing is None:
+        config_settings[key] = value
+    elif isinstance(existing, list):
+        existing.append(value)
+    else:
+        config_settings[key] = [existing, value]
+if not config_settings:
+    config_settings = None
 if not hasattr(backend, "build_wheel"):
     raise RuntimeError(f"Backend {backend_spec!r} does not provide build_wheel")
 wheel_name = backend.build_wheel(str(dist_dir), config_settings, None)
@@ -732,6 +791,39 @@ mod tests {
             package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         }
+    }
+
+    #[test]
+    fn normalize_pep517_config_settings_accepts_key_value_and_key_only() -> Result<()> {
+        let mut spec = mk_spec();
+        spec.package.version = "1.2.3".into();
+        spec.build.flags.config_settings = vec![
+            "editable_mode=compat".into(),
+            "setup-args=--plat-name=x86_64".into(),
+            "builddir".into(),
+            "version=$version".into(),
+        ];
+
+        let normalized = normalize_pep517_config_settings(&spec)?;
+        assert_eq!(
+            normalized,
+            vec![
+                "editable_mode=compat".to_string(),
+                "setup-args=--plat-name=x86_64".to_string(),
+                "builddir=".to_string(),
+                "version=1.2.3".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_pep517_config_settings_rejects_invalid_key() {
+        let mut spec = mk_spec();
+        spec.build.flags.config_settings = vec!["bad key=value".into()];
+        let err = normalize_pep517_config_settings(&spec)
+            .expect_err("invalid config setting key should fail");
+        assert!(err.to_string().contains("expected KEY=VALUE or KEY"));
     }
 
     #[test]

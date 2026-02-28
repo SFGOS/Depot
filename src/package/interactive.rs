@@ -614,6 +614,13 @@ pub fn create_interactive() -> Result<PackageSpec> {
                 .prompt()?;
         }
 
+        if matches!(build_type, BuildType::Python) && show_advanced {
+            flags.config_settings = prompt_repeating_list(
+                "PEP 517 config-setting",
+                "Format: KEY=VALUE (repeat keys to pass multiple values)",
+            )?;
+        }
+
         if matches!(build_type, BuildType::Bin) {
             flags.binary_type = prompt_optional_text(
                 "Binary type (optional):",
@@ -1222,6 +1229,19 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             ),
         );
     }
+    if !spec.build.flags.config_settings.is_empty() {
+        flags_tbl.insert(
+            "config_setting".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .config_settings
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if spec.build.flags.bindir != defaults.bindir {
         flags_tbl.insert(
             "bindir".into(),
@@ -1445,6 +1465,7 @@ mod tests {
         flags.makefile_commands = vec!["make".into()];
         flags.makefile_install_commands = vec!["make DESTDIR=$DESTDIR install".into()];
         flags.cargs = vec!["--locked".into()];
+        flags.config_settings = vec!["editable_mode=compat".into()];
         flags.rustflags = vec!["-Ctarget-cpu=native".into()];
         flags.cxxflags = vec!["-O2".into(), "-fno-rtti".into()];
         flags.target = "x86_64-unknown-linux-gnu".into();
@@ -1501,6 +1522,7 @@ mod tests {
         assert!(toml.contains("makefile_commands = ["));
         assert!(toml.contains("makefile_install_commands = ["));
         assert!(toml.contains("cargs = ["));
+        assert!(toml.contains("config_setting = ["));
         assert!(toml.contains("rustflags = ["));
         assert!(toml.contains("cxxflags = ["));
         assert!(toml.contains("target = \"x86_64-unknown-linux-gnu\""));
