@@ -20,6 +20,15 @@ fn is_zst_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_verify_supported_zst_file(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| {
+            let name = n.to_string_lossy();
+            name.ends_with(".zst") || name.ends_with(".zst.tmp")
+        })
+        .unwrap_or(false)
+}
+
 fn candidate_roots(rootfs: &Path, host_root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     out.push(rootfs.to_path_buf());
@@ -247,9 +256,9 @@ fn verify_detached_with_key_paths(
     if !sig_path.exists() {
         anyhow::bail!("Detached signature not found: {}", sig_path.display());
     }
-    if !is_zst_file(input) {
+    if !is_verify_supported_zst_file(input) {
         anyhow::bail!(
-            "Verification currently only supports .zst files: {}",
+            "Verification currently only supports .zst and .zst.tmp files: {}",
             input.display()
         );
     }
@@ -410,6 +419,30 @@ mod tests {
 
         // Also make sure host/rootfs lookup path version works without touching /.
         let _ = locate_keys_in_roots(rootfs.path(), host.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_detached_allows_zst_tmp_inputs() -> Result<()> {
+        let rootfs = tempfile::tempdir()?;
+        let (pub_path, sign_path) = write_test_keys(rootfs.path())?;
+
+        let file = rootfs.path().join("artifact.tar.zst");
+        let mut f = fs::File::create(&file)?;
+        f.write_all(b"test payload")?;
+        f.flush()?;
+
+        let keys = KeyLocations {
+            public_key: Some(pub_path.clone()),
+            signing_key: Some(sign_path),
+        };
+        let signing_material = load_signing_material(&keys)?;
+        let sig_path = PathBuf::from(format!("{}.sig", file.display()));
+        sign_detached_with_material(&file, &sig_path, &signing_material)?;
+
+        let tmp_file = rootfs.path().join("artifact.tar.zst.tmp");
+        fs::rename(&file, &tmp_file)?;
+        verify_zst_file_detached_with_public_key(&tmp_file, &sig_path, &pub_path)?;
         Ok(())
     }
 

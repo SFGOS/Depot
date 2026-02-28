@@ -661,6 +661,48 @@ fn extract_html_href_targets(html: &str) -> Vec<String> {
     out
 }
 
+fn default_repo_public_key_candidate_names(base_url: &str) -> Result<Vec<String>> {
+    let mut names = vec![
+        "vertex.pub".to_string(),
+        "depot.pub".to_string(),
+        "depot.minisign.pub".to_string(),
+        "minisign.pub".to_string(),
+        "repo.pub".to_string(),
+    ];
+
+    if let Ok(parsed) = url::Url::parse(base_url)
+        && let Some(last_segment) = parsed
+            .path_segments()
+            .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
+    {
+        names.push(format!("{}.pub", last_segment));
+    }
+
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn probe_repo_public_key_urls(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for key_name in default_repo_public_key_candidate_names(base_url)? {
+        let key_url = join_repo_url(base_url, &format!("keys/{}", key_name))?;
+        let resp = client
+            .get(&key_url)
+            .send()
+            .with_context(|| format!("Failed to fetch {}", key_url))?;
+        if resp.status().is_success() {
+            out.push((key_name, key_url));
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 fn list_repo_public_key_urls(
     base_url: &str,
     client: &reqwest::blocking::Client,
@@ -706,36 +748,40 @@ fn list_repo_public_key_urls(
         return Ok(out);
     }
 
+    let mut out = Vec::new();
     let keys_url = join_repo_url(base_url, "keys/")?;
     let resp = client
         .get(&keys_url)
         .send()
         .with_context(|| format!("Failed to fetch {}", keys_url))?;
-    if !resp.status().is_success() {
-        return Ok(Vec::new());
-    }
-    let body = resp
-        .text()
-        .with_context(|| format!("Failed to read {}", keys_url))?;
-    let keys_base = url::Url::parse(&keys_url)
-        .with_context(|| format!("Invalid repo keys URL: {}", keys_url))?;
+    if resp.status().is_success() {
+        let body = resp
+            .text()
+            .with_context(|| format!("Failed to read {}", keys_url))?;
+        let keys_base = url::Url::parse(&keys_url)
+            .with_context(|| format!("Invalid repo keys URL: {}", keys_url))?;
 
-    let mut out = Vec::new();
-    for href in extract_html_href_targets(&body) {
-        if href.is_empty() || href.starts_with('#') || href.starts_with('?') {
-            continue;
+        for href in extract_html_href_targets(&body) {
+            if href.is_empty() || href.starts_with('#') || href.starts_with('?') {
+                continue;
+            }
+            let Ok(url) = keys_base.join(&href) else {
+                continue;
+            };
+            let Some(name) = url.path_segments().and_then(|mut s| s.next_back()) else {
+                continue;
+            };
+            if name.is_empty() || !name.to_ascii_lowercase().ends_with(".pub") {
+                continue;
+            }
+            out.push((name.to_string(), url.to_string()));
         }
-        let Ok(url) = keys_base.join(&href) else {
-            continue;
-        };
-        let Some(name) = url.path_segments().and_then(|mut s| s.next_back()) else {
-            continue;
-        };
-        if name.is_empty() || !name.to_ascii_lowercase().ends_with(".pub") {
-            continue;
-        }
-        out.push((name.to_string(), url.to_string()));
     }
+
+    if out.is_empty() {
+        out = probe_repo_public_key_urls(base_url, client)?;
+    }
+
     out.sort();
     out.dedup();
     Ok(out)
@@ -1067,7 +1113,7 @@ pub fn fetch_binary_repo_db(
     };
 
     if sig_downloaded {
-        let trusted_keys = crate::signing::list_trusted_public_keys(rootfs)?;
+        let mut trusted_keys = crate::signing::list_trusted_public_keys(rootfs)?;
         if trusted_keys.is_empty() {
             if let Some(installed_key) = try_trust_repo_public_key_for_repo_db(
                 repo_name, base_url, rootfs, &cache_dir, &client, &tmp_zst, &tmp_sig,
@@ -1089,18 +1135,41 @@ pub fn fetch_binary_repo_db(
                     repo_name
                 );
             }
+            trusted_keys = crate::signing::list_trusted_public_keys(rootfs)?;
         }
 
-        if crate::signing::list_trusted_public_keys(rootfs)?.is_empty() {
+        if trusted_keys.is_empty() {
             // No key was trusted/installed, and allow_unsigned=true already handled above.
         } else {
-            let verified_key = verify_with_any_trusted_public_key(rootfs, &tmp_zst, &tmp_sig)
-                .with_context(|| {
-                    format!(
-                        "Failed to verify detached signature for binary repo '{}'",
-                        repo_name
-                    )
-                })?;
+            let verified_key = match verify_with_any_trusted_public_key(rootfs, &tmp_zst, &tmp_sig)
+            {
+                Ok(key) => key,
+                Err(initial_err) => {
+                    if let Some(installed_key) = try_trust_repo_public_key_for_repo_db(
+                        repo_name, base_url, rootfs, &cache_dir, &client, &tmp_zst, &tmp_sig,
+                    )? {
+                        crate::log_info!(
+                            "Trusted repo key for '{}' installed at {}",
+                            repo_name,
+                            installed_key.display()
+                        );
+                        verify_with_any_trusted_public_key(rootfs, &tmp_zst, &tmp_sig)
+                            .with_context(|| {
+                                format!(
+                                    "Failed to verify detached signature for binary repo '{}'",
+                                    repo_name
+                                )
+                            })?
+                    } else {
+                        return Err(initial_err).with_context(|| {
+                            format!(
+                                "Failed to verify detached signature for binary repo '{}'",
+                                repo_name
+                            )
+                        });
+                    }
+                }
+            };
             crate::log_info!(
                 "Verified detached signature for binary repo '{}' using {}",
                 repo_name,
@@ -2313,6 +2382,133 @@ license = ["MIT", "Apache-2.0"]
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].0, "repo.pub");
         assert!(keys[0].1.ends_with("/repo.pub"));
+    }
+
+    #[test]
+    fn test_list_repo_public_key_urls_probes_common_names_when_index_missing() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..7 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let (status, body) = if path == "/core/keys/vertex.pub" {
+                    ("200 OK", "trusted-key")
+                } else {
+                    ("404 Not Found", "missing")
+                };
+
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let base_url = format!("http://{}/core", addr);
+        let client = reqwest::blocking::Client::builder().build().unwrap();
+        let keys = list_repo_public_key_urls(&base_url, &client).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "vertex.pub");
+        assert!(keys[0].1.ends_with("/core/keys/vertex.pub"));
+    }
+
+    #[test]
+    fn test_fetch_binary_repo_db_can_recover_from_stale_trusted_key() {
+        use std::io::Write;
+
+        struct AssumeYesReset;
+        impl Drop for AssumeYesReset {
+            fn drop(&mut self) {
+                crate::ui::set_assume_yes(false);
+            }
+        }
+
+        crate::ui::set_assume_yes(true);
+        let _reset = AssumeYesReset;
+
+        let rootfs = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let stale_keypair = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let repo_keypair = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+
+        let trusted_dir = crate::signing::trusted_public_keys_dir(rootfs.path());
+        fs::create_dir_all(&trusted_dir).unwrap();
+        fs::write(
+            trusted_dir.join("vertex.pub"),
+            stale_keypair.pk.to_box().unwrap().to_bytes(),
+        )
+        .unwrap();
+
+        let repo_keys_dir = repo_dir.path().join("keys");
+        fs::create_dir_all(&repo_keys_dir).unwrap();
+        fs::write(
+            repo_keys_dir.join("vertex.pub"),
+            repo_keypair.pk.to_box().unwrap().to_bytes(),
+        )
+        .unwrap();
+
+        let repo_db_path = repo_dir.path().join("repo.db.zst");
+        let mut encoder =
+            zstd::stream::write::Encoder::new(fs::File::create(&repo_db_path).unwrap(), 3).unwrap();
+        encoder.write_all(b"repo-db-content").unwrap();
+        encoder.finish().unwrap();
+
+        let sig = minisign::sign(
+            Some(&repo_keypair.pk),
+            &repo_keypair.sk,
+            fs::File::open(&repo_db_path).unwrap(),
+            None,
+            Some("repo db signature"),
+        )
+        .unwrap();
+        fs::write(repo_dir.path().join("repo.db.zst.sig"), sig.to_bytes()).unwrap();
+
+        let repo_cfg = crate::config::BinaryRepo {
+            url: url::Url::from_directory_path(repo_dir.path())
+                .expect("file URL")
+                .to_string(),
+            allow_unsigned: false,
+            ..Default::default()
+        };
+
+        let sqlite_db =
+            fetch_binary_repo_db("core", &repo_cfg, rootfs.path(), cache_dir.path()).unwrap();
+        assert_eq!(fs::read(sqlite_db).unwrap(), b"repo-db-content");
+
+        let installed_key = trusted_dir.join("core-vertex.pub");
+        assert!(installed_key.exists());
+        assert_eq!(
+            fs::read(installed_key).unwrap(),
+            repo_keypair.pk.to_box().unwrap().to_bytes()
+        );
     }
 
     #[test]
