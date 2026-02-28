@@ -75,6 +75,18 @@ fn clean_build_workspace(config: &config::Config) -> Result<()> {
             config.build_dir.display()
         ));
     }
+    if config.cache_dir.exists() {
+        fs::remove_dir_all(&config.cache_dir).with_context(|| {
+            format!(
+                "Failed to clean source cache dir: {}",
+                config.cache_dir.display()
+            )
+        })?;
+        ui::success(format!(
+            "Cleaned source cache: {}",
+            config.cache_dir.display()
+        ));
+    }
     Ok(())
 }
 
@@ -1504,37 +1516,55 @@ pub fn run(cli: Cli) -> Result<()> {
                         lib32_spec.package.revision
                     ));
                 }
-                if !ui::prompt_package_action("installation", &install_targets, true)? {
-                    anyhow::bail!("Aborted");
-                }
-                if !cli.lib32_only {
-                    for out in pkg_spec.outputs() {
-                        let mut spec_for_out = pkg_spec.clone();
-                        let output_name = out.name.clone();
-                        spec_for_out.package = out;
-                        spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
-                        spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
-                        let out_destdir =
-                            output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
-                        install_staged_to_rootfs(
-                            &spec_for_out,
-                            &out_destdir,
-                            &cli.rootfs,
-                            &config,
-                        )?;
+                if ui::prompt_package_action("installation", &install_targets, false)? {
+                    if !cli.lib32_only {
+                        for out in pkg_spec.outputs() {
+                            let mut spec_for_out = pkg_spec.clone();
+                            let output_name = out.name.clone();
+                            spec_for_out.package = out;
+                            spec_for_out.alternatives =
+                                pkg_spec.alternatives_for_output(&output_name);
+                            spec_for_out.dependencies =
+                                pkg_spec.dependencies_for_output(&output_name);
+                            let out_destdir =
+                                output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
+                            install_staged_to_rootfs(
+                                &spec_for_out,
+                                &out_destdir,
+                                &cli.rootfs,
+                                &config,
+                            )?;
+                            ui::success(format!(
+                                "Successfully installed {} v{}",
+                                spec_for_out.package.name, spec_for_out.package.version
+                            ));
+                            // TODO(snapper): create post-install snapshot after --install commit succeeds.
+                        }
+                    }
+                    if let Some((lib32_spec, lib32_destdir)) = &lib32_install_bundle {
+                        install_staged_to_rootfs(lib32_spec, lib32_destdir, &cli.rootfs, &config)?;
                         ui::success(format!(
                             "Successfully installed {} v{}",
-                            spec_for_out.package.name, spec_for_out.package.version
+                            lib32_spec.package.name, lib32_spec.package.version
                         ));
-                        // TODO(snapper): create post-install snapshot after --install commit succeeds.
                     }
-                }
-                if let Some((lib32_spec, lib32_destdir)) = &lib32_install_bundle {
-                    install_staged_to_rootfs(lib32_spec, lib32_destdir, &cli.rootfs, &config)?;
-                    ui::success(format!(
-                        "Successfully installed {} v{}",
-                        lib32_spec.package.name, lib32_spec.package.version
-                    ));
+                } else {
+                    if !cli.lib32_only {
+                        for out in pkg_spec.outputs() {
+                            ui::success(format!(
+                                "Built successfully: {}-{}-{}",
+                                out.name, out.version, out.revision
+                            ));
+                        }
+                    }
+                    if let Some((lib32_spec, _)) = &lib32_install_bundle {
+                        ui::success(format!(
+                            "Built successfully: {}-{}-{}",
+                            lib32_spec.package.name,
+                            lib32_spec.package.version,
+                            lib32_spec.package.revision
+                        ));
+                    }
                 }
             }
 
@@ -2028,4 +2058,52 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use std::io::Write;
+
+    #[test]
+    fn clean_build_workspace_removes_build_and_source_cache_dirs() -> Result<()> {
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.build_dir = rootfs.path().join("tmp/build");
+        cfg.cache_dir = rootfs.path().join("tmp/sources");
+
+        fs::create_dir_all(&cfg.build_dir)
+            .with_context(|| format!("Failed to create {}", cfg.build_dir.display()))?;
+        fs::create_dir_all(&cfg.cache_dir)
+            .with_context(|| format!("Failed to create {}", cfg.cache_dir.display()))?;
+
+        let mut build_file = fs::File::create(cfg.build_dir.join("artifact.txt"))?;
+        build_file.write_all(b"build data")?;
+        build_file.flush()?;
+
+        let mut source_file = fs::File::create(cfg.cache_dir.join("source.tar.zst"))?;
+        source_file.write_all(b"source data")?;
+        source_file.flush()?;
+
+        clean_build_workspace(&cfg)?;
+
+        assert!(!cfg.build_dir.exists());
+        assert!(!cfg.cache_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn clean_build_workspace_noops_when_dirs_are_missing() -> Result<()> {
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.build_dir = rootfs.path().join("tmp/build");
+        cfg.cache_dir = rootfs.path().join("tmp/sources");
+
+        clean_build_workspace(&cfg)?;
+
+        assert!(!cfg.build_dir.exists());
+        assert!(!cfg.cache_dir.exists());
+        Ok(())
+    }
 }

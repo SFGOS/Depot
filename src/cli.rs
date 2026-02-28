@@ -29,7 +29,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub cross_prefix: Option<String>,
 
-    /// Clean build workspace after successful install/build
+    /// Clean build workspace and source cache after successful install/build
     #[arg(long, global = true)]
     pub clean: bool,
 
