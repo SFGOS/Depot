@@ -295,11 +295,31 @@ pub fn sign_zst_files_detached(rootfs: &Path, inputs: &[PathBuf]) -> Result<Vec<
         anyhow::bail!("No input files provided for signing");
     }
 
+    let mut signable_inputs: Vec<&PathBuf> = Vec::new();
+    for input in inputs {
+        if !input.exists() {
+            crate::log_warn!("Skipping missing path: {}", input.display());
+            continue;
+        }
+        if !input.is_file() {
+            crate::log_warn!("Skipping non-file path: {}", input.display());
+            continue;
+        }
+        if !is_zst_file(input) {
+            crate::log_warn!("Skipping non-.zst input for signing: {}", input.display());
+            continue;
+        }
+        signable_inputs.push(input);
+    }
+    if signable_inputs.is_empty() {
+        anyhow::bail!("No signable .zst files were provided");
+    }
+
     let keys = locate_keys(rootfs)?;
     let signing_material = load_signing_material(&keys)?;
-    let mut sig_paths = Vec::with_capacity(inputs.len());
+    let mut sig_paths = Vec::with_capacity(signable_inputs.len());
 
-    for input in inputs {
+    for input in signable_inputs {
         let sig_path = detached_sig_path(input);
         sign_detached_with_material(input, &sig_path, &signing_material)?;
         sig_paths.push(sig_path);
@@ -431,6 +451,55 @@ mod tests {
                 .context("signature verification should succeed")?;
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn sign_zst_files_detached_skips_non_zst_inputs() -> Result<()> {
+        let rootfs = tempfile::tempdir()?;
+        let _ = write_test_keys(rootfs.path())?;
+        let valid = rootfs.path().join("valid.depot.pkg.tar.zst");
+        let mut valid_file = fs::File::create(&valid)?;
+        valid_file.write_all(b"valid payload")?;
+        valid_file.flush()?;
+
+        let non_zst = rootfs.path().join("notes.txt");
+        let mut note_file = fs::File::create(&non_zst)?;
+        note_file.write_all(b"not a package")?;
+        note_file.flush()?;
+
+        let dir_entry = rootfs.path().join("keys");
+        fs::create_dir_all(&dir_entry)?;
+
+        let missing = rootfs.path().join("missing.depot.pkg.tar.zst");
+
+        let inputs = vec![non_zst, dir_entry, missing, valid.clone()];
+        let sig_paths = sign_zst_files_detached(rootfs.path(), &inputs)?;
+
+        assert_eq!(sig_paths.len(), 1);
+        assert_eq!(
+            sig_paths[0],
+            PathBuf::from(format!("{}.sig", valid.display()))
+        );
+        assert!(sig_paths[0].exists());
+        Ok(())
+    }
+
+    #[test]
+    fn sign_zst_files_detached_errors_when_no_signable_inputs() -> Result<()> {
+        let rootfs = tempfile::tempdir()?;
+        let text = rootfs.path().join("notes.txt");
+        fs::write(&text, b"notes")?;
+        let dir_entry = rootfs.path().join("keys");
+        fs::create_dir_all(&dir_entry)?;
+
+        let err = sign_zst_files_detached(rootfs.path(), &[text, dir_entry])
+            .expect_err("expected no-signable-input error");
+        assert!(
+            err.to_string()
+                .contains("No signable .zst files were provided"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 
