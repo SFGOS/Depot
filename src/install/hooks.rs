@@ -1,6 +1,6 @@
 //! Transaction hook loading and execution.
 //!
-//! Hook files live under `<rootfs>/etc/depot.d/hooks/*.toml` and follow a
+//! Hook files live under `<rootfs>/usr/share/depot.d/hooks/*.toml` and follow a
 //! Starpack-inspired format:
 //!
 //! ```toml
@@ -29,7 +29,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-const TRANSACTION_HOOKS_DIR_REL: &str = "etc/depot.d/hooks";
+const TRANSACTION_HOOKS_DIR_REL: &str = "usr/share/depot.d/hooks";
 
 /// Hook phase within an install/update/remove transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
