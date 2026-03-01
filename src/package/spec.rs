@@ -155,7 +155,7 @@ impl PackageSpec {
         Ok(())
     }
 
-    /// Expand variables like $name and $version in a string
+    /// Expand variables like `$name` and `$version` in a string.
     pub fn expand_vars(&self, input: &str) -> String {
         let specdir = self.spec_dir.to_string_lossy();
         input

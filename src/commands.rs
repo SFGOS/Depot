@@ -992,14 +992,19 @@ fn print_plan_summary(plan: &planner::ExecutionPlan) {
     }
 }
 
+struct InstallPlanExecutionOptions<'a> {
+    no_flags: bool,
+    cross_prefix: Option<&'a str>,
+    clean: bool,
+    dry_run: bool,
+    confirm_installation: bool,
+}
+
 fn execute_install_plan_with_child_commands(
     plan: &planner::ExecutionPlan,
     rootfs: &Path,
-    no_flags: bool,
-    cross_prefix: Option<&str>,
-    clean: bool,
-    dry_run: bool,
     config: &config::Config,
+    options: InstallPlanExecutionOptions<'_>,
 ) -> Result<()> {
     #[derive(Clone)]
     struct BinaryPhaseItem {
@@ -1024,11 +1029,13 @@ fn execute_install_plan_with_child_commands(
         .iter()
         .map(|step| step.package.clone())
         .collect();
-    if !ui::prompt_package_action("installation", &planned_packages, true)? {
+    if options.confirm_installation
+        && !ui::prompt_package_action("installation", &planned_packages, true)?
+    {
         anyhow::bail!("Aborted");
     }
 
-    if dry_run {
+    if options.dry_run {
         ui::info("Dry run enabled, no install/build actions executed.");
         return Ok(());
     }
@@ -1205,13 +1212,13 @@ fn execute_install_plan_with_child_commands(
                 cmd.arg("-r").arg(rootfs);
                 cmd.arg("--no-deps");
                 cmd.arg("--yes");
-                if no_flags {
+                if options.no_flags {
                     cmd.arg("--no-flags");
                 }
-                if let Some(p) = cross_prefix {
+                if let Some(p) = options.cross_prefix {
                     cmd.arg("--cross-prefix").arg(p);
                 }
-                if clean {
+                if options.clean {
                     cmd.arg("--clean");
                 }
                 cmd.arg("install").arg(path);
@@ -1295,11 +1302,14 @@ pub fn run(cli: Cli) -> Result<()> {
                     execute_install_plan_with_child_commands(
                         &plan,
                         &cli.rootfs,
-                        cli.no_flags,
-                        cli.cross_prefix.as_deref(),
-                        cli.clean,
-                        cli.dry_run,
                         &config,
+                        InstallPlanExecutionOptions {
+                            no_flags: cli.no_flags,
+                            cross_prefix: cli.cross_prefix.as_deref(),
+                            clean: cli.clean,
+                            dry_run: cli.dry_run,
+                            confirm_installation: true,
+                        },
                     )?;
                     if cli.clean {
                         clean_build_workspace(&config)?;
@@ -1703,11 +1713,14 @@ pub fn run(cli: Cli) -> Result<()> {
                     execute_install_plan_with_child_commands(
                         &dep_plan,
                         &cli.rootfs,
-                        cli.no_flags,
-                        cli.cross_prefix.as_deref(),
-                        cli.clean,
-                        cli.dry_run,
                         &config,
+                        InstallPlanExecutionOptions {
+                            no_flags: cli.no_flags,
+                            cross_prefix: cli.cross_prefix.as_deref(),
+                            clean: cli.clean,
+                            dry_run: cli.dry_run,
+                            confirm_installation: false,
+                        },
                     )?;
                 }
                 deps::require_build_deps(&pkg_spec, &db_path)?;

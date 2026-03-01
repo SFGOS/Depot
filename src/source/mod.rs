@@ -14,6 +14,13 @@ use std::path::{Path, PathBuf};
 use url::Url;
 use walkdir::WalkDir;
 
+fn expand_manual_source_value(spec: &PackageSpec, raw: &str) -> String {
+    let carch = spec.build.flags.carch.as_str();
+    spec.expand_vars(raw)
+        .replace("$CARCH", carch)
+        .replace("${CARCH}", carch)
+}
+
 /// Copy manual sources to the build directory before fetching remote sources.
 ///
 /// Manual sources support:
@@ -62,7 +69,7 @@ pub fn copy_manual_sources(spec: &PackageSpec, cache_dir: &Path, build_dir: &Pat
 
         if !local_entries.is_empty() {
             for raw_file in local_entries {
-                let file = spec.expand_vars(&raw_file);
+                let file = expand_manual_source_value(spec, &raw_file);
                 let src_path = spec.spec_dir.join(&file);
                 if !src_path.exists() {
                     bail!(
@@ -86,7 +93,7 @@ pub fn copy_manual_sources(spec: &PackageSpec, cache_dir: &Path, build_dir: &Pat
 
         if !url_entries.is_empty() {
             for raw_url in url_entries {
-                let expanded_url = spec.expand_vars(&raw_url);
+                let expanded_url = expand_manual_source_value(spec, &raw_url);
                 let parsed = Url::parse(&expanded_url)
                     .with_context(|| format!("Invalid URL: {}", expanded_url))?;
 
@@ -151,7 +158,7 @@ fn copy_manual_source_file(
     default_dest: &str,
 ) -> Result<()> {
     let dest_name = if let Some(dest) = manual.dest.as_ref() {
-        spec.expand_vars(dest)
+        expand_manual_source_value(spec, dest)
     } else {
         default_dest.to_string()
     };
@@ -699,6 +706,40 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(build_dir.join("pam/system-auth")).unwrap(),
             "auth"
+        );
+    }
+
+    #[test]
+    fn copy_manual_sources_expands_carch_in_files_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec_dir = tmp.path().join("spec");
+        let cache_dir = tmp.path().join("cache");
+        let build_dir = tmp.path().join("build");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(spec_dir.join("build.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(spec_dir.join("config.armv7"), "armv7-config").unwrap();
+
+        let mut spec = mk_spec_with_manuals(
+            spec_dir.clone(),
+            vec![ManualSource {
+                file: None,
+                files: vec!["build.sh".into(), "config.$CARCH".into()],
+                url: None,
+                urls: Vec::new(),
+                sha256: None,
+                dest: None,
+            }],
+        );
+        spec.build.flags.carch = "armv7".into();
+
+        copy_manual_sources(&spec, &cache_dir, &build_dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(build_dir.join("build.sh")).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(build_dir.join("config.armv7")).unwrap(),
+            "armv7-config"
         );
     }
 }
