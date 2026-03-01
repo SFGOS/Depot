@@ -4,11 +4,14 @@ use crate::fakeroot;
 use crate::package::PackageSpec;
 use anyhow::{Context, Result, bail};
 use std::fs;
+use std::io::{BufRead, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use sys_mount::{Mount, MountFlags, Unmount, UnmountFlags};
 use walkdir::WalkDir;
 
 const STAGED_SCRIPTS_DIR: &str = "scripts";
+const DEFERRED_HOOKS_FILE_REL: &str = "var/lib/depot/deferred-hooks.tsv";
 const ALL_HOOKS: [Hook; 6] = [
     Hook::PreInstall,
     Hook::PostInstall,
@@ -62,6 +65,18 @@ impl Hook {
         }
     }
 
+    fn from_canonical_name(name: &str) -> Option<Self> {
+        match name {
+            "pre_install" => Some(Hook::PreInstall),
+            "post_install" => Some(Hook::PostInstall),
+            "pre_update" => Some(Hook::PreUpdate),
+            "post_update" => Some(Hook::PostUpdate),
+            "pre_remove" => Some(Hook::PreRemove),
+            "post_remove" => Some(Hook::PostRemove),
+            _ => None,
+        }
+    }
+
     fn candidate_names(self) -> [String; 6] {
         let canonical = self.canonical_name();
         let dashed = canonical.replace('_', "-");
@@ -100,6 +115,13 @@ impl Hook {
         let compact = self.canonical_name().replace('_', "");
         [compact.clone(), format!("{}.sh", compact)]
     }
+}
+
+#[derive(Debug, Clone)]
+struct DeferredHook {
+    pkg_name: String,
+    hook: Hook,
+    script_rel: PathBuf,
 }
 
 /// Return the staged scripts directory path inside a package staging tree.
@@ -233,17 +255,159 @@ pub fn run_hook_if_present(
         script_path.display()
     );
 
-    let status = run_script_with_rootfs_context(&script_path, rootfs, pkg_name, hook)?;
-
-    if !status.success() {
-        bail!(
-            "Lifecycle hook {} failed: {}",
-            hook.canonical_name(),
-            script_path.display()
-        );
+    match run_script_with_rootfs_context(&script_path, rootfs, pkg_name, hook)? {
+        HookRunOutcome::Ran(status) => {
+            if !status.success() {
+                bail!(
+                    "Lifecycle hook {} failed: {}",
+                    hook.canonical_name(),
+                    script_path.display()
+                );
+            }
+        }
+        HookRunOutcome::Deferred => {}
     }
 
     Ok(true)
+}
+
+enum HookRunOutcome {
+    Ran(std::process::ExitStatus),
+    Deferred,
+}
+
+#[derive(Default)]
+struct ChrootMountGuard {
+    mounted: Vec<Mount>,
+}
+
+impl ChrootMountGuard {
+    fn mount_path(
+        &mut self,
+        source: &Path,
+        target: &Path,
+        fstype: Option<&str>,
+        flags: MountFlags,
+        data: Option<&str>,
+    ) -> Result<()> {
+        let mut builder = Mount::builder().flags(flags);
+        if let Some(fs) = fstype {
+            builder = builder.fstype(fs);
+        }
+        if let Some(options) = data {
+            builder = builder.data(options);
+        }
+        let mount = builder
+            .mount(source, target)
+            .with_context(|| format!("Failed to mount {}", target.display()))?;
+        self.mounted.push(mount);
+        Ok(())
+    }
+}
+
+impl Drop for ChrootMountGuard {
+    fn drop(&mut self) {
+        for mount in self.mounted.iter().rev() {
+            if mount.unmount(UnmountFlags::empty()).is_ok() {
+                continue;
+            }
+            let _ = mount.unmount(UnmountFlags::DETACH);
+        }
+    }
+}
+
+fn should_use_chroot(rootfs: &Path) -> bool {
+    let canonical_root = fs::canonicalize("/").ok();
+    let canonical_rootfs = fs::canonicalize(rootfs).ok();
+    match (canonical_rootfs, canonical_root) {
+        (Some(target), Some(root)) => target != root,
+        _ => rootfs != Path::new("/"),
+    }
+}
+
+fn mount_chroot_filesystems(rootfs: &Path) -> Result<ChrootMountGuard> {
+    let proc_dir = rootfs.join("proc");
+    let dev_dir = rootfs.join("dev");
+    let dev_pts_dir = dev_dir.join("pts");
+    let sys_dir = rootfs.join("sys");
+
+    fs::create_dir_all(&proc_dir)
+        .with_context(|| format!("Failed to create {}", proc_dir.display()))?;
+    fs::create_dir_all(&dev_dir)
+        .with_context(|| format!("Failed to create {}", dev_dir.display()))?;
+    fs::create_dir_all(&dev_pts_dir)
+        .with_context(|| format!("Failed to create {}", dev_pts_dir.display()))?;
+    fs::create_dir_all(&sys_dir)
+        .with_context(|| format!("Failed to create {}", sys_dir.display()))?;
+
+    let mut guard = ChrootMountGuard::default();
+    guard.mount_path(
+        Path::new("proc"),
+        &proc_dir,
+        Some("proc"),
+        MountFlags::NODEV | MountFlags::NOEXEC | MountFlags::NOSUID,
+        None,
+    )?;
+    guard.mount_path(Path::new("/dev"), &dev_dir, None, MountFlags::BIND, None)?;
+    guard.mount_path(
+        Path::new("sysfs"),
+        &sys_dir,
+        Some("sysfs"),
+        MountFlags::NODEV | MountFlags::NOEXEC | MountFlags::NOSUID,
+        None,
+    )?;
+    if let Err(_e) = guard.mount_path(
+        Path::new("devpts"),
+        &dev_pts_dir,
+        Some("devpts"),
+        MountFlags::NOSUID | MountFlags::NOEXEC,
+        Some("gid=5,mode=620"),
+    ) {
+        guard.mount_path(
+            Path::new("devpts"),
+            &dev_pts_dir,
+            Some("devpts"),
+            MountFlags::NOSUID | MountFlags::NOEXEC,
+            None,
+        )?;
+    }
+
+    maybe_bind_host_file_into_chroot(&mut guard, rootfs, Path::new("/etc/resolv.conf"))?;
+    Ok(guard)
+}
+
+fn maybe_bind_host_file_into_chroot(
+    guard: &mut ChrootMountGuard,
+    rootfs: &Path,
+    host_path: &Path,
+) -> Result<()> {
+    if !host_path.exists() {
+        return Ok(());
+    }
+
+    let rel = host_path
+        .strip_prefix(Path::new("/"))
+        .with_context(|| format!("Expected absolute host path: {}", host_path.display()))?;
+    let target = rootfs.join(rel);
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    if !target.exists() {
+        fs::File::create(&target)
+            .with_context(|| format!("Failed to create {}", target.display()))?;
+    }
+
+    if let Err(err) = guard.mount_path(host_path, &target, None, MountFlags::BIND, None) {
+        crate::log_warn!(
+            "Failed to bind-mount {} into chroot at {}: {}",
+            host_path.display(),
+            target.display(),
+            err
+        );
+    }
+    Ok(())
 }
 
 fn run_script_with_rootfs_context(
@@ -251,43 +415,56 @@ fn run_script_with_rootfs_context(
     rootfs: &Path,
     pkg_name: &str,
     hook: Hook,
-) -> Result<std::process::ExitStatus> {
+) -> Result<HookRunOutcome> {
     // When root and rootfs provides /bin/sh, run inside a real chroot so scripts
     // can rely on `cd /` and relative paths resolving within that rootfs.
     if fakeroot::is_root()
-        && rootfs.join("bin/sh").exists()
+        && should_use_chroot(rootfs)
         && let Ok(rel) = script_path.strip_prefix(rootfs)
     {
-        let rel_script = format!("./{}", rel.to_string_lossy());
-        return Command::new("chroot")
-            .arg(rootfs)
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg("export DEPOT_PACKAGE DEPOT_ROOTFS DEPOT_ACTION DEPOT_PHASE; cd / && exec /bin/sh \"$1\"")
-            .arg("sh")
-            .arg(rel_script)
-            .env("DEPOT_PACKAGE", pkg_name)
-            .env("DEPOT_ROOTFS", "/")
-            .env("DEPOT_ACTION", hook.action())
-            .env("DEPOT_PHASE", hook.phase())
-            .status()
-            .with_context(|| {
-                format!(
-                    "Failed to execute lifecycle hook {} in chroot at {}",
-                    hook.canonical_name(),
-                    rootfs.display()
-                )
-            });
+        if rootfs.join("bin/sh").exists() {
+            let status = run_hook_script_in_chroot(rootfs, rel, pkg_name, hook, false)?;
+            return Ok(HookRunOutcome::Ran(status));
+        }
+
+        // Post hooks can be deferred until the target shell exists and chroot
+        // execution is available.
+        if matches!(
+            hook,
+            Hook::PostInstall | Hook::PostUpdate | Hook::PostRemove
+        ) {
+            enqueue_deferred_hook(rootfs, pkg_name, hook, rel)?;
+            crate::log_warn!(
+                "Deferred lifecycle hook {} for {} until {} has /bin/sh",
+                hook.canonical_name(),
+                pkg_name,
+                rootfs.display()
+            );
+            return Ok(HookRunOutcome::Deferred);
+        }
     }
 
     // Fallback (non-root / no rootfs shell / script outside rootfs):
     // execute with host /bin/sh while setting cwd to rootfs, so relative paths
     // inside scripts resolve against that rootfs root.
-    Command::new("/bin/sh")
-        .arg(script_path)
+    let script_arg = if let Ok(rel) = script_path.strip_prefix(rootfs) {
+        PathBuf::from(format!("./{}", rel.to_string_lossy()))
+    } else {
+        script_path.to_path_buf()
+    };
+    let rootfs_env = if rootfs.is_absolute() {
+        rootfs.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("Failed to resolve current working directory for DEPOT_ROOTFS")?
+            .join(rootfs)
+    };
+
+    let status = Command::new("/bin/sh")
+        .arg(script_arg)
         .current_dir(rootfs)
         .env("DEPOT_PACKAGE", pkg_name)
-        .env("DEPOT_ROOTFS", rootfs)
+        .env("DEPOT_ROOTFS", &rootfs_env)
         .env("DEPOT_ACTION", hook.action())
         .env("DEPOT_PHASE", hook.phase())
         .status()
@@ -297,7 +474,201 @@ fn run_script_with_rootfs_context(
                 hook.canonical_name(),
                 script_path.display()
             )
-        })
+        })?;
+    Ok(HookRunOutcome::Ran(status))
+}
+
+fn run_hook_script_in_chroot(
+    rootfs: &Path,
+    rel_script: &Path,
+    pkg_name: &str,
+    hook: Hook,
+    quiet: bool,
+) -> Result<std::process::ExitStatus> {
+    let _mounts = mount_chroot_filesystems(rootfs)?;
+    let rel_script = format!("./{}", rel_script.to_string_lossy());
+    let mut cmd = Command::new("chroot");
+    cmd.arg(rootfs)
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("export DEPOT_PACKAGE DEPOT_ROOTFS DEPOT_ACTION DEPOT_PHASE; cd / && exec /bin/sh \"$1\"")
+        .arg("sh")
+        .arg(rel_script)
+        .env("DEPOT_PACKAGE", pkg_name)
+        .env("DEPOT_ROOTFS", "/")
+        .env("DEPOT_ACTION", hook.action())
+        .env("DEPOT_PHASE", hook.phase());
+    if quiet {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    cmd.status().with_context(|| {
+        format!(
+            "Failed to execute lifecycle hook {} in chroot at {}",
+            hook.canonical_name(),
+            rootfs.display()
+        )
+    })
+}
+
+fn deferred_hooks_file(rootfs: &Path) -> PathBuf {
+    rootfs.join(DEFERRED_HOOKS_FILE_REL)
+}
+
+fn read_deferred_hooks(path: &Path) -> Result<Vec<DeferredHook>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file =
+        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let mut hooks = Vec::new();
+
+    for (idx, line) in reader.lines().enumerate() {
+        let line =
+            line.with_context(|| format!("Failed to read deferred hook line {}", idx + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let pkg_name = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .with_context(|| format!("Malformed deferred hook line {} (package)", idx + 1))?;
+        let hook_name = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .with_context(|| format!("Malformed deferred hook line {} (hook)", idx + 1))?;
+        let script_rel = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .with_context(|| format!("Malformed deferred hook line {} (script)", idx + 1))?;
+        let hook = Hook::from_canonical_name(hook_name).with_context(|| {
+            format!("Unknown deferred hook '{}' on line {}", hook_name, idx + 1)
+        })?;
+
+        hooks.push(DeferredHook {
+            pkg_name: pkg_name.to_string(),
+            hook,
+            script_rel: PathBuf::from(script_rel),
+        });
+    }
+
+    Ok(hooks)
+}
+
+fn write_deferred_hooks(path: &Path, hooks: &[DeferredHook]) -> Result<()> {
+    if hooks.is_empty() {
+        if path.exists() {
+            fs::remove_file(path)
+                .with_context(|| format!("Failed to remove {}", path.display()))?;
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+
+    let mut f =
+        fs::File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
+    for item in hooks {
+        writeln!(
+            f,
+            "{}\t{}\t{}",
+            item.pkg_name,
+            item.hook.canonical_name(),
+            item.script_rel.display()
+        )
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    f.flush()
+        .with_context(|| format!("Failed to flush {}", path.display()))?;
+    Ok(())
+}
+
+fn enqueue_deferred_hook(
+    rootfs: &Path,
+    pkg_name: &str,
+    hook: Hook,
+    script_rel: &Path,
+) -> Result<()> {
+    let path = deferred_hooks_file(rootfs);
+    let mut hooks = read_deferred_hooks(&path)?;
+    if hooks
+        .iter()
+        .any(|h| h.pkg_name == pkg_name && h.hook == hook && h.script_rel == script_rel)
+    {
+        return Ok(());
+    }
+    hooks.push(DeferredHook {
+        pkg_name: pkg_name.to_string(),
+        hook,
+        script_rel: script_rel.to_path_buf(),
+    });
+    write_deferred_hooks(&path, &hooks)
+}
+
+/// Attempt to run deferred lifecycle hooks for this rootfs once.
+///
+/// Deferred hooks are best-effort: failures are kept in queue for later retry.
+pub fn run_deferred_hooks_if_possible(rootfs: &Path) -> Result<()> {
+    if !fakeroot::is_root() || !should_use_chroot(rootfs) || !rootfs.join("bin/sh").exists() {
+        return Ok(());
+    }
+
+    let path = deferred_hooks_file(rootfs);
+    let hooks = read_deferred_hooks(&path)?;
+    if hooks.is_empty() {
+        return Ok(());
+    }
+
+    let mut remaining = Vec::new();
+    for item in hooks {
+        let script_path = rootfs.join(&item.script_rel);
+        if !script_path.exists() {
+            crate::log_warn!(
+                "Dropping deferred lifecycle hook {} for {} because script is missing: {}",
+                item.hook.canonical_name(),
+                item.pkg_name,
+                script_path.display()
+            );
+            continue;
+        }
+
+        match run_hook_script_in_chroot(rootfs, &item.script_rel, &item.pkg_name, item.hook, true) {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                crate::log_warn!(
+                    "Deferred lifecycle hook {} for {} failed with status {} (kept queued)",
+                    item.hook.canonical_name(),
+                    item.pkg_name,
+                    status
+                );
+                remaining.push(item);
+            }
+            Err(err) => {
+                crate::log_warn!(
+                    "Deferred lifecycle hook {} for {} failed with error (kept queued): {}",
+                    item.hook.canonical_name(),
+                    item.pkg_name,
+                    err
+                );
+                remaining.push(item);
+            }
+        }
+    }
+
+    write_deferred_hooks(&path, &remaining)?;
+    if !remaining.is_empty() {
+        crate::log_warn!(
+            "{} deferred lifecycle hook(s) remain queued in {}",
+            remaining.len(),
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn resolve_hook_script(script_dir: &Path, hook: Hook, pkg_name: &str) -> Result<Option<PathBuf>> {
@@ -760,6 +1131,60 @@ mod tests {
         let err = run_hook_if_present(&scripts, Hook::PreUpdate, &rootfs, "foo")
             .expect_err("expected ambiguous script names to fail");
         assert!(err.to_string().contains("Ambiguous lifecycle hook"));
+    }
+
+    #[test]
+    fn run_hook_if_present_with_relative_rootfs_uses_correct_script_and_env_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("depot-hook-rel-rootfs-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let rootfs_abs = tmp.path().join("root");
+        std::fs::create_dir_all(&rootfs_abs).unwrap();
+        let rootfs_rel = rootfs_abs.strip_prefix(&cwd).unwrap().to_path_buf();
+        let scripts = rootfs_rel.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+
+        std::fs::write(
+            scripts.join("post_install"),
+            "echo ok > \"$DEPOT_ROOTFS/hook.out\"\n",
+        )
+        .unwrap();
+
+        let ran = run_hook_if_present(&scripts, Hook::PostInstall, &rootfs_rel, "foo").unwrap();
+        assert!(ran);
+        assert_eq!(
+            std::fs::read_to_string(rootfs_abs.join("hook.out")).unwrap(),
+            "ok\n"
+        );
+    }
+
+    #[test]
+    fn deferred_hooks_file_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hooks.tsv");
+        let hooks = vec![
+            DeferredHook {
+                pkg_name: "foo".into(),
+                hook: Hook::PostInstall,
+                script_rel: PathBuf::from("usr/share/depot/foo/scripts/post_install"),
+            },
+            DeferredHook {
+                pkg_name: "bar".into(),
+                hook: Hook::PostUpdate,
+                script_rel: PathBuf::from("usr/share/depot/bar/scripts/post_update"),
+            },
+        ];
+        write_deferred_hooks(&path, &hooks).unwrap();
+        let loaded = read_deferred_hooks(&path).unwrap();
+        assert_eq!(loaded.len(), hooks.len());
+        assert_eq!(loaded[0].pkg_name, hooks[0].pkg_name);
+        assert_eq!(loaded[0].hook, hooks[0].hook);
+        assert_eq!(loaded[0].script_rel, hooks[0].script_rel);
+        assert_eq!(loaded[1].pkg_name, hooks[1].pkg_name);
+        assert_eq!(loaded[1].hook, hooks[1].hook);
+        assert_eq!(loaded[1].script_rel, hooks[1].script_rel);
     }
 
     #[test]

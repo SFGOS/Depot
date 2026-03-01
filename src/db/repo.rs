@@ -1661,9 +1661,15 @@ fn download_binary_package_archive(
     client: &reqwest::blocking::Client,
     pkg_url: &str,
     tmp_path: &Path,
+    progress_cb: &mut Option<&mut dyn FnMut(u64, Option<u64>)>,
 ) -> Result<()> {
     match copy_file_url_to_path(pkg_url, tmp_path)? {
-        FileUrlCopyOutcome::Copied => {}
+        FileUrlCopyOutcome::Copied => {
+            if let Some(cb) = progress_cb.as_mut() {
+                let total = fs::metadata(tmp_path).map(|m| m.len()).unwrap_or(0);
+                cb(total, Some(total));
+            }
+        }
         FileUrlCopyOutcome::Missing => {
             anyhow::bail!("Failed to fetch {}: local file not found", pkg_url);
         }
@@ -1676,10 +1682,29 @@ fn download_binary_package_archive(
                 anyhow::bail!("Failed to fetch {}: HTTP {}", pkg_url, resp.status());
             }
 
+            let total = resp.content_length();
+            if let Some(cb) = progress_cb.as_mut() {
+                cb(0, total);
+            }
+
             let mut out = fs::File::create(tmp_path)
                 .with_context(|| format!("Failed to create {}", tmp_path.display()))?;
-            std::io::copy(&mut resp, &mut out)
-                .with_context(|| format!("Failed to save {}", tmp_path.display()))?;
+            let mut downloaded = 0u64;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = resp
+                    .read(&mut buf)
+                    .with_context(|| format!("Failed to read {}", pkg_url))?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n])
+                    .with_context(|| format!("Failed to save {}", tmp_path.display()))?;
+                downloaded = downloaded.saturating_add(n as u64);
+                if let Some(cb) = progress_cb.as_mut() {
+                    cb(downloaded, total);
+                }
+            }
             out.flush()
                 .with_context(|| format!("Failed to flush {}", tmp_path.display()))?;
         }
@@ -1744,18 +1769,13 @@ fn verify_binary_package_signature(
         );
     }
 
-    let verified_key = verify_with_any_trusted_public_key(rootfs, pkg_path, sig_path)
+    let _verified_key = verify_with_any_trusted_public_key(rootfs, pkg_path, sig_path)
         .with_context(|| {
             format!(
                 "Failed to verify detached package signature for {}",
                 pkg_path.display()
             )
         })?;
-    crate::log_info!(
-        "Verified detached package signature for '{}' using {}",
-        pkg_path.display(),
-        verified_key.display()
-    );
     Ok(())
 }
 
@@ -1766,6 +1786,19 @@ pub fn cache_binary_package_archive(
     repo: &crate::config::BinaryRepo,
     rec: &BinaryRepoPackageRecord,
     package_cache_dir: &Path,
+) -> Result<BinaryRepoCachedArchive> {
+    cache_binary_package_archive_with_progress(repo_name, repo, rec, package_cache_dir, None)
+}
+
+/// Ensure a binary package archive and detached signature are present in cache
+/// without performing checksum/signature verification, optionally reporting
+/// download progress.
+pub fn cache_binary_package_archive_with_progress(
+    repo_name: &str,
+    repo: &crate::config::BinaryRepo,
+    rec: &BinaryRepoPackageRecord,
+    package_cache_dir: &Path,
+    mut progress_cb: Option<&mut dyn FnMut(u64, Option<u64>)>,
 ) -> Result<BinaryRepoCachedArchive> {
     let machine_arch = std::env::consts::ARCH;
     let base_url = repo.effective_url_for_arch(machine_arch).with_context(|| {
@@ -1790,8 +1823,7 @@ pub fn cache_binary_package_archive(
         .context("Failed to build HTTP client for binary package fetch")?;
 
     let package_downloaded = if !package_path.exists() {
-        crate::log_info!("Fetching binary package: {}", pkg_url);
-        download_binary_package_archive(&client, &pkg_url, &tmp_path)?;
+        download_binary_package_archive(&client, &pkg_url, &tmp_path, &mut progress_cb)?;
         fs::rename(&tmp_path, &package_path).with_context(|| {
             format!(
                 "Failed to move {} to {}",
@@ -1801,7 +1833,12 @@ pub fn cache_binary_package_archive(
         })?;
         true
     } else {
-        crate::log_info!("Using cached binary package: {}", package_path.display());
+        if let Some(cb) = progress_cb.as_mut() {
+            let total = fs::metadata(&package_path)
+                .with_context(|| format!("Failed to stat {}", package_path.display()))?
+                .len();
+            cb(total, Some(total));
+        }
         false
     };
 

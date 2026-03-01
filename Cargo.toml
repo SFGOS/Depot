@@ -39,6 +39,7 @@ reqwest = { version = "0.13.2", default-features = false, features = ["blocking"
 filetime = "0.2.27"
 clap_complete = "4.5.66"
 clap_mangen = "0.2.31"
+sys-mount = { version = "3.1.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "=3.25.0"

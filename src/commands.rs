@@ -4,8 +4,10 @@ use crate::{
     signing, source, staging, ui,
 };
 use anyhow::{Context, Result};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::HashMap;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 fn parse_licenses_from_toml(metadata: &toml::Value) -> Vec<String> {
@@ -920,6 +922,18 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn binary_arch_from_filename(filename: &str) -> String {
+    let stem = filename
+        .strip_suffix(".depot.pkg.tar.zst")
+        .unwrap_or(filename);
+    let mut parts = stem.rsplitn(4, '-');
+    parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(std::env::consts::ARCH)
+        .to_string()
+}
+
 fn print_plan_summary(plan: &planner::ExecutionPlan) {
     let summary = plan.summary();
     ui::info(format!(
@@ -1027,24 +1041,46 @@ fn execute_install_plan_with_child_commands(
             "Downloading {} binary package(s) and detached signatures...",
             binary_phase_items.len()
         ));
-        for (idx, item) in binary_phase_items.iter().enumerate() {
-            ui::info(format!(
-                "  [{}/{}] {}-{} ({})",
-                idx + 1,
-                binary_phase_items.len(),
+        let use_tty_progress = std::io::stderr().is_terminal();
+        for item in &binary_phase_items {
+            let label = format!(
+                "{}-{}-{}",
                 item.record.name,
                 item.record.version,
-                item.repo_name
-            ));
+                binary_arch_from_filename(&item.record.filename)
+            );
+            let pb = ProgressBar::new(item.record.size.max(1));
+            pb.set_draw_target(if use_tty_progress {
+                ProgressDrawTarget::stderr()
+            } else {
+                ProgressDrawTarget::hidden()
+            });
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{prefix:.bold} [{bar:40.cyan/blue}] {eta}")
+                    .unwrap_or_else(|_| ProgressStyle::default_bar())
+                    .progress_chars("#>-"),
+            );
+            pb.set_prefix(label);
+
             let repo_cfg = config
                 .binary_repos
                 .get(&item.repo_name)
                 .with_context(|| format!("Binary repo '{}' not found in config", item.repo_name))?;
-            let cached = db::repo::cache_binary_package_archive(
+            let mut progress_cb = |downloaded: u64, total: Option<u64>| {
+                if let Some(t) = total
+                    && t > 0
+                {
+                    pb.set_length(t);
+                }
+                pb.set_position(downloaded);
+            };
+            let cached = db::repo::cache_binary_package_archive_with_progress(
                 &item.repo_name,
                 repo_cfg,
                 &item.record,
                 &config.package_cache_dir,
+                Some(&mut progress_cb),
             )
             .with_context(|| {
                 format!(
@@ -1052,6 +1088,7 @@ fn execute_install_plan_with_child_commands(
                     item.record.filename, item.repo_name
                 )
             })?;
+            pb.finish_and_clear();
             binary_archives.insert(
                 (item.repo_name.clone(), item.record.filename.clone()),
                 cached,
@@ -1062,14 +1099,20 @@ fn execute_install_plan_with_child_commands(
             "Verifying checksums for {} binary package(s)...",
             binary_phase_items.len()
         ));
-        for (idx, item) in binary_phase_items.iter().enumerate() {
-            ui::info(format!(
-                "  [{}/{}] {}-{}",
-                idx + 1,
-                binary_phase_items.len(),
-                item.record.name,
-                item.record.version
-            ));
+        let checksum_pb = ProgressBar::new(binary_phase_items.len() as u64);
+        checksum_pb.set_draw_target(if use_tty_progress {
+            ProgressDrawTarget::stderr()
+        } else {
+            ProgressDrawTarget::hidden()
+        });
+        checksum_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {eta}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-"),
+        );
+        checksum_pb.set_prefix("checksums");
+        for item in &binary_phase_items {
             let cached = binary_archives
                 .get(&(item.repo_name.clone(), item.record.filename.clone()))
                 .with_context(|| {
@@ -1085,20 +1128,28 @@ fn execute_install_plan_with_child_commands(
                     item.record.filename, item.repo_name
                 )
             })?;
+            checksum_pb.inc(1);
         }
+        checksum_pb.finish_and_clear();
 
         ui::info(format!(
             "Verifying detached signatures for {} binary package(s)...",
             binary_phase_items.len()
         ));
-        for (idx, item) in binary_phase_items.iter().enumerate() {
-            ui::info(format!(
-                "  [{}/{}] {}-{}",
-                idx + 1,
-                binary_phase_items.len(),
-                item.record.name,
-                item.record.version
-            ));
+        let signature_pb = ProgressBar::new(binary_phase_items.len() as u64);
+        signature_pb.set_draw_target(if use_tty_progress {
+            ProgressDrawTarget::stderr()
+        } else {
+            ProgressDrawTarget::hidden()
+        });
+        signature_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {eta}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-"),
+        );
+        signature_pb.set_prefix("signatures");
+        for item in &binary_phase_items {
             let repo_cfg = config
                 .binary_repos
                 .get(&item.repo_name)
@@ -1124,7 +1175,9 @@ fn execute_install_plan_with_child_commands(
                     item.record.filename, item.repo_name
                 )
             })?;
+            signature_pb.inc(1);
         }
+        signature_pb.finish_and_clear();
     }
 
     let exe = std::env::current_exe().context("Failed to locate depot executable")?;
@@ -1162,16 +1215,6 @@ fn execute_install_plan_with_child_commands(
                 }
             }
             planner::PlanOrigin::Binary { repo_name, record } => {
-                ui::info(format!(
-                    "[{}/{}] installing {} {}-{} from binary:{}",
-                    idx + 1,
-                    total_steps,
-                    record.name,
-                    record.version,
-                    record.revision,
-                    repo_name
-                ));
-
                 let cached = binary_archives
                     .get(&(repo_name.clone(), record.filename.clone()))
                     .with_context(|| {
@@ -1191,6 +1234,8 @@ fn execute_install_plan_with_child_commands(
             planner::PlanOrigin::Installed => {}
         }
     }
+
+    install::scripts::run_deferred_hooks_if_possible(rootfs)?;
     Ok(())
 }
 
@@ -1202,7 +1247,9 @@ pub fn run(cli: Cli) -> Result<()> {
             spec_or_archive,
             spec,
         } => {
-            warn_if_running_as_root_for_build("install", &cli.rootfs);
+            if !crate::fakeroot::is_root() {
+                anyhow::bail!("The 'install' command must be run as root");
+            }
             let mut spec_path = spec.unwrap_or(spec_or_archive);
 
             // Load configuration early so we can use the configured repo clone dir
@@ -1535,6 +1582,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 ));
             }
 
+            install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
+
             if cli.clean {
                 clean_build_workspace(&config)?;
             }
@@ -1820,6 +1869,8 @@ pub fn run(cli: Cli) -> Result<()> {
                             lib32_spec.package.name, lib32_spec.package.version
                         ));
                     }
+
+                    install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
                 } else {
                     if !cli.lib32_only {
                         for out in pkg_spec.outputs() {
