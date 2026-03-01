@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "Depot")]
-#[command(about = "Depot - Source-based package manager for Linux", long_about = None)]
+#[command(about = "Source-based package manager for Linux", long_about = None)]
 #[command(version)]
 pub struct Cli {
     /// Custom root filesystem path

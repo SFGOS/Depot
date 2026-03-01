@@ -151,11 +151,6 @@ pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> R
 
     tx.commit()?;
 
-    crate::log_info!(
-        "Registered {} files and {} directories in database",
-        manifest.files.len(),
-        manifest.directories.len()
-    );
     Ok(())
 }
 

@@ -4,6 +4,7 @@ use crate::{
     signing, source, staging, ui,
 };
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -33,6 +34,205 @@ fn parse_dependency_list(metadata: &toml::Value, kind: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn load_package_archive_into_staging(
+    archive_path: &Path,
+) -> Result<(package::PackageSpec, tempfile::TempDir)> {
+    let tmp_dir = tempfile::TempDir::new().with_context(|| {
+        format!(
+            "Failed to create staging dir for {}",
+            archive_path.display()
+        )
+    })?;
+    let extract_dir = tmp_dir.path().to_path_buf();
+
+    let file = fs::File::open(archive_path)
+        .with_context(|| format!("Failed to open archive {}", archive_path.display()))?;
+    let zstd_decoder = zstd::stream::read::Decoder::new(file)
+        .with_context(|| format!("Failed to read zstd stream {}", archive_path.display()))?;
+    let mut archive = tar::Archive::new(zstd_decoder);
+
+    let mut metadata_content = String::new();
+    for entry in archive.entries().with_context(|| {
+        format!(
+            "Failed to read archive entries from {}",
+            archive_path.display()
+        )
+    })? {
+        let mut entry = entry.with_context(|| {
+            format!(
+                "Failed to read archive entry from {}",
+                archive_path.display()
+            )
+        })?;
+        if entry.path()?.to_string_lossy() == ".metadata.toml" {
+            use std::io::Read;
+            entry
+                .read_to_string(&mut metadata_content)
+                .with_context(|| {
+                    format!(
+                        "Failed to read .metadata.toml in {}",
+                        archive_path.display()
+                    )
+                })?;
+            break;
+        }
+    }
+
+    if metadata_content.is_empty() {
+        anyhow::bail!(
+            "Package archive does not contain .metadata.toml: {}",
+            archive_path.display()
+        );
+    }
+
+    let file = fs::File::open(archive_path)
+        .with_context(|| format!("Failed to open archive {}", archive_path.display()))?;
+    let zstd_decoder = zstd::stream::read::Decoder::new(file)
+        .with_context(|| format!("Failed to read zstd stream {}", archive_path.display()))?;
+    let mut archive = tar::Archive::new(zstd_decoder);
+    archive.unpack(&extract_dir).with_context(|| {
+        format!(
+            "Failed to extract package archive {} into {}",
+            archive_path.display(),
+            extract_dir.display()
+        )
+    })?;
+
+    let metadata: toml::Value = toml::from_str(&metadata_content).with_context(|| {
+        format!(
+            "Failed to parse .metadata.toml in {}",
+            archive_path.display()
+        )
+    })?;
+
+    let mut spec = package::PackageSpec {
+        package: package::PackageInfo {
+            name: metadata
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            version: metadata
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            revision: metadata
+                .get("revision")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(1) as u32,
+            description: metadata
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            homepage: metadata
+                .get("homepage")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            license: parse_licenses_from_toml(&metadata),
+        },
+        packages: Vec::new(),
+        alternatives: package::Alternatives::default(),
+        manual_sources: Vec::new(),
+        source: Vec::new(),
+        build: package::Build {
+            build_type: package::BuildType::Bin,
+            flags: package::BuildFlags::default(),
+        },
+        dependencies: package::Dependencies {
+            build: Vec::new(),
+            runtime: parse_dependency_list(&metadata, "runtime"),
+            test: Vec::new(),
+            optional: parse_dependency_list(&metadata, "optional"),
+        },
+        package_alternatives: Default::default(),
+        package_dependencies: Default::default(),
+        spec_dir: PathBuf::from("."),
+    };
+
+    if let Some(provides) = metadata.get("provides").and_then(|v| v.as_array()) {
+        spec.alternatives.provides = provides
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(String::from)
+            .collect();
+    }
+
+    Ok((spec, tmp_dir))
+}
+
+fn extract_package_archive_to_staging(archive_path: &Path) -> Result<tempfile::TempDir> {
+    let tmp_dir = tempfile::TempDir::new().with_context(|| {
+        format!(
+            "Failed to create staging dir for {}",
+            archive_path.display()
+        )
+    })?;
+    let extract_dir = tmp_dir.path().to_path_buf();
+
+    let file = fs::File::open(archive_path)
+        .with_context(|| format!("Failed to open archive {}", archive_path.display()))?;
+    let zstd_decoder = zstd::stream::read::Decoder::new(file)
+        .with_context(|| format!("Failed to read zstd stream {}", archive_path.display()))?;
+    let mut archive = tar::Archive::new(zstd_decoder);
+    archive.unpack(&extract_dir).with_context(|| {
+        format!(
+            "Failed to extract package archive {} into {}",
+            archive_path.display(),
+            extract_dir.display()
+        )
+    })?;
+    Ok(tmp_dir)
+}
+
+fn parse_license_list_from_repo(license: &Option<String>) -> Vec<String> {
+    let Some(raw) = license.as_ref() else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn package_spec_from_repo_record(
+    record: &db::repo::BinaryRepoPackageRecord,
+) -> package::PackageSpec {
+    package::PackageSpec {
+        package: package::PackageInfo {
+            name: record.name.clone(),
+            version: record.version.clone(),
+            revision: record.revision,
+            description: record.description.clone().unwrap_or_default(),
+            homepage: record.homepage.clone().unwrap_or_default(),
+            license: parse_license_list_from_repo(&record.license),
+        },
+        packages: Vec::new(),
+        alternatives: package::Alternatives {
+            provides: record.provides.clone(),
+            replaces: Vec::new(),
+        },
+        manual_sources: Vec::new(),
+        source: Vec::new(),
+        build: package::Build {
+            build_type: package::BuildType::Bin,
+            flags: package::BuildFlags::default(),
+        },
+        dependencies: package::Dependencies {
+            build: Vec::new(),
+            runtime: record.runtime_dependencies.clone(),
+            test: Vec::new(),
+            optional: record.optional_dependencies.clone(),
+        },
+        package_alternatives: Default::default(),
+        package_dependencies: Default::default(),
+        spec_dir: PathBuf::from("."),
+    }
 }
 
 fn build_type_runs_automatic_tests(build_type: package::BuildType) -> bool {
@@ -405,6 +605,26 @@ fn install_staged_to_rootfs(
     Ok(())
 }
 
+fn install_package_outputs_to_rootfs(
+    pkg_spec: &package::PackageSpec,
+    destdir: &Path,
+    rootfs: &Path,
+    config: &config::Config,
+) -> Result<Vec<package::PackageInfo>> {
+    let mut installed = Vec::new();
+    for out in pkg_spec.outputs() {
+        let mut spec_for_out = pkg_spec.clone();
+        let output_name = out.name.clone();
+        spec_for_out.package = out;
+        spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
+        spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
+        let out_destdir = output_destdir_for(destdir, &pkg_spec.package.name, &output_name);
+        install_staged_to_rootfs(&spec_for_out, &out_destdir, rootfs, config)?;
+        installed.push(spec_for_out.package);
+    }
+    Ok(installed)
+}
+
 fn repo_kind_label(kind: RepoKindArg) -> &'static str {
     match kind {
         RepoKindArg::Source => "source",
@@ -711,6 +931,9 @@ fn print_plan_summary(plan: &planner::ExecutionPlan) {
         summary.skipped_installed,
         human_bytes(summary.known_download_bytes)
     ));
+    if std::env::var_os("DEPOT_VERBOSE_PLAN").is_none() {
+        return;
+    }
     for step in &plan.steps {
         let (action, origin) = match &step.action {
             planner::PlanAction::SkipInstalled => ("skip", "installed".to_string()),
@@ -755,8 +978,15 @@ fn execute_install_plan_with_child_commands(
     dry_run: bool,
     config: &config::Config,
 ) -> Result<()> {
+    #[derive(Clone)]
+    struct BinaryPhaseItem {
+        repo_name: String,
+        record: db::repo::BinaryRepoPackageRecord,
+    }
+
     let summary = plan.summary();
-    if plan.actionable_steps().next().is_none() {
+    let actionable_steps: Vec<_> = plan.actionable_steps().collect();
+    if actionable_steps.is_empty() {
         ui::info("Nothing to do.");
         return Ok(());
     }
@@ -767,8 +997,8 @@ fn execute_install_plan_with_child_commands(
             summary.source_build_installs
         ));
     }
-    let planned_packages: Vec<String> = plan
-        .actionable_steps()
+    let planned_packages: Vec<String> = actionable_steps
+        .iter()
         .map(|step| step.package.clone())
         .collect();
     if !ui::prompt_package_action("installation", &planned_packages, true)? {
@@ -780,53 +1010,185 @@ fn execute_install_plan_with_child_commands(
         return Ok(());
     }
 
-    let exe = std::env::current_exe().context("Failed to locate depot executable")?;
+    let mut binary_phase_items = Vec::new();
+    for step in &actionable_steps {
+        if let planner::PlanOrigin::Binary { repo_name, record } = &step.origin {
+            binary_phase_items.push(BinaryPhaseItem {
+                repo_name: repo_name.clone(),
+                record: (**record).clone(),
+            });
+        }
+    }
 
-    for step in plan.actionable_steps() {
-        let input_path = match &step.origin {
-            planner::PlanOrigin::Source { path, .. } => path.clone(),
-            planner::PlanOrigin::Binary { repo_name, record } => {
-                let repo_cfg = config
-                    .binary_repos
-                    .get(repo_name)
-                    .with_context(|| format!("Binary repo '{}' not found in config", repo_name))?;
-                db::repo::fetch_binary_package_archive(
-                    repo_name,
-                    repo_cfg,
-                    rootfs,
-                    record,
-                    &config.package_cache_dir,
-                )?
-            }
-            planner::PlanOrigin::Installed => continue,
-        };
+    let mut binary_archives: HashMap<(String, String), db::repo::BinaryRepoCachedArchive> =
+        HashMap::new();
+    if !binary_phase_items.is_empty() {
+        ui::info(format!(
+            "Downloading {} binary package(s) and detached signatures...",
+            binary_phase_items.len()
+        ));
+        for (idx, item) in binary_phase_items.iter().enumerate() {
+            ui::info(format!(
+                "  [{}/{}] {}-{} ({})",
+                idx + 1,
+                binary_phase_items.len(),
+                item.record.name,
+                item.record.version,
+                item.repo_name
+            ));
+            let repo_cfg = config
+                .binary_repos
+                .get(&item.repo_name)
+                .with_context(|| format!("Binary repo '{}' not found in config", item.repo_name))?;
+            let cached = db::repo::cache_binary_package_archive(
+                &item.repo_name,
+                repo_cfg,
+                &item.record,
+                &config.package_cache_dir,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to cache binary package '{}' from repo '{}'",
+                    item.record.filename, item.repo_name
+                )
+            })?;
+            binary_archives.insert(
+                (item.repo_name.clone(), item.record.filename.clone()),
+                cached,
+            );
+        }
 
         ui::info(format!(
-            "Executing planned step: {} ({})",
-            step.package,
-            input_path.display()
+            "Verifying checksums for {} binary package(s)...",
+            binary_phase_items.len()
         ));
+        for (idx, item) in binary_phase_items.iter().enumerate() {
+            ui::info(format!(
+                "  [{}/{}] {}-{}",
+                idx + 1,
+                binary_phase_items.len(),
+                item.record.name,
+                item.record.version
+            ));
+            let cached = binary_archives
+                .get(&(item.repo_name.clone(), item.record.filename.clone()))
+                .with_context(|| {
+                    format!(
+                        "Cached archive missing for {} from repo '{}'",
+                        item.record.filename, item.repo_name
+                    )
+                })?;
+            db::repo::verify_binary_package_archive_checksums(&cached.package_path, &item.record)
+                .with_context(|| {
+                format!(
+                    "Checksum verification failed for {} from repo '{}'",
+                    item.record.filename, item.repo_name
+                )
+            })?;
+        }
 
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("-r").arg(rootfs);
-        cmd.arg("--no-deps");
-        cmd.arg("--yes");
-        if no_flags {
-            cmd.arg("--no-flags");
+        ui::info(format!(
+            "Verifying detached signatures for {} binary package(s)...",
+            binary_phase_items.len()
+        ));
+        for (idx, item) in binary_phase_items.iter().enumerate() {
+            ui::info(format!(
+                "  [{}/{}] {}-{}",
+                idx + 1,
+                binary_phase_items.len(),
+                item.record.name,
+                item.record.version
+            ));
+            let repo_cfg = config
+                .binary_repos
+                .get(&item.repo_name)
+                .with_context(|| format!("Binary repo '{}' not found in config", item.repo_name))?;
+            let cached = binary_archives
+                .get(&(item.repo_name.clone(), item.record.filename.clone()))
+                .with_context(|| {
+                    format!(
+                        "Cached archive missing for {} from repo '{}'",
+                        item.record.filename, item.repo_name
+                    )
+                })?;
+            db::repo::verify_binary_package_archive_signature(
+                &item.repo_name,
+                repo_cfg,
+                rootfs,
+                &cached.package_path,
+                &cached.signature_path,
+            )
+            .with_context(|| {
+                format!(
+                    "Detached signature verification failed for {} from repo '{}'",
+                    item.record.filename, item.repo_name
+                )
+            })?;
         }
-        if let Some(p) = cross_prefix {
-            cmd.arg("--cross-prefix").arg(p);
-        }
-        if clean {
-            cmd.arg("--clean");
-        }
-        cmd.arg("install").arg(input_path);
+    }
 
-        let status = cmd
-            .status()
-            .context("Failed to spawn planned install step")?;
-        if !status.success() {
-            anyhow::bail!("Planned install step for '{}' failed", step.package);
+    let exe = std::env::current_exe().context("Failed to locate depot executable")?;
+    let total_steps = actionable_steps.len();
+    for (idx, step) in actionable_steps.into_iter().enumerate() {
+        match &step.origin {
+            planner::PlanOrigin::Source { path, .. } => {
+                ui::info(format!(
+                    "[{}/{}] building+installing {} from source",
+                    idx + 1,
+                    total_steps,
+                    step.package
+                ));
+
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.arg("-r").arg(rootfs);
+                cmd.arg("--no-deps");
+                cmd.arg("--yes");
+                if no_flags {
+                    cmd.arg("--no-flags");
+                }
+                if let Some(p) = cross_prefix {
+                    cmd.arg("--cross-prefix").arg(p);
+                }
+                if clean {
+                    cmd.arg("--clean");
+                }
+                cmd.arg("install").arg(path);
+
+                let status = cmd
+                    .status()
+                    .context("Failed to spawn planned install step")?;
+                if !status.success() {
+                    anyhow::bail!("Planned install step for '{}' failed", step.package);
+                }
+            }
+            planner::PlanOrigin::Binary { repo_name, record } => {
+                ui::info(format!(
+                    "[{}/{}] installing {} {}-{} from binary:{}",
+                    idx + 1,
+                    total_steps,
+                    record.name,
+                    record.version,
+                    record.revision,
+                    repo_name
+                ));
+
+                let cached = binary_archives
+                    .get(&(repo_name.clone(), record.filename.clone()))
+                    .with_context(|| {
+                        format!(
+                            "Cached archive missing for planned binary step '{}' from repo '{}'",
+                            record.filename, repo_name
+                        )
+                    })?;
+                let staged = extract_package_archive_to_staging(&cached.package_path)?;
+                let spec = package_spec_from_repo_record(record);
+                let installed =
+                    install_package_outputs_to_rootfs(&spec, staged.path(), rootfs, config)?;
+                for pkg in installed {
+                    ui::success(format!("Installed {} v{}", pkg.name, pkg.version));
+                }
+            }
+            planner::PlanOrigin::Installed => {}
         }
     }
     Ok(())
@@ -965,94 +1327,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 if spec_path.to_string_lossy().ends_with(".tar.zst") {
                     // Install from archive
                     ui::info(format!("Detected package archive: {}", spec_path.display()));
-                    let tmp_dir = tempfile::TempDir::new()?;
-                    let extract_dir = tmp_dir.path().to_path_buf();
-
-                    // Extract metadata.toml first to get spec
-                    let file = fs::File::open(&spec_path)?;
-                    let zstd_decoder = zstd::stream::read::Decoder::new(file)?;
-                    let mut archive = tar::Archive::new(zstd_decoder);
-
-                    let mut metadata_content = String::new();
-                    for entry in archive.entries()? {
-                        let mut entry = entry?;
-                        if entry.path()?.to_string_lossy() == ".metadata.toml" {
-                            use std::io::Read;
-                            entry.read_to_string(&mut metadata_content)?;
-                            break;
-                        }
-                    }
-
-                    if metadata_content.is_empty() {
-                        anyhow::bail!(
-                            "Package archive does not contain .metadata.toml: {}",
-                            spec_path.display()
-                        );
-                    }
-
-                    let file = fs::File::open(&spec_path)?;
-                    let zstd_decoder = zstd::stream::read::Decoder::new(file)?;
-                    let mut archive = tar::Archive::new(zstd_decoder);
-                    archive.unpack(&extract_dir)?;
-
-                    let metadata: toml::Value = toml::from_str(&metadata_content)?;
-
-                    // Create a minimal spec from metadata
-                    let mut spec = package::PackageSpec {
-                        package: package::PackageInfo {
-                            name: metadata
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            version: metadata
-                                .get("version")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            revision: metadata
-                                .get("revision")
-                                .and_then(|v| v.as_integer())
-                                .unwrap_or(1) as u32,
-                            description: metadata
-                                .get("description")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            homepage: metadata
-                                .get("homepage")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            license: parse_licenses_from_toml(&metadata),
-                        },
-                        packages: Vec::new(),
-                        alternatives: package::Alternatives::default(),
-                        manual_sources: Vec::new(),
-                        source: Vec::new(),
-                        build: package::Build {
-                            build_type: package::BuildType::Bin,
-                            flags: package::BuildFlags::default(),
-                        },
-                        dependencies: package::Dependencies {
-                            build: Vec::new(),
-                            runtime: parse_dependency_list(&metadata, "runtime"),
-                            test: Vec::new(),
-                            optional: parse_dependency_list(&metadata, "optional"),
-                        },
-                        package_alternatives: Default::default(),
-                        package_dependencies: Default::default(),
-                        spec_dir: PathBuf::from("."),
-                    };
-
-                    if let Some(provides) = metadata.get("provides").and_then(|v| v.as_array()) {
-                        spec.alternatives.provides = provides
-                            .iter()
-                            .filter_map(|v| v.as_str())
-                            .map(String::from)
-                            .collect();
-                    }
-
+                    let (spec, tmp_dir) = load_package_archive_into_staging(&spec_path)?;
                     (spec, Some(tmp_dir))
                 } else {
                     // Install from spec (normal build)
@@ -1224,23 +1499,20 @@ pub fn run(cli: Cli) -> Result<()> {
             };
 
             if !cli.lib32_only {
-                // 4. Stage (clean .la files, etc.)
-                staging::process(&destdir, &pkg_spec)?;
+                if staging_dir.is_none() {
+                    // Source-build path: apply staging transforms (strip/compress/static cleanup).
+                    staging::process(&destdir, &pkg_spec)?;
+                } else {
+                    // Binary archive path: install as-packaged without post-build transformations.
+                    ui::info("Installing binary archive payload without staging transforms");
+                }
 
-                // 5-6. Install/update to rootfs and register in DB
-                for out in pkg_spec.outputs() {
-                    let mut spec_for_out = pkg_spec.clone();
-                    let output_name = out.name.clone();
-                    spec_for_out.package = out;
-                    spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
-                    spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
-                    let out_destdir =
-                        output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
-                    install_staged_to_rootfs(&spec_for_out, &out_destdir, &cli.rootfs, &config)?;
-
+                let installed =
+                    install_package_outputs_to_rootfs(&pkg_spec, &destdir, &cli.rootfs, &config)?;
+                for pkg in installed {
                     ui::success(format!(
                         "Successfully installed {} v{}",
-                        spec_for_out.package.name, spec_for_out.package.version
+                        pkg.name, pkg.version
                     ));
                     // TODO(snapper): create post-install snapshot after install commit succeeds.
                 }
@@ -2104,6 +2376,69 @@ mod tests {
 
         assert!(!cfg.build_dir.exists());
         assert!(!cfg.cache_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn binary_install_path_uses_repo_record_metadata_without_archive_metadata() -> Result<()> {
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let pkg_dir = tempfile::tempdir().context("Failed to create temp package dir")?;
+        let archive_path = pkg_dir.path().join("pkg-1.0-1-x86_64.depot.pkg.tar.zst");
+
+        // Build an archive that intentionally does not contain .metadata.toml.
+        let file = fs::File::create(&archive_path)
+            .with_context(|| format!("Failed to create {}", archive_path.display()))?;
+        let encoder =
+            zstd::stream::write::Encoder::new(file, 3).context("Failed to create zstd encoder")?;
+        let mut tar = tar::Builder::new(encoder);
+        let payload = b"hello";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("usr/bin/hello").unwrap();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append(&header, &payload[..]).unwrap();
+        let encoder = tar.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+        cfg.db_dir = rootfs.path().join("var/lib/depot");
+
+        let staged = extract_package_archive_to_staging(&archive_path)?;
+        let record = db::repo::BinaryRepoPackageRecord {
+            repo_name: "core".into(),
+            name: "pkg".into(),
+            version: "1.0".into(),
+            revision: 1,
+            filename: archive_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            size: payload.len() as u64,
+            sha256: String::new(),
+            sha512: String::new(),
+            description: Some("test package".into()),
+            homepage: Some("https://example.test".into()),
+            license: Some("MIT".into()),
+            provides: vec!["pkg-virtual".into()],
+            runtime_dependencies: vec!["glibc".into()],
+            optional_dependencies: vec!["manpages".into()],
+        };
+        let spec = package_spec_from_repo_record(&record);
+        let installed =
+            install_package_outputs_to_rootfs(&spec, staged.path(), rootfs.path(), &cfg)?;
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].name, "pkg");
+        assert!(rootfs.path().join("usr/bin/hello").exists());
+
+        let db_path = cfg.db_dir.join("packages.db");
+        assert_eq!(
+            db::get_package_version(&db_path, "pkg")?,
+            Some("1.0".into())
+        );
         Ok(())
     }
 }
