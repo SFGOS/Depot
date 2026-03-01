@@ -166,6 +166,7 @@ pub fn get_package_files(db_path: &Path, name: &str) -> Result<Vec<String>> {
     }
 
     let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
 
     // If the package is not present in the DB (fresh install), treat that as
     // "no previously installed files" rather than an error.
@@ -197,6 +198,7 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
     }
 
     let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
 
     // Get package ID
     let pkg_id: i64 = conn
@@ -314,6 +316,7 @@ pub fn show_package_info(db_path: &Path, name: &str) -> Result<()> {
     }
 
     let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
 
     let (version, revision, description, homepage, license): (String, u32, String, String, String) = conn
         .query_row(
@@ -348,6 +351,7 @@ pub fn list_packages(db_path: &Path) -> Result<()> {
     }
 
     let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
 
     let mut stmt = conn.prepare("SELECT name, version FROM packages ORDER BY name")?;
     let packages = stmt.query_map([], |row| {
@@ -621,6 +625,27 @@ mod tests {
     }
 
     #[test]
+    fn get_package_version_missing_db_returns_none_without_creating_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+
+        let version = get_package_version(&db_path, "nonexistent").unwrap();
+        assert!(version.is_none());
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn calculate_upgrade_paths_handles_existing_db_file_without_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        std::fs::File::create(&db_path).unwrap();
+
+        let remove_paths =
+            calculate_upgrade_paths(&db_path, "nonexistent", &["usr/bin/foo".to_string()]).unwrap();
+        assert!(remove_paths.is_empty());
+    }
+
+    #[test]
     fn remove_package_tolerates_missing_files_and_cleans_db() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("packages.db");
@@ -718,7 +743,12 @@ mod tests {
 pub fn get_installed_packages(db_path: &Path) -> Result<std::collections::HashSet<String>> {
     use std::collections::HashSet;
 
+    if !db_path.exists() {
+        return Ok(HashSet::new());
+    }
+
     let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
     let mut stmt = conn.prepare("SELECT name FROM packages")?;
     let names: HashSet<String> = stmt
         .query_map([], |row| row.get(0))?
@@ -731,7 +761,12 @@ pub fn get_installed_packages(db_path: &Path) -> Result<std::collections::HashSe
 pub fn get_all_provides(db_path: &Path) -> Result<std::collections::HashSet<String>> {
     use std::collections::HashSet;
 
+    if !db_path.exists() {
+        return Ok(HashSet::new());
+    }
+
     let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
     let mut stmt = conn.prepare("SELECT provides_name FROM provides")?;
     let names: HashSet<String> = stmt
         .query_map([], |row| row.get(0))?
@@ -742,7 +777,12 @@ pub fn get_all_provides(db_path: &Path) -> Result<std::collections::HashSet<Stri
 
 /// Get version of a specific installed package
 pub fn get_package_version(db_path: &Path, name: &str) -> Result<Option<String>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
     let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
     let version: Option<String> = conn
         .query_row(
             "SELECT version FROM packages WHERE name = ?1",
@@ -769,6 +809,7 @@ pub fn owns_path(db_path: &Path, path: &Path) -> Result<Option<String>> {
     }
 
     let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
     let owner = conn
         .query_row(
             "SELECT p.name
