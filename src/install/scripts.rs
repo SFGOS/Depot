@@ -1147,12 +1147,12 @@ mod tests {
         std::fs::create_dir_all(&scripts).unwrap();
 
         std::fs::write(
-            scripts.join("post_install"),
+            scripts.join("pre_install"),
             "echo ok > \"$DEPOT_ROOTFS/hook.out\"\n",
         )
         .unwrap();
 
-        let ran = run_hook_if_present(&scripts, Hook::PostInstall, &rootfs_rel, "foo").unwrap();
+        let ran = run_hook_if_present(&scripts, Hook::PreInstall, &rootfs_rel, "foo").unwrap();
         assert!(ran);
         assert_eq!(
             std::fs::read_to_string(rootfs_abs.join("hook.out")).unwrap(),

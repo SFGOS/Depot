@@ -934,6 +934,15 @@ fn binary_arch_from_filename(filename: &str) -> String {
         .to_string()
 }
 
+fn merge_missing_dependencies(mut base: Vec<String>, extra: Vec<String>) -> Vec<String> {
+    for dep in extra {
+        if !base.contains(&dep) {
+            base.push(dep);
+        }
+    }
+    base
+}
+
 fn print_plan_summary(plan: &planner::ExecutionPlan) {
     let summary = plan.summary();
     ui::info(format!(
@@ -1425,14 +1434,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 deps::print_dep_status(&pkg_spec, &db_path)?;
 
                 // Collect all missing dependencies (build + runtime)
-                let mut missing = deps::check_build_deps(&pkg_spec, &db_path)?;
-                let missing_runtime = deps::check_runtime_deps(&pkg_spec, &db_path)?;
-
-                for dep in missing_runtime {
-                    if !missing.contains(&dep) {
-                        missing.push(dep);
-                    }
-                }
+                let missing = merge_missing_dependencies(
+                    deps::check_build_deps(&pkg_spec, &db_path)?,
+                    deps::check_runtime_deps(&pkg_spec, &db_path)?,
+                );
                 if !missing.is_empty() {
                     // Check for dependency cycles via DEPOT_DEPCHAIN env var
                     let dep_chain = std::env::var("DEPOT_DEPCHAIN").unwrap_or_default();
@@ -1667,12 +1672,12 @@ pub fn run(cli: Cli) -> Result<()> {
             // Check build dependencies
             if !cli.no_deps {
                 deps::print_dep_status(&pkg_spec, &db_path)?;
-                let missing = deps::check_build_deps(&pkg_spec, &db_path)?;
+                let missing = merge_missing_dependencies(
+                    deps::check_build_deps(&pkg_spec, &db_path)?,
+                    deps::check_runtime_deps(&pkg_spec, &db_path)?,
+                );
                 if !missing.is_empty() {
-                    ui::warn(format!(
-                        "Missing build dependencies: {}",
-                        missing.join(", ")
-                    ));
+                    ui::warn(format!("Missing dependencies: {}", missing.join(", ")));
                     let local_sibling_root = spec_path
                         .parent()
                         .and_then(|p| p.parent())
@@ -1706,6 +1711,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     )?;
                 }
                 deps::require_build_deps(&pkg_spec, &db_path)?;
+                deps::require_runtime_deps(&pkg_spec, &db_path)?;
             } else if cli.dry_run {
                 ui::info("Dry run enabled, stopping before build.");
                 return Ok(());
@@ -2491,5 +2497,19 @@ mod tests {
             Some("1.0".into())
         );
         Ok(())
+    }
+
+    #[test]
+    fn merge_missing_dependencies_preserves_order_and_uniqueness() {
+        let merged = merge_missing_dependencies(
+            vec!["make".into(), "pkgconf".into(), "glibc".into()],
+            vec![
+                "glibc".into(),
+                "openssl".into(),
+                "pkgconf".into(),
+                "zlib".into(),
+            ],
+        );
+        assert_eq!(merged, vec!["make", "pkgconf", "glibc", "openssl", "zlib"]);
     }
 }
