@@ -346,6 +346,19 @@ impl PackageSpec {
                         self.build.flags.carch = s.to_string();
                     }
                 }
+                "makeflags" | "make_flags" | "make-flags" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.makeflags = s.to_string();
+                    } else if let Some(arr) = v.as_array() {
+                        self.build.flags.makeflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(str::trim)
+                            .filter(|x| !x.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                    }
+                }
                 "make_vars" | "make-vars" | "make_build_vars" | "make-build-vars" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.make_vars = arr
@@ -858,6 +871,22 @@ impl PackageSpec {
             "carch" => {
                 if let Some(s) = values.last().and_then(|v| v.as_str()) {
                     self.build.flags.carch = s.to_string();
+                }
+            }
+            "makeflags" | "make_flags" | "make-flags" | "MAKEFLAGS" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        let joined = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(str::trim)
+                            .filter(|x| !x.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        append_whitespace_separated(&mut self.build.flags.makeflags, &joined);
+                    } else if let Some(s) = v.as_str() {
+                        append_whitespace_separated(&mut self.build.flags.makeflags, s);
+                    }
                 }
             }
             "make_vars" | "make-vars" | "make_build_vars" | "make-build-vars" => {
@@ -1652,6 +1681,7 @@ cc = "my-cc"
 cflags = ["-O2"]
 cxxflags = ["-O2", "-pipe"]
 passthrough_env = ["RUSTFLAGS"]
+makeflags = "-j8"
 make_vars = ["V=1"]
 make_dirs = ["lib"]
 make_test_dirs = ["tests"]
@@ -1708,6 +1738,10 @@ post_configure = ["echo configured"]
         config.appends.insert(
             "build.flags.make_test_vars".to_string(),
             vec![toml::Value::String("TESTS=smoke".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.makeflags".to_string(),
+            vec![toml::Value::String("--output-sync=target".to_string())],
         );
         config.appends.insert(
             "build.flags.make_dirs".to_string(),
@@ -1782,6 +1816,7 @@ post_configure = ["echo configured"]
                 .passthrough_env
                 .contains(&"CARGO_HOME".to_string())
         );
+        assert_eq!(spec.build.flags.makeflags, "-j8 --output-sync=target");
         assert!(spec.build.flags.make_vars.contains(&"V=1".to_string()));
         assert!(spec.build.flags.make_dirs.contains(&"lib".to_string()));
         assert!(spec.build.flags.make_dirs.contains(&"libelf".to_string()));
@@ -2379,6 +2414,39 @@ make_install_dirs = ["lib", "apps"]
     }
 
     #[test]
+    fn parse_makeflags_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "autotools"
+
+[build.flags]
+MAKEFLAGS = ["-j12", "--output-sync=target"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.build.flags.makeflags, "-j12 --output-sync=target");
+    }
+
+    #[test]
     fn test_chost_cbuild_overrides() {
         let mut spec = mk_spec("foo", "1.0");
         let config = crate::config::Config {
@@ -2857,6 +2925,15 @@ pub struct BuildFlags {
     /// CPU architecture short name (CARCH equivalent), e.g. "x86_64", "aarch64"
     #[serde(default = "default_carch")]
     pub carch: String,
+    /// MAKEFLAGS environment variable passed to build commands.
+    #[serde(
+        default,
+        alias = "make-flags",
+        alias = "make_flags",
+        alias = "MAKEFLAGS",
+        deserialize_with = "deserialize_string_or_array_joined"
+    )]
+    pub makeflags: String,
     /// Variable overrides passed directly to `make` (compile step), e.g. ["V=1", "CC=clang"].
     #[serde(
         default,
@@ -3022,6 +3099,7 @@ impl Default for BuildFlags {
             chost: String::new(),
             cbuild: String::new(),
             carch: default_carch(),
+            makeflags: String::new(),
             make_vars: Vec::new(),
             make_exec: String::new(),
             make_target: String::new(),
@@ -3089,6 +3167,31 @@ where
     }
 }
 
+fn deserialize_string_or_array_joined<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrArray {
+        String(String),
+        Array(Vec<String>),
+    }
+
+    match Option::<StringOrArray>::deserialize(deserializer)? {
+        Some(StringOrArray::String(s)) => Ok(s),
+        Some(StringOrArray::Array(a)) => Ok(a
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")),
+        None => Ok(String::new()),
+    }
+}
+
 fn deserialize_boolish<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
 where
     D: Deserializer<'de>,
@@ -3125,6 +3228,19 @@ fn toml_value_as_boolish(value: &toml::Value) -> Option<bool> {
             "false" | "0" | "no" | "off" => Some(false),
             _ => None,
         })
+}
+
+fn append_whitespace_separated(dst: &mut String, value: &str) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if dst.is_empty() {
+        dst.push_str(trimmed);
+    } else {
+        dst.push(' ');
+        dst.push_str(trimmed);
+    }
 }
 
 fn default_cc() -> String {

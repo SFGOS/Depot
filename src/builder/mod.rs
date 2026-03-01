@@ -78,6 +78,13 @@ pub fn standard_build_env(
     if !flags.prefix.is_empty() {
         set_env_var(&mut env_vars, "PREFIX", flags.prefix.clone());
     }
+    if !flags.makeflags.trim().is_empty() {
+        set_env_var(
+            &mut env_vars,
+            "MAKEFLAGS",
+            flags.makeflags.trim().to_string(),
+        );
+    }
 
     set_env_var(&mut env_vars, "DEPOT_ROOTFS", flags.rootfs.clone());
     set_env_var(
@@ -414,6 +421,19 @@ mod tests {
         assert!(
             !disabled_env.iter().any(|(k, _)| k == "LDFLAGS"),
             "expected LDFLAGS to be omitted when no_flags is set in spec"
+        );
+    }
+
+    #[test]
+    fn test_standard_build_env_exports_makeflags() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.makeflags = "-j12 --output-sync=target".to_string();
+
+        let env = standard_build_env(&spec, None, true, true);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "MAKEFLAGS" && v == "-j12 --output-sync=target"),
+            "expected MAKEFLAGS to be exported from build flags"
         );
     }
 

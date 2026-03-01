@@ -972,6 +972,12 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             Value::String(spec.build.flags.carch.clone()),
         );
     }
+    if !spec.build.flags.makeflags.is_empty() {
+        flags_tbl.insert(
+            "makeflags".into(),
+            Value::String(spec.build.flags.makeflags.clone()),
+        );
+    }
     if !spec.build.flags.make_vars.is_empty() {
         flags_tbl.insert(
             "make_vars".into(),
@@ -1475,6 +1481,7 @@ mod tests {
         flags.no_delete_static = true;
         flags.no_compress_man = true;
         flags.skip_tests = true;
+        flags.makeflags = "-j12 --output-sync=target".into();
         flags.make_vars = vec!["V=1".into()];
         flags.make_dirs = vec!["lib".into(), "libelf".into()];
         flags.make_test_vars = vec!["TESTS=unit".into()];
@@ -1533,6 +1540,7 @@ mod tests {
         assert!(toml.contains("no_delete_static = true"));
         assert!(toml.contains("no_compress_man = true"));
         assert!(toml.contains("skip_tests = true"));
+        assert!(toml.contains("makeflags = \"-j12 --output-sync=target\""));
         assert!(toml.contains("make_vars = ["));
         assert!(toml.contains("make_dirs = ["));
         assert!(toml.contains("make_test_vars = ["));
