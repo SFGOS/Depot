@@ -53,12 +53,22 @@ pub struct Cli {
 pub enum Commands {
     /// Build and install a package from a spec file
     Install {
-        /// Path to package spec (.toml) or package archive (.tar.zst)
-        #[arg(value_name = "SPEC_OR_ARCHIVE")]
-        spec_or_archive: PathBuf,
+        /// One or more package names, spec paths (.toml), or package archives (.tar.zst)
+        #[arg(
+            value_name = "SPEC_OR_ARCHIVE",
+            num_args = 1..,
+            required_unless_present = "spec"
+        )]
+        spec_or_archive: Vec<PathBuf>,
 
         /// Explicitly specify path to package spec (.toml file)
-        #[arg(short, long = "spec", visible_alias = "package", alias = "p")]
+        #[arg(
+            short,
+            long = "spec",
+            visible_alias = "package",
+            alias = "p",
+            conflicts_with = "spec_or_archive"
+        )]
         spec: Option<PathBuf>,
     },
     /// Remove an installed package
@@ -219,4 +229,44 @@ pub enum RepoCommands {
 pub enum RepoKindArg {
     Source,
     Binary,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn install_accepts_multiple_positional_targets() {
+        let cli = Cli::try_parse_from(["depot", "install", "base", "linux"]).unwrap();
+        match cli.command {
+            Commands::Install {
+                spec_or_archive,
+                spec,
+            } => {
+                assert!(spec.is_none());
+                assert_eq!(
+                    spec_or_archive,
+                    vec![PathBuf::from("base"), PathBuf::from("linux")]
+                );
+            }
+            _ => panic!("expected install command"),
+        }
+    }
+
+    #[test]
+    fn install_accepts_spec_flag_without_positional_target() {
+        let cli = Cli::try_parse_from(["depot", "install", "--spec", "pkg.toml"]).unwrap();
+        match cli.command {
+            Commands::Install {
+                spec_or_archive,
+                spec,
+            } => {
+                assert!(spec_or_archive.is_empty());
+                assert_eq!(spec, Some(PathBuf::from("pkg.toml")));
+            }
+            _ => panic!("expected install command"),
+        }
+    }
 }

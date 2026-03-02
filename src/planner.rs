@@ -179,15 +179,27 @@ impl<'a> Resolver<'a> {
     }
 
     fn plan_for_install_target(mut self, target: InstallTarget) -> Result<ExecutionPlan> {
+        self.resolve_install_target(&target)?;
+        self.finish_plan()
+    }
+
+    fn plan_for_install_targets(mut self, targets: &[InstallTarget]) -> Result<ExecutionPlan> {
+        for target in targets {
+            self.resolve_install_target(target)?;
+        }
+        self.finish_plan()
+    }
+
+    fn resolve_install_target(&mut self, target: &InstallTarget) -> Result<()> {
         match target {
             InstallTarget::PackageName(name) => {
-                if deps::is_dep_satisfied_in_db(&name, &self.db_path)? {
+                if deps::is_dep_satisfied_in_db(name, &self.db_path)? {
                     if self.emitted_installed_roots.insert(name.clone()) {
-                        self.add_installed_root_step(name, "requested package".to_string());
+                        self.add_installed_root_step(name.clone(), "requested package".to_string());
                     }
                 } else {
                     let root =
-                        self.resolve_dep_node(&name, None, "requested package".to_string())?;
+                        self.resolve_dep_node(name, None, "requested package".to_string())?;
                     if let Some(root_idx) = root {
                         self.mark_requested_by(root_idx, "requested package".to_string());
                     }
@@ -195,11 +207,11 @@ impl<'a> Resolver<'a> {
             }
             InstallTarget::SpecPath(path) => {
                 let root_idx =
-                    self.ensure_source_spec_node(&path, true, true, "requested spec".to_string())?;
+                    self.ensure_source_spec_node(path, true, true, "requested spec".to_string())?;
                 self.mark_requested_by(root_idx, "requested spec".to_string());
             }
         }
-        self.finish_plan()
+        Ok(())
     }
 
     fn plan_for_deps(mut self, deps_to_install: &[String]) -> Result<ExecutionPlan> {
@@ -700,6 +712,15 @@ pub(crate) fn build_install_plan(
     opts: PlannerOptions,
 ) -> Result<ExecutionPlan> {
     Resolver::new(config, rootfs, opts).plan_for_install_target(target)
+}
+
+pub(crate) fn build_install_plan_for_targets(
+    config: &Config,
+    rootfs: &Path,
+    targets: &[InstallTarget],
+    opts: PlannerOptions,
+) -> Result<ExecutionPlan> {
+    Resolver::new(config, rootfs, opts).plan_for_install_targets(targets)
 }
 
 pub(crate) fn build_dependency_install_plan(

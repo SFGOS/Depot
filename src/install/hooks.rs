@@ -429,7 +429,8 @@ fn run_hook_command(
         .env("DEPOT_PACKAGE", ctx.package)
         .env("DEPOT_ROOTFS", rootfs)
         .env("DEPOT_HOOK_FILE", &hook.file_path)
-        .env("DEPOT_HOOK_NAME", &hook_name);
+        .env("DEPOT_HOOK_NAME", &hook_name)
+        .env("PATH", crate::runtime_env::safe_script_path());
 
     let status = run_command_with_optional_stdin(&mut command, stdin_payload.as_deref())
         .with_context(|| {

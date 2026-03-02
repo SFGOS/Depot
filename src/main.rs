@@ -15,6 +15,7 @@ mod install;
 mod locking;
 mod package;
 mod planner;
+mod runtime_env;
 mod shell_helpers;
 mod signing;
 mod source;

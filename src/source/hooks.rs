@@ -61,6 +61,7 @@ fn apply_patches(
         // Apply with patch(1). Keep it simple: -p1 is the common case.
         let status = Command::new("patch")
             .current_dir(src_dir)
+            .env("PATH", crate::runtime_env::safe_script_path())
             .arg("-p1")
             .arg("-i")
             .arg(&patch_path)
@@ -93,6 +94,7 @@ fn run_post_extract_commands(spec: &PackageSpec, source: &Source, src_dir: &Path
         let status = Command::new("sh")
             .current_dir(src_dir)
             .env("DEPOT_SPECDIR", &spec.spec_dir)
+            .env("PATH", crate::runtime_env::safe_script_path())
             .arg("-c")
             .arg(&cmd)
             .status()

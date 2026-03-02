@@ -1255,6 +1255,319 @@ fn execute_install_plan_with_child_commands(
     Ok(())
 }
 
+fn is_archive_install_request(spec_path: &Path) -> bool {
+    spec_path.exists()
+        && spec_path
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with(".tar.zst")
+}
+
+fn shared_local_sibling_root(spec_paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut roots = spec_paths.iter().filter_map(|path| {
+        path.parent()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+    });
+    let first = roots.next()?;
+    if roots.all(|path| path == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DirectInstallOptions<'a> {
+    rootfs: &'a Path,
+    no_deps: bool,
+    no_flags: bool,
+    cross_prefix: Option<&'a str>,
+    clean: bool,
+    dry_run: bool,
+    lib32_only: bool,
+}
+
+fn run_direct_install_request(
+    options: DirectInstallOptions<'_>,
+    config: &config::Config,
+    mut spec_path: PathBuf,
+) -> Result<bool> {
+    let mut install_lock = locking::open_lock(config)?;
+    let install_lock_path = locking::lock_path(config);
+    let _install_lock_guard = locking::try_write(&mut install_lock, &install_lock_path, "install")?;
+
+    // Repo clone dir is available via `config.repo_clone_dir` and
+    // is passed explicitly to index builders below.
+
+    // If the provided path doesn't exist, treat it as a package name and
+    // try to locate a spec under configured repo dir or local packages/.
+    if !spec_path.exists() {
+        let name = spec_path.to_string_lossy().to_string();
+        ui::info(format!("Looking up package '{}' in local indexes...", name));
+        let pkg_index =
+            index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
+        if let Some(found) = pkg_index.find(&name) {
+            spec_path = found;
+        } else {
+            let host_arch = std::env::consts::ARCH;
+            let mut binary_repos: Vec<_> = config
+                .binary_repos
+                .iter()
+                .filter(|(_, repo)| repo.enabled && repo.supports_arch(host_arch))
+                .collect();
+            binary_repos.sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
+
+            for (repo_name, repo_cfg) in binary_repos {
+                match db::repo::find_binary_repo_package(
+                    repo_name,
+                    repo_cfg,
+                    options.rootfs,
+                    &config.package_cache_dir,
+                    &name,
+                ) {
+                    Ok(Some(rec)) => {
+                        let archive = db::repo::fetch_binary_package_archive(
+                            repo_name,
+                            repo_cfg,
+                            options.rootfs,
+                            &rec,
+                            &config.package_cache_dir,
+                        )?;
+                        ui::info(format!(
+                            "Resolved '{}' from binary repo '{}' as {}-{} (package {}) ({} bytes){} -> {}",
+                            name,
+                            repo_name,
+                            rec.version,
+                            rec.revision,
+                            rec.name,
+                            rec.size,
+                            rec.description
+                                .as_ref()
+                                .map(|d| format!(" [{}]", d))
+                                .unwrap_or_default(),
+                            archive.display()
+                        ));
+                        spec_path = archive;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        crate::log_warn!("Binary repo '{}': {}", repo_name, e);
+                    }
+                }
+            }
+        }
+    }
+
+    ui::info(format!("Installing package from: {}", spec_path.display()));
+
+    let (mut pkg_spec, staging_dir): (package::PackageSpec, Option<tempfile::TempDir>) =
+        if spec_path.to_string_lossy().ends_with(".tar.zst") {
+            // Install from archive
+            ui::info(format!("Detected package archive: {}", spec_path.display()));
+            let (spec, tmp_dir) = load_package_archive_into_staging(&spec_path)?;
+            (spec, Some(tmp_dir))
+        } else {
+            // Install from spec (normal build)
+            let mut pkg_spec = package::PackageSpec::from_file(&spec_path)?;
+            pkg_spec.apply_config(config);
+            (pkg_spec, None)
+        };
+
+    if options.lib32_only && staging_dir.is_some() {
+        anyhow::bail!("--lib32-only is only supported when installing from a package spec");
+    }
+
+    ui::info(format!(
+        "Package: {} v{}-{}",
+        pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
+    ));
+
+    if options.dry_run {
+        ui::info("Dry run enabled, stopping before install/build work.");
+        return Ok(false);
+    }
+
+    let install_targets = vec![format!(
+        "{} v{}-{}",
+        pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
+    )];
+    if !ui::prompt_package_action("installation", &install_targets, true)? {
+        anyhow::bail!("Aborted");
+    }
+
+    // TODO(snapper): create pre-install snapshot before install work starts.
+
+    // Ensure database directory exists
+    std::fs::create_dir_all(&config.db_dir).with_context(|| {
+        format!(
+            "Failed to create database directory: {}",
+            config.db_dir.display()
+        )
+    })?;
+    let db_path = config.db_dir.join("packages.db");
+
+    if staging_dir.is_none() {
+        maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
+    }
+
+    // Check dependencies and prompt for auto-install if needed
+    if !options.no_deps {
+        deps::print_dep_status(&pkg_spec, &db_path)?;
+
+        // Collect all missing dependencies (build + runtime)
+        let missing = merge_missing_dependencies(
+            deps::check_build_deps(&pkg_spec, &db_path)?,
+            deps::check_runtime_deps(&pkg_spec, &db_path)?,
+        );
+        if !missing.is_empty() {
+            // Check for dependency cycles via DEPOT_DEPCHAIN env var
+            let dep_chain = std::env::var("DEPOT_DEPCHAIN").unwrap_or_default();
+            let chain_set: std::collections::HashSet<&str> =
+                dep_chain.split(',').filter(|s| !s.is_empty()).collect();
+
+            if chain_set.contains(pkg_spec.package.name.as_str()) {
+                anyhow::bail!(
+                    "Dependency cycle detected! {} is already in chain: {}",
+                    pkg_spec.package.name,
+                    dep_chain
+                );
+            }
+
+            ui::warn(format!("Missing dependencies: {}", missing.join(", ")));
+            if ui::prompt_package_action("dependency installation", &missing, true)? {
+                // Build package index for fast lookups
+                let pkg_index =
+                    index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
+
+                // Build new dep chain
+                let new_chain = if dep_chain.is_empty() {
+                    pkg_spec.package.name.clone()
+                } else {
+                    format!("{},{}", dep_chain, pkg_spec.package.name)
+                };
+
+                // Attempt to install missing deps
+                for dep in missing {
+                    // Use package index for O(1) lookup
+                    let candidate = pkg_index.find(&dep);
+
+                    if let Some(dep_spec_path) = candidate {
+                        ui::info(format!("Installing dependency: {}...", dep));
+
+                        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+                        cmd.arg("-r").arg(options.rootfs);
+
+                        if options.no_deps {
+                            cmd.arg("--no-deps");
+                        }
+                        if options.no_flags {
+                            cmd.arg("--no-flags");
+                        }
+                        if let Some(p) = options.cross_prefix {
+                            cmd.arg("--cross-prefix").arg(p);
+                        }
+                        if options.clean {
+                            cmd.arg("--clean");
+                        }
+
+                        cmd.arg("install").arg(&dep_spec_path);
+                        cmd.env("DEPOT_DEPCHAIN", &new_chain);
+
+                        let status = cmd.status()?;
+
+                        if !status.success() {
+                            anyhow::bail!("Failed to install dependency: {}", dep);
+                        }
+                    } else {
+                        anyhow::bail!("Could not find package spec for dependency: {}", dep);
+                    }
+                }
+            }
+        }
+
+        // Enforce required dependencies before building/installing.
+        deps::require_build_deps(&pkg_spec, &db_path)?;
+        deps::require_runtime_deps(&pkg_spec, &db_path)?;
+    }
+
+    let cross_config = options
+        .cross_prefix
+        .map(cross::CrossConfig::from_prefix)
+        .transpose()?;
+    let mut built_src_dir: Option<PathBuf> = None;
+
+    let destdir = if let Some(dir) = &staging_dir {
+        dir.path().to_path_buf()
+    } else {
+        // 1-2. Fetch + extract sources (supports archives and git URL#rev)
+        let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
+        built_src_dir = Some(src_dir.clone());
+
+        // 3. Build
+        let destdir = config
+            .build_dir
+            .join("destdir")
+            .join(&pkg_spec.package.name);
+
+        if !options.lib32_only {
+            builder::build(
+                &pkg_spec,
+                &src_dir,
+                &destdir,
+                cross_config.as_ref(),
+                !options.no_flags,
+            )?;
+
+            // 3.1 Copy license files into staged tree
+            staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
+            install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
+        }
+
+        destdir
+    };
+
+    if !options.lib32_only {
+        if staging_dir.is_none() {
+            // Source-build path: apply staging transforms (strip/compress/static cleanup).
+            staging::process(&destdir, &pkg_spec)?;
+        } else {
+            // Binary archive path: install as-packaged without post-build transformations.
+            ui::info("Installing binary archive payload without staging transforms");
+        }
+
+        let installed =
+            install_package_outputs_to_rootfs(&pkg_spec, &destdir, options.rootfs, config)?;
+        for pkg in installed {
+            ui::success(format!(
+                "Successfully installed {} v{}",
+                pkg.name, pkg.version
+            ));
+            // TODO(snapper): create post-install snapshot after install commit succeeds.
+        }
+    }
+
+    if let Some(src_dir) = built_src_dir.as_deref()
+        && let Some((lib32_spec, lib32_destdir)) = build_lib32_companion_package(
+            &pkg_spec,
+            src_dir,
+            config,
+            cross_config.as_ref(),
+            !options.no_flags,
+            options.lib32_only,
+        )?
+    {
+        install_staged_to_rootfs(&lib32_spec, &lib32_destdir, options.rootfs, config)?;
+        ui::success(format!(
+            "Successfully installed {} v{}",
+            lib32_spec.package.name, lib32_spec.package.version
+        ));
+    }
+
+    Ok(true)
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     ui::set_assume_yes(cli.yes);
 
@@ -1266,340 +1579,95 @@ pub fn run(cli: Cli) -> Result<()> {
             if !crate::fakeroot::is_root() {
                 anyhow::bail!("The 'install' command must be run as root");
             }
-            let mut spec_path = spec.unwrap_or(spec_or_archive);
-
-            // Load configuration early so we can use the configured repo clone dir
-            let config = config::Config::for_rootfs(&cli.rootfs);
-
-            if !cli.no_deps {
-                let request_path_like = spec_path.exists();
-                let is_archive_request = request_path_like
-                    && spec_path
-                        .to_string_lossy()
-                        .to_ascii_lowercase()
-                        .ends_with(".tar.zst");
-                if !is_archive_request {
-                    let target = if request_path_like {
-                        planner::InstallTarget::SpecPath(spec_path.clone())
-                    } else {
-                        planner::InstallTarget::PackageName(spec_path.to_string_lossy().to_string())
-                    };
-                    let local_sibling_root = spec_path
-                        .parent()
-                        .and_then(|p| p.parent())
-                        .map(Path::to_path_buf);
-                    let plan = planner::build_install_plan(
-                        &config,
-                        &cli.rootfs,
-                        target,
-                        planner::PlannerOptions {
-                            assume_yes: cli.yes,
-                            prefer_binary: config.repo_settings.prefer_binary,
-                            local_sibling_root,
-                        },
-                    )?;
-                    print_plan_summary(&plan);
-                    execute_install_plan_with_child_commands(
-                        &plan,
-                        &cli.rootfs,
-                        &config,
-                        InstallPlanExecutionOptions {
-                            no_flags: cli.no_flags,
-                            cross_prefix: cli.cross_prefix.as_deref(),
-                            clean: cli.clean,
-                            dry_run: cli.dry_run,
-                            confirm_installation: true,
-                        },
-                    )?;
-                    if cli.clean {
-                        clean_build_workspace(&config)?;
-                    }
-                    return Ok(());
-                }
-            }
-
-            let mut install_lock = locking::open_lock(&config)?;
-            let install_lock_path = locking::lock_path(&config);
-            let _install_lock_guard =
-                locking::try_write(&mut install_lock, &install_lock_path, "install")?;
-
-            // Repo clone dir is available via `config.repo_clone_dir` and
-            // is passed explicitly to index builders below.
-
-            // If the provided path doesn't exist, treat it as a package name and
-            // try to locate a spec under configured repo dir or local packages/.
-            if !spec_path.exists() {
-                let name = spec_path.to_string_lossy().to_string();
-                ui::info(format!("Looking up package '{}' in local indexes...", name));
-                let pkg_index =
-                    index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
-                if let Some(found) = pkg_index.find(&name) {
-                    spec_path = found;
-                } else {
-                    let host_arch = std::env::consts::ARCH;
-                    let mut binary_repos: Vec<_> = config
-                        .binary_repos
-                        .iter()
-                        .filter(|(_, repo)| repo.enabled && repo.supports_arch(host_arch))
-                        .collect();
-                    binary_repos
-                        .sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
-
-                    for (repo_name, repo_cfg) in binary_repos {
-                        match db::repo::find_binary_repo_package(
-                            repo_name,
-                            repo_cfg,
-                            &cli.rootfs,
-                            &config.package_cache_dir,
-                            &name,
-                        ) {
-                            Ok(Some(rec)) => {
-                                let archive = db::repo::fetch_binary_package_archive(
-                                    repo_name,
-                                    repo_cfg,
-                                    &cli.rootfs,
-                                    &rec,
-                                    &config.package_cache_dir,
-                                )?;
-                                ui::info(format!(
-                                    "Resolved '{}' from binary repo '{}' as {}-{} (package {}) ({} bytes){} -> {}",
-                                    name,
-                                    repo_name,
-                                    rec.version,
-                                    rec.revision,
-                                    rec.name,
-                                    rec.size,
-                                    rec.description
-                                        .as_ref()
-                                        .map(|d| format!(" [{}]", d))
-                                        .unwrap_or_default(),
-                                    archive.display()
-                                ));
-                                spec_path = archive;
-                                break;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                crate::log_warn!("Binary repo '{}': {}", repo_name, e);
-                            }
-                        }
-                    }
-                }
-            }
-
-            ui::info(format!("Installing package from: {}", spec_path.display()));
-
-            let (mut pkg_spec, staging_dir): (package::PackageSpec, Option<tempfile::TempDir>) =
-                if spec_path.to_string_lossy().ends_with(".tar.zst") {
-                    // Install from archive
-                    ui::info(format!("Detected package archive: {}", spec_path.display()));
-                    let (spec, tmp_dir) = load_package_archive_into_staging(&spec_path)?;
-                    (spec, Some(tmp_dir))
-                } else {
-                    // Install from spec (normal build)
-                    let mut pkg_spec = package::PackageSpec::from_file(&spec_path)?;
-                    pkg_spec.apply_config(&config);
-                    (pkg_spec, None)
-                };
-
-            if cli.lib32_only && staging_dir.is_some() {
-                anyhow::bail!("--lib32-only is only supported when installing from a package spec");
-            }
-
-            ui::info(format!(
-                "Package: {} v{}-{}",
-                pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
-            ));
-
-            if cli.dry_run {
-                ui::info("Dry run enabled, stopping before install/build work.");
-                return Ok(());
-            }
-
-            let install_targets = vec![format!(
-                "{} v{}-{}",
-                pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
-            )];
-            if !ui::prompt_package_action("installation", &install_targets, true)? {
-                anyhow::bail!("Aborted");
-            }
-
-            // TODO(snapper): create pre-install snapshot before install work starts.
-
-            // Ensure database directory exists
-            std::fs::create_dir_all(&config.db_dir).with_context(|| {
-                format!(
-                    "Failed to create database directory: {}",
-                    config.db_dir.display()
-                )
-            })?;
-            let db_path = config.db_dir.join("packages.db");
-
-            if staging_dir.is_none() {
-                maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
-            }
-
-            // Check dependencies and prompt for auto-install if needed
-            if !cli.no_deps {
-                deps::print_dep_status(&pkg_spec, &db_path)?;
-
-                // Collect all missing dependencies (build + runtime)
-                let missing = merge_missing_dependencies(
-                    deps::check_build_deps(&pkg_spec, &db_path)?,
-                    deps::check_runtime_deps(&pkg_spec, &db_path)?,
-                );
-                if !missing.is_empty() {
-                    // Check for dependency cycles via DEPOT_DEPCHAIN env var
-                    let dep_chain = std::env::var("DEPOT_DEPCHAIN").unwrap_or_default();
-                    let chain_set: std::collections::HashSet<&str> =
-                        dep_chain.split(',').filter(|s| !s.is_empty()).collect();
-
-                    if chain_set.contains(pkg_spec.package.name.as_str()) {
-                        anyhow::bail!(
-                            "Dependency cycle detected! {} is already in chain: {}",
-                            pkg_spec.package.name,
-                            dep_chain
-                        );
-                    }
-
-                    ui::warn(format!("Missing dependencies: {}", missing.join(", ")));
-                    if ui::prompt_package_action("dependency installation", &missing, true)? {
-                        // Build package index for fast lookups
-                        let pkg_index = index::PackageIndex::build_with_repo_dir(Some(
-                            config.repo_clone_dir.clone(),
-                        ));
-
-                        // Build new dep chain
-                        let new_chain = if dep_chain.is_empty() {
-                            pkg_spec.package.name.clone()
-                        } else {
-                            format!("{},{}", dep_chain, pkg_spec.package.name)
-                        };
-
-                        // Attempt to install missing deps
-                        for dep in missing {
-                            // Use package index for O(1) lookup
-                            let candidate = pkg_index.find(&dep);
-
-                            if let Some(dep_spec_path) = candidate {
-                                ui::info(format!("Installing dependency: {}...", dep));
-
-                                let mut cmd = std::process::Command::new(std::env::current_exe()?);
-                                cmd.arg("-r").arg(&cli.rootfs);
-
-                                if cli.no_deps {
-                                    cmd.arg("--no-deps");
-                                }
-                                if cli.no_flags {
-                                    cmd.arg("--no-flags");
-                                }
-                                if let Some(ref p) = cli.cross_prefix {
-                                    cmd.arg("--cross-prefix").arg(p);
-                                }
-                                if cli.clean {
-                                    cmd.arg("--clean");
-                                }
-
-                                cmd.arg("install").arg(&dep_spec_path);
-                                cmd.env("DEPOT_DEPCHAIN", &new_chain);
-
-                                let status = cmd.status()?;
-
-                                if !status.success() {
-                                    anyhow::bail!("Failed to install dependency: {}", dep);
-                                }
-                            } else {
-                                anyhow::bail!(
-                                    "Could not find package spec for dependency: {}",
-                                    dep
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Enforce required dependencies before building/installing.
-                deps::require_build_deps(&pkg_spec, &db_path)?;
-                deps::require_runtime_deps(&pkg_spec, &db_path)?;
-            }
-
-            let cross_config = cli
-                .cross_prefix
-                .as_ref()
-                .map(|p| cross::CrossConfig::from_prefix(p))
-                .transpose()?;
-            let mut built_src_dir: Option<PathBuf> = None;
-
-            let destdir = if let Some(dir) = &staging_dir {
-                dir.path().to_path_buf()
-            } else {
-                // 1-2. Fetch + extract sources (supports archives and git URL#rev)
-                let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
-                built_src_dir = Some(src_dir.clone());
-
-                // 3. Build
-                let destdir = config
-                    .build_dir
-                    .join("destdir")
-                    .join(&pkg_spec.package.name);
-
-                if !cli.lib32_only {
-                    builder::build(
-                        &pkg_spec,
-                        &src_dir,
-                        &destdir,
-                        cross_config.as_ref(),
-                        !cli.no_flags,
-                    )?;
-
-                    // 3.1 Copy license files into staged tree
-                    staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
-                    install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
-                }
-
-                destdir
+            let install_requests = match spec {
+                Some(spec_path) => vec![spec_path],
+                None => spec_or_archive,
             };
 
-            if !cli.lib32_only {
-                if staging_dir.is_none() {
-                    // Source-build path: apply staging transforms (strip/compress/static cleanup).
-                    staging::process(&destdir, &pkg_spec)?;
+            // Load configuration early so we can use configured repos/paths.
+            let config = config::Config::for_rootfs(&cli.rootfs);
+            let mut planned_targets = Vec::new();
+            let mut planned_spec_paths = Vec::new();
+            let mut direct_requests = Vec::new();
+
+            if cli.no_deps {
+                direct_requests = install_requests;
+            } else {
+                for request in install_requests {
+                    if is_archive_install_request(&request) {
+                        direct_requests.push(request);
+                        continue;
+                    }
+                    if request.exists() {
+                        planned_spec_paths.push(request.clone());
+                        planned_targets.push(planner::InstallTarget::SpecPath(request));
+                    } else {
+                        planned_targets.push(planner::InstallTarget::PackageName(
+                            request.to_string_lossy().to_string(),
+                        ));
+                    }
+                }
+            }
+
+            let mut ran_plan_mode = false;
+            if !planned_targets.is_empty() {
+                ran_plan_mode = true;
+                let planner_opts = planner::PlannerOptions {
+                    assume_yes: cli.yes,
+                    prefer_binary: config.repo_settings.prefer_binary,
+                    local_sibling_root: shared_local_sibling_root(&planned_spec_paths),
+                };
+                let plan = if planned_targets.len() == 1 {
+                    planner::build_install_plan(
+                        &config,
+                        &cli.rootfs,
+                        planned_targets[0].clone(),
+                        planner_opts,
+                    )?
                 } else {
-                    // Binary archive path: install as-packaged without post-build transformations.
-                    ui::info("Installing binary archive payload without staging transforms");
-                }
-
-                let installed =
-                    install_package_outputs_to_rootfs(&pkg_spec, &destdir, &cli.rootfs, &config)?;
-                for pkg in installed {
-                    ui::success(format!(
-                        "Successfully installed {} v{}",
-                        pkg.name, pkg.version
-                    ));
-                    // TODO(snapper): create post-install snapshot after install commit succeeds.
-                }
-            }
-
-            if let Some(src_dir) = built_src_dir.as_deref()
-                && let Some((lib32_spec, lib32_destdir)) = build_lib32_companion_package(
-                    &pkg_spec,
-                    src_dir,
+                    planner::build_install_plan_for_targets(
+                        &config,
+                        &cli.rootfs,
+                        &planned_targets,
+                        planner_opts,
+                    )?
+                };
+                print_plan_summary(&plan);
+                execute_install_plan_with_child_commands(
+                    &plan,
+                    &cli.rootfs,
                     &config,
-                    cross_config.as_ref(),
-                    !cli.no_flags,
-                    cli.lib32_only,
-                )?
-            {
-                install_staged_to_rootfs(&lib32_spec, &lib32_destdir, &cli.rootfs, &config)?;
-                ui::success(format!(
-                    "Successfully installed {} v{}",
-                    lib32_spec.package.name, lib32_spec.package.version
-                ));
+                    InstallPlanExecutionOptions {
+                        no_flags: cli.no_flags,
+                        cross_prefix: cli.cross_prefix.as_deref(),
+                        clean: cli.clean,
+                        dry_run: cli.dry_run,
+                        confirm_installation: true,
+                    },
+                )?;
             }
 
-            install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
+            let mut ran_direct_install = false;
+            for request in direct_requests {
+                ran_direct_install |= run_direct_install_request(
+                    DirectInstallOptions {
+                        rootfs: &cli.rootfs,
+                        no_deps: cli.no_deps,
+                        no_flags: cli.no_flags,
+                        cross_prefix: cli.cross_prefix.as_deref(),
+                        clean: cli.clean,
+                        dry_run: cli.dry_run,
+                        lib32_only: cli.lib32_only,
+                    },
+                    &config,
+                    request,
+                )?;
+            }
+            if ran_direct_install {
+                install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
+            }
 
-            if cli.clean {
+            if cli.clean && (ran_plan_mode || ran_direct_install) {
                 clean_build_workspace(&config)?;
             }
         }

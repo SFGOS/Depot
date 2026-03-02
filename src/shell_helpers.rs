@@ -63,13 +63,7 @@ impl ShellHelpers {
             })?;
         }
 
-        let parent_path = std::env::var("PATH").unwrap_or_default();
-        let helper_path = bin_dir.to_string_lossy().into_owned();
-        let path_value = if parent_path.is_empty() {
-            helper_path
-        } else {
-            format!("{}:{}", helper_path, parent_path)
-        };
+        let path_value = crate::runtime_env::prepend_helper_to_safe_path(&bin_dir);
 
         Ok(Self {
             _tempdir: tempdir,

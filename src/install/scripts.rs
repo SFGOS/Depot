@@ -467,6 +467,7 @@ fn run_script_with_rootfs_context(
         .env("DEPOT_ROOTFS", &rootfs_env)
         .env("DEPOT_ACTION", hook.action())
         .env("DEPOT_PHASE", hook.phase())
+        .env("PATH", crate::runtime_env::safe_script_path())
         .status()
         .with_context(|| {
             format!(
@@ -497,7 +498,8 @@ fn run_hook_script_in_chroot(
         .env("DEPOT_PACKAGE", pkg_name)
         .env("DEPOT_ROOTFS", "/")
         .env("DEPOT_ACTION", hook.action())
-        .env("DEPOT_PHASE", hook.phase());
+        .env("DEPOT_PHASE", hook.phase())
+        .env("PATH", crate::runtime_env::safe_script_path());
     if quiet {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
@@ -1065,6 +1067,30 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(rootfs.join("hook.out")).unwrap(),
             "install:pre:foo\n"
+        );
+    }
+
+    #[test]
+    fn run_hook_if_present_uses_safe_script_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scripts = tmp.path().join("scripts");
+        let rootfs = tmp.path().join("root");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        std::fs::write(
+            scripts.join("pre_install"),
+            "echo \"$PATH\" > \"$DEPOT_ROOTFS/path.out\"\n",
+        )
+        .unwrap();
+
+        let ran = run_hook_if_present(&scripts, Hook::PreInstall, &rootfs, "foo").unwrap();
+        assert!(ran);
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("path.out"))
+                .unwrap()
+                .trim_end(),
+            crate::runtime_env::safe_script_path()
         );
     }
 
