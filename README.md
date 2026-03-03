@@ -85,6 +85,10 @@ runtime = ["libc"]
 optional = ["bash-completion"]
 ```
 
+LTO controls are available via `build.flags`:
+- `ltoflags`: exported as `LTOFLAGS`
+- `use_lto`: defaults to `true`; when enabled, `ltoflags` are appended to `CFLAGS`, `CXXFLAGS`, and `LDFLAGS`
+
 ## Configuration
 
 Depot can be configured via `/etc/depot.d/` (or relative to the rootfs).

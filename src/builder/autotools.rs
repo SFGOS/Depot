@@ -32,9 +32,14 @@ pub fn build(
         flags.cc.clone()
     };
 
-    if export_compiler_flags && !flags.cflags.is_empty() {
-        // Expand shell command substitutions like $($CC -print-resource-dir)
-        let cflags_str = flags.cflags.join(" ");
+    if export_compiler_flags
+        && let Some(cflags_str) = env_vars
+            .iter()
+            .find(|(key, _)| key == "CFLAGS")
+            .map(|(_, value)| value.clone())
+        && !cflags_str.trim().is_empty()
+    {
+        // Expand shell command substitutions like $($CC -print-resource-dir).
         let expanded = expand_shell_commands(&cflags_str, &cc)?;
         crate::builder::set_env_var(&mut env_vars, "CFLAGS", expanded);
     }

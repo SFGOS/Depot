@@ -1,6 +1,6 @@
 [package]
 name = "depot"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 
 [lints.rust]
@@ -27,7 +27,7 @@ toml = "0.9.8"
 url = "2.5.8"
 walkdir = "2.5.0"
 xz2 = "0.1.7"
-zip = "8.1.0"
+zip = "8.2.0"
 zstd = { version = "0.13.3", features = ["zstdmt"] }
 inquire = "0.9.4"
 md5 = "0.8.0"

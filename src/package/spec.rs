@@ -300,6 +300,17 @@ impl PackageSpec {
                         self.build.flags.ldflags = vec![s.to_string()];
                     }
                 }
+                "ltoflags" | "lto_flags" | "lto-flags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.ltoflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.ltoflags = vec![s.to_string()];
+                    }
+                }
                 "keep" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.keep = arr
@@ -505,6 +516,11 @@ impl PackageSpec {
                         self.build.flags.no_flags = b;
                     }
                 }
+                "use_lto" | "use-lto" => {
+                    if let Some(b) = toml_value_as_boolish(v) {
+                        self.build.flags.use_lto = b;
+                    }
+                }
                 "no_strip" | "no-strip" => {
                     if let Some(b) = v.as_bool() {
                         self.build.flags.no_strip = b;
@@ -691,6 +707,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.ldflags.push(s.to_string());
+                    }
+                }
+            }
+            "ltoflags" | "lto_flags" | "lto-flags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .ltoflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.ltoflags.push(s.to_string());
                     }
                 }
             }
@@ -1063,6 +1091,11 @@ impl PackageSpec {
             "no_flags" | "no-flags" => {
                 if let Some(b) = values.last().and_then(|v| v.as_bool()) {
                     self.build.flags.no_flags = b;
+                }
+            }
+            "use_lto" | "use-lto" => {
+                if let Some(b) = values.last().and_then(toml_value_as_boolish) {
+                    self.build.flags.use_lto = b;
                 }
             }
             "no_strip" | "no-strip" => {
@@ -1686,6 +1719,8 @@ make_vars = ["V=1"]
 make_dirs = ["lib"]
 make_test_dirs = ["tests"]
 make_install_dirs = ["lib"]
+ltoflags = ["-flto=auto"]
+use_lto = true
 no_flags = true
 no_strip = true
 no_delete_static = true
@@ -1718,6 +1753,16 @@ post_configure = ["echo configured"]
             vec![toml::Value::Array(vec![toml::Value::String(
                 "etc/locale.gen".to_string(),
             )])],
+        );
+        config.appends.insert(
+            "build.flags.ltoflags".to_string(),
+            vec![toml::Value::Array(vec![toml::Value::String(
+                "-fno-fat-lto-objects".to_string(),
+            )])],
+        );
+        config.appends.insert(
+            "build.flags.use_lto".to_string(),
+            vec![toml::Value::Boolean(false)],
         );
         config.appends.insert(
             "build.flags.no_strip".to_string(),
@@ -1794,6 +1839,19 @@ post_configure = ["echo configured"]
                 .rustflags
                 .contains(&"opt-level=3".to_string())
         );
+        assert!(
+            spec.build
+                .flags
+                .ltoflags
+                .contains(&"-flto=auto".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .ltoflags
+                .contains(&"-fno-fat-lto-objects".to_string())
+        );
+        assert!(!spec.build.flags.use_lto);
         assert!(spec.build.flags.no_flags);
         assert!(!spec.build.flags.no_strip);
         assert!(!spec.build.flags.no_delete_static);
@@ -1915,6 +1973,79 @@ no_flags = true
 
         let spec = PackageSpec::from_file(&path).unwrap();
         assert!(spec.build.flags.no_flags);
+    }
+
+    #[test]
+    fn parse_ltoflags_and_use_lto_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+ltoflags = ["-flto=auto", "-fuse-linker-plugin"]
+use_lto = false
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.build.flags.ltoflags,
+            vec!["-flto=auto".to_string(), "-fuse-linker-plugin".to_string()]
+        );
+        assert!(!spec.build.flags.use_lto);
+    }
+
+    #[test]
+    fn parse_ltoflags_and_use_lto_aliases_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+LTOFLAGS = "-flto=auto"
+"use-lto" = false
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.build.flags.ltoflags, vec!["-flto=auto".to_string()]);
+        assert!(!spec.build.flags.use_lto);
     }
 
     #[test]
@@ -2800,9 +2931,28 @@ pub struct BuildFlags {
     pub cxxflags_lib32: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub ldflags: Vec<String>,
+    /// Link-time optimization flags exported to `LTOFLAGS`.
+    ///
+    /// When `use_lto` is true (default), these flags are also appended to
+    /// `CFLAGS`, `CXXFLAGS`, and `LDFLAGS`.
+    #[serde(
+        default,
+        alias = "lto-flags",
+        alias = "lto_flags",
+        alias = "LTOFLAGS",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub ltoflags: Vec<String>,
     /// Keep existing files and install package-provided replacement as `<path>.depotnew`.
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub keep: Vec<String>,
+    /// Disable automatic LTOFLAGS injection into CFLAGS/CXXFLAGS/LDFLAGS.
+    #[serde(
+        default = "default_use_lto",
+        alias = "use-lto",
+        deserialize_with = "deserialize_boolish"
+    )]
+    pub use_lto: bool,
     /// Disable exporting CFLAGS/CXXFLAGS/LDFLAGS for this package build.
     #[serde(default, alias = "no-flags")]
     pub no_flags: bool,
@@ -3071,7 +3221,9 @@ impl Default for BuildFlags {
             cxxflags: Vec::new(),
             cxxflags_lib32: Vec::new(),
             ldflags: Vec::new(),
+            ltoflags: Vec::new(),
             keep: Vec::new(),
+            use_lto: default_use_lto(),
             no_flags: false,
             no_strip: false,
             no_delete_static: false,
@@ -3254,6 +3406,10 @@ fn default_cc() -> String {
         return "clang".to_string();
     }
     "gcc".to_string()
+}
+
+fn default_use_lto() -> bool {
+    true
 }
 
 fn default_ar() -> String {

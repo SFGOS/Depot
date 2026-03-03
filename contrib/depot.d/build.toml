@@ -10,6 +10,10 @@ cflags += ["-pipe"]
 # Default LDFLAGS
 ldflags = ["-Wl,-O1"]
 
+# Default LTOFLAGS and automatic injection into CFLAGS/CXXFLAGS/LDFLAGS.
+ltoflags = ["-flto=auto"]
+use_lto = true
+
 # CARCH short name (can be overridden per-package)
 carch = "x86_64"
 

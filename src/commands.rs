@@ -491,12 +491,25 @@ fn build_lib32_companion_package(
     Ok(Some((lib32_pkg_spec, lib32_destdir)))
 }
 
-fn install_staged_to_rootfs(
+#[derive(Debug, Clone)]
+struct PlannedStagedInstall {
+    is_update: bool,
+    remove_paths: Vec<String>,
+    hook_context: install::hooks::HookExecutionContextOwned,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedPackageInstall {
+    spec: package::PackageSpec,
+    destdir: PathBuf,
+    staged: PlannedStagedInstall,
+}
+
+fn plan_staged_install(
     pkg_spec: &package::PackageSpec,
     destdir: &Path,
-    rootfs: &Path,
     config: &config::Config,
-) -> Result<()> {
+) -> Result<PlannedStagedInstall> {
     std::fs::create_dir_all(&config.db_dir).with_context(|| {
         format!(
             "Failed to create database directory: {}",
@@ -506,10 +519,6 @@ fn install_staged_to_rootfs(
     let db_path = config.db_dir.join("packages.db");
 
     let is_update = db::get_package_version(&db_path, &pkg_spec.package.name)?.is_some();
-    let staged_scripts_dir = install::scripts::staged_scripts_dir(destdir);
-    let installed_scripts_dir =
-        install::scripts::installed_scripts_dir(rootfs, &pkg_spec.package.name);
-
     let new_files = staging::generate_manifest_with_dirs(destdir)?;
     let remove_paths =
         db::calculate_upgrade_paths(&db_path, &pkg_spec.package.name, &new_files.files)?;
@@ -523,17 +532,64 @@ fn install_staged_to_rootfs(
     affected_paths.sort();
     affected_paths.dedup();
 
-    install::hooks::run_transaction_hooks(
-        rootfs,
-        &install::hooks::HookExecutionContext {
-            phase: install::hooks::HookPhase::Pre,
+    Ok(PlannedStagedInstall {
+        is_update,
+        remove_paths,
+        hook_context: install::hooks::HookExecutionContextOwned {
             operation,
-            package: &pkg_spec.package.name,
-            affected_paths: &affected_paths,
+            package: pkg_spec.package.name.clone(),
+            affected_paths,
         },
-    )?;
+    })
+}
 
-    if is_update {
+fn plan_package_outputs_for_install(
+    pkg_spec: &package::PackageSpec,
+    destdir: &Path,
+    config: &config::Config,
+) -> Result<Vec<PlannedPackageInstall>> {
+    let mut plans = Vec::new();
+    for out in pkg_spec.outputs() {
+        let mut spec_for_out = pkg_spec.clone();
+        let output_name = out.name.clone();
+        spec_for_out.package = out;
+        spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
+        spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
+        let out_destdir = output_destdir_for(destdir, &pkg_spec.package.name, &output_name);
+        let staged = plan_staged_install(&spec_for_out, &out_destdir, config)?;
+        plans.push(PlannedPackageInstall {
+            spec: spec_for_out,
+            destdir: out_destdir,
+            staged,
+        });
+    }
+    Ok(plans)
+}
+
+fn run_transaction_hooks_for_plans(
+    rootfs: &Path,
+    phase: install::hooks::HookPhase,
+    plans: &[PlannedPackageInstall],
+) -> Result<usize> {
+    let contexts: Vec<_> = plans
+        .iter()
+        .map(|plan| plan.staged.hook_context.clone())
+        .collect();
+    install::hooks::run_transaction_hooks_batch(rootfs, phase, &contexts)
+}
+
+fn install_staged_to_rootfs(
+    pkg_spec: &package::PackageSpec,
+    destdir: &Path,
+    rootfs: &Path,
+    config: &config::Config,
+    plan: &PlannedStagedInstall,
+) -> Result<()> {
+    let staged_scripts_dir = install::scripts::staged_scripts_dir(destdir);
+    let installed_scripts_dir =
+        install::scripts::installed_scripts_dir(rootfs, &pkg_spec.package.name);
+
+    if plan.is_update {
         let has_staged_pre = install::scripts::run_hook_if_present(
             &staged_scripts_dir,
             install::scripts::Hook::PreUpdate,
@@ -562,10 +618,11 @@ fn install_staged_to_rootfs(
         destdir,
         rootfs,
         &tx_base,
-        &remove_paths,
+        &plan.remove_paths,
         &pkg_spec.build.flags.keep,
     )?;
 
+    let db_path = config.db_dir.join("packages.db");
     if let Err(e) = db::register_package(&db_path, pkg_spec, destdir) {
         let _ = tx.rollback();
         return Err(e);
@@ -578,7 +635,7 @@ fn install_staged_to_rootfs(
         &pkg_spec.package.name,
     )?;
 
-    if is_update {
+    if plan.is_update {
         let _ = install::scripts::run_hook_if_present(
             &installed_scripts_dir,
             install::scripts::Hook::PostUpdate,
@@ -594,36 +651,33 @@ fn install_staged_to_rootfs(
         )?;
     }
 
-    install::hooks::run_transaction_hooks(
-        rootfs,
-        &install::hooks::HookExecutionContext {
-            phase: install::hooks::HookPhase::Post,
-            operation,
-            package: &pkg_spec.package.name,
-            affected_paths: &affected_paths,
-        },
-    )?;
-
     Ok(())
 }
 
+fn install_planned_packages_to_rootfs(
+    plans: &[PlannedPackageInstall],
+    rootfs: &Path,
+    config: &config::Config,
+) -> Result<Vec<package::PackageInfo>> {
+    let mut installed = Vec::with_capacity(plans.len());
+    for plan in plans {
+        install_staged_to_rootfs(&plan.spec, &plan.destdir, rootfs, config, &plan.staged)?;
+        installed.push(plan.spec.package.clone());
+    }
+    Ok(installed)
+}
+
+#[cfg(test)]
 fn install_package_outputs_to_rootfs(
     pkg_spec: &package::PackageSpec,
     destdir: &Path,
     rootfs: &Path,
     config: &config::Config,
 ) -> Result<Vec<package::PackageInfo>> {
-    let mut installed = Vec::new();
-    for out in pkg_spec.outputs() {
-        let mut spec_for_out = pkg_spec.clone();
-        let output_name = out.name.clone();
-        spec_for_out.package = out;
-        spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
-        spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
-        let out_destdir = output_destdir_for(destdir, &pkg_spec.package.name, &output_name);
-        install_staged_to_rootfs(&spec_for_out, &out_destdir, rootfs, config)?;
-        installed.push(spec_for_out.package);
-    }
+    let plans = plan_package_outputs_for_install(pkg_spec, destdir, config)?;
+    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Pre, &plans)?;
+    let installed = install_planned_packages_to_rootfs(&plans, rootfs, config)?;
+    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Post, &plans)?;
     Ok(installed)
 }
 
@@ -1196,8 +1250,32 @@ fn execute_install_plan_with_child_commands(
         signature_pb.finish_and_clear();
     }
 
+    let mut binary_pre_hook_plans = Vec::new();
+    for step in &actionable_steps {
+        if let planner::PlanOrigin::Binary { repo_name, record } = &step.origin {
+            let cached = binary_archives
+                .get(&(repo_name.clone(), record.filename.clone()))
+                .with_context(|| {
+                    format!(
+                        "Cached archive missing for planned binary step '{}' from repo '{}'",
+                        record.filename, repo_name
+                    )
+                })?;
+            let staged = extract_package_archive_to_staging(&cached.package_path)?;
+            let spec = package_spec_from_repo_record(record);
+            let plans = plan_package_outputs_for_install(&spec, staged.path(), config)?;
+            binary_pre_hook_plans.extend(plans);
+        }
+    }
+    run_transaction_hooks_for_plans(
+        rootfs,
+        install::hooks::HookPhase::Pre,
+        &binary_pre_hook_plans,
+    )?;
+
     let exe = std::env::current_exe().context("Failed to locate depot executable")?;
     let total_steps = actionable_steps.len();
+    let mut binary_post_hook_plans = Vec::new();
     for (idx, step) in actionable_steps.into_iter().enumerate() {
         match &step.origin {
             planner::PlanOrigin::Source { path, .. } => {
@@ -1241,8 +1319,9 @@ fn execute_install_plan_with_child_commands(
                     })?;
                 let staged = extract_package_archive_to_staging(&cached.package_path)?;
                 let spec = package_spec_from_repo_record(record);
-                let installed =
-                    install_package_outputs_to_rootfs(&spec, staged.path(), rootfs, config)?;
+                let plans = plan_package_outputs_for_install(&spec, staged.path(), config)?;
+                let installed = install_planned_packages_to_rootfs(&plans, rootfs, config)?;
+                binary_post_hook_plans.extend(plans);
                 for pkg in installed {
                     ui::success(format!("Installed {} v{}", pkg.name, pkg.version));
                 }
@@ -1251,6 +1330,11 @@ fn execute_install_plan_with_child_commands(
         }
     }
 
+    run_transaction_hooks_for_plans(
+        rootfs,
+        install::hooks::HookPhase::Post,
+        &binary_post_hook_plans,
+    )?;
     install::scripts::run_deferred_hooks_if_possible(rootfs)?;
     Ok(())
 }
@@ -1528,6 +1612,8 @@ fn run_direct_install_request(
         destdir
     };
 
+    let mut transaction_plans = Vec::new();
+
     if !options.lib32_only {
         if staging_dir.is_none() {
             // Source-build path: apply staging transforms (strip/compress/static cleanup).
@@ -1537,15 +1623,8 @@ fn run_direct_install_request(
             ui::info("Installing binary archive payload without staging transforms");
         }
 
-        let installed =
-            install_package_outputs_to_rootfs(&pkg_spec, &destdir, options.rootfs, config)?;
-        for pkg in installed {
-            ui::success(format!(
-                "Successfully installed {} v{}",
-                pkg.name, pkg.version
-            ));
-            // TODO(snapper): create post-install snapshot after install commit succeeds.
-        }
+        let output_plans = plan_package_outputs_for_install(&pkg_spec, &destdir, config)?;
+        transaction_plans.extend(output_plans);
     }
 
     if let Some(src_dir) = built_src_dir.as_deref()
@@ -1558,12 +1637,32 @@ fn run_direct_install_request(
             options.lib32_only,
         )?
     {
-        install_staged_to_rootfs(&lib32_spec, &lib32_destdir, options.rootfs, config)?;
+        let staged = plan_staged_install(&lib32_spec, &lib32_destdir, config)?;
+        transaction_plans.push(PlannedPackageInstall {
+            spec: lib32_spec,
+            destdir: lib32_destdir,
+            staged,
+        });
+    }
+
+    run_transaction_hooks_for_plans(
+        options.rootfs,
+        install::hooks::HookPhase::Pre,
+        &transaction_plans,
+    )?;
+    let installed = install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
+    for pkg in installed {
         ui::success(format!(
             "Successfully installed {} v{}",
-            lib32_spec.package.name, lib32_spec.package.version
+            pkg.name, pkg.version
         ));
+        // TODO(snapper): create post-install snapshot after install commit succeeds.
     }
+    run_transaction_hooks_for_plans(
+        options.rootfs,
+        install::hooks::HookPhase::Post,
+        &transaction_plans,
+    )?;
 
     Ok(true)
 }
@@ -1925,37 +2024,43 @@ pub fn run(cli: Cli) -> Result<()> {
                     ));
                 }
                 if ui::prompt_package_action("installation", &install_targets, false)? {
+                    let mut transaction_plans = Vec::new();
                     if !cli.lib32_only {
-                        for out in pkg_spec.outputs() {
-                            let mut spec_for_out = pkg_spec.clone();
-                            let output_name = out.name.clone();
-                            spec_for_out.package = out;
-                            spec_for_out.alternatives =
-                                pkg_spec.alternatives_for_output(&output_name);
-                            spec_for_out.dependencies =
-                                pkg_spec.dependencies_for_output(&output_name);
-                            let out_destdir =
-                                output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
-                            install_staged_to_rootfs(
-                                &spec_for_out,
-                                &out_destdir,
-                                &cli.rootfs,
-                                &config,
-                            )?;
-                            ui::success(format!(
-                                "Successfully installed {} v{}",
-                                spec_for_out.package.name, spec_for_out.package.version
-                            ));
-                            // TODO(snapper): create post-install snapshot after --install commit succeeds.
-                        }
+                        let output_plans =
+                            plan_package_outputs_for_install(&pkg_spec, &destdir, &config)?;
+                        transaction_plans.extend(output_plans);
                     }
                     if let Some((lib32_spec, lib32_destdir)) = &lib32_install_bundle {
-                        install_staged_to_rootfs(lib32_spec, lib32_destdir, &cli.rootfs, &config)?;
+                        let staged = plan_staged_install(lib32_spec, lib32_destdir, &config)?;
+                        transaction_plans.push(PlannedPackageInstall {
+                            spec: lib32_spec.clone(),
+                            destdir: lib32_destdir.clone(),
+                            staged,
+                        });
+                    }
+
+                    run_transaction_hooks_for_plans(
+                        &cli.rootfs,
+                        install::hooks::HookPhase::Pre,
+                        &transaction_plans,
+                    )?;
+                    let installed = install_planned_packages_to_rootfs(
+                        &transaction_plans,
+                        &cli.rootfs,
+                        &config,
+                    )?;
+                    for pkg in installed {
                         ui::success(format!(
                             "Successfully installed {} v{}",
-                            lib32_spec.package.name, lib32_spec.package.version
+                            pkg.name, pkg.version
                         ));
+                        // TODO(snapper): create post-install snapshot after --install commit succeeds.
                     }
+                    run_transaction_hooks_for_plans(
+                        &cli.rootfs,
+                        install::hooks::HookPhase::Post,
+                        &transaction_plans,
+                    )?;
 
                     install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
                 } else {

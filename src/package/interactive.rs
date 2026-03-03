@@ -880,6 +880,19 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             ),
         );
     }
+    if !spec.build.flags.ltoflags.is_empty() {
+        flags_tbl.insert(
+            "ltoflags".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .ltoflags
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if !spec.build.flags.keep.is_empty() {
         flags_tbl.insert(
             "keep".into(),
@@ -892,6 +905,9 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
                     .collect(),
             ),
         );
+    }
+    if spec.build.flags.use_lto != defaults.use_lto {
+        flags_tbl.insert("use_lto".into(), Value::Boolean(spec.build.flags.use_lto));
     }
     if spec.build.flags.no_flags != defaults.no_flags {
         flags_tbl.insert("no_flags".into(), Value::Boolean(spec.build.flags.no_flags));
@@ -1474,8 +1490,10 @@ mod tests {
         flags.config_settings = vec!["editable_mode=compat".into()];
         flags.rustflags = vec!["-Ctarget-cpu=native".into()];
         flags.cxxflags = vec!["-O2".into(), "-fno-rtti".into()];
+        flags.ltoflags = vec!["-flto=auto".into()];
         flags.target = "x86_64-unknown-linux-gnu".into();
         flags.keep = vec!["etc/locale.gen".into()];
+        flags.use_lto = false;
         flags.no_flags = true;
         flags.no_strip = true;
         flags.no_delete_static = true;
@@ -1532,9 +1550,11 @@ mod tests {
         assert!(toml.contains("config_setting = ["));
         assert!(toml.contains("rustflags = ["));
         assert!(toml.contains("cxxflags = ["));
+        assert!(toml.contains("ltoflags = ["));
         assert!(toml.contains("target = \"x86_64-unknown-linux-gnu\""));
         assert!(toml.contains("keep = ["));
         assert!(toml.contains("\"etc/locale.gen\""));
+        assert!(toml.contains("use_lto = false"));
         assert!(toml.contains("no_flags = true"));
         assert!(toml.contains("no_strip = true"));
         assert!(toml.contains("no_delete_static = true"));

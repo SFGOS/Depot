@@ -28,6 +28,23 @@ pub fn set_env_var(env_vars: &mut EnvVars, key: &str, value: impl Into<String>) 
     }
 }
 
+fn compiler_flag_sets(
+    flags: &crate::package::BuildFlags,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut cflags = flags.cflags.clone();
+    let mut cxxflags = flags.cxxflags.clone();
+    let mut ldflags = flags.ldflags.clone();
+    let ltoflags = flags.ltoflags.clone();
+
+    if flags.use_lto && !ltoflags.is_empty() {
+        cflags.extend(ltoflags.iter().cloned());
+        cxxflags.extend(ltoflags.iter().cloned());
+        ldflags.extend(ltoflags.iter().cloned());
+    }
+
+    (cflags, cxxflags, ldflags, ltoflags)
+}
+
 pub fn standard_build_env(
     spec: &PackageSpec,
     cross: Option<&CrossConfig>,
@@ -39,24 +56,25 @@ pub fn standard_build_env(
     let export_compiler_flags = export_compiler_flags && !flags.no_flags;
 
     if include_compiler_env && export_compiler_flags {
-        if !flags.cflags.is_empty() {
-            set_env_var(&mut env_vars, "CFLAGS", flags.cflags.join(" "));
+        let (cflags, cxxflags, ldflags, ltoflags) = compiler_flag_sets(flags);
+
+        if !cflags.is_empty() {
+            set_env_var(&mut env_vars, "CFLAGS", cflags.join(" "));
         }
-        if !flags.cxxflags.is_empty() {
-            set_env_var(&mut env_vars, "CXXFLAGS", flags.cxxflags.join(" "));
+        if !cxxflags.is_empty() {
+            set_env_var(&mut env_vars, "CXXFLAGS", cxxflags.join(" "));
+        }
+        if !ltoflags.is_empty() {
+            set_env_var(&mut env_vars, "LTOFLAGS", ltoflags.join(" "));
         }
 
-        let ldflags = if !flags.ldflags.is_empty() || !flags.libc.is_empty() {
+        let ldflags = if !ldflags.is_empty() || !flags.libc.is_empty() {
             if flags.libc.is_empty() {
-                flags.ldflags.join(" ")
-            } else if flags.ldflags.is_empty() {
+                ldflags.join(" ")
+            } else if ldflags.is_empty() {
                 format!("-Wl,--dynamic-linker={}", flags.libc)
             } else {
-                format!(
-                    "{} -Wl,--dynamic-linker={}",
-                    flags.ldflags.join(" "),
-                    flags.libc
-                )
+                format!("{} -Wl,--dynamic-linker={}", ldflags.join(" "), flags.libc)
             }
         } else {
             String::new()
@@ -421,6 +439,65 @@ mod tests {
         assert!(
             !disabled_env.iter().any(|(k, _)| k == "LDFLAGS"),
             "expected LDFLAGS to be omitted when no_flags is set in spec"
+        );
+    }
+
+    #[test]
+    fn test_standard_build_env_injects_ltoflags_into_compiler_and_linker_flags() {
+        let mut spec = mk_spec(vec!["-O2"], vec!["-Wl,--as-needed"]);
+        spec.build.flags.cxxflags = vec!["-O2".into()];
+        spec.build.flags.ltoflags = vec!["-flto=auto".into(), "-fuse-linker-plugin".into()];
+        spec.build.flags.use_lto = true;
+
+        let env = standard_build_env(&spec, None, true, true);
+        assert!(
+            env.iter()
+                .any(|(k, v)| { k == "CFLAGS" && v == "-O2 -flto=auto -fuse-linker-plugin" }),
+            "expected LTOFLAGS to be appended to CFLAGS"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CXXFLAGS" && v == "-O2 -flto=auto -fuse-linker-plugin"),
+            "expected LTOFLAGS to be appended to CXXFLAGS"
+        );
+        assert!(
+            env.iter().any(|(k, v)| {
+                k == "LDFLAGS" && v == "-Wl,--as-needed -flto=auto -fuse-linker-plugin"
+            }),
+            "expected LTOFLAGS to be appended to LDFLAGS"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "LTOFLAGS" && v == "-flto=auto -fuse-linker-plugin"),
+            "expected LTOFLAGS variable to be exported"
+        );
+    }
+
+    #[test]
+    fn test_standard_build_env_skips_lto_injection_when_disabled() {
+        let mut spec = mk_spec(vec!["-O2"], vec!["-Wl,--as-needed"]);
+        spec.build.flags.cxxflags = vec!["-O2".into()];
+        spec.build.flags.ltoflags = vec!["-flto=auto".into()];
+        spec.build.flags.use_lto = false;
+
+        let env = standard_build_env(&spec, None, true, true);
+        assert!(
+            env.iter().any(|(k, v)| k == "CFLAGS" && v == "-O2"),
+            "expected CFLAGS to remain unchanged when use_lto is false"
+        );
+        assert!(
+            env.iter().any(|(k, v)| k == "CXXFLAGS" && v == "-O2"),
+            "expected CXXFLAGS to remain unchanged when use_lto is false"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "LDFLAGS" && v == "-Wl,--as-needed"),
+            "expected LDFLAGS to remain unchanged when use_lto is false"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "LTOFLAGS" && v == "-flto=auto"),
+            "expected LTOFLAGS variable to be exported even when use_lto is false"
         );
     }
 
