@@ -142,7 +142,7 @@ fn is_dep_satisfied(
 fn build_type_runs_automatic_tests(spec: &PackageSpec) -> bool {
     matches!(
         spec.build.build_type,
-        BuildType::Autotools | BuildType::CMake
+        BuildType::Autotools | BuildType::CMake | BuildType::Perl
     )
 }
 

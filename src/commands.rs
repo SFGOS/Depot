@@ -240,7 +240,7 @@ fn package_spec_from_repo_record(
 fn build_type_runs_automatic_tests(build_type: package::BuildType) -> bool {
     matches!(
         build_type,
-        package::BuildType::Autotools | package::BuildType::CMake
+        package::BuildType::Autotools | package::BuildType::CMake | package::BuildType::Perl
     )
 }
 

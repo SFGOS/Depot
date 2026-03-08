@@ -17,6 +17,7 @@ impl fmt::Display for BuildType {
             BuildType::Autotools => write!(f, "Autotools"),
             BuildType::CMake => write!(f, "CMake"),
             BuildType::Meson => write!(f, "Meson"),
+            BuildType::Perl => write!(f, "Perl"),
             BuildType::Custom => write!(f, "Custom"),
             BuildType::Python => write!(f, "Python"),
             BuildType::Rust => write!(f, "Rust"),
@@ -332,6 +333,7 @@ pub fn create_interactive() -> Result<PackageSpec> {
         BuildType::Autotools,
         BuildType::CMake,
         BuildType::Meson,
+        BuildType::Perl,
         BuildType::Makefile,
         BuildType::Python,
         BuildType::Rust,
@@ -528,12 +530,13 @@ pub fn create_interactive() -> Result<PackageSpec> {
 
         if matches!(
             build_type,
-            BuildType::Autotools | BuildType::CMake | BuildType::Meson
+            BuildType::Autotools | BuildType::CMake | BuildType::Meson | BuildType::Perl
         ) {
             let help = match build_type {
                 BuildType::Autotools => "Examples: --disable-static, --enable-nls, --with-zlib",
                 BuildType::CMake => "Examples: -DENABLE_TESTS=OFF, -DUSE_SYSTEM_LIBS=ON",
                 BuildType::Meson => "Examples: -Dtests=false, -Ddefault_library=static",
+                BuildType::Perl => "Examples: INSTALLDIRS=vendor, INC=-I/usr/include/foo",
                 _ => "",
             };
             if Confirm::new("Add configure/setup options?")
@@ -821,6 +824,7 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
         BuildType::Autotools => "autotools",
         BuildType::CMake => "cmake",
         BuildType::Meson => "meson",
+        BuildType::Perl => "perl",
         BuildType::Custom => "custom",
         BuildType::Python => "python",
         BuildType::Rust => "rust",

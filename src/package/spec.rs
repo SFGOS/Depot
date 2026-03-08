@@ -1473,6 +1473,36 @@ type = "python"
     }
 
     #[test]
+    fn parse_perl_build_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "perl"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert!(matches!(spec.build.build_type, BuildType::Perl));
+    }
+
+    #[test]
     fn parse_python_config_settings_from_spec() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -2927,6 +2957,7 @@ pub enum BuildType {
     Autotools,
     CMake,
     Meson,
+    Perl,
     Custom,
     Python,
     Rust,

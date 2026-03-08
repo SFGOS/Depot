@@ -362,7 +362,7 @@ fn num_cpus() -> usize {
         .unwrap_or(1)
 }
 
-fn resolve_actual_src(spec: &PackageSpec, src_dir: &Path) -> Result<std::path::PathBuf> {
+pub(crate) fn resolve_actual_src(spec: &PackageSpec, src_dir: &Path) -> Result<std::path::PathBuf> {
     let flags = &spec.build.flags;
     let source_subdir = spec.expand_vars(&flags.source_subdir);
 
@@ -496,7 +496,11 @@ fn maybe_find_autotools_test_target(
     find_autotools_test_target(build_dir)
 }
 
-fn resolve_make_dirs(build_dir: &Path, dirs: &[String], field_name: &str) -> Result<Vec<PathBuf>> {
+pub(crate) fn resolve_make_dirs(
+    build_dir: &Path,
+    dirs: &[String],
+    field_name: &str,
+) -> Result<Vec<PathBuf>> {
     if dirs.is_empty() {
         return Ok(vec![build_dir.to_path_buf()]);
     }
@@ -590,11 +594,11 @@ fn nonempty_trimmed(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-fn resolve_make_exec(configured: &str) -> &str {
+pub(crate) fn resolve_make_exec(configured: &str) -> &str {
     nonempty_trimmed(configured).unwrap_or("make")
 }
 
-fn phase_targets(single: &str, many: &[String], default: Option<&str>) -> Vec<String> {
+pub(crate) fn phase_targets(single: &str, many: &[String], default: Option<&str>) -> Vec<String> {
     let mut targets = Vec::new();
     if let Some(target) = nonempty_trimmed(single) {
         targets.push(target.to_string());
@@ -612,7 +616,7 @@ fn phase_targets(single: &str, many: &[String], default: Option<&str>) -> Vec<St
     targets
 }
 
-fn make_exec_supports_make_assignments(make_exec: &str) -> bool {
+pub(crate) fn make_exec_supports_make_assignments(make_exec: &str) -> bool {
     let Some(tool) = Path::new(make_exec)
         .file_name()
         .and_then(|name| name.to_str())
@@ -629,7 +633,7 @@ fn make_exec_supports_make_assignments(make_exec: &str) -> bool {
         || tool.ends_with("make.exe")
 }
 
-fn add_make_variable_overrides_if_supported(
+pub(crate) fn add_make_variable_overrides_if_supported(
     cmd: &mut Command,
     make_exec: &str,
     vars: &[String],
@@ -680,7 +684,7 @@ fn add_make_variable_overrides(cmd: &mut Command, vars: &[String], phase: &str) 
     Ok(())
 }
 
-fn has_make_variable_override(vars: &[String], name: &str) -> bool {
+pub(crate) fn has_make_variable_override(vars: &[String], name: &str) -> bool {
     vars.iter().any(|raw| {
         let var = raw.trim();
         let Some((lhs, _rhs)) = var.split_once('=') else {

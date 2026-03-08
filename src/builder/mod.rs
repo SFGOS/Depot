@@ -6,6 +6,7 @@ mod cmake;
 mod custom;
 mod makefile;
 mod meson;
+mod perl;
 mod python;
 mod rust;
 pub mod state;
@@ -247,6 +248,7 @@ pub fn build(
         }
         BuildType::CMake => cmake::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Meson => meson::build(spec, src_dir, destdir, cross, export_compiler_flags),
+        BuildType::Perl => perl::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Custom => custom::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Python => python::build(spec, src_dir, destdir, cross, export_compiler_flags),
         BuildType::Rust => rust::build(spec, src_dir, destdir, cross, export_compiler_flags),
