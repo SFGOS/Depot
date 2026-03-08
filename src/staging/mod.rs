@@ -18,6 +18,19 @@ use walkdir::WalkDir;
 pub const INTERNAL_DEPOT_DIR: &str = ".depot";
 pub const INTERNAL_OUTPUTS_DIR: &str = ".depot/outputs";
 
+fn is_info_dir_index_path(rel_path: &str) -> bool {
+    matches!(rel_path, "usr/info/dir" | "usr/share/info/dir")
+        || rel_path.starts_with("usr/info/dir.")
+        || rel_path.starts_with("usr/share/info/dir.")
+}
+
+fn is_purged_install_basename(rel_path: &str) -> bool {
+    Path::new(rel_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".packlist" || name.ends_with(".pod"))
+}
+
 fn is_skipped_install_path(rel_path: &str) -> bool {
     let p = rel_path.trim_start_matches('/');
     p == ".metadata.toml"
@@ -27,8 +40,8 @@ fn is_skipped_install_path(rel_path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
         || p == "scripts"
         || p.starts_with("scripts/")
-        || p == "usr/share/info/dir"
-        || p.starts_with("usr/share/info/dir.")
+        || is_info_dir_index_path(p)
+        || is_purged_install_basename(p)
 }
 
 /// Return the internal split-output staging root inside a package `destdir`.
@@ -1160,16 +1173,60 @@ mod tests {
         let destdir = tmp.path().join("dest");
         let tx_base = tmp.path().join("tx");
         std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/info")).unwrap();
         std::fs::create_dir_all(destdir.join("usr/share/info")).unwrap();
+        std::fs::write(destdir.join("usr/info/dir"), "legacy index").unwrap();
+        std::fs::write(destdir.join("usr/info/dir.bz2"), "legacy index bz2").unwrap();
         std::fs::write(destdir.join("usr/share/info/dir"), "index").unwrap();
         std::fs::write(destdir.join("usr/share/info/dir.gz"), "index gz").unwrap();
         std::fs::write(destdir.join("usr/share/info/ok.info"), "ok").unwrap();
 
         let _tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
 
+        assert!(!rootfs.join("usr/info/dir").exists());
+        assert!(!rootfs.join("usr/info/dir.bz2").exists());
         assert!(!rootfs.join("usr/share/info/dir").exists());
         assert!(!rootfs.join("usr/share/info/dir.gz").exists());
         assert!(rootfs.join("usr/share/info/ok.info").exists());
+    }
+
+    #[test]
+    fn install_atomic_skips_packlists_and_pod_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/lib/perl5/5.42/core_perl")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/lib/perl5/5.42/vendor_perl/auto/Error")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/share/doc/perl-error")).unwrap();
+        std::fs::write(
+            destdir.join("usr/lib/perl5/5.42/core_perl/perllocal.pod"),
+            "perllocal",
+        )
+        .unwrap();
+        std::fs::write(
+            destdir.join("usr/lib/perl5/5.42/vendor_perl/auto/Error/.packlist"),
+            "packlist",
+        )
+        .unwrap();
+        std::fs::write(destdir.join("usr/share/doc/perl-error/Error.pod"), "pod").unwrap();
+        std::fs::write(destdir.join("usr/share/doc/perl-error/README"), "readme").unwrap();
+
+        let _tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
+
+        assert!(
+            !rootfs
+                .join("usr/lib/perl5/5.42/core_perl/perllocal.pod")
+                .exists()
+        );
+        assert!(
+            !rootfs
+                .join("usr/lib/perl5/5.42/vendor_perl/auto/Error/.packlist")
+                .exists()
+        );
+        assert!(!rootfs.join("usr/share/doc/perl-error/Error.pod").exists());
+        assert!(rootfs.join("usr/share/doc/perl-error/README").exists());
     }
 
     #[test]
@@ -1232,13 +1289,18 @@ mod tests {
     fn generate_manifest_skips_info_dir_index() {
         let tmp = tempfile::tempdir().unwrap();
         let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/info")).unwrap();
         std::fs::create_dir_all(destdir.join("usr/share/info")).unwrap();
+        std::fs::write(destdir.join("usr/info/dir"), "legacy index").unwrap();
+        std::fs::write(destdir.join("usr/info/dir.zst"), "legacy index zst").unwrap();
         std::fs::write(destdir.join("usr/share/info/dir"), "index").unwrap();
         std::fs::write(destdir.join("usr/share/info/dir.xz"), "index xz").unwrap();
         std::fs::write(destdir.join("usr/share/info/ok.info"), "ok").unwrap();
 
         let manifest = generate_manifest_with_dirs(&destdir).unwrap();
 
+        assert!(!manifest.files.contains(&"usr/info/dir".to_string()));
+        assert!(!manifest.files.contains(&"usr/info/dir.zst".to_string()));
         assert!(!manifest.files.contains(&"usr/share/info/dir".to_string()));
         assert!(
             !manifest
@@ -1249,6 +1311,50 @@ mod tests {
             manifest
                 .files
                 .contains(&"usr/share/info/ok.info".to_string())
+        );
+    }
+
+    #[test]
+    fn generate_manifest_skips_packlists_and_pod_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/lib/perl5/5.42/core_perl")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/lib/perl5/5.42/vendor_perl/auto/Error")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/share/doc/perl-error")).unwrap();
+        std::fs::write(
+            destdir.join("usr/lib/perl5/5.42/core_perl/perllocal.pod"),
+            "perllocal",
+        )
+        .unwrap();
+        std::fs::write(
+            destdir.join("usr/lib/perl5/5.42/vendor_perl/auto/Error/.packlist"),
+            "packlist",
+        )
+        .unwrap();
+        std::fs::write(destdir.join("usr/share/doc/perl-error/Error.pod"), "pod").unwrap();
+        std::fs::write(destdir.join("usr/share/doc/perl-error/README"), "readme").unwrap();
+
+        let manifest = generate_manifest_with_dirs(&destdir).unwrap();
+
+        assert!(
+            !manifest
+                .files
+                .contains(&"usr/lib/perl5/5.42/core_perl/perllocal.pod".to_string())
+        );
+        assert!(
+            !manifest
+                .files
+                .contains(&"usr/lib/perl5/5.42/vendor_perl/auto/Error/.packlist".to_string())
+        );
+        assert!(
+            !manifest
+                .files
+                .contains(&"usr/share/doc/perl-error/Error.pod".to_string())
+        );
+        assert!(
+            manifest
+                .files
+                .contains(&"usr/share/doc/perl-error/README".to_string())
         );
     }
 
