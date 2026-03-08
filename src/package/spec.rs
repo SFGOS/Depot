@@ -1280,6 +1280,35 @@ type = "custom"
     }
 
     #[test]
+    fn parse_source_without_sha256_defaults_to_skip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.sources()[0].sha256, "skip");
+    }
+
+    #[test]
     fn parse_git_source_with_cherry_pick() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -2801,7 +2830,8 @@ pub struct Alternatives {
 pub struct Source {
     pub url: String,
     /// Checksum for the source (e.g. `sha256:...`, `sha512:...`, `md5:...`, or raw SHA256 hex).
-    /// Use `skip` to bypass verification.
+    /// Defaults to `skip` when omitted.
+    #[serde(default = "default_source_sha256")]
     pub sha256: String,
     /// Directory name after extraction (supports $name, $version)
     pub extract_dir: String,
@@ -2855,6 +2885,10 @@ pub struct ManualSource {
     /// Defaults to `file` for local mode or a derived filename for URL mode.
     #[serde(default)]
     pub dest: Option<String>,
+}
+
+fn default_source_sha256() -> String {
+    "skip".to_string()
 }
 
 #[derive(Debug, Deserialize)]

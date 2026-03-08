@@ -870,12 +870,14 @@ mod tests {
 
     #[test]
     fn test_default_configure_install_dirs_respects_explicit_user_overrides() {
-        let mut flags = BuildFlags::default();
-        flags.configure = vec![
-            "--sbindir=/sbin".to_string(),
-            "--libdir=/custom/lib".to_string(),
-            "--datadir=/custom/share".to_string(),
-        ];
+        let flags = BuildFlags {
+            configure: vec![
+                "--sbindir=/sbin".to_string(),
+                "--libdir=/custom/lib".to_string(),
+                "--datadir=/custom/share".to_string(),
+            ],
+            ..BuildFlags::default()
+        };
         let help = "--bindir=DIR --sbindir=DIR --libdir=DIR --datadir=DIR";
         let args = default_configure_install_dirs(&flags, Some(help));
         assert!(!args.iter().any(|a| a.starts_with("--sbindir=")));
@@ -1123,8 +1125,10 @@ foo: bar
 
     #[test]
     fn test_resolve_configure_path_uses_configure_file_and_expands_vars() {
-        let mut flags = BuildFlags::default();
-        flags.configure_file = "build-aux/$name-configure".into();
+        let flags = BuildFlags {
+            configure_file: "build-aux/$name-configure".into(),
+            ..BuildFlags::default()
+        };
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),

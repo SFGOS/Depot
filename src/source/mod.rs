@@ -313,6 +313,29 @@ fn prepare_one(
         .map(|rev| spec.expand_vars(rev))
         .collect();
 
+    // Treat `<url>#<rev>` and bare `*.git` sources as git before local file://
+    // handling so `file://...repo.git#tag` resolves through the git checkout path.
+    if let Some((base, rev)) = split_git_url(&url) {
+        let checkout_dir = build_dir.join(&extract_dir_name);
+        if checkout_dir.exists() && checkout_dir.join(".depot_state").exists() {
+            crate::log_info!(
+                "Resuming build in existing git directory: {}",
+                checkout_dir.display()
+            );
+            return Ok(checkout_dir);
+        }
+        git::checkout(
+            &base,
+            &rev,
+            &checkout_dir,
+            &cache_dir.join("git"),
+            &spec.package.name,
+            &cherry_pick_revs,
+        )?;
+        hooks::post_extract(spec, source, &checkout_dir, cache_dir)?;
+        return Ok(checkout_dir);
+    }
+
     // Local file:// handling (directories or archives)
     if let Some(path_str) = url.strip_prefix("file://") {
         let local_path = PathBuf::from(path_str);
@@ -352,29 +375,6 @@ fn prepare_one(
         } else {
             bail!("Local file source not found: {}", local_path.display());
         }
-    }
-
-    // Heuristic: if the URL contains '#', treat it as a git URL with a revision.
-    // (except when it clearly looks like an archive URL)
-    if let Some((base, rev)) = split_git_url(&url) {
-        let checkout_dir = build_dir.join(&extract_dir_name);
-        if checkout_dir.exists() && checkout_dir.join(".depot_state").exists() {
-            crate::log_info!(
-                "Resuming build in existing git directory: {}",
-                checkout_dir.display()
-            );
-            return Ok(checkout_dir);
-        }
-        git::checkout(
-            &base,
-            &rev,
-            &checkout_dir,
-            &cache_dir.join("git"),
-            &spec.package.name,
-            &cherry_pick_revs,
-        )?;
-        hooks::post_extract(spec, source, &checkout_dir, cache_dir)?;
-        return Ok(checkout_dir);
     }
 
     if !source.cherry_pick.is_empty() {
@@ -459,6 +459,89 @@ mod tests {
         Alternatives, Build, BuildFlags, BuildType, Dependencies, ManualSource, PackageInfo,
         PackageSpec, Source,
     };
+    use git2::{Oid, Repository};
+    use std::path::Path;
+
+    fn commit_file(repo: &Repository, workdir: &Path, rel: &str, data: &str) -> Oid {
+        let full_path = workdir.join(rel);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full_path, data).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(rel)).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("depot-test", "depot@example.test").unwrap();
+        let mut parents = Vec::new();
+        if let Ok(head) = repo.head()
+            && let Some(oid) = head.target()
+        {
+            parents.push(repo.find_commit(oid).unwrap());
+        }
+        let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+
+        repo.commit(Some("HEAD"), &sig, &sig, "test", &tree, &parent_refs)
+            .unwrap()
+    }
+
+    fn make_git_source_spec(source_url: String, extract_dir: &str) -> PackageSpec {
+        PackageSpec {
+            package: PackageInfo {
+                name: "foo".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: vec![Source {
+                url: source_url,
+                sha256: "skip".into(),
+                extract_dir: extract_dir.into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
+            }],
+            build: Build {
+                build_type: BuildType::Custom,
+                flags: BuildFlags::default(),
+            },
+            dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        }
+    }
+
+    fn make_remote_git_repo() -> (tempfile::TempDir, String, Oid, Oid) {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote_dir = tmp.path().join("origin.git");
+        let workdir = tmp.path().join("work");
+
+        Repository::init_bare(&remote_dir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+        let tagged = commit_file(&repo, &workdir, "README", "tagged\n");
+        let tag_target = repo.find_object(tagged, None).unwrap();
+        repo.tag_lightweight("v1.0.0", &tag_target, false).unwrap();
+        let hashed = commit_file(&repo, &workdir, "README", "hashed\n");
+
+        let branch_ref = repo.head().unwrap().name().unwrap().to_string();
+        let mut remote = repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+        let push_specs = [
+            format!("{branch_ref}:{branch_ref}"),
+            "refs/tags/v1.0.0:refs/tags/v1.0.0".to_string(),
+        ];
+        let push_spec_refs: Vec<&String> = push_specs.iter().collect();
+        remote.push(&push_spec_refs, None).unwrap();
+
+        let remote_url = url::Url::from_file_path(&remote_dir).unwrap().to_string();
+        (tmp, remote_url, tagged, hashed)
+    }
 
     fn mk_spec_with_manuals(spec_dir: PathBuf, manuals: Vec<ManualSource>) -> PackageSpec {
         PackageSpec {
@@ -576,6 +659,42 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("source.cherry_pick is only supported for git sources")
+        );
+    }
+
+    #[test]
+    fn prepare_one_checks_out_git_tag_revision() {
+        let (_tmp, remote_url, tagged, _hashed) = make_remote_git_repo();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let build_dir = tempfile::tempdir().unwrap();
+        let spec = make_git_source_spec(format!("{remote_url}#v1.0.0"), "src-tag");
+
+        let checkout_dir =
+            prepare_one(&spec, &spec.source[0], cache_dir.path(), build_dir.path()).unwrap();
+        let repo = Repository::open(&checkout_dir).unwrap();
+
+        assert_eq!(repo.head().unwrap().target().unwrap(), tagged);
+        assert_eq!(
+            std::fs::read_to_string(checkout_dir.join("README")).unwrap(),
+            "tagged\n"
+        );
+    }
+
+    #[test]
+    fn prepare_one_checks_out_git_commit_hash_revision() {
+        let (_tmp, remote_url, _tagged, hashed) = make_remote_git_repo();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let build_dir = tempfile::tempdir().unwrap();
+        let spec = make_git_source_spec(format!("{remote_url}#{hashed}"), "src-hash");
+
+        let checkout_dir =
+            prepare_one(&spec, &spec.source[0], cache_dir.path(), build_dir.path()).unwrap();
+        let repo = Repository::open(&checkout_dir).unwrap();
+
+        assert_eq!(repo.head().unwrap().target().unwrap(), hashed);
+        assert_eq!(
+            std::fs::read_to_string(checkout_dir.join("README")).unwrap(),
+            "hashed\n"
         );
     }
 

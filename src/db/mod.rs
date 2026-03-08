@@ -459,6 +459,91 @@ pub fn calculate_upgrade_paths(
     Ok(remove_paths)
 }
 
+/// Get set of all installed package names
+pub fn get_installed_packages(db_path: &Path) -> Result<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+
+    if !db_path.exists() {
+        return Ok(HashSet::new());
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let mut stmt = conn.prepare("SELECT name FROM packages")?;
+    let names: HashSet<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(names)
+}
+
+/// Get set of all provided package names (alternatives)
+pub fn get_all_provides(db_path: &Path) -> Result<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+
+    if !db_path.exists() {
+        return Ok(HashSet::new());
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let mut stmt = conn.prepare("SELECT provides_name FROM provides")?;
+    let names: HashSet<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(names)
+}
+
+/// Get version of a specific installed package
+pub fn get_package_version(db_path: &Path, name: &str) -> Result<Option<String>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let version: Option<String> = conn
+        .query_row(
+            "SELECT version FROM packages WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(version)
+}
+
+/// Find the installed package that owns a filesystem path from the local DB.
+pub fn owns_path(db_path: &Path, path: &Path) -> Result<Option<String>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let normalized = path
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .trim_start_matches("./")
+        .to_string();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let owner = conn
+        .query_row(
+            "SELECT p.name
+             FROM files f
+             JOIN packages p ON p.id = f.package_id
+             WHERE f.path = ?1
+             LIMIT 1",
+            params![normalized],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(owner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,89 +817,4 @@ mod tests {
         assert!(files.contains(&"usr/bin/new_file".to_string()));
         assert!(!files.contains(&"usr/bin/shared_dir/old_file".to_string()));
     }
-}
-
-/// Get set of all installed package names
-pub fn get_installed_packages(db_path: &Path) -> Result<std::collections::HashSet<String>> {
-    use std::collections::HashSet;
-
-    if !db_path.exists() {
-        return Ok(HashSet::new());
-    }
-
-    let conn = Connection::open(db_path)?;
-    init_db(&conn)?;
-    let mut stmt = conn.prepare("SELECT name FROM packages")?;
-    let names: HashSet<String> = stmt
-        .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(names)
-}
-
-/// Get set of all provided package names (alternatives)
-pub fn get_all_provides(db_path: &Path) -> Result<std::collections::HashSet<String>> {
-    use std::collections::HashSet;
-
-    if !db_path.exists() {
-        return Ok(HashSet::new());
-    }
-
-    let conn = Connection::open(db_path)?;
-    init_db(&conn)?;
-    let mut stmt = conn.prepare("SELECT provides_name FROM provides")?;
-    let names: HashSet<String> = stmt
-        .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(names)
-}
-
-/// Get version of a specific installed package
-pub fn get_package_version(db_path: &Path, name: &str) -> Result<Option<String>> {
-    if !db_path.exists() {
-        return Ok(None);
-    }
-
-    let conn = Connection::open(db_path)?;
-    init_db(&conn)?;
-    let version: Option<String> = conn
-        .query_row(
-            "SELECT version FROM packages WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        )
-        .ok();
-    Ok(version)
-}
-
-/// Find the installed package that owns a filesystem path from the local DB.
-pub fn owns_path(db_path: &Path, path: &Path) -> Result<Option<String>> {
-    if !db_path.exists() {
-        return Ok(None);
-    }
-
-    let normalized = path
-        .to_string_lossy()
-        .trim_start_matches('/')
-        .trim_start_matches("./")
-        .to_string();
-    if normalized.is_empty() {
-        return Ok(None);
-    }
-
-    let conn = Connection::open(db_path)?;
-    init_db(&conn)?;
-    let owner = conn
-        .query_row(
-            "SELECT p.name
-             FROM files f
-             JOIN packages p ON p.id = f.package_id
-             WHERE f.path = ?1
-             LIMIT 1",
-            params![normalized],
-            |row| row.get(0),
-        )
-        .ok();
-    Ok(owner)
 }

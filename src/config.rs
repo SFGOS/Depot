@@ -611,7 +611,7 @@ cflags += ["-g"]
         let orig_home = std::env::var_os("HOME");
         let fake_home = tempfile::tempdir().unwrap();
         unsafe {
-            std::env::set_var("HOME", &fake_home.path());
+            std::env::set_var("HOME", fake_home.path());
         }
 
         let config = Config::for_rootfs(Path::new("/"));

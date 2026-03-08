@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use git2::{Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use inquire::Password;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -47,8 +48,16 @@ pub fn checkout(
         .ok_or_else(|| anyhow::anyhow!("Invalid mirror path"))?;
 
     crate::log_info!("Cloning git source into {}...", checkout_dir.display());
-    Repository::clone(mirror_url, checkout_dir)
+    let checkout_progress = CheckoutProgress::new(format!("git {}", pkgname));
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout_progress.attach(&mut checkout);
+
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.with_checkout(checkout);
+    builder
+        .clone(mirror_url, checkout_dir)
         .with_context(|| format!("Failed to clone from mirror for {}", url))?;
+    checkout_progress.finish("checkout complete");
 
     let repo = Repository::open(checkout_dir)?;
     checkout_rev(&repo, rev).with_context(|| format!("Failed to checkout revision '{}'", rev))?;
@@ -136,13 +145,15 @@ fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str) -> Result<()> {
     if !mirror_dir.exists() {
         crate::log_info!("Cloning git mirror for {} ({})...", pkgname, url);
         let mut fo = FetchOptions::new();
-        fo.remote_callbacks(remote_callbacks());
+        let transfer_progress = TransferProgress::new(format!("git {}", pkgname));
+        fo.remote_callbacks(remote_callbacks(Some(transfer_progress.bar()), url));
         let mut builder = git2::build::RepoBuilder::new();
         builder.fetch_options(fo);
         builder.bare(true);
         builder
             .clone(url, mirror_dir)
             .with_context(|| format!("Failed to clone git mirror: {}", url))?;
+        transfer_progress.finish("mirror ready");
         return Ok(());
     }
 
@@ -156,12 +167,14 @@ fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str) -> Result<()> {
         .with_context(|| format!("Failed to create remote for {}", url))?;
 
     let mut fo = FetchOptions::new();
-    fo.remote_callbacks(remote_callbacks());
+    let transfer_progress = TransferProgress::new(format!("git {}", pkgname));
+    fo.remote_callbacks(remote_callbacks(Some(transfer_progress.bar()), url));
 
     // Fetch all remote refs (tags + heads). Empty refspec uses default.
     remote
         .fetch(&[] as &[&str], Some(&mut fo), None)
         .with_context(|| format!("Failed to fetch updates for {}", url))?;
+    transfer_progress.finish("mirror updated");
 
     Ok(())
 }
@@ -261,15 +274,108 @@ fn resolve_remote_head_like<'a>(repo: &'a Repository) -> Result<Option<git2::Obj
     Ok(Some(repo.find_object(candidates[0].1, None)?))
 }
 
-fn remote_callbacks() -> RemoteCallbacks<'static> {
+fn remote_callbacks(progress_bar: Option<ProgressBar>, _label: &str) -> RemoteCallbacks<'static> {
     let mut callbacks = RemoteCallbacks::new();
     let mut credential_state = CredentialState::default();
 
     callbacks.credentials(move |url, username_from_url, allowed| {
         credential_state.provide(url, username_from_url, allowed)
     });
+    if let Some(progress_bar) = progress_bar {
+        callbacks.transfer_progress(move |stats| {
+            let total_objects = stats.total_objects() as u64;
+            if total_objects > 0 {
+                progress_bar.set_length(total_objects);
+                progress_bar.set_position(stats.received_objects() as u64);
+            }
+
+            progress_bar.set_message(format!(
+                "{} obj, {} delta, {} bytes",
+                stats.received_objects(),
+                stats.indexed_deltas(),
+                stats.received_bytes()
+            ));
+            true
+        });
+    }
 
     callbacks
+}
+
+struct TransferProgress {
+    bar: ProgressBar,
+}
+
+impl TransferProgress {
+    fn new(prefix: String) -> Self {
+        let bar = ProgressBar::new(1);
+        bar.set_draw_target(progress_draw_target());
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-"),
+        );
+        bar.set_prefix(prefix);
+        bar.set_message("starting transfer");
+        Self { bar }
+    }
+
+    fn bar(&self) -> ProgressBar {
+        self.bar.clone()
+    }
+
+    fn finish(&self, message: &str) {
+        self.bar.finish_and_clear();
+        crate::log_info!("{}", message);
+    }
+}
+
+struct CheckoutProgress {
+    bar: ProgressBar,
+}
+
+impl CheckoutProgress {
+    fn new(prefix: String) -> Self {
+        let bar = ProgressBar::new(1);
+        bar.set_draw_target(progress_draw_target());
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-"),
+        );
+        bar.set_prefix(prefix);
+        bar.set_message("preparing checkout");
+        Self { bar }
+    }
+
+    fn attach(&self, checkout: &mut git2::build::CheckoutBuilder<'static>) {
+        let bar = self.bar.clone();
+        checkout.progress(move |path, current, total| {
+            let total = total as u64;
+            if total > 0 {
+                bar.set_length(total);
+                bar.set_position(current as u64);
+            }
+            if let Some(path) = path {
+                bar.set_message(path.display().to_string());
+            }
+        });
+    }
+
+    fn finish(&self, message: &str) {
+        self.bar.finish_and_clear();
+        crate::log_info!("{}", message);
+    }
+}
+
+fn progress_draw_target() -> ProgressDrawTarget {
+    if io::stderr().is_terminal() {
+        ProgressDrawTarget::stderr()
+    } else {
+        ProgressDrawTarget::hidden()
+    }
 }
 
 #[derive(Default)]
@@ -458,7 +564,7 @@ mod tests {
         .unwrap();
 
         checkout_rev(&repo, "HEAD").unwrap();
-        assert_eq!(repo.head_detached().unwrap(), true);
+        assert!(repo.head_detached().unwrap());
         assert_eq!(repo.head().unwrap().target().unwrap(), commit_oid);
     }
 

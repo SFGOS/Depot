@@ -2151,7 +2151,7 @@ optional = []
         let indexed = manager.read_indexed_package(&pkg_path).unwrap();
         manager.insert_indexed_package(&mut conn, indexed).unwrap();
 
-        let (name, version, revision, desc, home, lic, sha256, sha512): (
+        type PackageRow = (
             String,
             String,
             i64,
@@ -2160,7 +2160,9 @@ optional = []
             Option<String>,
             String,
             String,
-        ) = conn
+        );
+
+        let (name, version, revision, desc, home, lic, sha256, sha512): PackageRow = conn
             .query_row(
                 "SELECT name, version, revision, description, homepage, license, sha256, sha512 FROM packages",
                 [],

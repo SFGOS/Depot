@@ -772,9 +772,11 @@ mod tests {
     use crate::package::{Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec};
 
     fn mk_spec_for_stage_processing() -> PackageSpec {
-        let mut flags = BuildFlags::default();
-        flags.no_strip = true;
-        flags.no_compress_man = true;
+        let flags = BuildFlags {
+            no_strip: true,
+            no_compress_man: true,
+            ..BuildFlags::default()
+        };
         PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),

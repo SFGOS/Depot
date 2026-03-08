@@ -277,9 +277,11 @@ mod tests {
 
     #[test]
     fn test_meson_setup_args_honor_explicit_prefix() {
-        let mut flags = BuildFlags::default();
-        flags.prefix = "/usr".to_string();
-        flags.configure = vec!["--prefix=/opt".to_string()];
+        let flags = BuildFlags {
+            prefix: "/usr".to_string(),
+            configure: vec!["--prefix=/opt".to_string()],
+            ..BuildFlags::default()
+        };
 
         let args = meson_setup_args(&flags, None, &[]);
         assert_eq!(args.iter().filter(|a| a.starts_with("--prefix")).count(), 1);

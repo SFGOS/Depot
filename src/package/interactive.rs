@@ -1477,35 +1477,37 @@ mod tests {
 
     #[test]
     fn spec_to_minimal_toml_includes_extended_build_flags() {
-        let mut flags = BuildFlags::default();
-        flags.source_subdir = "project/subdir".into();
-        flags.configure = vec!["--disable-static".into(), "--enable-foo".into()];
-        flags.configure_file = "build-aux/configure".into();
-        flags.post_configure = vec!["./configure-helper.sh".into()];
-        flags.post_compile = vec!["make check".into()];
-        flags.post_install = vec!["strip $DESTDIR/usr/bin/foo".into()];
-        flags.makefile_commands = vec!["make".into()];
-        flags.makefile_install_commands = vec!["make DESTDIR=$DESTDIR install".into()];
-        flags.cargs = vec!["--locked".into()];
-        flags.config_settings = vec!["editable_mode=compat".into()];
-        flags.rustflags = vec!["-Ctarget-cpu=native".into()];
-        flags.cxxflags = vec!["-O2".into(), "-fno-rtti".into()];
-        flags.ltoflags = vec!["-flto=auto".into()];
-        flags.target = "x86_64-unknown-linux-gnu".into();
-        flags.keep = vec!["etc/locale.gen".into()];
-        flags.use_lto = false;
-        flags.no_flags = true;
-        flags.no_strip = true;
-        flags.no_delete_static = true;
-        flags.no_compress_man = true;
-        flags.skip_tests = true;
-        flags.makeflags = "-j12 --output-sync=target".into();
-        flags.make_vars = vec!["V=1".into()];
-        flags.make_dirs = vec!["lib".into(), "libelf".into()];
-        flags.make_test_vars = vec!["TESTS=unit".into()];
-        flags.make_test_dirs = vec!["tests".into()];
-        flags.make_install_vars = vec!["STRIPPROG=true".into()];
-        flags.make_install_dirs = vec!["lib".into(), "apps".into()];
+        let flags = BuildFlags {
+            source_subdir: "project/subdir".into(),
+            configure: vec!["--disable-static".into(), "--enable-foo".into()],
+            configure_file: "build-aux/configure".into(),
+            post_configure: vec!["./configure-helper.sh".into()],
+            post_compile: vec!["make check".into()],
+            post_install: vec!["strip $DESTDIR/usr/bin/foo".into()],
+            makefile_commands: vec!["make".into()],
+            makefile_install_commands: vec!["make DESTDIR=$DESTDIR install".into()],
+            cargs: vec!["--locked".into()],
+            config_settings: vec!["editable_mode=compat".into()],
+            rustflags: vec!["-Ctarget-cpu=native".into()],
+            cxxflags: vec!["-O2".into(), "-fno-rtti".into()],
+            ltoflags: vec!["-flto=auto".into()],
+            target: "x86_64-unknown-linux-gnu".into(),
+            keep: vec!["etc/locale.gen".into()],
+            use_lto: false,
+            no_flags: true,
+            no_strip: true,
+            no_delete_static: true,
+            no_compress_man: true,
+            skip_tests: true,
+            makeflags: "-j12 --output-sync=target".into(),
+            make_vars: vec!["V=1".into()],
+            make_dirs: vec!["lib".into(), "libelf".into()],
+            make_test_vars: vec!["TESTS=unit".into()],
+            make_test_dirs: vec!["tests".into()],
+            make_install_vars: vec!["STRIPPROG=true".into()],
+            make_install_dirs: vec!["lib".into(), "apps".into()],
+            ..BuildFlags::default()
+        };
 
         let spec = PackageSpec {
             package: PackageInfo {

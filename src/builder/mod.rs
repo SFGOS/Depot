@@ -271,9 +271,11 @@ mod tests {
     use std::path::PathBuf;
 
     fn mk_spec(cflags: Vec<&str>, ldflags: Vec<&str>) -> PackageSpec {
-        let mut flags = BuildFlags::default();
-        flags.cflags = cflags.into_iter().map(String::from).collect();
-        flags.ldflags = ldflags.into_iter().map(String::from).collect();
+        let flags = BuildFlags {
+            cflags: cflags.into_iter().map(String::from).collect(),
+            ldflags: ldflags.into_iter().map(String::from).collect(),
+            ..BuildFlags::default()
+        };
         PackageSpec {
             package: PackageInfo {
                 name: "env-test".into(),
@@ -323,9 +325,9 @@ mod tests {
         prepare_command(&mut cmd, &vec![("MYVAR".to_string(), "myval".to_string())]);
 
         let envs: HashMap<_, _> = cmd.get_envs().collect();
-        assert!(envs.get(OsStr::new("PATH")).is_some());
-        assert!(envs.get(OsStr::new("HOME")).is_some());
-        assert!(envs.get(OsStr::new("FORBIDDEN")).is_none());
+        assert!(envs.contains_key(OsStr::new("PATH")));
+        assert!(envs.contains_key(OsStr::new("HOME")));
+        assert!(!envs.contains_key(OsStr::new("FORBIDDEN")));
         assert_eq!(
             envs.get(OsStr::new("SHELL")),
             Some(&Some(std::ffi::OsString::from("/bin/sh").as_os_str()))

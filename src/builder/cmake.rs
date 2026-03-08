@@ -436,10 +436,10 @@ mod tests {
         let spec_dir = tmp.path().join("specdir");
         let external = tmp.path().join("external");
         let expanded = src_root.join("x-1.0").join("sub");
-        std::fs::create_dir_all(&src_root.join("sub")).unwrap();
+        std::fs::create_dir_all(src_root.join("sub")).unwrap();
         std::fs::create_dir_all(&expanded).unwrap();
         // create directories for candidates
-        std::fs::create_dir_all(&spec_dir.join("../llvm")).unwrap();
+        std::fs::create_dir_all(spec_dir.join("../llvm")).unwrap();
         std::fs::create_dir_all(&external).unwrap();
 
         let spec = PackageSpec {

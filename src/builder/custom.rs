@@ -329,7 +329,7 @@ mod tests {
         spec.spec_dir = spec_dir.path().to_path_buf();
 
         // src_dir is empty; build() should copy build.sh from spec_dir and run it (no-op)
-        let _ = build(&spec, tmp_src.path(), tmp_dest.path(), None, true)?;
+        build(&spec, tmp_src.path(), tmp_dest.path(), None, true)?;
         // If we reached here, build() succeeded and build.sh was copied into src
         assert!(tmp_src.path().join("build.sh").exists());
         Ok(())
