@@ -1,6 +1,6 @@
 [package]
 name = "depot"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 
 [lints.rust]
@@ -32,7 +32,7 @@ zstd = { version = "0.13.3", features = ["zstdmt"] }
 inquire = "0.9.4"
 md5 = "0.8.0"
 suppaftp = "8.0.2"
-minisign = "0.8.0"
+minisign = "0.9.1"
 petgraph = "0.8.3"
 fd-lock = "4.0.4"
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "native-tls"] }
