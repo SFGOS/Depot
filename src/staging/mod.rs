@@ -31,6 +31,11 @@ fn is_purged_install_basename(rel_path: &str) -> bool {
         .is_some_and(|name| name == ".packlist" || name.ends_with(".pod"))
 }
 
+pub(crate) fn is_purged_payload_path(rel_path: &str) -> bool {
+    let p = rel_path.trim_start_matches('/');
+    is_info_dir_index_path(p) || is_purged_install_basename(p)
+}
+
 fn is_skipped_install_path(rel_path: &str) -> bool {
     let p = rel_path.trim_start_matches('/');
     p == ".metadata.toml"
@@ -40,8 +45,7 @@ fn is_skipped_install_path(rel_path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
         || p == "scripts"
         || p.starts_with("scripts/")
-        || is_info_dir_index_path(p)
-        || is_purged_install_basename(p)
+        || is_purged_payload_path(p)
 }
 
 /// Return the internal split-output staging root inside a package `destdir`.

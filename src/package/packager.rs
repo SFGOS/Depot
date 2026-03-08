@@ -16,6 +16,10 @@ fn is_internal_staging_rel_path(rel_path: &Path) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+fn is_skipped_package_payload_rel_path(rel_path: &Path) -> bool {
+    crate::staging::is_purged_payload_path(&rel_path.to_string_lossy())
+}
+
 fn license_value(licenses: &[String]) -> toml::Value {
     if licenses.len() == 1 {
         toml::Value::String(licenses[0].clone())
@@ -87,6 +91,9 @@ impl Packager {
                 continue;
             }
             if is_internal_staging_rel_path(rel_path) {
+                continue;
+            }
+            if is_skipped_package_payload_rel_path(rel_path) {
                 continue;
             }
 
@@ -225,6 +232,9 @@ impl Packager {
             if is_internal_staging_rel_path(Path::new(&relative)) {
                 continue;
             }
+            if is_skipped_package_payload_rel_path(Path::new(&relative)) {
+                continue;
+            }
 
             if file_type.is_dir() {
                 self.collect_files(base, &path, files)?;
@@ -246,6 +256,7 @@ fn num_cpus() -> usize {
 mod tests {
     use super::*;
     use crate::package::{Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo};
+    use std::io::Read;
 
     fn mk_packager(destdir: PathBuf) -> Packager {
         Packager::new(
@@ -312,6 +323,42 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_files_skips_purged_payload_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+        fs::create_dir_all(dest.join("usr/share/info")).unwrap();
+        fs::create_dir_all(dest.join("usr/lib/perl5/5.42/core_perl")).unwrap();
+        fs::create_dir_all(dest.join("usr/lib/perl5/5.42/vendor_perl/auto/Error")).unwrap();
+        fs::create_dir_all(dest.join("usr/share/doc/perl-error")).unwrap();
+        fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        fs::write(dest.join("usr/share/info/dir"), "index").unwrap();
+        fs::write(
+            dest.join("usr/lib/perl5/5.42/core_perl/perllocal.pod"),
+            "pod",
+        )
+        .unwrap();
+        fs::write(
+            dest.join("usr/lib/perl5/5.42/vendor_perl/auto/Error/.packlist"),
+            "packlist",
+        )
+        .unwrap();
+        fs::write(dest.join("usr/share/doc/perl-error/Error.pod"), "pod").unwrap();
+        fs::write(dest.join("usr/bin/foo"), "x").unwrap();
+
+        let packager = mk_packager(dest.to_path_buf());
+        let mut files = Vec::new();
+        packager.collect_files(dest, dest, &mut files).unwrap();
+
+        assert!(!files.contains(&"usr/share/info/dir".to_string()));
+        assert!(!files.contains(&"usr/lib/perl5/5.42/core_perl/perllocal.pod".to_string()));
+        assert!(
+            !files.contains(&"usr/lib/perl5/5.42/vendor_perl/auto/Error/.packlist".to_string())
+        );
+        assert!(!files.contains(&"usr/share/doc/perl-error/Error.pod".to_string()));
+        assert!(files.contains(&"usr/bin/foo".to_string()));
+    }
+
+    #[test]
     fn test_generate_files_yaml() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path();
@@ -371,5 +418,57 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].as_str(), Some("MIT"));
         assert_eq!(arr[1].as_str(), Some("Apache-2.0"));
+    }
+
+    #[test]
+    fn test_create_package_skips_purged_payload_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let out = tmp.path().join("out");
+        fs::create_dir_all(dest.join("usr/share/info")).unwrap();
+        fs::create_dir_all(dest.join("usr/lib/perl5/5.42/core_perl")).unwrap();
+        fs::create_dir_all(dest.join("usr/lib/perl5/5.42/vendor_perl/auto/Error")).unwrap();
+        fs::create_dir_all(dest.join("usr/share/doc/perl-error")).unwrap();
+        fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        fs::write(dest.join("usr/share/info/dir"), "index").unwrap();
+        fs::write(
+            dest.join("usr/lib/perl5/5.42/core_perl/perllocal.pod"),
+            "pod",
+        )
+        .unwrap();
+        fs::write(
+            dest.join("usr/lib/perl5/5.42/vendor_perl/auto/Error/.packlist"),
+            "packlist",
+        )
+        .unwrap();
+        fs::write(dest.join("usr/share/doc/perl-error/Error.pod"), "pod").unwrap();
+        fs::write(dest.join("usr/bin/foo"), "x").unwrap();
+        fs::create_dir_all(&out).unwrap();
+
+        let packager = mk_packager(dest.clone());
+        let archive_path = packager.create_package(&out, "x86_64").unwrap();
+
+        let archive_file = fs::File::open(&archive_path).unwrap();
+        let decoder = zstd::Decoder::new(archive_file).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let mut paths = Vec::new();
+
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            let mut sink = Vec::new();
+            let _ = entry.read_to_end(&mut sink);
+            paths.push(path);
+        }
+
+        assert!(!paths.contains(&"usr/share/info/dir".to_string()));
+        assert!(!paths.contains(&"usr/lib/perl5/5.42/core_perl/perllocal.pod".to_string()));
+        assert!(
+            !paths.contains(&"usr/lib/perl5/5.42/vendor_perl/auto/Error/.packlist".to_string())
+        );
+        assert!(!paths.contains(&"usr/share/doc/perl-error/Error.pod".to_string()));
+        assert!(paths.contains(&"usr/bin/foo".to_string()));
+        assert!(paths.contains(&".metadata.toml".to_string()));
+        assert!(paths.contains(&".files.yaml".to_string()));
     }
 }
