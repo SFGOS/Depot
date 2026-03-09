@@ -342,6 +342,66 @@ impl PackageSpec {
                         self.build.flags.prefix = s.to_string();
                     }
                 }
+                "bindir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.bindir = s.to_string();
+                    }
+                }
+                "sbindir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.sbindir = s.to_string();
+                    }
+                }
+                "libdir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.libdir = s.to_string();
+                    }
+                }
+                "libexecdir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.libexecdir = s.to_string();
+                    }
+                }
+                "sysconfdir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.sysconfdir = s.to_string();
+                    }
+                }
+                "localstatedir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.localstatedir = s.to_string();
+                    }
+                }
+                "sharedstatedir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.sharedstatedir = s.to_string();
+                    }
+                }
+                "includedir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.includedir = s.to_string();
+                    }
+                }
+                "datarootdir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.datarootdir = s.to_string();
+                    }
+                }
+                "datadir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.datadir = s.to_string();
+                    }
+                }
+                "mandir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.mandir = s.to_string();
+                    }
+                }
+                "infodir" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.infodir = s.to_string();
+                    }
+                }
                 "chost" => {
                     if let Some(s) = v.as_str() {
                         self.build.flags.chost = s.to_string();
@@ -884,6 +944,66 @@ impl PackageSpec {
             "prefix" => {
                 if let Some(s) = values.last().and_then(|v| v.as_str()) {
                     self.build.flags.prefix = s.to_string();
+                }
+            }
+            "bindir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.bindir = s.to_string();
+                }
+            }
+            "sbindir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.sbindir = s.to_string();
+                }
+            }
+            "libdir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.libdir = s.to_string();
+                }
+            }
+            "libexecdir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.libexecdir = s.to_string();
+                }
+            }
+            "sysconfdir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.sysconfdir = s.to_string();
+                }
+            }
+            "localstatedir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.localstatedir = s.to_string();
+                }
+            }
+            "sharedstatedir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.sharedstatedir = s.to_string();
+                }
+            }
+            "includedir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.includedir = s.to_string();
+                }
+            }
+            "datarootdir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.datarootdir = s.to_string();
+                }
+            }
+            "datadir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.datadir = s.to_string();
+                }
+            }
+            "mandir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.mandir = s.to_string();
+                }
+            }
+            "infodir" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.infodir = s.to_string();
                 }
             }
             "chost" => {
@@ -1773,6 +1893,11 @@ cc = "my-cc"
 cflags = ["-O2"]
 cxxflags = ["-O2", "-pipe"]
 passthrough_env = ["RUSTFLAGS"]
+bindir = "/opt/bin"
+sbindir = "/opt/sbin"
+libdir = "/opt/lib64"
+sysconfdir = "/opt/etc"
+datarootdir = "/opt/share-root"
 makeflags = "-j8"
 make_vars = ["V=1"]
 make_dirs = ["lib"]
@@ -1868,6 +1993,14 @@ post_configure = ["echo configured"]
             vec![toml::Value::String("build-aux/configure".to_string())],
         );
         config.appends.insert(
+            "build.flags.libexecdir".to_string(),
+            vec![toml::Value::String("/opt/libexec".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.datadir".to_string(),
+            vec![toml::Value::String("/opt/share-data".to_string())],
+        );
+        config.appends.insert(
             "build.flags.config-setting".to_string(),
             vec![toml::Value::String(
                 "setup-args=--plat-name=x86_64".to_string(),
@@ -1933,6 +2066,13 @@ post_configure = ["echo configured"]
                 .passthrough_env
                 .contains(&"CARGO_HOME".to_string())
         );
+        assert_eq!(spec.build.flags.bindir, "/opt/bin");
+        assert_eq!(spec.build.flags.sbindir, "/opt/sbin");
+        assert_eq!(spec.build.flags.libdir, "/opt/lib64");
+        assert_eq!(spec.build.flags.libexecdir, "/opt/libexec");
+        assert_eq!(spec.build.flags.sysconfdir, "/opt/etc");
+        assert_eq!(spec.build.flags.datarootdir, "/opt/share-root");
+        assert_eq!(spec.build.flags.datadir, "/opt/share-data");
         assert_eq!(spec.build.flags.makeflags, "-j8 --output-sync=target");
         assert!(spec.build.flags.make_vars.contains(&"V=1".to_string()));
         assert!(spec.build.flags.make_dirs.contains(&"lib".to_string()));
@@ -2274,6 +2414,61 @@ configure_file = "build-aux/configure"
 
         let spec = PackageSpec::from_file(&path).unwrap();
         assert_eq!(spec.build.flags.configure_file, "build-aux/configure");
+    }
+
+    #[test]
+    fn parse_install_dirs_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "cmake"
+
+[build.flags]
+bindir = "/custom/bin"
+sbindir = "/custom/sbin"
+libdir = "/custom/lib64"
+libexecdir = "/custom/libexec"
+sysconfdir = "/custom/etc"
+localstatedir = "/custom/var"
+sharedstatedir = "/custom/var/lib"
+includedir = "/custom/include"
+datarootdir = "/custom/share-root"
+datadir = "/custom/share"
+mandir = "/custom/share/man"
+infodir = "/custom/share/info"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.build.flags.bindir, "/custom/bin");
+        assert_eq!(spec.build.flags.sbindir, "/custom/sbin");
+        assert_eq!(spec.build.flags.libdir, "/custom/lib64");
+        assert_eq!(spec.build.flags.libexecdir, "/custom/libexec");
+        assert_eq!(spec.build.flags.sysconfdir, "/custom/etc");
+        assert_eq!(spec.build.flags.localstatedir, "/custom/var");
+        assert_eq!(spec.build.flags.sharedstatedir, "/custom/var/lib");
+        assert_eq!(spec.build.flags.includedir, "/custom/include");
+        assert_eq!(spec.build.flags.datarootdir, "/custom/share-root");
+        assert_eq!(spec.build.flags.datadir, "/custom/share");
+        assert_eq!(spec.build.flags.mandir, "/custom/share/man");
+        assert_eq!(spec.build.flags.infodir, "/custom/share/info");
     }
 
     #[test]
@@ -3262,6 +3457,45 @@ pub struct BuildFlags {
     /// Binary installation directory relative to DESTDIR (default: /usr/bin)
     #[serde(default = "default_bindir")]
     pub bindir: String,
+    /// System binary installation directory for supported builders (default: /usr/bin).
+    #[serde(default)]
+    pub sbindir: String,
+    /// Library installation directory for supported builders.
+    ///
+    /// Defaults to `/usr/lib`, or `/usr/lib32` for the lib32 build variant.
+    #[serde(default)]
+    pub libdir: String,
+    /// Library helper executable installation directory for supported builders.
+    ///
+    /// Defaults to the effective `libdir`.
+    #[serde(default)]
+    pub libexecdir: String,
+    /// System configuration directory for supported builders (default: /etc).
+    #[serde(default)]
+    pub sysconfdir: String,
+    /// Variable state directory for supported builders (default: /var).
+    #[serde(default)]
+    pub localstatedir: String,
+    /// Shared variable state directory for supported builders (default: /var/lib).
+    #[serde(default)]
+    pub sharedstatedir: String,
+    /// Header installation directory for supported builders (default: /usr/include).
+    #[serde(default)]
+    pub includedir: String,
+    /// Data root installation directory for supported builders (default: /usr/share).
+    #[serde(default)]
+    pub datarootdir: String,
+    /// Architecture-independent data installation directory for supported builders.
+    ///
+    /// Defaults to the effective `datarootdir`.
+    #[serde(default)]
+    pub datadir: String,
+    /// Manual page installation directory for supported builders (default: /usr/share/man).
+    #[serde(default)]
+    pub mandir: String,
+    /// Info page installation directory for supported builders (default: /usr/share/info).
+    #[serde(default)]
+    pub infodir: String,
 
     /// Subdirectory within extracted source to use as the actual source root.
     /// Useful for monorepos like llvm-project where you want to build just one component.
@@ -3336,6 +3570,17 @@ impl Default for BuildFlags {
             rustflags: Vec::new(),
             cargs: Vec::new(),
             bindir: default_bindir(),
+            sbindir: String::new(),
+            libdir: String::new(),
+            libexecdir: String::new(),
+            sysconfdir: String::new(),
+            localstatedir: String::new(),
+            sharedstatedir: String::new(),
+            includedir: String::new(),
+            datarootdir: String::new(),
+            datadir: String::new(),
+            mandir: String::new(),
+            infodir: String::new(),
             source_subdir: String::new(),
             build_dir: None,
             binary_type: String::new(),

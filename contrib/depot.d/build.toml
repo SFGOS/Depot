@@ -7,6 +7,11 @@ cc = "gcc"
 cflags = ["-O2"]
 cflags += ["-pipe"]
 
+# Optional install directory overrides for supported builders
+#bindir = "/usr/bin"
+#libdir = "/usr/lib"
+#sysconfdir = "/etc"
+
 # Default LDFLAGS
 ldflags = ["-Wl,-O1"]
 

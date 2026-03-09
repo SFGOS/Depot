@@ -35,12 +35,8 @@ pub fn build(
     let env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
 
     // Extract prefix from configure flags (cmake-style -DCMAKE_INSTALL_PREFIX=)
-    let prefix = flags
-        .configure
-        .iter()
-        .find(|s| s.contains("CMAKE_INSTALL_PREFIX="))
-        .and_then(|s| s.split('=').nth(1))
-        .unwrap_or(&flags.prefix);
+    let prefix = cmake_cache_entry_value(&flags.configure, "CMAKE_INSTALL_PREFIX")
+        .unwrap_or(flags.prefix.as_str());
 
     // Generate toolchain file if cross-compiling
     let toolchain_file = if let Some(cc_cfg) = cross {
@@ -64,6 +60,9 @@ pub fn build(
         cmake_cmd.arg("-B").arg(&build_dir);
         cmake_cmd.arg(format!("-DCMAKE_INSTALL_PREFIX={}", prefix));
         cmake_cmd.arg("-DCMAKE_BUILD_TYPE=Release");
+        for arg in cmake_install_dir_args(flags) {
+            cmake_cmd.arg(arg);
+        }
 
         // Add toolchain file for cross-compilation
         if let Some(ref tf) = toolchain_file {
@@ -283,10 +282,45 @@ fn cmake_configure_flags_specify_generator(flags: &[String]) -> bool {
 }
 
 fn cmake_configure_flags_set_make_program(flags: &[String]) -> bool {
-    flags.iter().any(|flag| {
+    cmake_cache_entry_value(flags, "CMAKE_MAKE_PROGRAM").is_some()
+}
+
+fn cmake_cache_entry_value<'a>(flags: &'a [String], variable: &str) -> Option<&'a str> {
+    let plain_prefix = format!("-D{variable}=");
+    let typed_prefix = format!("-D{variable}:");
+    flags.iter().find_map(|flag| {
         let trimmed = flag.trim();
-        trimmed.starts_with("-DCMAKE_MAKE_PROGRAM=")
+        if let Some(value) = trimmed.strip_prefix(&plain_prefix) {
+            return Some(value);
+        }
+        trimmed
+            .strip_prefix(&typed_prefix)
+            .and_then(|rest| rest.split_once('=').map(|(_, value)| value))
     })
+}
+
+fn cmake_install_dir_args(flags: &crate::package::BuildFlags) -> Vec<String> {
+    let dirs = crate::builder::install_dirs(flags);
+    let defaults = [
+        ("CMAKE_INSTALL_BINDIR", dirs.bindir),
+        ("CMAKE_INSTALL_SBINDIR", dirs.sbindir),
+        ("CMAKE_INSTALL_LIBDIR", dirs.libdir),
+        ("CMAKE_INSTALL_LIBEXECDIR", dirs.libexecdir),
+        ("CMAKE_INSTALL_SYSCONFDIR", dirs.sysconfdir),
+        ("CMAKE_INSTALL_LOCALSTATEDIR", dirs.localstatedir),
+        ("CMAKE_INSTALL_SHAREDSTATEDIR", dirs.sharedstatedir),
+        ("CMAKE_INSTALL_INCLUDEDIR", dirs.includedir),
+        ("CMAKE_INSTALL_DATAROOTDIR", dirs.datarootdir),
+        ("CMAKE_INSTALL_DATADIR", dirs.datadir),
+        ("CMAKE_INSTALL_MANDIR", dirs.mandir),
+        ("CMAKE_INSTALL_INFODIR", dirs.infodir),
+    ];
+
+    defaults
+        .into_iter()
+        .filter(|(variable, _)| cmake_cache_entry_value(&flags.configure, variable).is_none())
+        .map(|(variable, value)| format!("-D{variable}={value}"))
+        .collect()
 }
 
 fn num_cpus() -> usize {
@@ -427,6 +461,98 @@ mod tests {
         assert!(!cmake_configure_flags_set_make_program(&[
             "-DCMAKE_C_COMPILER=clang".to_string()
         ]));
+    }
+
+    #[test]
+    fn test_cmake_cache_entry_value_supports_plain_and_typed_entries() {
+        let flags = vec![
+            "-DCMAKE_INSTALL_PREFIX=/usr".to_string(),
+            "-DCMAKE_INSTALL_LIBDIR:PATH=/usr/lib64".to_string(),
+        ];
+
+        assert_eq!(
+            cmake_cache_entry_value(&flags, "CMAKE_INSTALL_PREFIX"),
+            Some("/usr")
+        );
+        assert_eq!(
+            cmake_cache_entry_value(&flags, "CMAKE_INSTALL_LIBDIR"),
+            Some("/usr/lib64")
+        );
+        assert_eq!(
+            cmake_cache_entry_value(&flags, "CMAKE_INSTALL_BINDIR"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_cmake_install_dir_args_include_defaults() {
+        let args = cmake_install_dir_args(&BuildFlags::default());
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=/usr/bin"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_SBINDIR=/usr/bin"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_LIBDIR=/usr/lib"));
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_LIBEXECDIR=/usr/lib")
+        );
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_SYSCONFDIR=/etc"));
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_LOCALSTATEDIR=/var")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_SHAREDSTATEDIR=/var/lib")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_INCLUDEDIR=/usr/include")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_DATAROOTDIR=/usr/share")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_DATADIR=/usr/share")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_MANDIR=/usr/share/man")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_INFODIR=/usr/share/info")
+        );
+    }
+
+    #[test]
+    fn test_cmake_install_dir_args_respect_explicit_user_overrides() {
+        let flags = BuildFlags {
+            configure: vec![
+                "-DCMAKE_INSTALL_SBINDIR=/sbin".to_string(),
+                "-DCMAKE_INSTALL_LIBDIR:PATH=/custom/lib".to_string(),
+                "-DCMAKE_INSTALL_DATADIR=/custom/share".to_string(),
+            ],
+            ..BuildFlags::default()
+        };
+
+        let args = cmake_install_dir_args(&flags);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("-DCMAKE_INSTALL_SBINDIR="))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("-DCMAKE_INSTALL_LIBDIR="))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("-DCMAKE_INSTALL_DATADIR="))
+        );
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=/usr/bin"));
     }
 
     #[test]

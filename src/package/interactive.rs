@@ -1274,6 +1274,72 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             Value::String(spec.build.flags.bindir.clone()),
         );
     }
+    if !spec.build.flags.sbindir.is_empty() {
+        flags_tbl.insert(
+            "sbindir".into(),
+            Value::String(spec.build.flags.sbindir.clone()),
+        );
+    }
+    if !spec.build.flags.libdir.is_empty() {
+        flags_tbl.insert(
+            "libdir".into(),
+            Value::String(spec.build.flags.libdir.clone()),
+        );
+    }
+    if !spec.build.flags.libexecdir.is_empty() {
+        flags_tbl.insert(
+            "libexecdir".into(),
+            Value::String(spec.build.flags.libexecdir.clone()),
+        );
+    }
+    if !spec.build.flags.sysconfdir.is_empty() {
+        flags_tbl.insert(
+            "sysconfdir".into(),
+            Value::String(spec.build.flags.sysconfdir.clone()),
+        );
+    }
+    if !spec.build.flags.localstatedir.is_empty() {
+        flags_tbl.insert(
+            "localstatedir".into(),
+            Value::String(spec.build.flags.localstatedir.clone()),
+        );
+    }
+    if !spec.build.flags.sharedstatedir.is_empty() {
+        flags_tbl.insert(
+            "sharedstatedir".into(),
+            Value::String(spec.build.flags.sharedstatedir.clone()),
+        );
+    }
+    if !spec.build.flags.includedir.is_empty() {
+        flags_tbl.insert(
+            "includedir".into(),
+            Value::String(spec.build.flags.includedir.clone()),
+        );
+    }
+    if !spec.build.flags.datarootdir.is_empty() {
+        flags_tbl.insert(
+            "datarootdir".into(),
+            Value::String(spec.build.flags.datarootdir.clone()),
+        );
+    }
+    if !spec.build.flags.datadir.is_empty() {
+        flags_tbl.insert(
+            "datadir".into(),
+            Value::String(spec.build.flags.datadir.clone()),
+        );
+    }
+    if !spec.build.flags.mandir.is_empty() {
+        flags_tbl.insert(
+            "mandir".into(),
+            Value::String(spec.build.flags.mandir.clone()),
+        );
+    }
+    if !spec.build.flags.infodir.is_empty() {
+        flags_tbl.insert(
+            "infodir".into(),
+            Value::String(spec.build.flags.infodir.clone()),
+        );
+    }
     if !spec.build.flags.binary_type.is_empty() {
         flags_tbl.insert(
             "binary_type".into(),
@@ -1497,6 +1563,17 @@ mod tests {
             ltoflags: vec!["-flto=auto".into()],
             target: "x86_64-unknown-linux-gnu".into(),
             keep: vec!["etc/locale.gen".into()],
+            sbindir: "/usr/sbin".into(),
+            libdir: "/usr/lib64".into(),
+            libexecdir: "/usr/libexec".into(),
+            sysconfdir: "/etc/custom".into(),
+            localstatedir: "/var/custom".into(),
+            sharedstatedir: "/var/lib/custom".into(),
+            includedir: "/usr/include/custom".into(),
+            datarootdir: "/usr/share/root".into(),
+            datadir: "/usr/share/custom".into(),
+            mandir: "/usr/share/custom/man".into(),
+            infodir: "/usr/share/custom/info".into(),
             use_lto: false,
             no_flags: true,
             no_strip: true,
@@ -1560,6 +1637,17 @@ mod tests {
         assert!(toml.contains("target = \"x86_64-unknown-linux-gnu\""));
         assert!(toml.contains("keep = ["));
         assert!(toml.contains("\"etc/locale.gen\""));
+        assert!(toml.contains("sbindir = \"/usr/sbin\""));
+        assert!(toml.contains("libdir = \"/usr/lib64\""));
+        assert!(toml.contains("libexecdir = \"/usr/libexec\""));
+        assert!(toml.contains("sysconfdir = \"/etc/custom\""));
+        assert!(toml.contains("localstatedir = \"/var/custom\""));
+        assert!(toml.contains("sharedstatedir = \"/var/lib/custom\""));
+        assert!(toml.contains("includedir = \"/usr/include/custom\""));
+        assert!(toml.contains("datarootdir = \"/usr/share/root\""));
+        assert!(toml.contains("datadir = \"/usr/share/custom\""));
+        assert!(toml.contains("mandir = \"/usr/share/custom/man\""));
+        assert!(toml.contains("infodir = \"/usr/share/custom/info\""));
         assert!(toml.contains("use_lto = false"));
         assert!(toml.contains("no_flags = true"));
         assert!(toml.contains("no_strip = true"));

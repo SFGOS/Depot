@@ -20,12 +20,68 @@ use std::process::{Command, Stdio};
 
 pub type EnvVars = Vec<(String, String)>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstallDirs {
+    pub bindir: String,
+    pub sbindir: String,
+    pub libdir: String,
+    pub libexecdir: String,
+    pub sysconfdir: String,
+    pub localstatedir: String,
+    pub sharedstatedir: String,
+    pub includedir: String,
+    pub datarootdir: String,
+    pub datadir: String,
+    pub mandir: String,
+    pub infodir: String,
+}
+
 pub fn set_env_var(env_vars: &mut EnvVars, key: &str, value: impl Into<String>) {
     let value = value.into();
     if let Some((_, existing)) = env_vars.iter_mut().find(|(k, _)| k == key) {
         *existing = value;
     } else {
         env_vars.push((key.to_string(), value));
+    }
+}
+
+fn default_libdir_for_variant(lib32_variant: bool) -> &'static str {
+    if lib32_variant {
+        "/usr/lib32"
+    } else {
+        "/usr/lib"
+    }
+}
+
+fn configured_install_dir(value: &str, default: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub(crate) fn install_dirs(flags: &crate::package::BuildFlags) -> InstallDirs {
+    let libdir = configured_install_dir(
+        &flags.libdir,
+        default_libdir_for_variant(flags.lib32_variant),
+    );
+    let datarootdir = configured_install_dir(&flags.datarootdir, "/usr/share");
+
+    InstallDirs {
+        bindir: configured_install_dir(&flags.bindir, "/usr/bin"),
+        sbindir: configured_install_dir(&flags.sbindir, "/usr/bin"),
+        libdir: libdir.clone(),
+        libexecdir: configured_install_dir(&flags.libexecdir, &libdir),
+        sysconfdir: configured_install_dir(&flags.sysconfdir, "/etc"),
+        localstatedir: configured_install_dir(&flags.localstatedir, "/var"),
+        sharedstatedir: configured_install_dir(&flags.sharedstatedir, "/var/lib"),
+        includedir: configured_install_dir(&flags.includedir, "/usr/include"),
+        datarootdir: datarootdir.clone(),
+        datadir: configured_install_dir(&flags.datadir, &datarootdir),
+        mandir: configured_install_dir(&flags.mandir, "/usr/share/man"),
+        infodir: configured_install_dir(&flags.infodir, "/usr/share/info"),
     }
 }
 
@@ -550,5 +606,39 @@ mod tests {
             env.iter().any(|(k, v)| k == "CC" && v == "spec-cc"),
             "expected default CC to take precedence over passthrough CC"
         );
+    }
+
+    #[test]
+    fn test_install_dirs_use_defaults_and_lib32_fallbacks() {
+        let default_dirs = install_dirs(&BuildFlags::default());
+        assert_eq!(default_dirs.bindir, "/usr/bin");
+        assert_eq!(default_dirs.sbindir, "/usr/bin");
+        assert_eq!(default_dirs.libdir, "/usr/lib");
+        assert_eq!(default_dirs.libexecdir, "/usr/lib");
+        assert_eq!(default_dirs.datarootdir, "/usr/share");
+        assert_eq!(default_dirs.datadir, "/usr/share");
+
+        let lib32_dirs = install_dirs(&BuildFlags {
+            lib32_variant: true,
+            ..BuildFlags::default()
+        });
+        assert_eq!(lib32_dirs.libdir, "/usr/lib32");
+        assert_eq!(lib32_dirs.libexecdir, "/usr/lib32");
+    }
+
+    #[test]
+    fn test_install_dirs_respect_explicit_overrides_and_derived_defaults() {
+        let dirs = install_dirs(&BuildFlags {
+            bindir: "/opt/bin".into(),
+            libdir: "/opt/lib64".into(),
+            datarootdir: "/opt/share-root".into(),
+            ..BuildFlags::default()
+        });
+
+        assert_eq!(dirs.bindir, "/opt/bin");
+        assert_eq!(dirs.libdir, "/opt/lib64");
+        assert_eq!(dirs.libexecdir, "/opt/lib64");
+        assert_eq!(dirs.datarootdir, "/opt/share-root");
+        assert_eq!(dirs.datadir, "/opt/share-root");
     }
 }

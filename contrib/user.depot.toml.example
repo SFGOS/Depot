@@ -8,3 +8,8 @@ cc = "clang"
 cflags = ["-O2"]
 cflags += ["-g"]
 carch = "x86_64"
+
+# Optional install directory overrides for supported builders
+#bindir = "/usr/local/bin"
+#sbindir = "/usr/local/sbin"
+#libdir = "/usr/local/lib"

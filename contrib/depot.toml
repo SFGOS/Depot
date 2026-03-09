@@ -13,6 +13,20 @@ cflags = ["-O2"]
 # Append additional flags (demonstrates += append support)
 cflags += ["-g"]
 
+# Optional install directory overrides for supported builders
+#bindir = "/usr/bin"
+#sbindir = "/usr/bin"
+#libdir = "/usr/lib"
+#libexecdir = "/usr/lib"
+#sysconfdir = "/etc"
+#localstatedir = "/var"
+#sharedstatedir = "/var/lib"
+#includedir = "/usr/include"
+#datarootdir = "/usr/share"
+#datadir = "/usr/share"
+#mandir = "/usr/share/man"
+#infodir = "/usr/share/info"
+
 # Linker flags
 ldflags = ["-Wl,-O1"]
 

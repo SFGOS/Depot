@@ -162,9 +162,28 @@ fn meson_setup_args(
     env_vars: &[(String, String)],
 ) -> Vec<String> {
     let mut args = Vec::new();
+    let dirs = crate::builder::install_dirs(flags);
 
     if !has_option(&flags.configure, "--prefix") {
         args.push(format!("--prefix={}", flags.prefix));
+    }
+    for (option, value) in [
+        ("--bindir", dirs.bindir),
+        ("--sbindir", dirs.sbindir),
+        ("--libdir", dirs.libdir),
+        ("--libexecdir", dirs.libexecdir),
+        ("--sysconfdir", dirs.sysconfdir),
+        ("--localstatedir", dirs.localstatedir),
+        ("--sharedstatedir", dirs.sharedstatedir),
+        ("--includedir", dirs.includedir),
+        ("--datarootdir", dirs.datarootdir),
+        ("--datadir", dirs.datadir),
+        ("--mandir", dirs.mandir),
+        ("--infodir", dirs.infodir),
+    ] {
+        if !has_option(&flags.configure, option) {
+            args.push(format!("{option}={value}"));
+        }
     }
     if !has_option(&flags.configure, "--buildtype") {
         args.push("--buildtype=release".to_string());
@@ -276,6 +295,23 @@ mod tests {
     }
 
     #[test]
+    fn test_meson_setup_args_include_install_dirs() {
+        let args = meson_setup_args(&BuildFlags::default(), None, &[]);
+        assert!(args.iter().any(|a| a == "--bindir=/usr/bin"));
+        assert!(args.iter().any(|a| a == "--sbindir=/usr/bin"));
+        assert!(args.iter().any(|a| a == "--libdir=/usr/lib"));
+        assert!(args.iter().any(|a| a == "--libexecdir=/usr/lib"));
+        assert!(args.iter().any(|a| a == "--sysconfdir=/etc"));
+        assert!(args.iter().any(|a| a == "--localstatedir=/var"));
+        assert!(args.iter().any(|a| a == "--sharedstatedir=/var/lib"));
+        assert!(args.iter().any(|a| a == "--includedir=/usr/include"));
+        assert!(args.iter().any(|a| a == "--datarootdir=/usr/share"));
+        assert!(args.iter().any(|a| a == "--datadir=/usr/share"));
+        assert!(args.iter().any(|a| a == "--mandir=/usr/share/man"));
+        assert!(args.iter().any(|a| a == "--infodir=/usr/share/info"));
+    }
+
+    #[test]
     fn test_meson_setup_args_honor_explicit_prefix() {
         let flags = BuildFlags {
             prefix: "/usr".to_string(),
@@ -286,6 +322,24 @@ mod tests {
         let args = meson_setup_args(&flags, None, &[]);
         assert_eq!(args.iter().filter(|a| a.starts_with("--prefix")).count(), 1);
         assert!(args.iter().any(|a| a == "--prefix=/opt"));
+    }
+
+    #[test]
+    fn test_meson_setup_args_honor_explicit_install_dirs() {
+        let flags = BuildFlags {
+            configure: vec![
+                "--sbindir=/sbin".to_string(),
+                "--libdir=/custom/lib".to_string(),
+                "--datadir=/custom/share".to_string(),
+            ],
+            ..BuildFlags::default()
+        };
+
+        let args = meson_setup_args(&flags, None, &[]);
+        assert!(!args.iter().any(|a| a == "--sbindir=/usr/bin"));
+        assert!(!args.iter().any(|a| a == "--libdir=/usr/lib"));
+        assert!(!args.iter().any(|a| a == "--datadir=/usr/share"));
+        assert!(args.iter().any(|a| a == "--bindir=/usr/bin"));
     }
 
     #[test]

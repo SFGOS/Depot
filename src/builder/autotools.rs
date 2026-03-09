@@ -442,25 +442,20 @@ fn default_configure_install_dirs(
     flags: &crate::package::BuildFlags,
     help_text: Option<&str>,
 ) -> Vec<String> {
-    let libdir = if flags.lib32_variant {
-        "/usr/lib32"
-    } else {
-        "/usr/lib"
-    };
-    let bindir = nonempty_trimmed(&flags.bindir).unwrap_or("/usr/bin");
+    let dirs = crate::builder::install_dirs(flags);
     let defaults = [
-        ("--bindir", bindir),
-        ("--sbindir", "/usr/bin"),
-        ("--libdir", libdir),
-        ("--libexecdir", libdir),
-        ("--sysconfdir", "/etc"),
-        ("--localstatedir", "/var"),
-        ("--sharedstatedir", "/var/lib"),
-        ("--includedir", "/usr/include"),
-        ("--datarootdir", "/usr/share"),
-        ("--datadir", "/usr/share"),
-        ("--mandir", "/usr/share/man"),
-        ("--infodir", "/usr/share/info"),
+        ("--bindir", dirs.bindir),
+        ("--sbindir", dirs.sbindir),
+        ("--libdir", dirs.libdir),
+        ("--libexecdir", dirs.libexecdir),
+        ("--sysconfdir", dirs.sysconfdir),
+        ("--localstatedir", dirs.localstatedir),
+        ("--sharedstatedir", dirs.sharedstatedir),
+        ("--includedir", dirs.includedir),
+        ("--datarootdir", dirs.datarootdir),
+        ("--datadir", dirs.datadir),
+        ("--mandir", dirs.mandir),
+        ("--infodir", dirs.infodir),
     ];
 
     defaults
