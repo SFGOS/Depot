@@ -161,7 +161,7 @@ struct Resolver<'a> {
 
 impl<'a> Resolver<'a> {
     fn new(config: &'a Config, rootfs: &'a Path, opts: PlannerOptions) -> Self {
-        let db_path = config.db_dir.join("packages.db");
+        let db_path = config.installed_db_path(rootfs);
         let pkg_index = PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
         Self {
             config,

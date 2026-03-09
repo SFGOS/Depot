@@ -707,7 +707,7 @@ pub fn install_atomic(
                 fs::create_dir_all(parent)?;
             }
 
-            if dest_path.symlink_metadata().is_ok() {
+            if let Ok(dest_meta) = dest_path.symlink_metadata() {
                 // lexists checks existence without following symlinks
                 // Backup existing
                 let backup_path = tx.backup_path(&install_rel_path);
@@ -716,10 +716,14 @@ pub fn install_atomic(
                 }
 
                 // Fallback: if symlink, read link and recreate at backup.
-                let dest_meta = dest_path.symlink_metadata()?;
                 if dest_meta.file_type().is_symlink() {
                     let target = fs::read_link(&dest_path)?;
                     std::os::unix::fs::symlink(&target, &backup_path)?;
+                } else if dest_meta.file_type().is_dir() {
+                    anyhow::bail!(
+                        "Refusing to replace existing directory with packaged file/symlink: {}",
+                        install_rel_path
+                    );
                 } else {
                     fs::copy(&dest_path, &backup_path)?;
                 }
@@ -731,12 +735,14 @@ pub fn install_atomic(
 
             // Install new file/symlink
             // Remove destination if it exists (we backed it up) so we can overwrite
-            if dest_path.symlink_metadata().is_ok() {
-                if dest_path.is_dir() {
-                    fs::remove_dir_all(&dest_path)?;
-                } else {
-                    fs::remove_file(&dest_path)?;
+            if let Ok(dest_meta) = dest_path.symlink_metadata() {
+                if dest_meta.file_type().is_dir() {
+                    anyhow::bail!(
+                        "Refusing to replace existing directory with packaged file/symlink: {}",
+                        install_rel_path
+                    );
                 }
+                fs::remove_file(&dest_path)?;
             }
 
             if file_type.is_symlink() {
@@ -1003,6 +1009,51 @@ mod tests {
         assert!(!rootfs.join("etc/pam.d/subdir/nested.depotnew").exists());
 
         tx.rollback().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_atomic_replaces_existing_symlink_without_touching_target_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(&destdir).unwrap();
+        std::fs::write(rootfs.join("usr/bin/existing"), "keep-me").unwrap();
+        std::os::unix::fs::symlink("usr/bin", rootfs.join("bin")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", destdir.join("bin")).unwrap();
+
+        let tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(rootfs.join("bin")).unwrap(),
+            PathBuf::from("usr/bin")
+        );
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/bin/existing")).unwrap(),
+            "keep-me"
+        );
+
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_atomic_rejects_replacing_directory_with_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(rootfs.join("usr/sbin")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr")).unwrap();
+        std::os::unix::fs::symlink("bin", destdir.join("usr/sbin")).unwrap();
+
+        let err = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Refusing to replace existing directory with packaged file/symlink")
+        );
     }
 
     #[test]

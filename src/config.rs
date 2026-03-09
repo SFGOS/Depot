@@ -269,6 +269,16 @@ impl Config {
         config
     }
 
+    /// Return the package database path used to query what is installed in `rootfs`.
+    ///
+    /// For the live system root (`/`), non-root processes still read the system DB
+    /// from `/var/lib/depot/packages.db` even though writable state is redirected
+    /// to per-user directories under `$HOME`.
+    pub fn installed_db_path(&self, rootfs: &Path) -> PathBuf {
+        let abs_rootfs = resolve_rootfs_base(rootfs);
+        abs_rootfs.join("var/lib/depot/packages.db")
+    }
+
     /// Load system-level and user-level overrides
     pub fn load_system(&mut self, rootfs: &Path) -> Result<()> {
         // Load host system config (fallback) and then the requested rootfs config
@@ -640,6 +650,25 @@ cflags += ["-g"]
                 std::env::remove_var("HOME");
             }
         }
+    }
+
+    #[test]
+    fn test_installed_db_path_targets_rootfs_db() {
+        let root = PathBuf::from("/tmp/test_root");
+        let config = Config::for_rootfs(&root);
+        assert_eq!(
+            config.installed_db_path(&root),
+            PathBuf::from("/tmp/test_root/var/lib/depot/packages.db")
+        );
+    }
+
+    #[test]
+    fn test_installed_db_path_uses_system_db_for_live_root() {
+        let config = Config::for_rootfs(Path::new("/"));
+        assert_eq!(
+            config.installed_db_path(Path::new("/")),
+            PathBuf::from("/var/lib/depot/packages.db")
+        );
     }
 
     #[test]

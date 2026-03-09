@@ -191,6 +191,20 @@ impl Packager {
             ),
         );
         map.insert("dependencies".to_string(), toml::Value::Table(deps));
+        if !self.spec.build.flags.keep.is_empty() {
+            map.insert(
+                "keep".to_string(),
+                toml::Value::Array(
+                    self.spec
+                        .build
+                        .flags
+                        .keep
+                        .iter()
+                        .map(|s| toml::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
 
         let toml_str = toml::to_string(&toml::Value::Table(map))
             .context("Failed to serialize metadata to TOML")?;
@@ -418,6 +432,27 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].as_str(), Some("MIT"));
         assert_eq!(arr[1].as_str(), Some("Apache-2.0"));
+    }
+
+    #[test]
+    fn test_generate_metadata_toml_includes_keep_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+
+        let mut packager = mk_packager(dest.to_path_buf());
+        packager.spec.build.flags.keep = vec!["etc/fstab".into(), "etc/passwd".into()];
+        packager.generate_metadata_toml().unwrap();
+
+        let meta_path = dest.join(".metadata.toml");
+        let content = fs::read_to_string(meta_path).unwrap();
+        let val: toml::Value = toml::from_str(&content).unwrap();
+        let keep = val
+            .get("keep")
+            .and_then(|v| v.as_array())
+            .expect("keep should be an array");
+        assert_eq!(keep.len(), 2);
+        assert_eq!(keep[0].as_str(), Some("etc/fstab"));
+        assert_eq!(keep[1].as_str(), Some("etc/passwd"));
     }
 
     #[test]

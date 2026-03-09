@@ -119,6 +119,149 @@ fn parse_dependency_list(metadata: &toml::Value, kind: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn parse_keep_list(metadata: &toml::Value) -> Vec<String> {
+    if let Some(s) = metadata.get("keep").and_then(|v| v.as_str()) {
+        return vec![s.to_string()];
+    }
+    if let Some(arr) = metadata.get("keep").and_then(|v| v.as_array()) {
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(String::from)
+            .collect();
+    }
+    Vec::new()
+}
+
+fn package_spec_from_archive_metadata(metadata: &toml::Value) -> package::PackageSpec {
+    let mut spec = package::PackageSpec {
+        package: package::PackageInfo {
+            name: metadata
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            version: metadata
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            revision: metadata
+                .get("revision")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(1) as u32,
+            description: metadata
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            homepage: metadata
+                .get("homepage")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            license: parse_licenses_from_toml(metadata),
+        },
+        packages: Vec::new(),
+        alternatives: package::Alternatives::default(),
+        manual_sources: Vec::new(),
+        source: Vec::new(),
+        build: package::Build {
+            build_type: package::BuildType::Bin,
+            flags: package::BuildFlags {
+                keep: parse_keep_list(metadata),
+                ..package::BuildFlags::default()
+            },
+        },
+        dependencies: package::Dependencies {
+            build: Vec::new(),
+            runtime: parse_dependency_list(metadata, "runtime"),
+            test: Vec::new(),
+            optional: parse_dependency_list(metadata, "optional"),
+        },
+        package_alternatives: Default::default(),
+        package_dependencies: Default::default(),
+        spec_dir: PathBuf::from("."),
+    };
+
+    if let Some(provides) = metadata.get("provides").and_then(|v| v.as_array()) {
+        spec.alternatives.provides = provides
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(String::from)
+            .collect();
+    }
+
+    spec
+}
+
+fn load_package_spec_from_staging(staged_dir: &Path) -> Result<package::PackageSpec> {
+    let metadata_path = staged_dir.join(".metadata.toml");
+    let metadata_content = fs::read_to_string(&metadata_path)
+        .with_context(|| format!("Failed to read {}", metadata_path.display()))?;
+    let metadata: toml::Value = toml::from_str(&metadata_content)
+        .with_context(|| format!("Failed to parse {}", metadata_path.display()))?;
+    Ok(package_spec_from_archive_metadata(&metadata))
+}
+
+fn parse_license_list_from_repo(license: &Option<String>) -> Vec<String> {
+    let Some(raw) = license.as_ref() else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn package_spec_from_repo_record(
+    record: &db::repo::BinaryRepoPackageRecord,
+) -> package::PackageSpec {
+    package::PackageSpec {
+        package: package::PackageInfo {
+            name: record.name.clone(),
+            version: record.version.clone(),
+            revision: record.revision,
+            description: record.description.clone().unwrap_or_default(),
+            homepage: record.homepage.clone().unwrap_or_default(),
+            license: parse_license_list_from_repo(&record.license),
+        },
+        packages: Vec::new(),
+        alternatives: package::Alternatives {
+            provides: record.provides.clone(),
+            replaces: Vec::new(),
+        },
+        manual_sources: Vec::new(),
+        source: Vec::new(),
+        build: package::Build {
+            build_type: package::BuildType::Bin,
+            flags: package::BuildFlags::default(),
+        },
+        dependencies: package::Dependencies {
+            build: Vec::new(),
+            runtime: record.runtime_dependencies.clone(),
+            test: Vec::new(),
+            optional: record.optional_dependencies.clone(),
+        },
+        package_alternatives: Default::default(),
+        package_dependencies: Default::default(),
+        spec_dir: PathBuf::from("."),
+    }
+}
+
+fn load_package_spec_from_staging_or_repo_record(
+    staged_dir: &Path,
+    record: &db::repo::BinaryRepoPackageRecord,
+) -> Result<package::PackageSpec> {
+    let metadata_path = staged_dir.join(".metadata.toml");
+    if metadata_path.exists() {
+        load_package_spec_from_staging(staged_dir)
+    } else {
+        Ok(package_spec_from_repo_record(record))
+    }
+}
+
 fn staging_temp_root(config: &config::Config) -> PathBuf {
     config.build_dir.join("staging")
 }
@@ -215,62 +358,7 @@ fn load_package_archive_into_staging(
         )
     })?;
 
-    let mut spec = package::PackageSpec {
-        package: package::PackageInfo {
-            name: metadata
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            version: metadata
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            revision: metadata
-                .get("revision")
-                .and_then(|v| v.as_integer())
-                .unwrap_or(1) as u32,
-            description: metadata
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            homepage: metadata
-                .get("homepage")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            license: parse_licenses_from_toml(&metadata),
-        },
-        packages: Vec::new(),
-        alternatives: package::Alternatives::default(),
-        manual_sources: Vec::new(),
-        source: Vec::new(),
-        build: package::Build {
-            build_type: package::BuildType::Bin,
-            flags: package::BuildFlags::default(),
-        },
-        dependencies: package::Dependencies {
-            build: Vec::new(),
-            runtime: parse_dependency_list(&metadata, "runtime"),
-            test: Vec::new(),
-            optional: parse_dependency_list(&metadata, "optional"),
-        },
-        package_alternatives: Default::default(),
-        package_dependencies: Default::default(),
-        spec_dir: PathBuf::from("."),
-    };
-
-    if let Some(provides) = metadata.get("provides").and_then(|v| v.as_array()) {
-        spec.alternatives.provides = provides
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(String::from)
-            .collect();
-    }
-
-    Ok((spec, tmp_dir))
+    Ok((package_spec_from_archive_metadata(&metadata), tmp_dir))
 }
 
 fn extract_package_archive_to_staging(
@@ -299,52 +387,6 @@ fn extract_package_archive_to_staging(
         )
     })?;
     Ok(tmp_dir)
-}
-
-fn parse_license_list_from_repo(license: &Option<String>) -> Vec<String> {
-    let Some(raw) = license.as_ref() else {
-        return Vec::new();
-    };
-    raw.split(',')
-        .map(|part| part.trim())
-        .filter(|part| !part.is_empty())
-        .map(String::from)
-        .collect()
-}
-
-fn package_spec_from_repo_record(
-    record: &db::repo::BinaryRepoPackageRecord,
-) -> package::PackageSpec {
-    package::PackageSpec {
-        package: package::PackageInfo {
-            name: record.name.clone(),
-            version: record.version.clone(),
-            revision: record.revision,
-            description: record.description.clone().unwrap_or_default(),
-            homepage: record.homepage.clone().unwrap_or_default(),
-            license: parse_license_list_from_repo(&record.license),
-        },
-        packages: Vec::new(),
-        alternatives: package::Alternatives {
-            provides: record.provides.clone(),
-            replaces: Vec::new(),
-        },
-        manual_sources: Vec::new(),
-        source: Vec::new(),
-        build: package::Build {
-            build_type: package::BuildType::Bin,
-            flags: package::BuildFlags::default(),
-        },
-        dependencies: package::Dependencies {
-            build: Vec::new(),
-            runtime: record.runtime_dependencies.clone(),
-            test: Vec::new(),
-            optional: record.optional_dependencies.clone(),
-        },
-        package_alternatives: Default::default(),
-        package_dependencies: Default::default(),
-        spec_dir: PathBuf::from("."),
-    }
 }
 
 fn build_type_runs_automatic_tests(build_type: package::BuildType) -> bool {
@@ -618,6 +660,7 @@ struct PlannedPackageInstall {
 fn plan_staged_install(
     pkg_spec: &package::PackageSpec,
     destdir: &Path,
+    rootfs: &Path,
     config: &config::Config,
 ) -> Result<PlannedStagedInstall> {
     std::fs::create_dir_all(&config.db_dir).with_context(|| {
@@ -626,7 +669,7 @@ fn plan_staged_install(
             config.db_dir.display()
         )
     })?;
-    let db_path = config.db_dir.join("packages.db");
+    let db_path = config.installed_db_path(rootfs);
 
     let is_update = db::get_package_version(&db_path, &pkg_spec.package.name)?.is_some();
     let new_files = staging::generate_manifest_with_dirs(destdir)?;
@@ -656,6 +699,7 @@ fn plan_staged_install(
 fn plan_package_outputs_for_install(
     pkg_spec: &package::PackageSpec,
     destdir: &Path,
+    rootfs: &Path,
     config: &config::Config,
 ) -> Result<Vec<PlannedPackageInstall>> {
     let mut plans = Vec::new();
@@ -666,7 +710,7 @@ fn plan_package_outputs_for_install(
         spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
         spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
         let out_destdir = output_destdir_for(destdir, &pkg_spec.package.name, &output_name);
-        let staged = plan_staged_install(&spec_for_out, &out_destdir, config)?;
+        let staged = plan_staged_install(&spec_for_out, &out_destdir, rootfs, config)?;
         plans.push(PlannedPackageInstall {
             spec: spec_for_out,
             destdir: out_destdir,
@@ -732,7 +776,7 @@ fn install_staged_to_rootfs(
         &pkg_spec.build.flags.keep,
     )?;
 
-    let db_path = config.db_dir.join("packages.db");
+    let db_path = config.installed_db_path(rootfs);
     if let Err(e) = db::register_package(&db_path, pkg_spec, destdir) {
         let _ = tx.rollback();
         return Err(e);
@@ -784,7 +828,7 @@ fn install_package_outputs_to_rootfs(
     rootfs: &Path,
     config: &config::Config,
 ) -> Result<Vec<package::PackageInfo>> {
-    let plans = plan_package_outputs_for_install(pkg_spec, destdir, config)?;
+    let plans = plan_package_outputs_for_install(pkg_spec, destdir, rootfs, config)?;
     run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Pre, &plans)?;
     let installed = install_planned_packages_to_rootfs(&plans, rootfs, config)?;
     run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Post, &plans)?;
@@ -1398,8 +1442,8 @@ fn execute_install_plan_with_child_commands(
                     )
                 })?;
             let staged = extract_package_archive_to_staging(config, &cached.package_path)?;
-            let spec = package_spec_from_repo_record(record);
-            let plans = plan_package_outputs_for_install(&spec, staged.path(), config)?;
+            let spec = load_package_spec_from_staging_or_repo_record(staged.path(), record)?;
+            let plans = plan_package_outputs_for_install(&spec, staged.path(), rootfs, config)?;
             binary_pre_hook_plans.extend(plans);
         }
     }
@@ -1454,8 +1498,8 @@ fn execute_install_plan_with_child_commands(
                         )
                     })?;
                 let staged = extract_package_archive_to_staging(config, &cached.package_path)?;
-                let spec = package_spec_from_repo_record(record);
-                let plans = plan_package_outputs_for_install(&spec, staged.path(), config)?;
+                let spec = load_package_spec_from_staging_or_repo_record(staged.path(), record)?;
+                let plans = plan_package_outputs_for_install(&spec, staged.path(), rootfs, config)?;
                 let installed = install_planned_packages_to_rootfs(&plans, rootfs, config)?;
                 binary_post_hook_plans.extend(plans);
                 for pkg in installed {
@@ -1626,7 +1670,7 @@ fn run_direct_install_request(
             config.db_dir.display()
         )
     })?;
-    let db_path = config.db_dir.join("packages.db");
+    let db_path = config.installed_db_path(options.rootfs);
 
     if staging_dir.is_none() {
         maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
@@ -1759,7 +1803,8 @@ fn run_direct_install_request(
             ui::info("Installing binary archive payload without staging transforms");
         }
 
-        let output_plans = plan_package_outputs_for_install(&pkg_spec, &destdir, config)?;
+        let output_plans =
+            plan_package_outputs_for_install(&pkg_spec, &destdir, options.rootfs, config)?;
         transaction_plans.extend(output_plans);
     }
 
@@ -1773,7 +1818,7 @@ fn run_direct_install_request(
             options.lib32_only,
         )?
     {
-        let staged = plan_staged_install(&lib32_spec, &lib32_destdir, config)?;
+        let staged = plan_staged_install(&lib32_spec, &lib32_destdir, options.rootfs, config)?;
         transaction_plans.push(PlannedPackageInstall {
             spec: lib32_spec,
             destdir: lib32_destdir,
@@ -1978,7 +2023,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     config.db_dir.display()
                 )
             })?;
-            let db_path = config.db_dir.join("packages.db");
+            let db_path = config.installed_db_path(&cli.rootfs);
 
             maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
 
@@ -2182,12 +2227,17 @@ pub fn run(cli: Cli) -> Result<()> {
 
                     let mut transaction_plans = Vec::new();
                     if !cli.lib32_only {
-                        let output_plans =
-                            plan_package_outputs_for_install(&pkg_spec, &destdir, &config)?;
+                        let output_plans = plan_package_outputs_for_install(
+                            &pkg_spec,
+                            &destdir,
+                            &cli.rootfs,
+                            &config,
+                        )?;
                         transaction_plans.extend(output_plans);
                     }
                     if let Some((lib32_spec, lib32_destdir)) = &lib32_install_bundle {
-                        let staged = plan_staged_install(lib32_spec, lib32_destdir, &config)?;
+                        let staged =
+                            plan_staged_install(lib32_spec, lib32_destdir, &cli.rootfs, &config)?;
                         transaction_plans.push(PlannedPackageInstall {
                             spec: lib32_spec.clone(),
                             destdir: lib32_destdir.clone(),
@@ -2255,14 +2305,14 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("{}", pkg_spec);
 
                 // Also show dependency status
-                let db_path = config.db_dir.join("packages.db");
+                let db_path = config.installed_db_path(&cli.rootfs);
                 deps::print_dep_status(&pkg_spec, &db_path)?;
             } else {
                 let config = config::Config::for_rootfs(&cli.rootfs);
                 let info_lock = locking::open_lock(&config)?;
                 let info_lock_path = locking::lock_path(&config);
                 let _info_lock_guard = locking::try_read(&info_lock, &info_lock_path, "info")?;
-                let db_path = config.db_dir.join("packages.db");
+                let db_path = config.installed_db_path(&cli.rootfs);
                 db::show_package_info(&db_path, &package)?;
             }
         }
@@ -2278,7 +2328,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let owns_lock = locking::open_lock(&config)?;
             let owns_lock_path = locking::lock_path(&config);
             let _owns_lock_guard = locking::try_read(&owns_lock, &owns_lock_path, "owns")?;
-            let db_path = config.db_dir.join("packages.db");
+            let db_path = config.installed_db_path(&cli.rootfs);
             match db::owns_path(&db_path, &path)? {
                 Some(owner) => ui::info(format!("{} is owned by {}", path.display(), owner)),
                 None => ui::warn(format!("No installed package owns {}", path.display())),
@@ -2289,7 +2339,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let list_lock = locking::open_lock(&config)?;
             let list_lock_path = locking::lock_path(&config);
             let _list_lock_guard = locking::try_read(&list_lock, &list_lock_path, "list")?;
-            let db_path = config.db_dir.join("packages.db");
+            let db_path = config.installed_db_path(&cli.rootfs);
             db::list_packages(&db_path)?;
         }
         Commands::Sign { files } => {
@@ -2958,6 +3008,124 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(root_mode, 0o4755);
+        Ok(())
+    }
+
+    #[test]
+    fn binary_archive_install_honors_keep_paths_from_metadata() -> Result<()> {
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let pkg_dir = tempfile::tempdir().context("Failed to create temp package dir")?;
+        let archive_path = pkg_dir
+            .path()
+            .join("filesystem-1.0-3-x86_64.depot.pkg.tar.zst");
+
+        let file = fs::File::create(&archive_path)
+            .with_context(|| format!("Failed to create {}", archive_path.display()))?;
+        let encoder =
+            zstd::stream::write::Encoder::new(file, 3).context("Failed to create zstd encoder")?;
+        let mut tar = tar::Builder::new(encoder);
+
+        let payload = b"package-fstab";
+        let mut fstab_header = tar::Header::new_gnu();
+        fstab_header.set_path("etc/fstab").unwrap();
+        fstab_header.set_size(payload.len() as u64);
+        fstab_header.set_mode(0o644);
+        fstab_header.set_cksum();
+        tar.append(&fstab_header, &payload[..]).unwrap();
+
+        let metadata = br#"name = "filesystem"
+version = "1.0.1"
+revision = 3
+description = "Base filesystem"
+homepage = "https://example.test"
+license = "Unlicense"
+keep = ["etc/fstab"]
+
+[dependencies]
+runtime = []
+optional = []
+"#;
+        let mut meta_header = tar::Header::new_gnu();
+        meta_header.set_path(".metadata.toml").unwrap();
+        meta_header.set_size(metadata.len() as u64);
+        meta_header.set_mode(0o644);
+        meta_header.set_cksum();
+        tar.append(&meta_header, &metadata[..]).unwrap();
+
+        let encoder = tar.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+        cfg.db_dir = rootfs.path().join("var/lib/depot");
+
+        fs::create_dir_all(rootfs.path().join("etc"))?;
+        fs::write(rootfs.path().join("etc/fstab"), "existing-fstab")?;
+
+        let (spec, staged) = load_package_archive_into_staging(&cfg, &archive_path)?;
+        assert_eq!(spec.build.flags.keep, vec!["etc/fstab".to_string()]);
+
+        let installed =
+            install_package_outputs_to_rootfs(&spec, staged.path(), rootfs.path(), &cfg)?;
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            fs::read_to_string(rootfs.path().join("etc/fstab"))?,
+            "existing-fstab"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.path().join("etc/fstab.depotnew"))?,
+            "package-fstab"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_staged_install_reads_updates_from_rootfs_installed_db() -> Result<()> {
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.db_dir = rootfs.path().join("home/vertex/.local/share/depot");
+
+        let installed_db = cfg.installed_db_path(rootfs.path());
+        fs::create_dir_all(
+            installed_db
+                .parent()
+                .context("Installed DB path should have a parent")?,
+        )?;
+
+        let existing_dest = rootfs.path().join("installed");
+        fs::create_dir_all(existing_dest.join("usr/bin"))?;
+        fs::write(existing_dest.join("usr/bin/tool"), "old")?;
+
+        let spec = package::PackageSpec {
+            package: package::PackageInfo {
+                name: "filesystem".into(),
+                version: "1.0.1".into(),
+                revision: 3,
+                description: "Base filesystem".into(),
+                homepage: "https://example.test".into(),
+                license: vec!["Unlicense".into()],
+            },
+            packages: Vec::new(),
+            alternatives: package::Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: package::Build {
+                build_type: package::BuildType::Bin,
+                flags: package::BuildFlags::default(),
+            },
+            dependencies: package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+        db::register_package(&installed_db, &spec, &existing_dest)?;
+
+        let staged_dest = rootfs.path().join("staged");
+        fs::create_dir_all(staged_dest.join("usr/bin"))?;
+        fs::write(staged_dest.join("usr/bin/tool"), "new")?;
+
+        let plan = plan_staged_install(&spec, &staged_dest, rootfs.path(), &cfg)?;
+        assert!(plan.is_update);
         Ok(())
     }
 
