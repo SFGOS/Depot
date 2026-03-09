@@ -337,6 +337,16 @@ impl PackageSpec {
                         self.build.flags.ar = s.to_string();
                     }
                 }
+                "ld" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.ld = s.to_string();
+                    }
+                }
+                "cpp" => {
+                    if let Some(s) = v.as_str() {
+                        self.build.flags.cpp = s.to_string();
+                    }
+                }
                 "prefix" => {
                     if let Some(s) = v.as_str() {
                         self.build.flags.prefix = s.to_string();
@@ -939,6 +949,16 @@ impl PackageSpec {
             "ar" => {
                 if let Some(s) = values.last().and_then(|v| v.as_str()) {
                     self.build.flags.ar = s.to_string();
+                }
+            }
+            "ld" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.ld = s.to_string();
+                }
+            }
+            "cpp" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.cpp = s.to_string();
                 }
             }
             "prefix" => {
@@ -1890,6 +1910,8 @@ type = "custom"
             r#"
 [flags]
 cc = "my-cc"
+ld = "ld.lld"
+CPP = "clang-cpp"
 cflags = ["-O2"]
 cxxflags = ["-O2", "-pipe"]
 passthrough_env = ["RUSTFLAGS"]
@@ -2014,6 +2036,8 @@ post_configure = ["echo configured"]
         spec.apply_config(&config);
 
         assert_eq!(spec.build.flags.cc, "my-cc");
+        assert_eq!(spec.build.flags.ld, "ld.lld");
+        assert_eq!(spec.build.flags.cpp, "clang-cpp");
         assert!(spec.build.flags.cflags.contains(&"-O2".to_string()));
         assert!(spec.build.flags.cflags.contains(&"-g".to_string()));
         assert!(spec.build.flags.cxxflags.contains(&"-O2".to_string()));
@@ -3273,6 +3297,12 @@ pub struct BuildFlags {
     /// Archiver
     #[serde(default = "default_ar")]
     pub ar: String,
+    /// Linker executable or linker flavor override for supported builders.
+    #[serde(default)]
+    pub ld: String,
+    /// C preprocessor executable exported as `CPP` when configured.
+    #[serde(default, alias = "CPP")]
+    pub cpp: String,
     /// Dynamic loader path
     #[serde(default)]
     pub libc: String,
@@ -3536,6 +3566,8 @@ impl Default for BuildFlags {
             cc: default_cc(),
             cxx: default_cxx(),
             ar: default_ar(),
+            ld: String::new(),
+            cpp: String::new(),
             libc: String::new(),
             rootfs: default_rootfs(),
             post_configure: Vec::new(),

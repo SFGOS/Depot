@@ -156,6 +156,11 @@ fn has_option(configure: &[String], long: &str) -> bool {
     false
 }
 
+fn has_builtin_option(configure: &[String], key: &str) -> bool {
+    let prefix = format!("-D{key}=");
+    configure.iter().any(|arg| arg.starts_with(&prefix))
+}
+
 fn meson_setup_args(
     flags: &crate::package::BuildFlags,
     cross_file: Option<&Path>,
@@ -190,6 +195,14 @@ fn meson_setup_args(
 
     if let Some(cf) = cross_file {
         args.push(format!("--cross-file={}", cf.display()));
+    }
+    if !flags.ld.trim().is_empty() {
+        if !has_builtin_option(&flags.configure, "c_ld") {
+            args.push(format!("-Dc_ld={}", flags.ld));
+        }
+        if !has_builtin_option(&flags.configure, "cpp_ld") {
+            args.push(format!("-Dcpp_ld={}", flags.ld));
+        }
     }
 
     // Append user flags last so they can override defaults when Meson allows it.
@@ -352,6 +365,33 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--libdir=/usr/lib"));
         assert!(!args.iter().any(|a| a == "--datadir=/usr/share"));
         assert!(args.iter().any(|a| a == "--bindir=/usr/bin"));
+    }
+
+    #[test]
+    fn test_meson_setup_args_include_linker_override() {
+        let flags = BuildFlags {
+            ld: "ld.lld".to_string(),
+            ..BuildFlags::default()
+        };
+
+        let args = meson_setup_args(&flags, None, &[]);
+        assert!(args.iter().any(|a| a == "-Dc_ld=ld.lld"));
+        assert!(args.iter().any(|a| a == "-Dcpp_ld=ld.lld"));
+    }
+
+    #[test]
+    fn test_meson_setup_args_honor_explicit_linker_override() {
+        let flags = BuildFlags {
+            ld: "ld.lld".to_string(),
+            configure: vec!["-Dc_ld=gold".to_string(), "-Dcpp_ld=gold".to_string()],
+            ..BuildFlags::default()
+        };
+
+        let args = meson_setup_args(&flags, None, &[]);
+        assert_eq!(args.iter().filter(|a| *a == "-Dc_ld=gold").count(), 1);
+        assert_eq!(args.iter().filter(|a| *a == "-Dcpp_ld=gold").count(), 1);
+        assert!(!args.iter().any(|a| a == "-Dc_ld=ld.lld"));
+        assert!(!args.iter().any(|a| a == "-Dcpp_ld=ld.lld"));
     }
 
     #[test]

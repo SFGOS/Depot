@@ -189,6 +189,12 @@ pub fn standard_build_env(
             set_env_var(&mut env_vars, "CC", flags.cc.clone());
             set_env_var(&mut env_vars, "CXX", flags.cxx.clone());
             set_env_var(&mut env_vars, "AR", flags.ar.clone());
+            if !flags.ld.trim().is_empty() {
+                set_env_var(&mut env_vars, "LD", flags.ld.clone());
+            }
+            if !flags.cpp.trim().is_empty() {
+                set_env_var(&mut env_vars, "CPP", flags.cpp.clone());
+            }
         }
     }
 
@@ -446,6 +452,17 @@ mod tests {
                 std::ffi::OsString::from("/var/cache/rustup-home").as_os_str()
             ))
         );
+    }
+
+    #[test]
+    fn test_standard_build_env_exports_native_linker_and_cpp() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.ld = "ld.lld".to_string();
+        spec.build.flags.cpp = "clang-cpp".to_string();
+
+        let env = standard_build_env(&spec, None, true, true);
+        assert!(env.iter().any(|(k, v)| k == "LD" && v == "ld.lld"));
+        assert!(env.iter().any(|(k, v)| k == "CPP" && v == "clang-cpp"));
     }
 
     #[test]
