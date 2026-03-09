@@ -10,6 +10,45 @@ use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+fn rootfs_is_system_root(rootfs: &Path) -> bool {
+    if rootfs == Path::new("/") {
+        return true;
+    }
+    fs::canonicalize(rootfs)
+        .map(|path| path == Path::new("/"))
+        .unwrap_or(false)
+}
+
+fn command_requires_live_root(command: &Commands) -> bool {
+    matches!(command, Commands::Install { .. } | Commands::Remove { .. })
+}
+
+fn should_reexec_with_sudo(cli: &Cli) -> bool {
+    !crate::fakeroot::is_root()
+        && rootfs_is_system_root(&cli.rootfs)
+        && command_requires_live_root(&cli.command)
+}
+
+fn maybe_reexec_with_sudo(cli: &Cli) -> Result<bool> {
+    if !should_reexec_with_sudo(cli) {
+        return Ok(false);
+    }
+
+    let exe = std::env::current_exe().context("Failed to locate depot executable")?;
+    let mut cmd = std::process::Command::new("sudo");
+    cmd.arg(exe);
+    cmd.args(std::env::args_os().skip(1));
+
+    let status = cmd
+        .status()
+        .context("Failed to re-execute depot via sudo for live-system install/remove")?;
+    if status.success() {
+        Ok(true)
+    } else {
+        anyhow::bail!("sudo depot command failed with status {}", status);
+    }
+}
+
 fn parse_licenses_from_toml(metadata: &toml::Value) -> Vec<String> {
     if let Some(s) = metadata.get("license").and_then(|v| v.as_str()) {
         return vec![s.to_string()];
@@ -38,10 +77,34 @@ fn parse_dependency_list(metadata: &toml::Value, kind: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn staging_temp_root(config: &config::Config) -> PathBuf {
+    config.build_dir.join("staging")
+}
+
+fn create_archive_staging_dir(
+    config: &config::Config,
+    archive_path: &Path,
+) -> Result<tempfile::TempDir> {
+    let staging_root = staging_temp_root(config);
+    fs::create_dir_all(&staging_root)
+        .with_context(|| format!("Failed to create staging root {}", staging_root.display()))?;
+    tempfile::Builder::new()
+        .prefix("archive-")
+        .tempdir_in(&staging_root)
+        .with_context(|| {
+            format!(
+                "Failed to create staging dir for {} under {}",
+                archive_path.display(),
+                staging_root.display()
+            )
+        })
+}
+
 fn load_package_archive_into_staging(
+    config: &config::Config,
     archive_path: &Path,
 ) -> Result<(package::PackageSpec, tempfile::TempDir)> {
-    let tmp_dir = tempfile::TempDir::new().with_context(|| {
+    let tmp_dir = create_archive_staging_dir(config, archive_path).with_context(|| {
         format!(
             "Failed to create staging dir for {}",
             archive_path.display()
@@ -167,8 +230,11 @@ fn load_package_archive_into_staging(
     Ok((spec, tmp_dir))
 }
 
-fn extract_package_archive_to_staging(archive_path: &Path) -> Result<tempfile::TempDir> {
-    let tmp_dir = tempfile::TempDir::new().with_context(|| {
+fn extract_package_archive_to_staging(
+    config: &config::Config,
+    archive_path: &Path,
+) -> Result<tempfile::TempDir> {
+    let tmp_dir = create_archive_staging_dir(config, archive_path).with_context(|| {
         format!(
             "Failed to create staging dir for {}",
             archive_path.display()
@@ -1261,7 +1327,7 @@ fn execute_install_plan_with_child_commands(
                         record.filename, repo_name
                     )
                 })?;
-            let staged = extract_package_archive_to_staging(&cached.package_path)?;
+            let staged = extract_package_archive_to_staging(config, &cached.package_path)?;
             let spec = package_spec_from_repo_record(record);
             let plans = plan_package_outputs_for_install(&spec, staged.path(), config)?;
             binary_pre_hook_plans.extend(plans);
@@ -1317,7 +1383,7 @@ fn execute_install_plan_with_child_commands(
                             record.filename, repo_name
                         )
                     })?;
-                let staged = extract_package_archive_to_staging(&cached.package_path)?;
+                let staged = extract_package_archive_to_staging(config, &cached.package_path)?;
                 let spec = package_spec_from_repo_record(record);
                 let plans = plan_package_outputs_for_install(&spec, staged.path(), config)?;
                 let installed = install_planned_packages_to_rootfs(&plans, rootfs, config)?;
@@ -1450,7 +1516,7 @@ fn run_direct_install_request(
         if spec_path.to_string_lossy().ends_with(".tar.zst") {
             // Install from archive
             ui::info(format!("Detected package archive: {}", spec_path.display()));
-            let (spec, tmp_dir) = load_package_archive_into_staging(&spec_path)?;
+            let (spec, tmp_dir) = load_package_archive_into_staging(config, &spec_path)?;
             (spec, Some(tmp_dir))
         } else {
             // Install from spec (normal build)
@@ -1669,15 +1735,15 @@ fn run_direct_install_request(
 
 pub fn run(cli: Cli) -> Result<()> {
     ui::set_assume_yes(cli.yes);
+    if maybe_reexec_with_sudo(&cli)? {
+        return Ok(());
+    }
 
     match cli.command {
         Commands::Install {
             spec_or_archive,
             spec,
         } => {
-            if !crate::fakeroot::is_root() {
-                anyhow::bail!("The 'install' command must be run as root");
-            }
             let install_requests = match spec {
                 Some(spec_path) => vec![spec_path],
                 None => spec_or_archive,
@@ -2648,7 +2714,7 @@ mod tests {
         cfg.build_dir = rootfs.path().join("var/cache/depot/build");
         cfg.db_dir = rootfs.path().join("var/lib/depot");
 
-        let staged = extract_package_archive_to_staging(&archive_path)?;
+        let staged = extract_package_archive_to_staging(&cfg, &archive_path)?;
         let record = db::repo::BinaryRepoPackageRecord {
             repo_name: "core".into(),
             name: "pkg".into(),
@@ -2686,6 +2752,58 @@ mod tests {
     }
 
     #[test]
+    fn binary_archive_staging_uses_config_build_dir_instead_of_process_tmpdir() -> Result<()> {
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let pkg_dir = tempfile::tempdir().context("Failed to create temp package dir")?;
+        let archive_path = pkg_dir.path().join("pkg-1.0-1-x86_64.depot.pkg.tar.zst");
+
+        let file = fs::File::create(&archive_path)
+            .with_context(|| format!("Failed to create {}", archive_path.display()))?;
+        let encoder =
+            zstd::stream::write::Encoder::new(file, 3).context("Failed to create zstd encoder")?;
+        let mut tar = tar::Builder::new(encoder);
+        let payload = b"hello";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("usr/bin/hello").unwrap();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append(&header, &payload[..]).unwrap();
+        let encoder = tar.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+
+        let blocked_tmp = rootfs.path().join("blocked-tmp");
+        fs::create_dir_all(&blocked_tmp)
+            .with_context(|| format!("Failed to create {}", blocked_tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&blocked_tmp, fs::Permissions::from_mode(0o555))
+                .with_context(|| format!("Failed to chmod {}", blocked_tmp.display()))?;
+        }
+
+        let previous_tmpdir = std::env::var_os("TMPDIR");
+        unsafe {
+            std::env::set_var("TMPDIR", &blocked_tmp);
+        }
+        let staged = extract_package_archive_to_staging(&cfg, &archive_path)?;
+        unsafe {
+            if let Some(value) = previous_tmpdir {
+                std::env::set_var("TMPDIR", value);
+            } else {
+                std::env::remove_var("TMPDIR");
+            }
+        }
+
+        assert!(staged.path().starts_with(staging_temp_root(&cfg)));
+        assert!(staged.path().join("usr/bin/hello").exists());
+        Ok(())
+    }
+
+    #[test]
     fn merge_missing_dependencies_preserves_order_and_uniqueness() {
         let merged = merge_missing_dependencies(
             vec!["make".into(), "pkgconf".into(), "glibc".into()],
@@ -2697,5 +2815,31 @@ mod tests {
             ],
         );
         assert_eq!(merged, vec!["make", "pkgconf", "glibc", "openssl", "zlib"]);
+    }
+
+    #[test]
+    fn rootfs_is_system_root_detects_live_rootfs() {
+        assert!(rootfs_is_system_root(Path::new("/")));
+        assert!(!rootfs_is_system_root(Path::new("/tmp/depot-test-rootfs")));
+    }
+
+    #[test]
+    fn command_requires_live_root_only_for_install_and_remove() {
+        assert!(command_requires_live_root(&Commands::Install {
+            spec_or_archive: vec![PathBuf::from("foo")],
+            spec: None,
+        }));
+        assert!(command_requires_live_root(&Commands::Remove {
+            package: "foo".to_string(),
+        }));
+        assert!(!command_requires_live_root(&Commands::Build {
+            spec_pos: Some(PathBuf::from("foo.toml")),
+            spec: None,
+            install: false,
+        }));
+        assert!(!command_requires_live_root(&Commands::Search {
+            query: "foo".to_string(),
+            files: false,
+        }));
     }
 }
