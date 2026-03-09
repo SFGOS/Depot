@@ -326,6 +326,7 @@ pub fn build(
 mod tests {
     use super::*;
     use crate::package::{Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec};
+    use crate::test_support::TestEnv;
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::path::PathBuf;
@@ -373,14 +374,13 @@ mod tests {
         // Set an env var that should be cleared
         cmd.env("FORBIDDEN", "value");
         // Set PATH manually in the current process to ensure it's picked up if it exists
-        unsafe {
-            std::env::set_var("PATH", "/usr/bin");
-            std::env::set_var("HOME", "/home/test");
-            std::env::set_var("SHELL", "/bin/zsh");
-            std::env::set_var("DEPOT_ROOTFS", "/my/rootfs");
-            std::env::set_var("TERM", "xterm-256color");
-            std::env::set_var("CLICOLOR_FORCE", "1");
-        }
+        let mut env = TestEnv::new();
+        env.set_var("PATH", "/usr/bin");
+        env.set_var("HOME", "/home/test");
+        env.set_var("SHELL", "/bin/zsh");
+        env.set_var("DEPOT_ROOTFS", "/my/rootfs");
+        env.set_var("TERM", "xterm-256color");
+        env.set_var("CLICOLOR_FORCE", "1");
 
         prepare_command(&mut cmd, &vec![("MYVAR".to_string(), "myval".to_string())]);
 
@@ -416,9 +416,8 @@ mod tests {
     #[test]
     fn test_prepare_command_preserves_destdir() {
         let mut cmd = std::process::Command::new("ls");
-        unsafe {
-            std::env::set_var("DESTDIR", "/tmp/dest");
-        }
+        let mut env = TestEnv::new();
+        env.set_var("DESTDIR", "/tmp/dest");
         prepare_command(&mut cmd, &Vec::new());
         let envs: HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(
@@ -430,10 +429,9 @@ mod tests {
     #[test]
     fn test_prepare_command_preserves_rust_toolchain_homes() {
         let mut cmd = std::process::Command::new("ls");
-        unsafe {
-            std::env::set_var("CARGO_HOME", "/var/cache/cargo-home");
-            std::env::set_var("RUSTUP_HOME", "/var/cache/rustup-home");
-        }
+        let mut env = TestEnv::new();
+        env.set_var("CARGO_HOME", "/var/cache/cargo-home");
+        env.set_var("RUSTUP_HOME", "/var/cache/rustup-home");
         prepare_command(&mut cmd, &Vec::new());
         let envs: HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(
@@ -581,9 +579,8 @@ mod tests {
         let mut spec = mk_spec(Vec::new(), Vec::new());
         spec.build.flags.passthrough_env = vec!["RUSTFLAGS".into()];
 
-        unsafe {
-            std::env::set_var("RUSTFLAGS", "-C target-cpu=native");
-        }
+        let mut env = TestEnv::new();
+        env.set_var("RUSTFLAGS", "-C target-cpu=native");
 
         let env = standard_build_env(&spec, None, false, true);
         assert!(
@@ -599,9 +596,8 @@ mod tests {
         spec.build.flags.cc = "spec-cc".to_string();
         spec.build.flags.passthrough_env = vec!["CC".into()];
 
-        unsafe {
-            std::env::set_var("CC", "host-cc");
-        }
+        let mut env = TestEnv::new();
+        env.set_var("CC", "host-cc");
 
         let env = standard_build_env(&spec, None, true, true);
         assert!(

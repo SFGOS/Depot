@@ -511,6 +511,7 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestEnv;
 
     #[test]
     fn test_config_for_rootfs() {
@@ -616,13 +617,9 @@ cflags += ["-g"]
 
     #[test]
     fn test_config_non_root_fallback() {
-        // Make the test deterministic by overriding HOME for the duration of the check.
-        // Save and restore the original value so other tests aren't affected.
-        let orig_home = std::env::var_os("HOME");
         let fake_home = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("HOME", fake_home.path());
-        }
+        let mut env = TestEnv::new();
+        env.set_var("HOME", fake_home.path());
 
         let config = Config::for_rootfs(Path::new("/"));
 
@@ -638,17 +635,6 @@ cflags += ["-g"]
         } else {
             // If running as root (e.g. in some CI), it should use /var
             assert_eq!(config.cache_dir, PathBuf::from("/var/cache/depot/sources"));
-        }
-
-        // restore original HOME
-        if let Some(v) = orig_home {
-            unsafe {
-                std::env::set_var("HOME", v);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("HOME");
-            }
         }
     }
 

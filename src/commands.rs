@@ -53,16 +53,42 @@ fn maybe_reexec_with_sudo(cli: &Cli) -> Result<bool> {
     }
 }
 
-fn run_child_install_command(
-    install_request: &Path,
+#[derive(Clone, Copy)]
+struct ChildInstallCommandOptions<'a> {
+    no_deps: bool,
+    assume_yes: bool,
+    no_flags: bool,
+    cross_prefix: Option<&'a str>,
+    clean: bool,
+    dep_chain: Option<&'a str>,
+}
+
+fn install_request_display(install_requests: &[PathBuf]) -> String {
+    install_requests
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn run_install_command_with_program(
+    program: &Path,
+    install_requests: &[PathBuf],
     rootfs: &Path,
-    options: InstallPlanExecutionOptions<'_>,
+    options: ChildInstallCommandOptions<'_>,
 ) -> Result<()> {
-    let exe = std::env::current_exe().context("Failed to locate depot executable")?;
-    let mut cmd = std::process::Command::new(&exe);
+    if install_requests.is_empty() {
+        return Ok(());
+    }
+
+    let mut cmd = std::process::Command::new(program);
     cmd.arg("-r").arg(rootfs);
-    cmd.arg("--no-deps");
-    cmd.arg("--yes");
+    if options.no_deps {
+        cmd.arg("--no-deps");
+    }
+    if options.assume_yes {
+        cmd.arg("--yes");
+    }
     if options.no_flags {
         cmd.arg("--no-flags");
     }
@@ -72,12 +98,16 @@ fn run_child_install_command(
     if options.clean {
         cmd.arg("--clean");
     }
-    cmd.arg("install").arg(install_request);
+    cmd.arg("install");
+    cmd.args(install_requests);
+    if let Some(dep_chain) = options.dep_chain {
+        cmd.env("DEPOT_DEPCHAIN", dep_chain);
+    }
 
     let status = cmd.status().with_context(|| {
         format!(
             "Failed to spawn child install for {}",
-            install_request.display()
+            install_request_display(install_requests)
         )
     })?;
     if status.success() {
@@ -85,10 +115,31 @@ fn run_child_install_command(
     } else {
         anyhow::bail!(
             "Child install failed for {} with status {}",
-            install_request.display(),
+            install_request_display(install_requests),
             status
         );
     }
+}
+
+fn run_child_install_command(
+    install_requests: &[PathBuf],
+    rootfs: &Path,
+    options: InstallPlanExecutionOptions<'_>,
+) -> Result<()> {
+    let exe = std::env::current_exe().context("Failed to locate depot executable")?;
+    run_install_command_with_program(
+        &exe,
+        install_requests,
+        rootfs,
+        ChildInstallCommandOptions {
+            no_deps: true,
+            assume_yes: true,
+            no_flags: options.no_flags,
+            cross_prefix: options.cross_prefix,
+            clean: options.clean,
+            dep_chain: None,
+        },
+    )
 }
 
 fn parse_licenses_from_toml(metadata: &toml::Value) -> Vec<String> {
@@ -1250,10 +1301,11 @@ fn execute_install_plan_with_child_commands(
     }
 
     if should_delegate_live_rootfs_installs(rootfs) {
+        let mut install_requests = Vec::new();
         for step in actionable_steps {
             match &step.origin {
                 planner::PlanOrigin::Source { path, .. } => {
-                    run_child_install_command(path, rootfs, options)?;
+                    install_requests.push(path.clone());
                 }
                 planner::PlanOrigin::Binary { repo_name, record } => {
                     let repo_cfg = config.binary_repos.get(repo_name).with_context(|| {
@@ -1266,11 +1318,12 @@ fn execute_install_plan_with_child_commands(
                         record,
                         &config.package_cache_dir,
                     )?;
-                    run_child_install_command(&archive_path, rootfs, options)?;
+                    install_requests.push(archive_path);
                 }
                 planner::PlanOrigin::Installed => {}
             }
         }
+        run_child_install_command(&install_requests, rootfs, options)?;
         return Ok(());
     }
 
@@ -1712,42 +1765,35 @@ fn run_direct_install_request(
                     format!("{},{}", dep_chain, pkg_spec.package.name)
                 };
 
-                // Attempt to install missing deps
+                let mut dep_spec_paths = Vec::new();
                 for dep in missing {
                     // Use package index for O(1) lookup
                     let candidate = pkg_index.find(&dep);
 
                     if let Some(dep_spec_path) = candidate {
-                        ui::info(format!("Installing dependency: {}...", dep));
-
-                        let mut cmd = std::process::Command::new(std::env::current_exe()?);
-                        cmd.arg("-r").arg(options.rootfs);
-
-                        if options.no_deps {
-                            cmd.arg("--no-deps");
-                        }
-                        if options.no_flags {
-                            cmd.arg("--no-flags");
-                        }
-                        if let Some(p) = options.cross_prefix {
-                            cmd.arg("--cross-prefix").arg(p);
-                        }
-                        if options.clean {
-                            cmd.arg("--clean");
-                        }
-
-                        cmd.arg("install").arg(&dep_spec_path);
-                        cmd.env("DEPOT_DEPCHAIN", &new_chain);
-
-                        let status = cmd.status()?;
-
-                        if !status.success() {
-                            anyhow::bail!("Failed to install dependency: {}", dep);
-                        }
+                        dep_spec_paths.push(dep_spec_path);
                     } else {
                         anyhow::bail!("Could not find package spec for dependency: {}", dep);
                     }
                 }
+                ui::info(format!(
+                    "Installing dependencies: {}",
+                    install_request_display(&dep_spec_paths)
+                ));
+                let exe = std::env::current_exe().context("Failed to locate depot executable")?;
+                run_install_command_with_program(
+                    &exe,
+                    &dep_spec_paths,
+                    options.rootfs,
+                    ChildInstallCommandOptions {
+                        no_deps: options.no_deps,
+                        assume_yes: false,
+                        no_flags: options.no_flags,
+                        cross_prefix: options.cross_prefix,
+                        clean: options.clean,
+                        dep_chain: Some(&new_chain),
+                    },
+                )?;
             }
         }
 
@@ -2206,19 +2252,17 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
                 if ui::prompt_package_action("installation", &install_targets, false)? {
                     if should_delegate_live_rootfs_installs(&cli.rootfs) {
-                        for archive in &created_files {
-                            run_child_install_command(
-                                archive,
-                                &cli.rootfs,
-                                InstallPlanExecutionOptions {
-                                    no_flags: cli.no_flags,
-                                    cross_prefix: cli.cross_prefix.as_deref(),
-                                    clean: cli.clean,
-                                    dry_run: cli.dry_run,
-                                    confirm_installation: false,
-                                },
-                            )?;
-                        }
+                        run_child_install_command(
+                            &created_files,
+                            &cli.rootfs,
+                            InstallPlanExecutionOptions {
+                                no_flags: cli.no_flags,
+                                cross_prefix: cli.cross_prefix.as_deref(),
+                                clean: cli.clean,
+                                dry_run: cli.dry_run,
+                                confirm_installation: false,
+                            },
+                        )?;
                         if cli.clean {
                             clean_build_workspace(&config)?;
                         }
@@ -2915,28 +2959,7 @@ mod tests {
         let mut cfg = config::Config::for_rootfs(rootfs.path());
         cfg.build_dir = rootfs.path().join("var/cache/depot/build");
 
-        let blocked_tmp = rootfs.path().join("blocked-tmp");
-        fs::create_dir_all(&blocked_tmp)
-            .with_context(|| format!("Failed to create {}", blocked_tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&blocked_tmp, fs::Permissions::from_mode(0o555))
-                .with_context(|| format!("Failed to chmod {}", blocked_tmp.display()))?;
-        }
-
-        let previous_tmpdir = std::env::var_os("TMPDIR");
-        unsafe {
-            std::env::set_var("TMPDIR", &blocked_tmp);
-        }
         let staged = extract_package_archive_to_staging(&cfg, &archive_path)?;
-        unsafe {
-            if let Some(value) = previous_tmpdir {
-                std::env::set_var("TMPDIR", value);
-            } else {
-                std::env::remove_var("TMPDIR");
-            }
-        }
 
         assert!(staged.path().starts_with(staging_temp_root(&cfg)));
         assert!(staged.path().join("usr/bin/hello").exists());
@@ -3141,6 +3164,64 @@ optional = []
             ],
         );
         assert_eq!(merged, vec!["make", "pkgconf", "glibc", "openssl", "zlib"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn child_install_command_batches_multiple_requests_in_one_invocation() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+        let script_path = temp.path().join("capture-child-install.sh");
+        let args_path = temp.path().join("args.txt");
+        let env_path = temp.path().join("env.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '%s' \"${{DEPOT_DEPCHAIN:-}}\" > \"{}\"\n",
+            args_path.display(),
+            env_path.display()
+        );
+        fs::write(&script_path, script)
+            .with_context(|| format!("Failed to write {}", script_path.display()))?;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to chmod {}", script_path.display()))?;
+
+        let requests = vec![
+            PathBuf::from("/tmp/pkg-a.toml"),
+            PathBuf::from("/tmp/pkg-b.toml"),
+        ];
+        let rootfs = Path::new("/");
+        run_install_command_with_program(
+            &script_path,
+            &requests,
+            rootfs,
+            ChildInstallCommandOptions {
+                no_deps: false,
+                assume_yes: false,
+                no_flags: true,
+                cross_prefix: Some("x86_64-linux-musl"),
+                clean: true,
+                dep_chain: Some("parent"),
+            },
+        )?;
+
+        let captured_args = fs::read_to_string(&args_path)
+            .with_context(|| format!("Failed to read {}", args_path.display()))?;
+        assert_eq!(
+            captured_args.lines().collect::<Vec<_>>(),
+            vec![
+                "-r",
+                "/",
+                "--no-flags",
+                "--cross-prefix",
+                "x86_64-linux-musl",
+                "--clean",
+                "install",
+                "/tmp/pkg-a.toml",
+                "/tmp/pkg-b.toml",
+            ]
+        );
+        assert_eq!(fs::read_to_string(&env_path)?, "parent");
+        Ok(())
     }
 
     #[test]

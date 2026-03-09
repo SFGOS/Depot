@@ -388,12 +388,14 @@ fn resolve_actual_src(
 mod tests {
     use super::*;
     use crate::package::{Build, BuildFlags, BuildType, PackageInfo, PackageSpec};
+    use crate::test_support::TestEnv;
     use tempfile::tempdir;
 
     #[test]
     fn test_expand_env_vars_replaces_vars() {
         // Set a test env var
-        unsafe { std::env::set_var("DEPOT_TEST_FOO", "bar") };
+        let mut env = TestEnv::new();
+        env.set_var("DEPOT_TEST_FOO", "bar");
         let input = "$DEPOT_TEST_FOO and ${DEPOT_TEST_FOO}";
         let out = expand_env_vars(input);
         assert!(out.contains("bar"));

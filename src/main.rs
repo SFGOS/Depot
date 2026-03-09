@@ -20,6 +20,8 @@ mod shell_helpers;
 mod signing;
 mod source;
 mod staging;
+#[cfg(test)]
+mod test_support;
 mod ui;
 
 use anyhow::Result;

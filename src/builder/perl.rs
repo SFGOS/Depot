@@ -276,6 +276,7 @@ fn has_assignment_prefix(args: &[String], name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::package::{Build, BuildFlags, BuildType, Dependencies, PackageInfo};
+    use crate::test_support::TestEnv;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
@@ -378,20 +379,15 @@ exec "$@"
 "#,
         )?;
 
+        let mut env = TestEnv::new();
         let old_path = std::env::var("PATH").unwrap_or_default();
-        unsafe {
-            std::env::set_var("PATH", format!("{}:{}", tools_path.display(), old_path));
-        }
+        env.set_var("PATH", format!("{}:{}", tools_path.display(), old_path));
 
         let mut spec = mk_spec("perl-test", "1.0");
         spec.build.flags.make_exec = tools_path.join("make").to_string_lossy().into_owned();
         spec.build.flags.configure = vec!["CCFLAGS=-fPIC".into()];
 
         let build_result = build(&spec, src_path, dest_path, None, true);
-
-        unsafe {
-            std::env::set_var("PATH", old_path);
-        }
 
         build_result?;
 
