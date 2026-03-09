@@ -68,6 +68,8 @@ pub(crate) fn install_dirs(flags: &crate::package::BuildFlags) -> InstallDirs {
         default_libdir_for_variant(flags.lib32_variant),
     );
     let datarootdir = configured_install_dir(&flags.datarootdir, "/usr/share");
+    let default_mandir = format!("{datarootdir}/man");
+    let default_infodir = format!("{datarootdir}/info");
 
     InstallDirs {
         bindir: configured_install_dir(&flags.bindir, "/usr/bin"),
@@ -80,8 +82,8 @@ pub(crate) fn install_dirs(flags: &crate::package::BuildFlags) -> InstallDirs {
         includedir: configured_install_dir(&flags.includedir, "/usr/include"),
         datarootdir: datarootdir.clone(),
         datadir: configured_install_dir(&flags.datadir, &datarootdir),
-        mandir: configured_install_dir(&flags.mandir, "/usr/share/man"),
-        infodir: configured_install_dir(&flags.infodir, "/usr/share/info"),
+        mandir: configured_install_dir(&flags.mandir, &default_mandir),
+        infodir: configured_install_dir(&flags.infodir, &default_infodir),
     }
 }
 

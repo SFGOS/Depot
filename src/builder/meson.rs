@@ -176,7 +176,6 @@ fn meson_setup_args(
         ("--localstatedir", dirs.localstatedir),
         ("--sharedstatedir", dirs.sharedstatedir),
         ("--includedir", dirs.includedir),
-        ("--datarootdir", dirs.datarootdir),
         ("--datadir", dirs.datadir),
         ("--mandir", dirs.mandir),
         ("--infodir", dirs.infodir),
@@ -305,10 +304,23 @@ mod tests {
         assert!(args.iter().any(|a| a == "--localstatedir=/var"));
         assert!(args.iter().any(|a| a == "--sharedstatedir=/var/lib"));
         assert!(args.iter().any(|a| a == "--includedir=/usr/include"));
-        assert!(args.iter().any(|a| a == "--datarootdir=/usr/share"));
         assert!(args.iter().any(|a| a == "--datadir=/usr/share"));
         assert!(args.iter().any(|a| a == "--mandir=/usr/share/man"));
         assert!(args.iter().any(|a| a == "--infodir=/usr/share/info"));
+    }
+
+    #[test]
+    fn test_meson_setup_args_derive_dirs_from_datarootdir() {
+        let flags = BuildFlags {
+            datarootdir: "/opt/share-root".to_string(),
+            ..BuildFlags::default()
+        };
+
+        let args = meson_setup_args(&flags, None, &[]);
+        assert!(!args.iter().any(|a| a.starts_with("--datarootdir=")));
+        assert!(args.iter().any(|a| a == "--datadir=/opt/share-root"));
+        assert!(args.iter().any(|a| a == "--mandir=/opt/share-root/man"));
+        assert!(args.iter().any(|a| a == "--infodir=/opt/share-root/info"));
     }
 
     #[test]
