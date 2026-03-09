@@ -381,11 +381,8 @@ impl<'a> Resolver<'a> {
     }
 
     fn choose_candidate(&self, dep: &str, candidates: &[Candidate]) -> Result<Candidate> {
-        let mut sorted = candidates.to_vec();
-        sorted.sort_by(|a, b| {
-            candidate_sort_key(a, self.opts.prefer_binary)
-                .cmp(&candidate_sort_key(b, self.opts.prefer_binary))
-        });
+        let mut sorted =
+            dedupe_candidate_packages(sort_candidates(candidates, self.opts.prefer_binary));
 
         if sorted.len() == 1 {
             return Ok(sorted.remove(0));
@@ -684,6 +681,25 @@ fn format_candidate_label(c: &Candidate) -> String {
     }
 }
 
+fn sort_candidates(candidates: &[Candidate], prefer_binary: bool) -> Vec<Candidate> {
+    let mut sorted = candidates.to_vec();
+    sorted.sort_by(|a, b| {
+        candidate_sort_key(a, prefer_binary).cmp(&candidate_sort_key(b, prefer_binary))
+    });
+    sorted
+}
+
+fn dedupe_candidate_packages(candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if seen.insert(candidate.package.to_ascii_lowercase()) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
 fn candidate_sort_key(c: &Candidate, prefer_binary: bool) -> (i32, i32, i32, String, String) {
     let is_binary = matches!(c.kind, CandidateKind::Binary { .. });
     let kind_rank = match (prefer_binary, is_binary) {
@@ -734,12 +750,17 @@ pub(crate) fn build_dependency_install_plan(
 
 #[cfg(test)]
 mod tests {
-    use super::source_deps_for_install;
+    use super::{
+        Candidate, CandidateKind, MatchKind, PlannerOptions, build_dependency_install_plan,
+        dedupe_candidate_packages, sort_candidates, source_deps_for_install,
+    };
+    use crate::config::Config;
+    use crate::db;
     use crate::package::{
         Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source,
     };
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn mk_spec() -> PackageSpec {
         PackageSpec {
@@ -799,6 +820,58 @@ mod tests {
         }
     }
 
+    fn mk_installed_spec(name: &str, version: &str) -> PackageSpec {
+        let mut spec = mk_spec();
+        spec.package.name = name.to_string();
+        spec.package.version = version.to_string();
+        spec
+    }
+
+    fn mk_binary_candidate(name: &str, repo_name: &str, priority: i32) -> Candidate {
+        Candidate {
+            package: name.to_string(),
+            kind: CandidateKind::Binary {
+                repo_name: repo_name.to_string(),
+                record: Box::new(db::repo::BinaryRepoPackageRecord {
+                    repo_name: repo_name.to_string(),
+                    name: name.to_string(),
+                    version: "1.0.0".to_string(),
+                    revision: 1,
+                    filename: format!("{name}-1.0.0-1-x86_64.depot.pkg.tar.zst"),
+                    size: 1024,
+                    sha256: "sha256".to_string(),
+                    sha512: "sha512".to_string(),
+                    description: None,
+                    homepage: None,
+                    license: None,
+                    provides: Vec::new(),
+                    runtime_dependencies: Vec::new(),
+                    optional_dependencies: Vec::new(),
+                }),
+            },
+            match_kind: MatchKind::Exact,
+            sort_repo_priority: priority,
+            sort_label: format!("binary:{repo_name}"),
+        }
+    }
+
+    fn mk_source_candidate(name: &str, path: &Path, local_sibling: bool) -> Candidate {
+        Candidate {
+            package: name.to_string(),
+            kind: CandidateKind::Source {
+                path: path.to_path_buf(),
+                local_sibling,
+            },
+            match_kind: MatchKind::Exact,
+            sort_repo_priority: if local_sibling { -10 } else { 0 },
+            sort_label: if local_sibling {
+                "source:local-sibling".to_string()
+            } else {
+                "source:local".to_string()
+            },
+        }
+    }
+
     #[test]
     fn source_deps_for_install_excludes_local_runtime_outputs_and_provides() {
         let spec = mk_spec();
@@ -815,5 +888,59 @@ mod tests {
         let spec = mk_spec();
         let deps = source_deps_for_install(&spec);
         assert!(!deps.contains(&"bats".to_string()));
+    }
+
+    #[test]
+    fn candidate_dedup_keeps_highest_priority_origin_for_same_package() {
+        let candidates = vec![
+            mk_source_candidate("meson", Path::new("packages/core/meson/meson.toml"), false),
+            mk_binary_candidate("meson", "core", 0),
+            mk_source_candidate(
+                "meson",
+                Path::new("../packages/core/meson/meson.toml"),
+                true,
+            ),
+        ];
+
+        let deduped = dedupe_candidate_packages(sort_candidates(&candidates, true));
+        assert_eq!(deduped.len(), 1);
+        assert!(matches!(deduped[0].kind, CandidateKind::Binary { .. }));
+    }
+
+    #[test]
+    fn candidate_dedup_uses_local_origin_when_binaries_are_not_preferred() {
+        let candidates = vec![
+            mk_binary_candidate("ninja", "core", 0),
+            mk_source_candidate("ninja", Path::new("packages/core/ninja/ninja.toml"), false),
+        ];
+
+        let deduped = dedupe_candidate_packages(sort_candidates(&candidates, false));
+        assert_eq!(deduped.len(), 1);
+        assert!(matches!(deduped[0].kind, CandidateKind::Source { .. }));
+    }
+
+    #[test]
+    fn build_dependency_install_plan_skips_installed_dependency() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let config = Config::for_rootfs(rootfs.path());
+        let db_path = config.db_dir.join("packages.db");
+        let destdir = rootfs.path().join("dest");
+        std::fs::create_dir_all(&destdir).unwrap();
+        db::register_package(&db_path, &mk_installed_spec("meson", "1.0.0"), &destdir).unwrap();
+
+        let plan = build_dependency_install_plan(
+            &config,
+            rootfs.path(),
+            &["meson".to_string()],
+            PlannerOptions {
+                assume_yes: false,
+                prefer_binary: true,
+                local_sibling_root: None,
+            },
+        )
+        .unwrap();
+
+        assert!(plan.steps.is_empty());
+        assert!(plan.actionable_steps().next().is_none());
     }
 }
