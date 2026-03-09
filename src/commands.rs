@@ -199,6 +199,7 @@ fn load_package_archive_into_staging(
     let zstd_decoder = zstd::stream::read::Decoder::new(file)
         .with_context(|| format!("Failed to read zstd stream {}", archive_path.display()))?;
     let mut archive = tar::Archive::new(zstd_decoder);
+    archive.set_preserve_permissions(true);
     archive.unpack(&extract_dir).with_context(|| {
         format!(
             "Failed to extract package archive {} into {}",
@@ -289,6 +290,7 @@ fn extract_package_archive_to_staging(
     let zstd_decoder = zstd::stream::read::Decoder::new(file)
         .with_context(|| format!("Failed to read zstd stream {}", archive_path.display()))?;
     let mut archive = tar::Archive::new(zstd_decoder);
+    archive.set_preserve_permissions(true);
     archive.unpack(&extract_dir).with_context(|| {
         format!(
             "Failed to extract package archive {} into {}",
@@ -2888,6 +2890,74 @@ mod tests {
 
         assert!(staged.path().starts_with(staging_temp_root(&cfg)));
         assert!(staged.path().join("usr/bin/hello").exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn binary_archive_install_preserves_setuid_permissions() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let pkg_dir = tempfile::tempdir().context("Failed to create temp package dir")?;
+        let archive_path = pkg_dir.path().join("sudo-1.0-1-x86_64.depot.pkg.tar.zst");
+
+        let file = fs::File::create(&archive_path)
+            .with_context(|| format!("Failed to create {}", archive_path.display()))?;
+        let encoder =
+            zstd::stream::write::Encoder::new(file, 3).context("Failed to create zstd encoder")?;
+        let mut tar = tar::Builder::new(encoder);
+        let payload = b"sudo";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("bin/sudo").unwrap();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o4755);
+        header.set_cksum();
+        tar.append(&header, &payload[..]).unwrap();
+        let encoder = tar.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+        cfg.db_dir = rootfs.path().join("var/lib/depot");
+
+        let staged = extract_package_archive_to_staging(&cfg, &archive_path)?;
+        let staged_mode = fs::metadata(staged.path().join("bin/sudo"))?
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(staged_mode, 0o4755);
+
+        let record = db::repo::BinaryRepoPackageRecord {
+            repo_name: "core".into(),
+            name: "sudo".into(),
+            version: "1.0".into(),
+            revision: 1,
+            filename: archive_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            size: payload.len() as u64,
+            sha256: String::new(),
+            sha512: String::new(),
+            description: Some("sudo".into()),
+            homepage: Some("https://example.test".into()),
+            license: Some("ISC".into()),
+            provides: Vec::new(),
+            runtime_dependencies: Vec::new(),
+            optional_dependencies: Vec::new(),
+        };
+        let spec = package_spec_from_repo_record(&record);
+        let installed =
+            install_package_outputs_to_rootfs(&spec, staged.path(), rootfs.path(), &cfg)?;
+
+        assert_eq!(installed.len(), 1);
+        let root_mode = fs::metadata(rootfs.path().join("bin/sudo"))?
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(root_mode, 0o4755);
         Ok(())
     }
 

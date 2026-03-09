@@ -214,6 +214,21 @@ fn append_os_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+#[cfg(unix)]
+fn apply_unix_mode(dst: &Path, metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode() & 0o7777;
+    fs::set_permissions(dst, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("Failed to set permissions on {}", dst.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_unix_mode(_dst: &Path, _metadata: &fs::Metadata) -> Result<()> {
+    Ok(())
+}
+
 fn is_elf_file(path: &Path) -> Result<bool> {
     let mut file =
         fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
@@ -647,6 +662,7 @@ pub fn install_atomic(
             let dest_path = rootfs.join(rel_path);
             if !dest_path.exists() {
                 fs::create_dir_all(&dest_path)?;
+                apply_unix_mode(&dest_path, &src_path.symlink_metadata()?)?;
             }
         }
 
@@ -730,6 +746,7 @@ pub fn install_atomic(
             } else {
                 fs::copy(src_path, &dest_path)
                     .with_context(|| format!("Failed to install: {}", install_rel_path))?;
+                apply_unix_mode(&dest_path, &metadata)?;
             }
         }
 
