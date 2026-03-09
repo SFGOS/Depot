@@ -29,6 +29,10 @@ fn should_reexec_with_sudo(cli: &Cli) -> bool {
         && command_requires_live_root(&cli.command)
 }
 
+fn should_delegate_live_rootfs_installs(rootfs: &Path) -> bool {
+    !crate::fakeroot::is_root() && rootfs_is_system_root(rootfs)
+}
+
 fn maybe_reexec_with_sudo(cli: &Cli) -> Result<bool> {
     if !should_reexec_with_sudo(cli) {
         return Ok(false);
@@ -46,6 +50,44 @@ fn maybe_reexec_with_sudo(cli: &Cli) -> Result<bool> {
         Ok(true)
     } else {
         anyhow::bail!("sudo depot command failed with status {}", status);
+    }
+}
+
+fn run_child_install_command(
+    install_request: &Path,
+    rootfs: &Path,
+    options: InstallPlanExecutionOptions<'_>,
+) -> Result<()> {
+    let exe = std::env::current_exe().context("Failed to locate depot executable")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("-r").arg(rootfs);
+    cmd.arg("--no-deps");
+    cmd.arg("--yes");
+    if options.no_flags {
+        cmd.arg("--no-flags");
+    }
+    if let Some(p) = options.cross_prefix {
+        cmd.arg("--cross-prefix").arg(p);
+    }
+    if options.clean {
+        cmd.arg("--clean");
+    }
+    cmd.arg("install").arg(install_request);
+
+    let status = cmd.status().with_context(|| {
+        format!(
+            "Failed to spawn child install for {}",
+            install_request.display()
+        )
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Child install failed for {} with status {}",
+            install_request.display(),
+            status
+        );
     }
 }
 
@@ -1112,6 +1154,7 @@ fn print_plan_summary(plan: &planner::ExecutionPlan) {
     }
 }
 
+#[derive(Clone, Copy)]
 struct InstallPlanExecutionOptions<'a> {
     no_flags: bool,
     cross_prefix: Option<&'a str>,
@@ -1157,6 +1200,31 @@ fn execute_install_plan_with_child_commands(
 
     if options.dry_run {
         ui::info("Dry run enabled, no install/build actions executed.");
+        return Ok(());
+    }
+
+    if should_delegate_live_rootfs_installs(rootfs) {
+        for step in actionable_steps {
+            match &step.origin {
+                planner::PlanOrigin::Source { path, .. } => {
+                    run_child_install_command(path, rootfs, options)?;
+                }
+                planner::PlanOrigin::Binary { repo_name, record } => {
+                    let repo_cfg = config.binary_repos.get(repo_name).with_context(|| {
+                        format!("Binary repo '{}' not found in config", repo_name)
+                    })?;
+                    let archive_path = db::repo::fetch_binary_package_archive(
+                        repo_name,
+                        repo_cfg,
+                        rootfs,
+                        record,
+                        &config.package_cache_dir,
+                    )?;
+                    run_child_install_command(&archive_path, rootfs, options)?;
+                }
+                planner::PlanOrigin::Installed => {}
+            }
+        }
         return Ok(());
     }
 
@@ -2090,6 +2158,26 @@ pub fn run(cli: Cli) -> Result<()> {
                     ));
                 }
                 if ui::prompt_package_action("installation", &install_targets, false)? {
+                    if should_delegate_live_rootfs_installs(&cli.rootfs) {
+                        for archive in &created_files {
+                            run_child_install_command(
+                                archive,
+                                &cli.rootfs,
+                                InstallPlanExecutionOptions {
+                                    no_flags: cli.no_flags,
+                                    cross_prefix: cli.cross_prefix.as_deref(),
+                                    clean: cli.clean,
+                                    dry_run: cli.dry_run,
+                                    confirm_installation: false,
+                                },
+                            )?;
+                        }
+                        if cli.clean {
+                            clean_build_workspace(&config)?;
+                        }
+                        return Ok(());
+                    }
+
                     let mut transaction_plans = Vec::new();
                     if !cli.lib32_only {
                         let output_plans =
@@ -2841,5 +2929,16 @@ mod tests {
             query: "foo".to_string(),
             files: false,
         }));
+    }
+
+    #[test]
+    fn should_delegate_live_rootfs_installs_only_for_live_root_when_non_root() {
+        assert_eq!(
+            should_delegate_live_rootfs_installs(Path::new("/")),
+            !crate::fakeroot::is_root()
+        );
+        assert!(!should_delegate_live_rootfs_installs(Path::new(
+            "/tmp/depot-test-rootfs"
+        )));
     }
 }
