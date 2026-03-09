@@ -1605,6 +1605,93 @@ struct DirectInstallOptions<'a> {
     lib32_only: bool,
 }
 
+fn run_direct_archive_install_requests(
+    options: DirectInstallOptions<'_>,
+    config: &config::Config,
+    archive_paths: &[PathBuf],
+    confirm_installation: bool,
+) -> Result<bool> {
+    if archive_paths.is_empty() {
+        return Ok(false);
+    }
+
+    let mut install_lock = locking::open_lock(config)?;
+    let install_lock_path = locking::lock_path(config);
+    let _install_lock_guard = locking::try_write(&mut install_lock, &install_lock_path, "install")?;
+
+    let mut staged_dirs = Vec::with_capacity(archive_paths.len());
+    let mut pkg_specs = Vec::with_capacity(archive_paths.len());
+    let mut install_targets = Vec::with_capacity(archive_paths.len());
+
+    for archive_path in archive_paths {
+        ui::info(format!(
+            "Installing package from: {}",
+            archive_path.display()
+        ));
+        ui::info(format!(
+            "Detected package archive: {}",
+            archive_path.display()
+        ));
+
+        let (pkg_spec, staging_dir) = load_package_archive_into_staging(config, archive_path)?;
+        if options.lib32_only {
+            anyhow::bail!("--lib32-only is only supported when installing from a package spec");
+        }
+
+        ui::info(format!(
+            "Package: {} v{}-{}",
+            pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
+        ));
+        install_targets.push(format!(
+            "{} v{}-{}",
+            pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
+        ));
+        pkg_specs.push(pkg_spec);
+        staged_dirs.push(staging_dir);
+    }
+
+    if options.dry_run {
+        ui::info("Dry run enabled, stopping before install/build work.");
+        return Ok(false);
+    }
+
+    if confirm_installation && !ui::prompt_package_action("installation", &install_targets, true)? {
+        anyhow::bail!("Aborted");
+    }
+
+    ui::info(format!(
+        "Installing {} binary archive payload(s) without staging transforms",
+        archive_paths.len()
+    ));
+
+    let mut transaction_plans = Vec::new();
+    for (pkg_spec, staging_dir) in pkg_specs.iter().zip(staged_dirs.iter()) {
+        let output_plans =
+            plan_package_outputs_for_install(pkg_spec, staging_dir.path(), options.rootfs, config)?;
+        transaction_plans.extend(output_plans);
+    }
+
+    run_transaction_hooks_for_plans(
+        options.rootfs,
+        install::hooks::HookPhase::Pre,
+        &transaction_plans,
+    )?;
+    let installed = install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
+    for pkg in installed {
+        ui::success(format!(
+            "Successfully installed {} v{}",
+            pkg.name, pkg.version
+        ));
+    }
+    run_transaction_hooks_for_plans(
+        options.rootfs,
+        install::hooks::HookPhase::Post,
+        &transaction_plans,
+    )?;
+
+    Ok(true)
+}
+
 fn run_direct_install_request(
     options: DirectInstallOptions<'_>,
     config: &config::Config,
@@ -1974,20 +2061,31 @@ pub fn run(cli: Cli) -> Result<()> {
             }
 
             let mut ran_direct_install = false;
-            for request in direct_requests {
-                ran_direct_install |= run_direct_install_request(
-                    DirectInstallOptions {
-                        rootfs: &cli.rootfs,
-                        no_deps: cli.no_deps,
-                        no_flags: cli.no_flags,
-                        cross_prefix: cli.cross_prefix.as_deref(),
-                        clean: cli.clean,
-                        dry_run: cli.dry_run,
-                        lib32_only: cli.lib32_only,
-                    },
+            let direct_install_options = DirectInstallOptions {
+                rootfs: &cli.rootfs,
+                no_deps: cli.no_deps,
+                no_flags: cli.no_flags,
+                cross_prefix: cli.cross_prefix.as_deref(),
+                clean: cli.clean,
+                dry_run: cli.dry_run,
+                lib32_only: cli.lib32_only,
+            };
+            if direct_requests.len() > 1
+                && direct_requests
+                    .iter()
+                    .all(|request| is_archive_install_request(request))
+            {
+                ran_direct_install |= run_direct_archive_install_requests(
+                    direct_install_options,
                     &config,
-                    request,
+                    &direct_requests,
+                    true,
                 )?;
+            } else {
+                for request in direct_requests {
+                    ran_direct_install |=
+                        run_direct_install_request(direct_install_options, &config, request)?;
+                }
             }
             if ran_direct_install {
                 install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
@@ -2963,6 +3061,83 @@ mod tests {
 
         assert!(staged.path().starts_with(staging_temp_root(&cfg)));
         assert!(staged.path().join("usr/bin/hello").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_archive_install_requests_batch_multiple_archives() -> Result<()> {
+        fn write_archive(
+            archive_path: &Path,
+            package_name: &str,
+            payload_path: &str,
+            payload: &[u8],
+        ) -> Result<()> {
+            let file = fs::File::create(archive_path)
+                .with_context(|| format!("Failed to create {}", archive_path.display()))?;
+            let encoder = zstd::stream::write::Encoder::new(file, 3)
+                .context("Failed to create zstd encoder")?;
+            let mut tar = tar::Builder::new(encoder);
+
+            let mut payload_header = tar::Header::new_gnu();
+            payload_header.set_path(payload_path)?;
+            payload_header.set_size(payload.len() as u64);
+            payload_header.set_mode(0o755);
+            payload_header.set_cksum();
+            tar.append(&payload_header, payload)?;
+
+            let metadata = format!(
+                "name = \"{package_name}\"\nversion = \"1.0\"\nrevision = 1\ndescription = \"test\"\nhomepage = \"https://example.test\"\nlicense = \"MIT\"\n\n[dependencies]\nruntime = []\noptional = []\n"
+            );
+            let mut meta_header = tar::Header::new_gnu();
+            meta_header.set_path(".metadata.toml")?;
+            meta_header.set_size(metadata.len() as u64);
+            meta_header.set_mode(0o644);
+            meta_header.set_cksum();
+            tar.append(&meta_header, metadata.as_bytes())?;
+
+            let encoder = tar.into_inner()?;
+            encoder.finish()?;
+            Ok(())
+        }
+
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let pkg_dir = tempfile::tempdir().context("Failed to create temp package dir")?;
+        let archive_a = pkg_dir.path().join("alpha-1.0-1-x86_64.depot.pkg.tar.zst");
+        let archive_b = pkg_dir.path().join("beta-1.0-1-x86_64.depot.pkg.tar.zst");
+        write_archive(&archive_a, "alpha", "usr/bin/alpha", b"alpha")?;
+        write_archive(&archive_b, "beta", "usr/bin/beta", b"beta")?;
+
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+        cfg.db_dir = rootfs.path().join("var/lib/depot");
+
+        let installed = run_direct_archive_install_requests(
+            DirectInstallOptions {
+                rootfs: rootfs.path(),
+                no_deps: true,
+                no_flags: false,
+                cross_prefix: None,
+                clean: false,
+                dry_run: false,
+                lib32_only: false,
+            },
+            &cfg,
+            &[archive_a, archive_b],
+            false,
+        )?;
+
+        assert!(installed);
+        assert!(rootfs.path().join("usr/bin/alpha").exists());
+        assert!(rootfs.path().join("usr/bin/beta").exists());
+        let db_path = cfg.installed_db_path(rootfs.path());
+        assert_eq!(
+            db::get_package_version(&db_path, "alpha")?,
+            Some("1.0".into())
+        );
+        assert_eq!(
+            db::get_package_version(&db_path, "beta")?,
+            Some("1.0".into())
+        );
         Ok(())
     }
 
