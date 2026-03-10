@@ -1438,6 +1438,10 @@ fn candidate_request_path(
 }
 
 fn sync_source_repositories_for_update(config: &config::Config) -> Result<()> {
+    if config.repo_settings.prefer_binary {
+        return Ok(());
+    }
+
     let mirrors = config.enabled_source_mirror_map();
     if mirrors.is_empty() {
         return Ok(());
@@ -1704,7 +1708,11 @@ fn collect_update_candidates(
         }
     }
 
-    let source_candidates = collect_best_source_update_candidates(config, &target_names)?;
+    let source_candidates = if config.repo_settings.prefer_binary {
+        HashMap::new()
+    } else {
+        collect_best_source_update_candidates(config, &target_names)?
+    };
     let binary_candidates = collect_best_binary_update_candidates(config, rootfs, &target_names)?;
 
     let mut updates = Vec::new();
@@ -4575,6 +4583,65 @@ optional = []
         .expect("expected update candidate");
         assert_eq!(selected.candidate_version, "1.0.0");
         assert_eq!(selected.candidate_completed_at, Some(200));
+    }
+
+    #[test]
+    fn collect_update_candidates_skips_source_when_prefer_binary_is_enabled() -> Result<()> {
+        let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+        let rootfs = temp.path().join("rootfs");
+        let repo_clones = temp.path().join("repos");
+        let build_dir = temp.path().join("build");
+        let db_dir = rootfs.join("var/lib/depot");
+        fs::create_dir_all(&db_dir)?;
+        fs::create_dir_all(&repo_clones)?;
+        fs::create_dir_all(&build_dir)?;
+
+        let mut config = config::Config::for_rootfs(&rootfs);
+        config.repo_clone_dir = repo_clones.clone();
+        config.build_dir = build_dir;
+        config.db_dir = db_dir.clone();
+        config.repo_settings.prefer_binary = true;
+        config.binary_repos.clear();
+        config.source_repos.insert(
+            "private".into(),
+            config::SourceRepo {
+                url: "https://example.test/private.git".into(),
+                enabled: true,
+                priority: 0,
+                subdirs: Vec::new(),
+            },
+        );
+
+        let installed_spec = package::PackageSpec {
+            package: package::PackageInfo {
+                name: "pkg".into(),
+                version: "1.0.0".into(),
+                revision: 1,
+                description: "pkg".into(),
+                homepage: "https://example.test".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: package::Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: package::Build {
+                build_type: package::BuildType::Bin,
+                flags: package::BuildFlags::default(),
+            },
+            dependencies: package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(dest.join("usr/bin"))?;
+        fs::write(dest.join("usr/bin/pkg"), "pkg")?;
+        db::register_package(&config.installed_db_path(&rootfs), &installed_spec, &dest)?;
+
+        let updates = collect_update_candidates(&config, &rootfs, &[])?;
+        assert!(updates.is_empty());
+        Ok(())
     }
 
     #[test]

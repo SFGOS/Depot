@@ -146,7 +146,10 @@ fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str) -> Result<()> {
         crate::log_info!("Cloning git mirror for {} ({})...", pkgname, url);
         let mut fo = FetchOptions::new();
         let transfer_progress = TransferProgress::new(format!("git {}", pkgname));
-        fo.remote_callbacks(remote_callbacks(Some(transfer_progress.bar()), url));
+        fo.remote_callbacks(authenticated_remote_callbacks(
+            Some(transfer_progress.bar()),
+            url,
+        ));
         let mut builder = git2::build::RepoBuilder::new();
         builder.fetch_options(fo);
         builder.bare(true);
@@ -168,7 +171,10 @@ fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str) -> Result<()> {
 
     let mut fo = FetchOptions::new();
     let transfer_progress = TransferProgress::new(format!("git {}", pkgname));
-    fo.remote_callbacks(remote_callbacks(Some(transfer_progress.bar()), url));
+    fo.remote_callbacks(authenticated_remote_callbacks(
+        Some(transfer_progress.bar()),
+        url,
+    ));
 
     // Fetch all remote refs (tags + heads). Empty refspec uses default.
     remote
@@ -274,7 +280,10 @@ fn resolve_remote_head_like<'a>(repo: &'a Repository) -> Result<Option<git2::Obj
     Ok(Some(repo.find_object(candidates[0].1, None)?))
 }
 
-fn remote_callbacks(progress_bar: Option<ProgressBar>, _label: &str) -> RemoteCallbacks<'static> {
+pub(crate) fn authenticated_remote_callbacks(
+    progress_bar: Option<ProgressBar>,
+    _label: &str,
+) -> RemoteCallbacks<'static> {
     let mut callbacks = RemoteCallbacks::new();
     let mut credential_state = CredentialState::default();
 

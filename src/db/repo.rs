@@ -2037,7 +2037,7 @@ pub fn sync_mirrors(
     repo_dir: &std::path::Path,
     mirrors: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
-    use git2::{Cred, FetchOptions, RemoteCallbacks, Repository, ResetType, build::RepoBuilder};
+    use git2::{FetchOptions, Repository, ResetType, build::RepoBuilder};
     use std::os::unix::fs::PermissionsExt;
 
     let base = repo_dir.to_path_buf();
@@ -2051,15 +2051,10 @@ pub fn sync_mirrors(
         if !target.exists() {
             crate::log_info!("Cloning mirror '{}' -> {}", name, target.display());
 
-            // Use git2 RepoBuilder to clone
-            let mut cb = RemoteCallbacks::new();
-            cb.credentials(|_url, username_from_url, _allowed| {
-                // Try default credentials (ssh-agent / keychain)
-                Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
-            });
-
             let mut fo = FetchOptions::new();
-            fo.remote_callbacks(cb);
+            fo.remote_callbacks(crate::source::authenticated_remote_callbacks(
+                None, &git_url,
+            ));
 
             let mut builder = RepoBuilder::new();
             builder.fetch_options(fo);
@@ -2072,13 +2067,10 @@ pub fn sync_mirrors(
             let repo = Repository::open(&target)
                 .with_context(|| format!("Failed to open repository at {}", target.display()))?;
 
-            let mut cb = RemoteCallbacks::new();
-            cb.credentials(|_url, username_from_url, _allowed| {
-                Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
-            });
-
             let mut fo = FetchOptions::new();
-            fo.remote_callbacks(cb);
+            fo.remote_callbacks(crate::source::authenticated_remote_callbacks(
+                None, &git_url,
+            ));
 
             // Fetch from origin
             let mut remote = repo

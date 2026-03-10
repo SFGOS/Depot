@@ -5,6 +5,8 @@ mod fetcher;
 mod git;
 pub mod hooks;
 
+pub(crate) use git::authenticated_remote_callbacks;
+
 use crate::package::PackageSpec;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
