@@ -181,7 +181,8 @@ fn copy_manual_source_file(
 
 /// Verify a file against an `expected` checksum string.
 ///
-/// Formats accepted: `sha256:HEX`, `sha512:HEX`, `md5:HEX`, or plain `HEX` (assumed sha256).
+/// Formats accepted: `sha256:HEX`, `sha512:HEX`, `md5:HEX`, `b2:HEX`,
+/// `b2sum:HEX`, or plain `HEX` (assumed sha256).
 fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
     use anyhow::bail;
     use std::io::Read;
@@ -250,6 +251,10 @@ fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
             let digest = ctx.finalize();
             let actual = format!("{:x}", digest);
             Ok(actual == hex)
+        }
+        "b2" | "b2sum" => {
+            let actual = b2sum_rust::Blake2bSum::new(64).read(path);
+            Ok(actual.eq_ignore_ascii_case(&hex))
         }
         _ => bail!("Unsupported checksum algorithm: {}", alg),
     }
@@ -716,11 +721,16 @@ mod tests {
             format!("{:x}", h.finalize())
         };
         let md5_hex = format!("{:x}", md5::compute(b"abc"));
+        let b2_hex = b2sum_rust::Blake2bSum::new(64)
+            .read(tmp.path())
+            .to_ascii_lowercase();
 
         assert!(verify_file_hash(tmp.path(), &sha256_hex).unwrap());
         assert!(verify_file_hash(tmp.path(), &format!("sha256:{}", sha256_hex)).unwrap());
         assert!(verify_file_hash(tmp.path(), &format!("sha512:{}", sha512_hex)).unwrap());
         assert!(verify_file_hash(tmp.path(), &format!("md5:{}", md5_hex)).unwrap());
+        assert!(verify_file_hash(tmp.path(), &format!("b2:{}", b2_hex)).unwrap());
+        assert!(verify_file_hash(tmp.path(), &format!("b2sum:{}", b2_hex)).unwrap());
         assert!(verify_file_hash(tmp.path(), &format!(":{}", sha256_hex)).unwrap());
         assert!(!verify_file_hash(tmp.path(), "md5:deadbeef").unwrap());
     }

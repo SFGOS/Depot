@@ -1,6 +1,6 @@
 [package]
 name = "depot"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2024"
 
 [lints.rust]
@@ -41,6 +41,7 @@ clap_complete = "4.5.66"
 clap_mangen = "0.2.31"
 sys-mount = { version = "3.1.0", default-features = false }
 time = { version = "0.3.47", features = ["formatting", "parsing"] }
+b2sum-rust = "0.3.0"
 
 [dev-dependencies]
 tempfile = "=3.26.0"

@@ -290,6 +290,7 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
 /// - `sha256:<hex>` (or just `<hex>` — default)
 /// - `sha512:<hex>`
 /// - `md5:<hex>`
+/// - `b2:<hex>` / `b2sum:<hex>`
 /// - `skip` to bypass verification
 fn verify_checksum(path: &Path, expected: &str) -> Result<bool> {
     // Delegate to the shared checker in the parent `source` module.
@@ -731,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_checksum_accepts_md5_sha512_and_default_sha256() {
+    fn verify_checksum_accepts_md5_sha512_b2sum_and_default_sha256() {
         use sha2::Digest;
         use sha2::Sha256;
         use sha2::Sha512;
@@ -753,6 +754,9 @@ mod tests {
         };
 
         let md5_hex = format!("{:x}", md5::compute(b"abc"));
+        let b2_hex = b2sum_rust::Blake2bSum::new(64)
+            .read(tmp.path())
+            .to_ascii_lowercase();
 
         // unprefixed should default to sha256
         assert!(verify_checksum(tmp.path(), &sha256_hex).unwrap());
@@ -760,6 +764,8 @@ mod tests {
         assert!(verify_checksum(tmp.path(), &format!("sha256:{}", sha256_hex)).unwrap());
         assert!(verify_checksum(tmp.path(), &format!("sha512:{}", sha512_hex)).unwrap());
         assert!(verify_checksum(tmp.path(), &format!("md5:{}", md5_hex)).unwrap());
+        assert!(verify_checksum(tmp.path(), &format!("b2:{}", b2_hex)).unwrap());
+        assert!(verify_checksum(tmp.path(), &format!("b2sum:{}", b2_hex)).unwrap());
         // empty algorithm before colon -> assume sha256
         assert!(verify_checksum(tmp.path(), &format!(":{}", sha256_hex)).unwrap());
         // negative: wrong value fails

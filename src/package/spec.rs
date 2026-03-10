@@ -3078,7 +3078,7 @@ pub struct Alternatives {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Source {
     pub url: String,
-    /// Checksum for the source (e.g. `sha256:...`, `sha512:...`, `md5:...`, or raw SHA256 hex).
+    /// Checksum for the source (e.g. `sha256:...`, `sha512:...`, `md5:...`, `b2:...`, `b2sum:...`, or raw SHA256 hex).
     /// Defaults to `skip` when omitted.
     #[serde(default = "default_source_sha256")]
     pub sha256: String,
