@@ -1,12 +1,15 @@
 //! Minisign-based detached signature helpers.
 
 use anyhow::{Context, Result};
+use inquire::Password;
 use minisign::{PublicKey, SecretKey, SecretKeyBox, SignatureBox};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 const PUBLIC_KEYS_DIR_REL: &str = "usr/share/depot/keys/public";
 const SIGN_KEYS_DIR_REL: &str = "usr/share/depot/keys/sign";
+const SIGNING_PASSWORD_ENV: &str = "DEPOT_MINISIGN_PASSWORD";
 
 #[derive(Debug, Clone, Default)]
 pub struct KeyLocations {
@@ -186,15 +189,7 @@ fn load_signing_material(keys: &KeyLocations) -> Result<SigningMaterial> {
             signing_key_path.display()
         )
     })?;
-    let secret_key = match secret_key_box.clone().into_unencrypted_secret_key() {
-        Ok(sk) => sk,
-        Err(_) => secret_key_box.into_secret_key(None).with_context(|| {
-            format!(
-                "Failed to load minisign signing key: {}",
-                signing_key_path.display()
-            )
-        })?,
-    };
+    let secret_key = load_secret_key(signing_key_path, secret_key_box)?;
     let public_key = if let Some(path) = &keys.public_key {
         Some(
             PublicKey::from_file(path).with_context(|| {
@@ -212,6 +207,55 @@ fn load_signing_material(keys: &KeyLocations) -> Result<SigningMaterial> {
         secret_key,
         public_key,
     })
+}
+
+fn load_secret_key(signing_key_path: &Path, secret_key_box: SecretKeyBox) -> Result<SecretKey> {
+    load_secret_key_with_password_override(signing_key_path, secret_key_box, None)
+}
+
+fn load_secret_key_with_password_override(
+    signing_key_path: &Path,
+    secret_key_box: SecretKeyBox,
+    password_override: Option<String>,
+) -> Result<SecretKey> {
+    match secret_key_box.clone().into_unencrypted_secret_key() {
+        Ok(sk) => Ok(sk),
+        Err(_) => {
+            let password = match password_override {
+                Some(password) => password,
+                None => signing_key_password(signing_key_path)?,
+            };
+            secret_key_box
+                .into_secret_key(Some(password))
+                .with_context(|| {
+                    format!(
+                        "Failed to load minisign signing key: {}",
+                        signing_key_path.display()
+                    )
+                })
+        }
+    }
+}
+
+fn signing_key_password(signing_key_path: &Path) -> Result<String> {
+    if let Some(password) = std::env::var_os(SIGNING_PASSWORD_ENV) {
+        return Ok(password.to_string_lossy().into_owned());
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "Encrypted minisign signing key requires an interactive terminal or {} to be set: {}",
+            SIGNING_PASSWORD_ENV,
+            signing_key_path.display()
+        );
+    }
+
+    Password::new(&format!(
+        "Minisign password for {}:",
+        signing_key_path.display()
+    ))
+    .without_confirmation()
+    .prompt()
+    .context("Failed to read minisign signing key password")
 }
 
 fn sign_detached_with_material(
@@ -376,6 +420,21 @@ mod tests {
         Ok((pub_path, sign_path))
     }
 
+    fn write_encrypted_test_keys(root: &Path, password: &str) -> Result<(PathBuf, PathBuf)> {
+        let public_dir = root.join(PUBLIC_KEYS_DIR_REL);
+        let sign_dir = root.join(SIGN_KEYS_DIR_REL);
+        fs::create_dir_all(&public_dir)?;
+        fs::create_dir_all(&sign_dir)?;
+
+        let pair = KeyPair::generate_encrypted_keypair(Some(password.to_string()))
+            .context("Failed to generate encrypted keypair")?;
+        let pub_path = public_dir.join("depot.pub");
+        let sign_path = sign_dir.join("depot.key");
+        fs::write(&pub_path, pair.pk.to_box()?.to_bytes())?;
+        fs::write(&sign_path, pair.sk.to_box(Some("test"))?.to_bytes())?;
+        Ok((pub_path, sign_path))
+    }
+
     #[test]
     fn locate_keys_checks_rootfs_before_host() -> Result<()> {
         let rootfs = tempfile::tempdir()?;
@@ -419,6 +478,21 @@ mod tests {
 
         // Also make sure host/rootfs lookup path version works without touching /.
         let _ = locate_keys_in_roots(rootfs.path(), host.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_secret_key_accepts_explicit_password_for_encrypted_key() -> Result<()> {
+        let rootfs = tempfile::tempdir()?;
+        let (_, sign_path) = write_encrypted_test_keys(rootfs.path(), "password")?;
+        let secret_key_text = fs::read_to_string(&sign_path)?;
+        let secret_key_box = SecretKeyBox::from_string(&secret_key_text)?;
+
+        let _secret_key = load_secret_key_with_password_override(
+            &sign_path,
+            secret_key_box,
+            Some("password".to_string()),
+        )?;
         Ok(())
     }
 
