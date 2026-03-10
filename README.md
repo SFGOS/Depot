@@ -43,11 +43,12 @@ depot install zlib-1.2.11-1-x86_64.depot.pkg.tar.zst
   - Resolves a full dependency plan first (binary repos and/or source specs), then executes in dependency order.
   - Use `--yes` for non-interactive confirmation/provider selection.
   - Use `--dry-run` to print the plan without performing work.
+  - Use `--test-deps` to include declared test dependencies in dependency installation.
   - Binary package installs verify both checksums and detached minisign signatures (`.sig`).
 - `remove <PACKAGE>`: Remove an installed package.
 - `build <SPEC>`: Build a package and create an archive without installing.
   - Resolves and offers to install missing build dependencies before fetching/building.
-  - Missing test dependencies automatically disable test execution for that build.
+  - Missing test dependencies automatically disable test execution unless `--test-deps` or `[install].test_deps = true` is set.
 - `update [PACKAGE ...]`: Update installed packages from configured repositories.
   - With no package names, updates every installed package that has a newer repo version available.
   - Refreshes source repos first, compares installed package version/revision and UTC completion time against repo metadata, and installs any newly introduced runtime dependencies before applying updates.

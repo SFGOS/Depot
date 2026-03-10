@@ -36,3 +36,7 @@ carch = "x86_64"
 # Target triples (optional)
 #chost = "x86_64-pc-linux-gnu"
 #cbuild = "x86_64-pc-linux-gnu"
+
+[install]
+# Install test dependencies along with build/runtime dependencies.
+test_deps = false

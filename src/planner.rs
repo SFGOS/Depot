@@ -104,6 +104,7 @@ pub(crate) struct PlannerOptions {
     pub assume_yes: bool,
     pub prefer_binary: bool,
     pub local_sibling_root: Option<PathBuf>,
+    pub include_test_deps: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -265,9 +266,13 @@ impl<'a> Resolver<'a> {
         local_sibling: bool,
         requested_by: String,
     ) -> Result<NodeIndex> {
+        let include_test_deps = self.opts.include_test_deps;
         let (package_name, deps_needed) = {
             let spec = self.load_spec(path)?;
-            (spec.package.name.clone(), source_deps_for_install(spec))
+            (
+                spec.package.name.clone(),
+                source_deps_for_install(spec, include_test_deps),
+            )
         };
         if let Some(&idx) = self.by_package.get(&package_name) {
             self.mark_requested_by(idx, requested_by);
@@ -608,7 +613,7 @@ impl<'a> Resolver<'a> {
     }
 }
 
-fn source_deps_for_install(spec: &PackageSpec) -> Vec<String> {
+fn source_deps_for_install(spec: &PackageSpec, include_test_deps: bool) -> Vec<String> {
     let mut deps_all = Vec::new();
     let local_provides = spec.local_dependency_provides();
     if !spec.is_metapackage() {
@@ -628,6 +633,11 @@ fn source_deps_for_install(spec: &PackageSpec) -> Vec<String> {
             if !local_provides.contains(deps::dep_name(&dep)) {
                 push_unique(&mut deps_all, dep);
             }
+        }
+    }
+    if include_test_deps && !spec.build.flags.skip_tests {
+        for dep in &spec.dependencies.test {
+            push_unique(&mut deps_all, dep.clone());
         }
     }
     deps_all
@@ -876,7 +886,7 @@ mod tests {
     #[test]
     fn source_deps_for_install_excludes_local_runtime_outputs_and_provides() {
         let spec = mk_spec();
-        let deps = source_deps_for_install(&spec);
+        let deps = source_deps_for_install(&spec, false);
         assert!(deps.contains(&"make".to_string()));
         assert!(deps.contains(&"zlib".to_string()));
         assert!(deps.contains(&"openssl".to_string()));
@@ -887,8 +897,15 @@ mod tests {
     #[test]
     fn source_deps_for_install_does_not_include_test_deps() {
         let spec = mk_spec();
-        let deps = source_deps_for_install(&spec);
+        let deps = source_deps_for_install(&spec, false);
         assert!(!deps.contains(&"bats".to_string()));
+    }
+
+    #[test]
+    fn source_deps_for_install_includes_test_deps_when_enabled() {
+        let spec = mk_spec();
+        let deps = source_deps_for_install(&spec, true);
+        assert!(deps.contains(&"bats".to_string()));
     }
 
     #[test]
@@ -937,6 +954,7 @@ mod tests {
                 assume_yes: false,
                 prefer_binary: true,
                 local_sibling_root: None,
+                include_test_deps: false,
             },
         )
         .unwrap();

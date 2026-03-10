@@ -41,6 +41,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub dry_run: bool,
 
+    /// Install test dependencies alongside build/runtime dependencies
+    #[arg(long, global = true)]
+    pub test_deps: bool,
+
     /// Build/install only the lib32 companion package path (skip primary package output)
     #[arg(long, global = true)]
     pub lib32_only: bool,
@@ -309,5 +313,11 @@ mod tests {
             Commands::Check { dir } => assert_eq!(dir, PathBuf::from("packages")),
             _ => panic!("expected check command"),
         }
+    }
+
+    #[test]
+    fn global_test_deps_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["depot", "--test-deps", "install", "foo"]).unwrap();
+        assert!(cli.test_deps);
     }
 }

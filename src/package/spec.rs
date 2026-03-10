@@ -2877,6 +2877,7 @@ cbuild = "x86_64-pc-linux-gnu"
             mirrors: std::collections::HashMap::new(),
             repo_clone_dir: PathBuf::from("/tmp"),
             package_cache_dir: PathBuf::from("/tmp"),
+            install_test_deps: false,
         };
 
         spec.apply_config(&config);

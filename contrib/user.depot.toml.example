@@ -9,6 +9,9 @@ cflags = ["-O2"]
 cflags += ["-g"]
 carch = "x86_64"
 
+[install]
+test_deps = false
+
 # Optional install directory overrides for supported builders
 #bindir = "/usr/local/bin"
 #sbindir = "/usr/local/sbin"

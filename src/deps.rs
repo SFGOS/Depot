@@ -306,6 +306,20 @@ pub fn require_runtime_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Verify all test dependencies are installed, error if not.
+pub fn require_test_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
+    let missing = check_test_deps(spec, db_path)?;
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Missing test dependencies: {}\nInstall them first with: depot install --test-deps <package>",
+            missing.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

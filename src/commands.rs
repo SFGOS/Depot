@@ -40,6 +40,10 @@ fn should_delegate_live_rootfs_installs(rootfs: &Path) -> bool {
     !crate::fakeroot::is_root() && rootfs_is_system_root(rootfs)
 }
 
+fn install_test_deps_enabled(cli_test_deps: bool, config: &config::Config) -> bool {
+    cli_test_deps || config.install_test_deps
+}
+
 fn maybe_reexec_with_sudo(cli: &Cli) -> Result<bool> {
     if !should_reexec_with_sudo(cli) {
         return Ok(false);
@@ -67,6 +71,7 @@ struct ChildInstallCommandOptions<'a> {
     no_flags: bool,
     cross_prefix: Option<&'a str>,
     clean: bool,
+    install_test_deps: bool,
     dep_chain: Option<&'a str>,
 }
 
@@ -104,6 +109,9 @@ fn run_install_command_with_program(
     }
     if options.clean {
         cmd.arg("--clean");
+    }
+    if options.install_test_deps {
+        cmd.arg("--test-deps");
     }
     cmd.arg("install");
     cmd.args(install_requests);
@@ -144,6 +152,7 @@ fn run_child_install_command(
             no_flags: options.no_flags,
             cross_prefix: options.cross_prefix,
             clean: options.clean,
+            install_test_deps: options.install_test_deps,
             dep_chain: None,
         },
     )
@@ -475,6 +484,10 @@ fn maybe_disable_tests_for_missing_deps(
     }
 
     Ok(())
+}
+
+fn should_install_test_deps(pkg_spec: &package::PackageSpec, install_test_deps: bool) -> bool {
+    install_test_deps && !pkg_spec.build.flags.skip_tests && !pkg_spec.dependencies.test.is_empty()
 }
 
 fn clean_build_workspace(config: &config::Config) -> Result<()> {
@@ -1249,6 +1262,7 @@ struct UpdateCommandOptions<'a> {
     clean: bool,
     dry_run: bool,
     assume_yes: bool,
+    install_test_deps: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1782,6 +1796,7 @@ fn run_update_install_command(
             no_flags: options.no_flags,
             cross_prefix: options.cross_prefix,
             clean: options.clean,
+            install_test_deps: options.install_test_deps,
             dep_chain: None,
         },
     )
@@ -1856,6 +1871,7 @@ fn run_update_command(
                 assume_yes: options.assume_yes,
                 prefer_binary: config.repo_settings.prefer_binary,
                 local_sibling_root: None,
+                include_test_deps: options.install_test_deps,
             },
         )?;
         print_plan_summary(&dep_plan);
@@ -1875,6 +1891,7 @@ fn run_update_command(
                 clean: options.clean,
                 dry_run: false,
                 confirm_installation: false,
+                install_test_deps: options.install_test_deps,
             },
         )?;
     } else if options.dry_run {
@@ -2350,6 +2367,7 @@ struct InstallPlanExecutionOptions<'a> {
     clean: bool,
     dry_run: bool,
     confirm_installation: bool,
+    install_test_deps: bool,
 }
 
 fn execute_install_plan_with_child_commands(
@@ -2695,6 +2713,7 @@ struct DirectInstallOptions<'a> {
     clean: bool,
     dry_run: bool,
     lib32_only: bool,
+    install_test_deps: bool,
 }
 
 fn run_direct_archive_install_requests(
@@ -2897,7 +2916,9 @@ fn run_direct_install_request(
     })?;
     let db_path = config.installed_db_path(options.rootfs);
 
-    if staging_dir.is_none() {
+    if staging_dir.is_none()
+        && (options.no_deps || !should_install_test_deps(&pkg_spec, options.install_test_deps))
+    {
         maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
     }
 
@@ -2910,6 +2931,11 @@ fn run_direct_install_request(
             deps::check_build_deps(&pkg_spec, &db_path)?,
             deps::check_runtime_deps(&pkg_spec, &db_path)?,
         );
+        let missing = if should_install_test_deps(&pkg_spec, options.install_test_deps) {
+            merge_missing_dependencies(missing, deps::check_test_deps(&pkg_spec, &db_path)?)
+        } else {
+            missing
+        };
         if !missing.is_empty() {
             // Check for dependency cycles via DEPOT_DEPCHAIN env var
             let dep_chain = std::env::var("DEPOT_DEPCHAIN").unwrap_or_default();
@@ -2963,6 +2989,7 @@ fn run_direct_install_request(
                         no_flags: options.no_flags,
                         cross_prefix: options.cross_prefix,
                         clean: options.clean,
+                        install_test_deps: options.install_test_deps,
                         dep_chain: Some(&new_chain),
                     },
                 )?;
@@ -2972,6 +2999,9 @@ fn run_direct_install_request(
         // Enforce required dependencies before building/installing.
         deps::require_build_deps(&pkg_spec, &db_path)?;
         deps::require_runtime_deps(&pkg_spec, &db_path)?;
+        if should_install_test_deps(&pkg_spec, options.install_test_deps) {
+            deps::require_test_deps(&pkg_spec, &db_path)?;
+        }
     }
 
     let cross_config = options
@@ -3072,6 +3102,7 @@ pub fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    let cli_test_deps = cli.test_deps;
     match cli.command {
         Commands::Install {
             spec_or_archive,
@@ -3084,6 +3115,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
             // Load configuration early so we can use configured repos/paths.
             let config = config::Config::for_rootfs(&cli.rootfs);
+            let install_test_deps = install_test_deps_enabled(cli_test_deps, &config);
             let mut planned_targets = Vec::new();
             let mut planned_spec_paths = Vec::new();
             let mut direct_requests = Vec::new();
@@ -3114,6 +3146,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     assume_yes: cli.yes,
                     prefer_binary: config.repo_settings.prefer_binary,
                     local_sibling_root: shared_local_sibling_root(&planned_spec_paths),
+                    include_test_deps: install_test_deps,
                 };
                 let plan = if planned_targets.len() == 1 {
                     planner::build_install_plan(
@@ -3141,6 +3174,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         clean: cli.clean,
                         dry_run: cli.dry_run,
                         confirm_installation: true,
+                        install_test_deps,
                     },
                 )?;
             }
@@ -3154,6 +3188,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 clean: cli.clean,
                 dry_run: cli.dry_run,
                 lib32_only: cli.lib32_only,
+                install_test_deps,
             };
             if direct_requests.len() > 1
                 && direct_requests
@@ -3241,6 +3276,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let mut pkg_spec = package::PackageSpec::from_file(&spec_path)?;
 
             let config = config::Config::for_rootfs(&cli.rootfs);
+            let install_test_deps = install_test_deps_enabled(cli_test_deps, &config);
 
             // Apply system overrides
             pkg_spec.apply_config(&config);
@@ -3254,7 +3290,9 @@ pub fn run(cli: Cli) -> Result<()> {
             })?;
             let db_path = config.installed_db_path(&cli.rootfs);
 
-            maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
+            if cli.no_deps || !should_install_test_deps(&pkg_spec, install_test_deps) {
+                maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
+            }
 
             // Check build dependencies
             if !cli.no_deps {
@@ -3263,6 +3301,11 @@ pub fn run(cli: Cli) -> Result<()> {
                     deps::check_build_deps(&pkg_spec, &db_path)?,
                     deps::check_runtime_deps(&pkg_spec, &db_path)?,
                 );
+                let missing = if should_install_test_deps(&pkg_spec, install_test_deps) {
+                    merge_missing_dependencies(missing, deps::check_test_deps(&pkg_spec, &db_path)?)
+                } else {
+                    missing
+                };
                 if !missing.is_empty() {
                     ui::warn(format!("Missing dependencies: {}", missing.join(", ")));
                     let local_sibling_root = spec_path
@@ -3277,6 +3320,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             assume_yes: cli.yes,
                             prefer_binary: config.repo_settings.prefer_binary,
                             local_sibling_root,
+                            include_test_deps: install_test_deps,
                         },
                     )?;
                     print_plan_summary(&dep_plan);
@@ -3297,11 +3341,15 @@ pub fn run(cli: Cli) -> Result<()> {
                             clean: cli.clean,
                             dry_run: cli.dry_run,
                             confirm_installation: false,
+                            install_test_deps,
                         },
                     )?;
                 }
                 deps::require_build_deps(&pkg_spec, &db_path)?;
                 deps::require_runtime_deps(&pkg_spec, &db_path)?;
+                if should_install_test_deps(&pkg_spec, install_test_deps) {
+                    deps::require_test_deps(&pkg_spec, &db_path)?;
+                }
             } else if cli.dry_run {
                 ui::info("Dry run enabled, stopping before build.");
                 return Ok(());
@@ -3444,6 +3492,7 @@ pub fn run(cli: Cli) -> Result<()> {
                                 clean: cli.clean,
                                 dry_run: cli.dry_run,
                                 confirm_installation: false,
+                                install_test_deps,
                             },
                         )?;
                         if cli.clean {
@@ -3536,6 +3585,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     clean: cli.clean,
                     dry_run: cli.dry_run,
                     assume_yes: cli.yes,
+                    install_test_deps: install_test_deps_enabled(cli_test_deps, &config),
                 },
             )?;
         }
@@ -3990,6 +4040,7 @@ pub fn run(cli: Cli) -> Result<()> {
             println!("Build Directory: {}", config.build_dir.display());
             println!("Database Directory: {}", config.db_dir.display());
             println!("Repo Clone Directory: {}", config.repo_clone_dir.display());
+            println!("Install Test Deps: {}", config.install_test_deps);
             println!(
                 "Configured Repos: {} source, {} binary",
                 config.source_repos.len(),
@@ -4228,6 +4279,7 @@ mod tests {
                 clean: false,
                 dry_run: false,
                 lib32_only: false,
+                install_test_deps: false,
             },
             &cfg,
             &[archive_a, archive_b],
@@ -4831,6 +4883,7 @@ optional = []
                 no_flags: true,
                 cross_prefix: Some("x86_64-linux-musl"),
                 clean: true,
+                install_test_deps: true,
                 dep_chain: Some("parent"),
             },
         )?;
@@ -4846,6 +4899,7 @@ optional = []
                 "--cross-prefix",
                 "x86_64-linux-musl",
                 "--clean",
+                "--test-deps",
                 "install",
                 "/tmp/pkg-a.toml",
                 "/tmp/pkg-b.toml",

@@ -218,6 +218,8 @@ pub struct Config {
     pub repo_clone_dir: PathBuf,
     /// Cache directory for binary packages and repo metadata.
     pub package_cache_dir: PathBuf,
+    /// Install test dependencies alongside build/runtime dependencies.
+    pub install_test_deps: bool,
 }
 
 impl Config {
@@ -260,6 +262,7 @@ impl Config {
             mirrors: std::collections::HashMap::new(),
             repo_clone_dir: abs_rootfs.join("usr/src/depot"),
             package_cache_dir,
+            install_test_deps: false,
         };
 
         if let Err(e) = config.load_system(&abs_rootfs) {
@@ -312,6 +315,13 @@ impl Config {
                 // If it has a [package] section, merge it into package_overrides
                 if let Some(pkg) = val.get("package") {
                     merge_toml_values(&mut self.package_overrides, pkg);
+                }
+                if let Some(include_test_deps) = val
+                    .get("install")
+                    .and_then(|v| v.get("test_deps"))
+                    .and_then(|v| v.as_bool())
+                {
+                    self.install_test_deps = include_test_deps;
                 }
 
                 for (k, v) in appends {
@@ -673,6 +683,9 @@ cc = "clang"
 
 [build.flags]
 cflags = ["-O3"]
+
+[install]
+test_deps = true
 "#,
         )
         .unwrap();
@@ -700,6 +713,7 @@ cflags = ["-O3"]
                 .map(|a| a.len()),
             Some(1)
         );
+        assert!(config.install_test_deps);
     }
 
     #[test]
