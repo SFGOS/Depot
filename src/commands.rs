@@ -2712,20 +2712,12 @@ fn run_direct_archive_install_requests(
             "Installing package from: {}",
             archive_path.display()
         ));
-        ui::info(format!(
-            "Detected package archive: {}",
-            archive_path.display()
-        ));
 
         let (pkg_spec, staging_dir) = load_package_archive_into_staging(config, archive_path)?;
         if options.lib32_only {
             anyhow::bail!("--lib32-only is only supported when installing from a package spec");
         }
 
-        ui::info(format!(
-            "Package: {} v{}-{}",
-            pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
-        ));
         install_targets.push(format!(
             "{} v{}-{}",
             pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
@@ -2853,7 +2845,6 @@ fn run_direct_install_request(
     let (mut pkg_spec, staging_dir): (package::PackageSpec, Option<tempfile::TempDir>) =
         if spec_path.to_string_lossy().ends_with(".tar.zst") {
             // Install from archive
-            ui::info(format!("Detected package archive: {}", spec_path.display()));
             let (spec, tmp_dir) = load_package_archive_into_staging(config, &spec_path)?;
             (spec, Some(tmp_dir))
         } else {
@@ -2867,10 +2858,12 @@ fn run_direct_install_request(
         anyhow::bail!("--lib32-only is only supported when installing from a package spec");
     }
 
-    ui::info(format!(
-        "Package: {} v{}-{}",
-        pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
-    ));
+    if staging_dir.is_none() {
+        ui::info(format!(
+            "Package: {} v{}-{}",
+            pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
+        ));
+    }
 
     if options.dry_run {
         ui::info("Dry run enabled, stopping before install/build work.");

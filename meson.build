@@ -1,6 +1,6 @@
 project(
   'depot',
-  version: '0.13.1',
+  version: '0.13.2',
   meson_version: '>=0.60.0',
 )
 
