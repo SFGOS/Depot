@@ -565,6 +565,25 @@ pub fn list_installed_package_records(db_path: &Path) -> Result<Vec<InstalledPac
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
 
+/// Return the alternatives provided by an installed package.
+pub fn get_package_provides(db_path: &Path, name: &str) -> Result<Vec<String>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT pr.provides_name
+         FROM provides pr
+         JOIN packages p ON p.id = pr.package_id
+         WHERE p.name = ?1
+         ORDER BY pr.provides_name",
+    )?;
+    let rows = stmt.query_map(params![name], |row| row.get(0))?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
 /// Get set of all provided package names (alternatives)
 pub fn get_all_provides(db_path: &Path) -> Result<std::collections::HashSet<String>> {
     use std::collections::HashSet;
@@ -653,6 +672,7 @@ mod tests {
             packages: Vec::new(),
             alternatives: Alternatives {
                 provides: vec![format!("{}-virtual", name)],
+                conflicts: Vec::new(),
                 replaces: Vec::new(),
             },
             manual_sources: Vec::new(),

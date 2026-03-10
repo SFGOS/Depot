@@ -83,6 +83,7 @@ struct IndexedPackage {
     sha256: String,
     sha512: String,
     provides: Vec<String>,
+    conflicts: Vec<String>,
     runtime_dependencies: Vec<String>,
     optional_dependencies: Vec<String>,
     archive_files: Vec<String>,
@@ -118,6 +119,7 @@ pub struct BinaryRepoPackageRecord {
     pub homepage: Option<String>,
     pub license: Option<String>,
     pub provides: Vec<String>,
+    pub conflicts: Vec<String>,
     pub runtime_dependencies: Vec<String>,
     pub optional_dependencies: Vec<String>,
 }
@@ -296,6 +298,11 @@ impl RepoManager {
                 name TEXT NOT NULL,
                 FOREIGN KEY(package_id) REFERENCES packages(id)
             );
+            CREATE TABLE conflicts (
+                package_id INTEGER,
+                name TEXT NOT NULL,
+                FOREIGN KEY(package_id) REFERENCES packages(id)
+            );
             CREATE TABLE dependencies (
                 package_id INTEGER,
                 kind TEXT NOT NULL,
@@ -316,6 +323,7 @@ impl RepoManager {
         conn.execute_batch(
             "CREATE INDEX idx_packages_name ON packages(name);
              CREATE INDEX idx_provides_name ON provides(name);
+             CREATE INDEX idx_conflicts_name ON conflicts(name);
              CREATE INDEX idx_dependencies_name ON dependencies(name);
              CREATE INDEX idx_dependencies_kind ON dependencies(kind);
              CREATE INDEX idx_repo_files_path ON files(path);",
@@ -344,6 +352,7 @@ impl RepoManager {
         let mut homepage = None;
         let mut license = None;
         let mut provides = Vec::new();
+        let mut conflicts = Vec::new();
         let mut runtime_dependencies = Vec::new();
         let mut optional_dependencies = Vec::new();
         let mut archive_files = Vec::new();
@@ -392,6 +401,15 @@ impl RepoManager {
                     if let Some(provides_arr) = metadata.get("provides").and_then(|v| v.as_array())
                     {
                         provides = provides_arr
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(String::from)
+                            .collect();
+                    }
+                    if let Some(conflicts_arr) =
+                        metadata.get("conflicts").and_then(|v| v.as_array())
+                    {
+                        conflicts = conflicts_arr
                             .iter()
                             .filter_map(|v| v.as_str())
                             .map(String::from)
@@ -460,6 +478,7 @@ impl RepoManager {
             sha256,
             sha512,
             provides,
+            conflicts,
             runtime_dependencies,
             optional_dependencies,
             archive_files,
@@ -480,6 +499,7 @@ impl RepoManager {
             sha256,
             sha512,
             provides,
+            conflicts,
             runtime_dependencies,
             optional_dependencies,
             archive_files,
@@ -511,6 +531,12 @@ impl RepoManager {
             conn.execute(
                 "INSERT INTO provides (package_id, name) VALUES (?1, ?2)",
                 params![package_id, provide],
+            )?;
+        }
+        for conflict in conflicts {
+            conn.execute(
+                "INSERT INTO conflicts (package_id, name) VALUES (?1, ?2)",
+                params![package_id, conflict],
             )?;
         }
 
@@ -1461,6 +1487,27 @@ fn query_package_provides(conn: &Connection, package_id: i64) -> Result<Vec<Stri
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+fn query_package_conflicts(conn: &Connection, package_id: i64) -> Result<Vec<String>> {
+    let has_conflicts_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='conflicts'",
+            [],
+            |r| {
+                let n: i64 = r.get(0)?;
+                Ok(n > 0)
+            },
+        )
+        .unwrap_or(false);
+    if !has_conflicts_table {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt =
+        conn.prepare("SELECT name FROM conflicts WHERE package_id = ?1 ORDER BY name")?;
+    let rows = stmt.query_map(params![package_id], |row| row.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 fn query_package_runtime_deps(conn: &Connection, package_id: i64) -> Result<Vec<String>> {
     let has_dependencies_table: bool = conn
         .query_row(
@@ -1563,6 +1610,7 @@ fn find_cached_binary_repo_packages(
                 homepage: row.get(10)?,
                 license: row.get(11)?,
                 provides: Vec::new(),
+                conflicts: Vec::new(),
                 runtime_dependencies: Vec::new(),
                 optional_dependencies: Vec::new(),
             },
@@ -1573,6 +1621,7 @@ fn find_cached_binary_repo_packages(
     for row in rows {
         let (package_id, mut rec) = row?;
         rec.provides = query_package_provides(&conn, package_id)?;
+        rec.conflicts = query_package_conflicts(&conn, package_id)?;
         rec.runtime_dependencies = query_package_runtime_deps(&conn, package_id)?;
         rec.optional_dependencies = query_package_optional_deps(&conn, package_id)?;
         out.push(rec);
@@ -1629,6 +1678,7 @@ fn list_cached_binary_repo_packages(
                 homepage: row.get(10)?,
                 license: row.get(11)?,
                 provides: Vec::new(),
+                conflicts: Vec::new(),
                 runtime_dependencies: Vec::new(),
                 optional_dependencies: Vec::new(),
             },
@@ -1639,6 +1689,7 @@ fn list_cached_binary_repo_packages(
     for row in rows {
         let (package_id, mut rec) = row?;
         rec.provides = query_package_provides(&conn, package_id)?;
+        rec.conflicts = query_package_conflicts(&conn, package_id)?;
         rec.runtime_dependencies = query_package_runtime_deps(&conn, package_id)?;
         rec.optional_dependencies = query_package_optional_deps(&conn, package_id)?;
         out.push(rec);
@@ -2463,6 +2514,7 @@ license = ["MIT", "Apache-2.0"]
             homepage: None,
             license: None,
             provides: Vec::new(),
+            conflicts: Vec::new(),
             runtime_dependencies: Vec::new(),
             optional_dependencies: Vec::new(),
         };
@@ -2498,6 +2550,7 @@ license = ["MIT", "Apache-2.0"]
             homepage: None,
             license: None,
             provides: Vec::new(),
+            conflicts: Vec::new(),
             runtime_dependencies: Vec::new(),
             optional_dependencies: Vec::new(),
         }

@@ -814,6 +814,7 @@ mod tests {
                 "foo-libs".into(),
                 Alternatives {
                     provides: vec!["libfoo".into()],
+                    conflicts: Vec::new(),
                     replaces: Vec::new(),
                 },
             )]),
@@ -856,6 +857,7 @@ mod tests {
                     homepage: None,
                     license: None,
                     provides: Vec::new(),
+                    conflicts: Vec::new(),
                     runtime_dependencies: Vec::new(),
                     optional_dependencies: Vec::new(),
                 }),

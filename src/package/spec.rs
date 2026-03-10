@@ -1557,9 +1557,11 @@ type = "custom"
 
 [alternatives]
 provides = ["toolchain"]
+conflicts = ["gcc"]
 
 [package_alternatives.clang]
 provides = ["cc", "c++", "gcc"]
+conflicts = ["clang-legacy"]
 
 [package_alternatives.llvm]
 provides = ["binutils"]
@@ -1573,12 +1575,24 @@ provides = ["binutils"]
             vec!["binutils".to_string()]
         );
         assert_eq!(
+            spec.alternatives_for_output("llvm").conflicts,
+            Vec::<String>::new()
+        );
+        assert_eq!(
             spec.alternatives_for_output("clang").provides,
             vec!["cc".to_string(), "c++".to_string(), "gcc".to_string()]
         );
         assert_eq!(
+            spec.alternatives_for_output("clang").conflicts,
+            vec!["clang-legacy".to_string()]
+        );
+        assert_eq!(
             spec.alternatives_for_output("other").provides,
             vec!["toolchain".to_string()]
+        );
+        assert_eq!(
+            spec.alternatives_for_output("other").conflicts,
+            vec!["gcc".to_string()]
         );
     }
 
@@ -3001,6 +3015,9 @@ impl fmt::Display for PackageSpec {
         if !self.alternatives.provides.is_empty() {
             writeln!(f, "Provides: {}", self.alternatives.provides.join(", "))?;
         }
+        if !self.alternatives.conflicts.is_empty() {
+            writeln!(f, "Conflicts: {}", self.alternatives.conflicts.join(", "))?;
+        }
         Ok(())
     }
 }
@@ -3064,11 +3081,13 @@ impl PackageSpec {
     }
 }
 
-/// Package alternatives (provides/replaces)
+/// Package alternatives such as virtual provides and install conflicts.
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct Alternatives {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provides: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
     /// Reserved for future package replacement feature
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[allow(dead_code)]

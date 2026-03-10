@@ -4,7 +4,7 @@
 
 use crate::package::PackageSpec;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -12,9 +12,15 @@ use walkdir::WalkDir;
 
 /// Filename for the source-repo index written at a repo root.
 pub const SOURCE_REPO_INDEX_FILENAME: &str = "depot-index.tsv";
-const SOURCE_REPO_INDEX_HEADER: &str = "depot-source-index-v1";
+const SOURCE_REPO_INDEX_HEADER_V1: &str = "depot-source-index-v1";
+const SOURCE_REPO_INDEX_HEADER_V2: &str = "depot-source-index-v2";
 const SOURCE_REPO_INDEX_KIND_PACKAGE: &str = "P";
 const SOURCE_REPO_INDEX_KIND_PROVIDES: &str = "V";
+const SOURCE_REPO_INDEX_KIND_CONFLICTS: &str = "C";
+const SOURCE_REPO_INDEX_KIND_DEP_BUILD: &str = "B";
+const SOURCE_REPO_INDEX_KIND_DEP_RUNTIME: &str = "R";
+const SOURCE_REPO_INDEX_KIND_DEP_TEST: &str = "T";
+const SOURCE_REPO_INDEX_KIND_DEP_OPTIONAL: &str = "O";
 
 /// Statistics for generating a source repository index file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +35,10 @@ pub struct SourceRepoIndexStats {
     pub package_rows: usize,
     /// Number of provides rows written to the index.
     pub provides_rows: usize,
+    /// Number of conflict rows written to the index.
+    pub conflicts_rows: usize,
+    /// Number of dependency rows written to the index.
+    pub dependency_rows: usize,
     /// Number of discovered TOML files ignored because they were not package specs.
     pub ignored_toml_files: usize,
 }
@@ -50,6 +60,15 @@ pub struct SourceSearchHit {
     pub provides: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct IndexedSpecRows {
+    name: String,
+    rel: String,
+    provides: Vec<String>,
+    conflicts: Vec<String>,
+    deps: Vec<(String, String)>,
+}
+
 /// Return the source index file path for `repo_root`.
 pub fn source_repo_index_path(repo_root: &Path) -> PathBuf {
     repo_root.join(SOURCE_REPO_INDEX_FILENAME)
@@ -58,9 +77,15 @@ pub fn source_repo_index_path(repo_root: &Path) -> PathBuf {
 /// Create/update the source-repo package index at `repo_root`.
 ///
 /// The file format is line-based TSV with deterministic ordering:
-/// - Header: `depot-source-index-v1`
+/// - Header: `depot-source-index-v2`
 /// - Package name row: `P<TAB><name><TAB><relative-spec-path>`
 /// - Provides row: `V<TAB><feature><TAB><relative-spec-path>`
+/// - Conflicts row: `C<TAB><name><TAB><relative-spec-path>`
+/// - Dependency rows:
+///   - `B<TAB><dep><TAB><relative-spec-path>` for build dependencies
+///   - `R<TAB><dep><TAB><relative-spec-path>` for runtime dependencies
+///   - `T<TAB><dep><TAB><relative-spec-path>` for test dependencies
+///   - `O<TAB><dep><TAB><relative-spec-path>` for optional dependencies
 pub fn create_source_repo_index(
     repo_root: &Path,
     subdirs: &[String],
@@ -73,7 +98,7 @@ pub fn create_source_repo_index(
     }
 
     let scan_roots = resolve_scan_roots(&repo_root, subdirs)?;
-    let mut spec_rows: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut spec_rows: Vec<IndexedSpecRows> = Vec::new();
     let mut toml_files_scanned = 0usize;
     let mut ignored_toml_files = 0usize;
 
@@ -95,22 +120,86 @@ pub fn create_source_repo_index(
             )
         })?;
         let rel = rel.to_string_lossy().replace('\\', "/");
-        spec_rows.push((spec.package.name.clone(), rel, spec.alternatives.provides));
+        let mut conflicts = BTreeSet::new();
+        for alternatives in spec.package_alternatives.values() {
+            for conflict in &alternatives.conflicts {
+                conflicts.insert(conflict.clone());
+            }
+        }
+        for conflict in &spec.alternatives.conflicts {
+            conflicts.insert(conflict.clone());
+        }
+
+        let mut provides = BTreeSet::new();
+        for alternatives in spec.package_alternatives.values() {
+            for provide in &alternatives.provides {
+                provides.insert(provide.clone());
+            }
+        }
+        for provide in &spec.alternatives.provides {
+            provides.insert(provide.clone());
+        }
+
+        let mut deps = BTreeSet::new();
+        for dep in &spec.dependencies.build {
+            deps.insert((SOURCE_REPO_INDEX_KIND_DEP_BUILD.to_string(), dep.clone()));
+        }
+        for dep in &spec.dependencies.runtime {
+            deps.insert((SOURCE_REPO_INDEX_KIND_DEP_RUNTIME.to_string(), dep.clone()));
+        }
+        for dep in &spec.dependencies.test {
+            deps.insert((SOURCE_REPO_INDEX_KIND_DEP_TEST.to_string(), dep.clone()));
+        }
+        for dep in &spec.dependencies.optional {
+            deps.insert((SOURCE_REPO_INDEX_KIND_DEP_OPTIONAL.to_string(), dep.clone()));
+        }
+        for dep_overrides in spec.package_dependencies.values() {
+            for dep in &dep_overrides.build {
+                deps.insert((SOURCE_REPO_INDEX_KIND_DEP_BUILD.to_string(), dep.clone()));
+            }
+            for dep in &dep_overrides.runtime {
+                deps.insert((SOURCE_REPO_INDEX_KIND_DEP_RUNTIME.to_string(), dep.clone()));
+            }
+            for dep in &dep_overrides.test {
+                deps.insert((SOURCE_REPO_INDEX_KIND_DEP_TEST.to_string(), dep.clone()));
+            }
+            for dep in &dep_overrides.optional {
+                deps.insert((SOURCE_REPO_INDEX_KIND_DEP_OPTIONAL.to_string(), dep.clone()));
+            }
+        }
+
+        spec_rows.push(IndexedSpecRows {
+            name: spec.package.name.clone(),
+            rel,
+            provides: provides.into_iter().collect(),
+            conflicts: conflicts.into_iter().collect(),
+            deps: deps.into_iter().collect(),
+        });
     }
 
     let mut rows: Vec<(String, String, String)> = Vec::new();
-    for (name, rel, provides) in &spec_rows {
+    for spec_row in &spec_rows {
         rows.push((
             SOURCE_REPO_INDEX_KIND_PACKAGE.to_string(),
-            name.clone(),
-            rel.clone(),
+            spec_row.name.clone(),
+            spec_row.rel.clone(),
         ));
-        for provided in provides {
+        for provided in &spec_row.provides {
             rows.push((
                 SOURCE_REPO_INDEX_KIND_PROVIDES.to_string(),
                 provided.clone(),
-                rel.clone(),
+                spec_row.rel.clone(),
             ));
+        }
+        for conflict in &spec_row.conflicts {
+            rows.push((
+                SOURCE_REPO_INDEX_KIND_CONFLICTS.to_string(),
+                conflict.clone(),
+                spec_row.rel.clone(),
+            ));
+        }
+        for (dep_kind, dep_name) in &spec_row.deps {
+            rows.push((dep_kind.clone(), dep_name.clone(), spec_row.rel.clone()));
         }
     }
     rows.sort_by(|a, b| {
@@ -120,7 +209,7 @@ pub fn create_source_repo_index(
     });
 
     let mut out = String::new();
-    out.push_str(SOURCE_REPO_INDEX_HEADER);
+    out.push_str(SOURCE_REPO_INDEX_HEADER_V2);
     out.push('\n');
     for (kind, name, rel) in &rows {
         if name.contains('\n') || name.contains('\r') || name.contains('\t') {
@@ -159,6 +248,22 @@ pub fn create_source_repo_index(
         .iter()
         .filter(|(kind, _, _)| kind == SOURCE_REPO_INDEX_KIND_PROVIDES)
         .count();
+    let conflicts_rows = rows
+        .iter()
+        .filter(|(kind, _, _)| kind == SOURCE_REPO_INDEX_KIND_CONFLICTS)
+        .count();
+    let dependency_rows = rows
+        .iter()
+        .filter(|(kind, _, _)| {
+            matches!(
+                kind.as_str(),
+                SOURCE_REPO_INDEX_KIND_DEP_BUILD
+                    | SOURCE_REPO_INDEX_KIND_DEP_RUNTIME
+                    | SOURCE_REPO_INDEX_KIND_DEP_TEST
+                    | SOURCE_REPO_INDEX_KIND_DEP_OPTIONAL
+            )
+        })
+        .count();
 
     Ok(SourceRepoIndexStats {
         index_path,
@@ -166,6 +271,8 @@ pub fn create_source_repo_index(
         specs_indexed: spec_rows.len(),
         package_rows,
         provides_rows,
+        conflicts_rows,
+        dependency_rows,
         ignored_toml_files,
     })
 }
@@ -251,7 +358,8 @@ impl PackageIndex {
         let header = lines
             .next()
             .ok_or_else(|| anyhow::anyhow!("Missing source index header"))?;
-        if header.trim() != SOURCE_REPO_INDEX_HEADER {
+        let header = header.trim();
+        if header != SOURCE_REPO_INDEX_HEADER_V1 && header != SOURCE_REPO_INDEX_HEADER_V2 {
             anyhow::bail!(
                 "Unsupported source index header '{}' in {}",
                 header,
@@ -288,6 +396,11 @@ impl PackageIndex {
                         .or_default()
                         .push(path);
                 }
+                SOURCE_REPO_INDEX_KIND_CONFLICTS
+                | SOURCE_REPO_INDEX_KIND_DEP_BUILD
+                | SOURCE_REPO_INDEX_KIND_DEP_RUNTIME
+                | SOURCE_REPO_INDEX_KIND_DEP_TEST
+                | SOURCE_REPO_INDEX_KIND_DEP_OPTIONAL => {}
                 _ => {
                     anyhow::bail!(
                         "Unknown source index row type '{}' on line {} in {}",
@@ -461,22 +574,51 @@ fn scan_toml_files(scan_roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
 
-    fn write_meta_spec(path: &Path, name: &str, provides: &[&str]) {
+    fn write_meta_spec(
+        path: &Path,
+        name: &str,
+        provides: &[&str],
+        conflicts: &[&str],
+        runtime_deps: &[&str],
+    ) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        let provides_line = if provides.is_empty() {
+        let alternatives_lines = if provides.is_empty() && conflicts.is_empty() {
             String::new()
         } else {
-            let quoted = provides
+            let mut section = String::from("[alternatives]\n");
+            if !provides.is_empty() {
+                let quoted = provides
+                    .iter()
+                    .map(|p| format!("\"{p}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                section.push_str(&format!("provides = [{quoted}]\n"));
+            }
+            if !conflicts.is_empty() {
+                let quoted = conflicts
+                    .iter()
+                    .map(|c| format!("\"{c}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                section.push_str(&format!("conflicts = [{quoted}]\n"));
+            }
+            section.push('\n');
+            section
+        };
+        let deps_line = if runtime_deps.is_empty() {
+            String::new()
+        } else {
+            let quoted = runtime_deps
                 .iter()
                 .map(|p| format!("\"{p}\""))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("[alternatives]\nprovides = [{quoted}]\n\n")
+            format!("[dependencies]\nruntime = [{quoted}]\n\n")
         };
         let content = format!(
-            "[package]\nname = \"{name}\"\nversion = \"1.0.0\"\ndescription = \"test\"\nhomepage = \"https://example.com\"\nlicense = \"MIT\"\n\n{provides_line}[build]\ntype = \"meta\"\n"
+            "[package]\nname = \"{name}\"\nversion = \"1.0.0\"\ndescription = \"test\"\nhomepage = \"https://example.com\"\nlicense = \"MIT\"\n\n{alternatives_lines}{deps_line}[build]\ntype = \"meta\"\n"
         );
         std::fs::write(path, content).unwrap();
     }
@@ -486,13 +628,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("depot");
         let spec_path = repo_root.join("core/hello/hello.toml");
-        write_meta_spec(&spec_path, "hello", &["sh"]);
+        write_meta_spec(&spec_path, "hello", &["sh"], &["busybox"], &["glibc"]);
 
         let stats = create_source_repo_index(&repo_root, &["core".to_string()]).unwrap();
         assert_eq!(stats.specs_indexed, 1);
         assert_eq!(stats.package_rows, 1);
         assert_eq!(stats.provides_rows, 1);
+        assert_eq!(stats.conflicts_rows, 1);
+        assert_eq!(stats.dependency_rows, 1);
         assert!(stats.index_path.exists());
+
+        let index_text = std::fs::read_to_string(stats.index_path).unwrap();
+        assert!(index_text.starts_with("depot-source-index-v2\n"));
+        assert!(index_text.contains("C\tbusybox\tcore/hello/hello.toml\n"));
+        assert!(index_text.contains("R\tglibc\tcore/hello/hello.toml\n"));
 
         let index = PackageIndex::build_with_repo_dir(Some(repo_root.clone()));
         let hit = index.find("hello").expect("package name should resolve");
@@ -508,7 +657,7 @@ mod tests {
         let repo_store = tmp.path().join("repo-store");
         let repo_root = repo_store.join("vertex");
         let spec_path = repo_root.join("core/base/base.toml");
-        write_meta_spec(&spec_path, "base", &[]);
+        write_meta_spec(&spec_path, "base", &[], &[], &[]);
 
         let index = PackageIndex::build_with_repo_dir(Some(repo_store));
         let hit = index
@@ -522,7 +671,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("depot");
         let spec_path = repo_root.join("core/curl/curl.toml");
-        write_meta_spec(&spec_path, "curl", &["libcurl"]);
+        write_meta_spec(&spec_path, "curl", &["libcurl"], &[], &[]);
 
         std::fs::create_dir_all(&repo_root).unwrap();
         std::fs::write(source_repo_index_path(&repo_root), "invalid-header\n").unwrap();
@@ -543,5 +692,24 @@ mod tests {
             err.to_string()
                 .contains("must be a relative path without '..'")
         );
+    }
+
+    #[test]
+    fn build_with_repo_dir_accepts_v1_index_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("depot");
+        std::fs::create_dir_all(repo_root.join("core/base")).unwrap();
+        std::fs::write(
+            source_repo_index_path(&repo_root),
+            "depot-source-index-v1\nP\tbase\tcore/base/base.toml\nV\tsh\tcore/base/base.toml\n",
+        )
+        .unwrap();
+
+        let index = PackageIndex::build_with_repo_dir(Some(repo_root.clone()));
+        let hit = index.find("base").expect("package name should resolve");
+        assert!(hit.ends_with(Path::new("core/base/base.toml")));
+        let providers = index.find_providers("sh");
+        assert_eq!(providers.len(), 1);
+        assert!(providers[0].ends_with(Path::new("core/base/base.toml")));
     }
 }

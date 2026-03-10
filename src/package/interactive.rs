@@ -655,6 +655,21 @@ pub fn create_interactive() -> Result<PackageSpec> {
         "Optional dependency",
         "Package that enables optional runtime functionality",
     )?;
+    let alternatives = if show_advanced {
+        Alternatives {
+            provides: prompt_repeating_list(
+                "Alternative provided name",
+                "Virtual package name(s) this package satisfies, e.g. sh, editor, libfoo",
+            )?,
+            conflicts: prompt_repeating_list(
+                "Conflicting package/provide",
+                "Installed package or provided name that must be removed before install",
+            )?,
+            replaces: Vec::new(),
+        }
+    } else {
+        Alternatives::default()
+    };
 
     Ok(PackageSpec {
         package: PackageInfo {
@@ -666,7 +681,7 @@ pub fn create_interactive() -> Result<PackageSpec> {
             license,
         },
         packages: Vec::new(),
-        alternatives: Alternatives::default(),
+        alternatives,
         manual_sources,
         source: sources,
         build: Build { build_type, flags },
@@ -816,6 +831,35 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             arr.push(Value::Table(st));
         }
         root.insert("source".into(), Value::Array(arr));
+    }
+
+    if !spec.alternatives.provides.is_empty() || !spec.alternatives.conflicts.is_empty() {
+        let mut alternatives_tbl = Table::new();
+        if !spec.alternatives.provides.is_empty() {
+            alternatives_tbl.insert(
+                "provides".into(),
+                Value::Array(
+                    spec.alternatives
+                        .provides
+                        .iter()
+                        .map(|s| Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if !spec.alternatives.conflicts.is_empty() {
+            alternatives_tbl.insert(
+                "conflicts".into(),
+                Value::Array(
+                    spec.alternatives
+                        .conflicts
+                        .iter()
+                        .map(|s| Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        root.insert("alternatives".into(), Value::Table(alternatives_tbl));
     }
 
     // build (only include set fields)
@@ -1755,6 +1799,65 @@ mod tests {
             .expect("expected dependencies.optional array");
         assert_eq!(optional_deps.len(), 1);
         assert_eq!(optional_deps[0].as_str(), Some("gtk-doc"));
+    }
+
+    #[test]
+    fn spec_to_minimal_toml_includes_alternatives_conflicts_and_provides() {
+        let spec = PackageSpec {
+            package: PackageInfo {
+                name: "foo".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "A test".into(),
+                homepage: "".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Alternatives {
+                provides: vec!["editor".into(), "sh".into()],
+                conflicts: vec!["nano".into(), "busybox-sh".into()],
+                replaces: Vec::new(),
+            },
+            manual_sources: Vec::new(),
+            source: vec![Source {
+                url: "https://example.com/foo-1.0.tar.gz".into(),
+                sha256: "skip".into(),
+                extract_dir: "foo-1.0".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
+            }],
+            build: Build {
+                build_type: BuildType::Autotools,
+                flags: BuildFlags::default(),
+            },
+            dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+
+        let toml = spec_to_minimal_toml(&spec).unwrap();
+        let val: toml::Value = toml::from_str(&toml).unwrap();
+        let alternatives = val
+            .get("alternatives")
+            .and_then(|v| v.as_table())
+            .expect("expected alternatives table");
+        let provides = alternatives
+            .get("provides")
+            .and_then(|v| v.as_array())
+            .expect("expected alternatives.provides array");
+        let conflicts = alternatives
+            .get("conflicts")
+            .and_then(|v| v.as_array())
+            .expect("expected alternatives.conflicts array");
+
+        assert_eq!(provides.len(), 2);
+        assert_eq!(provides[0].as_str(), Some("editor"));
+        assert_eq!(provides[1].as_str(), Some("sh"));
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].as_str(), Some("nano"));
+        assert_eq!(conflicts[1].as_str(), Some("busybox-sh"));
     }
 
     #[test]

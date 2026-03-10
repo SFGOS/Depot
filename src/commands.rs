@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use git2::Direction;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -258,6 +258,13 @@ fn package_spec_from_archive_metadata(metadata: &toml::Value) -> package::Packag
             .map(String::from)
             .collect();
     }
+    if let Some(conflicts) = metadata.get("conflicts").and_then(|v| v.as_array()) {
+        spec.alternatives.conflicts = conflicts
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(String::from)
+            .collect();
+    }
 
     spec
 }
@@ -297,6 +304,7 @@ fn package_spec_from_repo_record(
         packages: Vec::new(),
         alternatives: package::Alternatives {
             provides: record.provides.clone(),
+            conflicts: record.conflicts.clone(),
             replaces: Vec::new(),
         },
         manual_sources: Vec::new(),
@@ -726,6 +734,265 @@ struct PlannedPackageInstall {
     spec: package::PackageSpec,
     destdir: PathBuf,
     staged: PlannedStagedInstall,
+}
+
+#[derive(Debug, Clone)]
+struct InstallConflictSubject {
+    package: String,
+    provides: Vec<String>,
+    conflicts: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InstalledConflictPackage {
+    name: String,
+    provides: Vec<String>,
+}
+
+fn install_conflict_subjects_for_output_spec(
+    spec: &package::PackageSpec,
+) -> Vec<InstallConflictSubject> {
+    spec.outputs()
+        .into_iter()
+        .map(|output| {
+            let alternatives = spec.alternatives_for_output(&output.name);
+            InstallConflictSubject {
+                package: output.name,
+                provides: alternatives.provides,
+                conflicts: alternatives.conflicts,
+            }
+        })
+        .collect()
+}
+
+fn install_conflict_subjects_for_spec(
+    spec: &package::PackageSpec,
+    include_primary: bool,
+    include_lib32: bool,
+) -> Vec<InstallConflictSubject> {
+    let mut subjects = Vec::new();
+    if include_primary {
+        subjects.extend(install_conflict_subjects_for_output_spec(spec));
+    }
+    if include_lib32 {
+        subjects.extend(install_conflict_subjects_for_output_spec(
+            &make_lib32_package_spec(spec),
+        ));
+    }
+    subjects
+}
+
+fn install_conflict_subject_for_binary_record(
+    record: &db::repo::BinaryRepoPackageRecord,
+) -> InstallConflictSubject {
+    InstallConflictSubject {
+        package: record.name.clone(),
+        provides: record.provides.clone(),
+        conflicts: record.conflicts.clone(),
+    }
+}
+
+fn matching_conflict_names(
+    conflicts: &[String],
+    package_name: &str,
+    provides: &[String],
+) -> Vec<String> {
+    let mut matches = Vec::new();
+    for conflict in conflicts {
+        if conflict == package_name || provides.iter().any(|provided| provided == conflict) {
+            matches.push(conflict.clone());
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+fn validate_no_transaction_conflicts(subjects: &[InstallConflictSubject]) -> Result<()> {
+    let mut violations = BTreeSet::new();
+    for (idx, left) in subjects.iter().enumerate() {
+        for right in subjects.iter().skip(idx + 1) {
+            let left_hits =
+                matching_conflict_names(&left.conflicts, &right.package, &right.provides);
+            if !left_hits.is_empty() {
+                violations.insert(format!(
+                    "{} conflicts with {} via {}",
+                    left.package,
+                    right.package,
+                    left_hits.join(", ")
+                ));
+            }
+            let right_hits =
+                matching_conflict_names(&right.conflicts, &left.package, &left.provides);
+            if !right_hits.is_empty() {
+                violations.insert(format!(
+                    "{} conflicts with {} via {}",
+                    right.package,
+                    left.package,
+                    right_hits.join(", ")
+                ));
+            }
+        }
+    }
+
+    if violations.is_empty() {
+        return Ok(());
+    }
+
+    let mut message =
+        String::from("Cannot install conflicting packages in the same transaction:\n");
+    for violation in violations {
+        message.push_str("  ");
+        message.push_str(&violation);
+        message.push('\n');
+    }
+    anyhow::bail!(message.trim_end().to_string());
+}
+
+fn collect_installed_conflict_packages(db_path: &Path) -> Result<Vec<InstalledConflictPackage>> {
+    let mut installed = Vec::new();
+    for record in db::list_installed_package_records(db_path)? {
+        installed.push(InstalledConflictPackage {
+            provides: db::get_package_provides(db_path, &record.name)?,
+            name: record.name,
+        });
+    }
+    Ok(installed)
+}
+
+fn collect_conflicting_installed_packages(
+    subjects: &[InstallConflictSubject],
+    installed: &[InstalledConflictPackage],
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    validate_no_transaction_conflicts(subjects)?;
+    let planned_packages: HashSet<_> = subjects
+        .iter()
+        .map(|subject| subject.package.clone())
+        .collect();
+    let mut removals: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for subject in subjects {
+        for installed_pkg in installed {
+            if installed_pkg.name == subject.package {
+                continue;
+            }
+            let matched = matching_conflict_names(
+                &subject.conflicts,
+                &installed_pkg.name,
+                &installed_pkg.provides,
+            );
+            if matched.is_empty() {
+                continue;
+            }
+            if planned_packages.contains(&installed_pkg.name) {
+                anyhow::bail!(
+                    "Cannot install conflicting packages in the same transaction: {} conflicts with {}",
+                    subject.package,
+                    installed_pkg.name
+                );
+            }
+            removals
+                .entry(installed_pkg.name.clone())
+                .or_default()
+                .insert(subject.package.clone());
+        }
+    }
+
+    Ok(removals)
+}
+
+fn remove_installed_package_with_hooks(
+    package: &str,
+    rootfs: &Path,
+    config: &config::Config,
+) -> Result<()> {
+    let db_path = config.installed_db_path(rootfs);
+    let affected_paths = db::get_package_files(&db_path, package)?;
+    install::hooks::run_transaction_hooks(
+        rootfs,
+        &install::hooks::HookExecutionContext {
+            phase: install::hooks::HookPhase::Pre,
+            operation: install::hooks::HookOperation::Remove,
+            package,
+            affected_paths: &affected_paths,
+        },
+    )?;
+    let script_dir = install::scripts::installed_scripts_dir(rootfs, package);
+    let _ = install::scripts::run_hook_if_present(
+        &script_dir,
+        install::scripts::Hook::PreRemove,
+        rootfs,
+        package,
+    )?;
+    db::remove_package(&db_path, package, rootfs)?;
+    let post_remove = install::scripts::run_hook_if_present(
+        &script_dir,
+        install::scripts::Hook::PostRemove,
+        rootfs,
+        package,
+    );
+    let cleanup_scripts = install::scripts::remove_installed_scripts(rootfs, package);
+    post_remove?;
+    cleanup_scripts?;
+    install::hooks::run_transaction_hooks(
+        rootfs,
+        &install::hooks::HookExecutionContext {
+            phase: install::hooks::HookPhase::Post,
+            operation: install::hooks::HookOperation::Remove,
+            package,
+            affected_paths: &affected_paths,
+        },
+    )?;
+    ui::success(format!("Successfully removed {}", package));
+    Ok(())
+}
+
+fn resolve_installed_conflicts_for_subjects(
+    subjects: &[InstallConflictSubject],
+    rootfs: &Path,
+    config: &config::Config,
+    dry_run: bool,
+) -> Result<()> {
+    if subjects.is_empty() {
+        return Ok(());
+    }
+
+    let db_path = config.installed_db_path(rootfs);
+    let installed = collect_installed_conflict_packages(&db_path)?;
+    let removals = collect_conflicting_installed_packages(subjects, &installed)?;
+    if removals.is_empty() {
+        return Ok(());
+    }
+
+    let prompt_entries: Vec<String> = removals
+        .iter()
+        .map(|(package, conflicted_by)| {
+            format!(
+                "{} (conflicts with {})",
+                package,
+                conflicted_by.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })
+        .collect();
+
+    if dry_run {
+        ui::info(format!(
+            "Dry run: would remove conflicting installed package(s): {}",
+            prompt_entries.join(", ")
+        ));
+        return Ok(());
+    }
+
+    if !ui::prompt_package_action("conflict removal", &prompt_entries, true)? {
+        anyhow::bail!("Aborted");
+    }
+
+    for package in removals.keys() {
+        ui::info(format!("Removing conflicting package: {}", package));
+        remove_installed_package_with_hooks(package, rootfs, config)?;
+    }
+
+    Ok(())
 }
 
 fn plan_staged_install(
@@ -1288,6 +1555,7 @@ struct UpdateCandidate {
     candidate_completed_at: Option<i64>,
     runtime_dependencies: Vec<String>,
     provides: Vec<String>,
+    conflicts: Vec<String>,
     repo_priority: i32,
     origin: UpdateOrigin,
 }
@@ -1648,6 +1916,7 @@ fn select_update_candidate(
             candidate_completed_at: candidate.completed_at,
             runtime_dependencies: candidate.spec.dependencies.runtime.clone(),
             provides: candidate.spec.alternatives.provides.clone(),
+            conflicts: candidate.spec.alternatives.conflicts.clone(),
             repo_priority: candidate.repo_priority,
             origin: UpdateOrigin::Source {
                 repo_name: candidate.repo_name.clone(),
@@ -1676,6 +1945,7 @@ fn select_update_candidate(
             candidate_completed_at: record.completed_at,
             runtime_dependencies: record.runtime_dependencies.clone(),
             provides: record.provides.clone(),
+            conflicts: record.conflicts.clone(),
             repo_priority: *repo_priority,
             origin: UpdateOrigin::Binary {
                 repo_name: record.repo_name.clone(),
@@ -1840,6 +2110,16 @@ fn run_update_command(
         })
         .collect();
 
+    let conflict_subjects: Vec<_> = updates
+        .iter()
+        .map(|candidate| InstallConflictSubject {
+            package: candidate.package.clone(),
+            provides: candidate.provides.clone(),
+            conflicts: candidate.conflicts.clone(),
+        })
+        .collect();
+    validate_no_transaction_conflicts(&conflict_subjects)?;
+
     ui::info(format!("{} package(s) can be updated:", updates.len()));
     for target in &targets {
         ui::info(format!("  {}", target));
@@ -1861,6 +2141,13 @@ fn run_update_command(
     if !options.dry_run && !ui::prompt_package_action("update", &targets, true)? {
         anyhow::bail!("Aborted");
     }
+
+    resolve_installed_conflicts_for_subjects(
+        &conflict_subjects,
+        options.rootfs,
+        config,
+        options.dry_run,
+    )?;
 
     if !missing_deps.is_empty() {
         let dep_plan = planner::build_dependency_install_plan(
@@ -2405,6 +2692,27 @@ fn execute_install_plan_with_child_commands(
         anyhow::bail!("Aborted");
     }
 
+    let mut conflict_subjects = Vec::new();
+    for step in &actionable_steps {
+        match &step.origin {
+            planner::PlanOrigin::Source { path, .. } => {
+                let mut spec = package::PackageSpec::from_file(path)
+                    .with_context(|| format!("Failed to parse spec {}", path.display()))?;
+                spec.apply_config(config);
+                conflict_subjects.extend(install_conflict_subjects_for_spec(
+                    &spec,
+                    true,
+                    spec.build.flags.build_32,
+                ));
+            }
+            planner::PlanOrigin::Binary { record, .. } => {
+                conflict_subjects.push(install_conflict_subject_for_binary_record(record));
+            }
+            planner::PlanOrigin::Installed => {}
+        }
+    }
+    resolve_installed_conflicts_for_subjects(&conflict_subjects, rootfs, config, options.dry_run)?;
+
     if options.dry_run {
         ui::info("Dry run enabled, no install/build actions executed.");
         return Ok(());
@@ -2753,6 +3061,17 @@ fn run_direct_archive_install_requests(
         staged_dirs.push(staging_dir);
     }
 
+    let mut conflict_subjects = Vec::new();
+    for pkg_spec in &pkg_specs {
+        conflict_subjects.extend(install_conflict_subjects_for_spec(pkg_spec, true, false));
+    }
+    resolve_installed_conflicts_for_subjects(
+        &conflict_subjects,
+        options.rootfs,
+        config,
+        options.dry_run,
+    )?;
+
     if options.dry_run {
         ui::info("Dry run enabled, stopping before install/build work.");
         return Ok(false);
@@ -2891,6 +3210,21 @@ fn run_direct_install_request(
             pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
         ));
     }
+
+    let mut conflict_subjects = install_conflict_subjects_for_spec(
+        &pkg_spec,
+        !options.lib32_only,
+        staging_dir.is_none() && (options.lib32_only || pkg_spec.build.flags.build_32),
+    );
+    if staging_dir.is_some() {
+        conflict_subjects = install_conflict_subjects_for_spec(&pkg_spec, true, false);
+    }
+    resolve_installed_conflicts_for_subjects(
+        &conflict_subjects,
+        options.rootfs,
+        config,
+        options.dry_run,
+    )?;
 
     if options.dry_run {
         ui::info("Dry run enabled, stopping before install/build work.");
@@ -3222,48 +3556,11 @@ pub fn run(cli: Cli) -> Result<()> {
             let remove_lock_path = locking::lock_path(&config);
             let _remove_lock_guard =
                 locking::try_write(&mut remove_lock, &remove_lock_path, "remove")?;
-            let db_path = config.db_dir.join("packages.db");
             let removal_targets = vec![package.clone()];
             if !ui::prompt_package_action("removal", &removal_targets, true)? {
                 anyhow::bail!("Aborted");
             }
-            let affected_paths = db::get_package_files(&db_path, &package)?;
-            install::hooks::run_transaction_hooks(
-                &cli.rootfs,
-                &install::hooks::HookExecutionContext {
-                    phase: install::hooks::HookPhase::Pre,
-                    operation: install::hooks::HookOperation::Remove,
-                    package: &package,
-                    affected_paths: &affected_paths,
-                },
-            )?;
-            let script_dir = install::scripts::installed_scripts_dir(&cli.rootfs, &package);
-            let _ = install::scripts::run_hook_if_present(
-                &script_dir,
-                install::scripts::Hook::PreRemove,
-                &cli.rootfs,
-                &package,
-            )?;
-            db::remove_package(&db_path, &package, &cli.rootfs)?;
-            let post_remove = install::scripts::run_hook_if_present(
-                &script_dir,
-                install::scripts::Hook::PostRemove,
-                &cli.rootfs,
-                &package,
-            );
-            let cleanup_scripts = install::scripts::remove_installed_scripts(&cli.rootfs, &package);
-            post_remove?;
-            cleanup_scripts?;
-            install::hooks::run_transaction_hooks(
-                &cli.rootfs,
-                &install::hooks::HookExecutionContext {
-                    phase: install::hooks::HookPhase::Post,
-                    operation: install::hooks::HookOperation::Remove,
-                    package: &package,
-                    affected_paths: &affected_paths,
-                },
-            )?;
-            ui::success(format!("Successfully removed {}", package));
+            remove_installed_package_with_hooks(&package, &cli.rootfs, &config)?;
         }
         Commands::Build {
             spec_pos,
@@ -3736,11 +4033,13 @@ pub fn run(cli: Cli) -> Result<()> {
                     stats.index_path.display()
                 ));
                 ui::info(format!(
-                    "Indexed {} spec(s) from {} TOML file(s): package rows={} provides rows={} ignored_toml={}",
+                    "Indexed {} spec(s) from {} TOML file(s): package rows={} provides rows={} conflicts rows={} dependency rows={} ignored_toml={}",
                     stats.specs_indexed,
                     stats.toml_files_scanned,
                     stats.package_rows,
                     stats.provides_rows,
+                    stats.conflicts_rows,
+                    stats.dependency_rows,
                     stats.ignored_toml_files
                 ));
             }
@@ -4173,6 +4472,7 @@ mod tests {
             homepage: Some("https://example.test".into()),
             license: Some("MIT".into()),
             provides: vec!["pkg-virtual".into()],
+            conflicts: Vec::new(),
             runtime_dependencies: vec!["glibc".into()],
             optional_dependencies: vec!["manpages".into()],
         };
@@ -4228,6 +4528,7 @@ mod tests {
         fn write_archive(
             archive_path: &Path,
             package_name: &str,
+            conflicts: &[&str],
             payload_path: &str,
             payload: &[u8],
         ) -> Result<()> {
@@ -4244,8 +4545,20 @@ mod tests {
             payload_header.set_cksum();
             tar.append(&payload_header, payload)?;
 
+            let conflicts_toml = if conflicts.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "conflicts = [{}]\n",
+                    conflicts
+                        .iter()
+                        .map(|conflict| format!("\"{conflict}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             let metadata = format!(
-                "name = \"{package_name}\"\nversion = \"1.0\"\nrevision = 1\ndescription = \"test\"\nhomepage = \"https://example.test\"\nlicense = \"MIT\"\n\n[dependencies]\nruntime = []\noptional = []\n"
+                "name = \"{package_name}\"\nversion = \"1.0\"\nrevision = 1\ndescription = \"test\"\nhomepage = \"https://example.test\"\nlicense = \"MIT\"\n{conflicts_toml}\n[dependencies]\nruntime = []\noptional = []\n"
             );
             let mut meta_header = tar::Header::new_gnu();
             meta_header.set_path(".metadata.toml")?;
@@ -4263,8 +4576,8 @@ mod tests {
         let pkg_dir = tempfile::tempdir().context("Failed to create temp package dir")?;
         let archive_a = pkg_dir.path().join("alpha-1.0-1-x86_64.depot.pkg.tar.zst");
         let archive_b = pkg_dir.path().join("beta-1.0-1-x86_64.depot.pkg.tar.zst");
-        write_archive(&archive_a, "alpha", "usr/bin/alpha", b"alpha")?;
-        write_archive(&archive_b, "beta", "usr/bin/beta", b"beta")?;
+        write_archive(&archive_a, "alpha", &[], "usr/bin/alpha", b"alpha")?;
+        write_archive(&archive_b, "beta", &[], "usr/bin/beta", b"beta")?;
 
         let mut cfg = config::Config::for_rootfs(rootfs.path());
         cfg.build_dir = rootfs.path().join("var/cache/depot/build");
@@ -4297,6 +4610,110 @@ mod tests {
         assert_eq!(
             db::get_package_version(&db_path, "beta")?,
             Some("1.0".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_archive_install_rejects_conflicting_archives_in_same_batch() -> Result<()> {
+        fn write_archive(
+            archive_path: &Path,
+            package_name: &str,
+            conflicts: &[&str],
+        ) -> Result<()> {
+            let file = fs::File::create(archive_path)
+                .with_context(|| format!("Failed to create {}", archive_path.display()))?;
+            let encoder = zstd::stream::write::Encoder::new(file, 3)
+                .context("Failed to create zstd encoder")?;
+            let mut tar = tar::Builder::new(encoder);
+
+            let payload = package_name.as_bytes();
+            let mut payload_header = tar::Header::new_gnu();
+            payload_header.set_path(format!("usr/bin/{package_name}"))?;
+            payload_header.set_size(payload.len() as u64);
+            payload_header.set_mode(0o755);
+            payload_header.set_cksum();
+            tar.append(&payload_header, payload)?;
+
+            let conflicts_toml = if conflicts.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "conflicts = [{}]\n",
+                    conflicts
+                        .iter()
+                        .map(|conflict| format!("\"{conflict}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let metadata = format!(
+                "name = \"{package_name}\"\nversion = \"1.0\"\nrevision = 1\ndescription = \"test\"\nhomepage = \"https://example.test\"\nlicense = \"MIT\"\n{conflicts_toml}\n[dependencies]\nruntime = []\noptional = []\n"
+            );
+            let mut meta_header = tar::Header::new_gnu();
+            meta_header.set_path(".metadata.toml")?;
+            meta_header.set_size(metadata.len() as u64);
+            meta_header.set_mode(0o644);
+            meta_header.set_cksum();
+            tar.append(&meta_header, metadata.as_bytes())?;
+
+            let encoder = tar.into_inner()?;
+            encoder.finish()?;
+            Ok(())
+        }
+
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let pkg_dir = tempfile::tempdir().context("Failed to create temp package dir")?;
+        let archive_a = pkg_dir.path().join("alpha-1.0-1-x86_64.depot.pkg.tar.zst");
+        let archive_b = pkg_dir.path().join("beta-1.0-1-x86_64.depot.pkg.tar.zst");
+        write_archive(&archive_a, "alpha", &["beta"])?;
+        write_archive(&archive_b, "beta", &[])?;
+
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+        cfg.db_dir = rootfs.path().join("var/lib/depot");
+
+        let err = run_direct_archive_install_requests(
+            DirectInstallOptions {
+                rootfs: rootfs.path(),
+                no_deps: true,
+                no_flags: false,
+                cross_prefix: None,
+                clean: false,
+                dry_run: false,
+                lib32_only: false,
+                install_test_deps: false,
+            },
+            &cfg,
+            &[archive_a, archive_b],
+            false,
+        )
+        .expect_err("conflicting archives should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("Cannot install conflicting packages in the same transaction")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collect_conflicting_installed_packages_matches_by_name_and_provide() -> Result<()> {
+        let removals = collect_conflicting_installed_packages(
+            &[InstallConflictSubject {
+                package: "beta".into(),
+                provides: Vec::new(),
+                conflicts: vec!["alpha".into(), "editor".into()],
+            }],
+            &[InstalledConflictPackage {
+                name: "alpha".into(),
+                provides: vec!["editor".into()],
+            }],
+        )?;
+
+        assert_eq!(
+            removals.get("alpha"),
+            Some(&BTreeSet::from(["beta".to_string()]))
         );
         Ok(())
     }
@@ -4354,6 +4771,7 @@ mod tests {
             homepage: Some("https://example.test".into()),
             license: Some("ISC".into()),
             provides: Vec::new(),
+            conflicts: Vec::new(),
             runtime_dependencies: Vec::new(),
             optional_dependencies: Vec::new(),
         };
@@ -4567,6 +4985,7 @@ optional = []
                     homepage: None,
                     license: None,
                     provides: Vec::new(),
+                    conflicts: Vec::new(),
                     runtime_dependencies: Vec::new(),
                     optional_dependencies: Vec::new(),
                 },
@@ -4741,6 +5160,7 @@ optional = []
                     candidate_completed_at: None,
                     runtime_dependencies: vec!["glibc".into(), "helper-virtual".into()],
                     provides: Vec::new(),
+                    conflicts: Vec::new(),
                     repo_priority: 0,
                     origin: UpdateOrigin::Source {
                         repo_name: "source".into(),
@@ -4757,6 +5177,7 @@ optional = []
                     candidate_completed_at: None,
                     runtime_dependencies: Vec::new(),
                     provides: vec!["helper-virtual".into()],
+                    conflicts: Vec::new(),
                     repo_priority: 0,
                     origin: UpdateOrigin::Source {
                         repo_name: "source".into(),
@@ -4773,6 +5194,7 @@ optional = []
                     candidate_completed_at: None,
                     runtime_dependencies: vec!["newdep".into()],
                     provides: Vec::new(),
+                    conflicts: Vec::new(),
                     repo_priority: 0,
                     origin: UpdateOrigin::Source {
                         repo_name: "source".into(),
@@ -4785,6 +5207,28 @@ optional = []
 
         assert_eq!(missing, vec!["newdep".to_string()]);
         Ok(())
+    }
+
+    #[test]
+    fn validate_no_transaction_conflicts_rejects_conflicting_updates() {
+        let err = validate_no_transaction_conflicts(&[
+            InstallConflictSubject {
+                package: "alpha".into(),
+                provides: Vec::new(),
+                conflicts: vec!["beta".into()],
+            },
+            InstallConflictSubject {
+                package: "beta".into(),
+                provides: Vec::new(),
+                conflicts: Vec::new(),
+            },
+        ])
+        .expect_err("conflicting update set should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("Cannot install conflicting packages in the same transaction")
+        );
     }
 
     #[test]

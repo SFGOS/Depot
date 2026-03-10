@@ -495,6 +495,7 @@ mod tests {
                 "foo-libs".to_string(),
                 crate::package::Alternatives {
                     provides: vec!["libfoo".into()],
+                    conflicts: Vec::new(),
                     replaces: Vec::new(),
                 },
             )]),

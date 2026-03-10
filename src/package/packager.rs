@@ -171,6 +171,17 @@ impl Packager {
                     .collect(),
             ),
         );
+        map.insert(
+            "conflicts".to_string(),
+            toml::Value::Array(
+                self.spec
+                    .alternatives
+                    .conflicts
+                    .iter()
+                    .map(|s| toml::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
 
         // Add install-relevant dependency kinds for repo/runtime consumers.
         let mut deps = toml::map::Map::new();
