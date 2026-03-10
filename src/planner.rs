@@ -837,6 +837,7 @@ mod tests {
                     name: name.to_string(),
                     version: "1.0.0".to_string(),
                     revision: 1,
+                    completed_at: None,
                     filename: format!("{name}-1.0.0-1-x86_64.depot.pkg.tar.zst"),
                     size: 1024,
                     sha256: "sha256".to_string(),

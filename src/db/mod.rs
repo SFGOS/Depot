@@ -8,9 +8,19 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::fs;
 use std::path::Path;
+use walkdir::WalkDir;
 
 fn format_licenses(licenses: &[String]) -> String {
     licenses.join(", ")
+}
+
+/// Installed package row from the local package database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPackageRecord {
+    pub name: String,
+    pub version: String,
+    pub revision: u32,
+    pub completed_at: Option<i64>,
 }
 
 /// Initialize database and register a package
@@ -24,20 +34,22 @@ pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> R
     init_db(&conn)?;
 
     let tx = conn.transaction()?;
+    let completed_at = package_completed_at(destdir)?;
 
     // Generate manifest with files and directories
     let manifest = staging::generate_manifest_with_dirs(destdir)?;
 
     // Insert/update package without changing its primary key (UPSERT keeps the existing row).
     tx.execute(
-        "INSERT INTO packages (name, version, revision, description, homepage, license)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO packages (name, version, revision, description, homepage, license, completed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(name) DO UPDATE SET
             version=excluded.version,
             revision=excluded.revision,
             description=excluded.description,
             homepage=excluded.homepage,
-            license=excluded.license",
+            license=excluded.license,
+            completed_at=excluded.completed_at",
         params![
             spec.package.name,
             spec.package.version,
@@ -45,6 +57,7 @@ pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> R
             spec.package.description,
             spec.package.homepage,
             format_licenses(&spec.package.license),
+            completed_at,
         ],
     )?;
 
@@ -374,7 +387,8 @@ fn init_db(conn: &Connection) -> Result<()> {
             revision INTEGER NOT NULL DEFAULT 1,
             description TEXT,
             homepage TEXT,
-            license TEXT
+            license TEXT,
+            completed_at INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS provides (
@@ -406,7 +420,60 @@ fn init_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_directories_path ON directories(path);
         ",
     )?;
+    ensure_packages_completed_at_column(conn)?;
     Ok(())
+}
+
+fn ensure_packages_completed_at_column(conn: &Connection) -> Result<()> {
+    let has_completed_at: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'completed_at'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        )
+        .context("Failed to inspect installed package DB schema")?;
+    if !has_completed_at {
+        conn.execute("ALTER TABLE packages ADD COLUMN completed_at INTEGER", [])
+            .context("Failed to add completed_at column to installed package DB")?;
+    }
+    Ok(())
+}
+
+fn package_completed_at(destdir: &Path) -> Result<Option<i64>> {
+    let metadata_path = destdir.join(".metadata.toml");
+    if let Some(completed_at) =
+        crate::metadata_time::read_completed_at_from_metadata_path(&metadata_path)?
+    {
+        return Ok(Some(completed_at));
+    }
+    latest_tree_mtime(destdir)
+}
+
+fn latest_tree_mtime(path: &Path) -> Result<Option<i64>> {
+    let mut latest = None;
+
+    for entry in WalkDir::new(path)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        let modified = entry
+            .metadata()
+            .with_context(|| format!("Failed to read metadata for {}", entry.path().display()))?
+            .modified()
+            .with_context(|| {
+                format!(
+                    "Failed to read modification time for {}",
+                    entry.path().display()
+                )
+            })?;
+        let modified = crate::metadata_time::system_time_to_unix(modified)?;
+        latest = Some(latest.map_or(modified, |current: i64| current.max(modified)));
+    }
+
+    Ok(latest)
 }
 
 /// Decide whether a conflicting path is safe to auto-remove ownership for.
@@ -475,6 +542,27 @@ pub fn get_installed_packages(db_path: &Path) -> Result<std::collections::HashSe
         .filter_map(|r| r.ok())
         .collect();
     Ok(names)
+}
+
+/// List installed packages with version and revision metadata.
+pub fn list_installed_package_records(db_path: &Path) -> Result<Vec<InstalledPackageRecord>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let mut stmt =
+        conn.prepare("SELECT name, version, revision, completed_at FROM packages ORDER BY name")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(InstalledPackageRecord {
+            name: row.get(0)?,
+            version: row.get(1)?,
+            revision: row.get::<_, i64>(2)? as u32,
+            completed_at: row.get(3)?,
+        })
+    })?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
 }
 
 /// Get set of all provided package names (alternatives)
@@ -633,6 +721,50 @@ mod tests {
 
         let version = get_package_version(&db_path, "foo").unwrap();
         assert_eq!(version.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn register_package_uses_metadata_completed_at_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        let spec = mk_spec("foo", "1.0");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        std::fs::write(dest.join("usr/bin/foo"), "bin").unwrap();
+        std::fs::write(
+            dest.join(".metadata.toml"),
+            "completed_at = \"2026-03-10T12:34:56Z\"\n",
+        )
+        .unwrap();
+
+        register_package(&db_path, &spec, &dest).unwrap();
+
+        let records = list_installed_package_records(&db_path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].completed_at, Some(1_773_146_096));
+    }
+
+    #[test]
+    fn register_package_falls_back_to_destdir_mtime_when_metadata_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        let spec = mk_spec("foo", "1.0");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        let file = dest.join("usr/bin/foo");
+        std::fs::write(&file, "bin").unwrap();
+
+        let ts = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(&file, ts).unwrap();
+        filetime::set_file_mtime(&dest.join("usr"), ts).unwrap();
+        filetime::set_file_mtime(&dest.join("usr/bin"), ts).unwrap();
+        filetime::set_file_mtime(&dest, ts).unwrap();
+
+        register_package(&db_path, &spec, &dest).unwrap();
+
+        let records = list_installed_package_records(&db_path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].completed_at, Some(1_700_000_000));
     }
 
     #[test]

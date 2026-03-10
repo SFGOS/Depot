@@ -1,5 +1,6 @@
 //! Repository management and SQLite database generation
 
+use crate::metadata_time;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256, Sha512};
@@ -73,6 +74,7 @@ struct IndexedPackage {
     name: String,
     version: String,
     revision: u32,
+    completed_at: Option<i64>,
     description: Option<String>,
     homepage: Option<String>,
     license: Option<String>,
@@ -107,6 +109,7 @@ pub struct BinaryRepoPackageRecord {
     pub name: String,
     pub version: String,
     pub revision: u32,
+    pub completed_at: Option<i64>,
     pub filename: String,
     pub size: u64,
     pub sha256: String,
@@ -279,6 +282,7 @@ impl RepoManager {
                 name TEXT NOT NULL,
                 version TEXT NOT NULL,
                 revision INTEGER NOT NULL,
+                completed_at INTEGER,
                 description TEXT,
                 homepage TEXT,
                 license TEXT,
@@ -335,6 +339,7 @@ impl RepoManager {
         let mut name = String::new();
         let mut version = String::new();
         let mut revision = 1;
+        let mut completed_at = path_modified_unix_timestamp(pkg_path)?;
         let mut description = None;
         let mut homepage = None;
         let mut license = None;
@@ -372,6 +377,8 @@ impl RepoManager {
                         .get("revision")
                         .and_then(|v| v.as_integer())
                         .unwrap_or(1) as u32;
+                    completed_at =
+                        metadata_time::parse_completed_at_value(&metadata).or(completed_at);
                     description = metadata
                         .get("description")
                         .and_then(|v| v.as_str())
@@ -444,6 +451,7 @@ impl RepoManager {
             name,
             version,
             revision,
+            completed_at,
             description,
             homepage,
             license,
@@ -463,6 +471,7 @@ impl RepoManager {
             name,
             version,
             revision,
+            completed_at,
             description,
             homepage,
             license,
@@ -478,12 +487,13 @@ impl RepoManager {
 
         // Insert into database
         conn.execute(
-            "INSERT INTO packages (name, version, revision, description, homepage, license, filename, size, sha256, sha512)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO packages (name, version, revision, completed_at, description, homepage, license, filename, size, sha256, sha512)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 name,
                 version,
                 revision as i64,
+                completed_at,
                 description,
                 homepage,
                 license,
@@ -1503,12 +1513,18 @@ fn find_cached_binary_repo_packages(
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open binary repo DB {}", db_path.display()))?;
 
-    let mut stmt = conn.prepare(
+    let completed_at_expr = if repo_packages_have_completed_at(&conn)? {
+        "p.completed_at"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
         "SELECT
             p.id,
             p.name,
             p.version,
             p.revision,
+            {completed_at_expr},
             p.filename,
             p.size,
             p.sha256,
@@ -1525,8 +1541,9 @@ fn find_cached_binary_repo_packages(
             )
          ORDER BY
             CASE WHEN lower(p.name) = lower(?1) THEN 0 ELSE 1 END,
-            p.name ASC",
-    )?;
+            p.name ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
     let rows = stmt.query_map(params![query], |row| {
         let package_id = row.get::<_, i64>(0)?;
@@ -1537,13 +1554,14 @@ fn find_cached_binary_repo_packages(
                 name: row.get(1)?,
                 version: row.get(2)?,
                 revision: row.get::<_, i64>(3)? as u32,
-                filename: row.get(4)?,
-                size: row.get::<_, i64>(5)? as u64,
-                sha256: row.get(6)?,
-                sha512: row.get(7)?,
-                description: row.get(8)?,
-                homepage: row.get(9)?,
-                license: row.get(10)?,
+                completed_at: row.get(4)?,
+                filename: row.get(5)?,
+                size: row.get::<_, i64>(6)? as u64,
+                sha256: row.get(7)?,
+                sha512: row.get(8)?,
+                description: row.get(9)?,
+                homepage: row.get(10)?,
+                license: row.get(11)?,
                 provides: Vec::new(),
                 runtime_dependencies: Vec::new(),
                 optional_dependencies: Vec::new(),
@@ -1560,6 +1578,93 @@ fn find_cached_binary_repo_packages(
         out.push(rec);
     }
     Ok(out)
+}
+
+fn list_cached_binary_repo_packages(
+    repo_name: &str,
+    db_path: &Path,
+) -> Result<Vec<BinaryRepoPackageRecord>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("Failed to open binary repo DB {}", db_path.display()))?;
+
+    let completed_at_expr = if repo_packages_have_completed_at(&conn)? {
+        "p.completed_at"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT
+            p.id,
+            p.name,
+            p.version,
+            p.revision,
+            {completed_at_expr},
+            p.filename,
+            p.size,
+            p.sha256,
+            p.sha512,
+            p.description,
+            p.homepage,
+            p.license
+         FROM packages p
+         ORDER BY p.name ASC, p.version ASC, p.revision ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+
+    let rows = stmt.query_map([], |row| {
+        let package_id = row.get::<_, i64>(0)?;
+        Ok((
+            package_id,
+            BinaryRepoPackageRecord {
+                repo_name: repo_name.to_string(),
+                name: row.get(1)?,
+                version: row.get(2)?,
+                revision: row.get::<_, i64>(3)? as u32,
+                completed_at: row.get(4)?,
+                filename: row.get(5)?,
+                size: row.get::<_, i64>(6)? as u64,
+                sha256: row.get(7)?,
+                sha512: row.get(8)?,
+                description: row.get(9)?,
+                homepage: row.get(10)?,
+                license: row.get(11)?,
+                provides: Vec::new(),
+                runtime_dependencies: Vec::new(),
+                optional_dependencies: Vec::new(),
+            },
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (package_id, mut rec) = row?;
+        rec.provides = query_package_provides(&conn, package_id)?;
+        rec.runtime_dependencies = query_package_runtime_deps(&conn, package_id)?;
+        rec.optional_dependencies = query_package_optional_deps(&conn, package_id)?;
+        out.push(rec);
+    }
+    Ok(out)
+}
+
+fn repo_packages_have_completed_at(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'completed_at'",
+        [],
+        |row| {
+            let count: i64 = row.get(0)?;
+            Ok(count > 0)
+        },
+    )
+    .context("Failed to inspect binary repo DB schema")
+}
+
+fn path_modified_unix_timestamp(path: &Path) -> Result<Option<i64>> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("Failed to read metadata for {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("Failed to read modification time for {}", path.display()))?;
+    Ok(Some(metadata_time::system_time_to_unix(modified)?))
 }
 
 /// Resolve an exact package name/provide match from a binary repo after verifying
@@ -1593,6 +1698,17 @@ pub fn find_binary_repo_packages(
 ) -> Result<Vec<BinaryRepoPackageRecord>> {
     let db_path = fetch_binary_repo_db(repo_name, repo, rootfs, package_cache_dir)?;
     find_cached_binary_repo_packages(repo_name, &db_path, query)
+}
+
+/// List all binary packages from a cached, verified repository database.
+pub fn list_binary_repo_packages(
+    repo_name: &str,
+    repo: &crate::config::BinaryRepo,
+    rootfs: &Path,
+    package_cache_dir: &Path,
+) -> Result<Vec<BinaryRepoPackageRecord>> {
+    let db_path = fetch_binary_repo_db(repo_name, repo, rootfs, package_cache_dir)?;
+    list_cached_binary_repo_packages(repo_name, &db_path)
 }
 
 fn verify_hex_digest(path: &Path, algorithm: &str, expected_hex: &str) -> Result<bool> {
@@ -2109,6 +2225,18 @@ mod tests {
             )
             .unwrap();
         assert!(has_sha512);
+
+        let has_completed_at: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'completed_at'",
+                [],
+                |r| {
+                    let n: i64 = r.get(0)?;
+                    Ok(n > 0)
+                },
+            )
+            .unwrap();
+        assert!(has_completed_at);
     }
 
     #[test]
@@ -2129,6 +2257,7 @@ revision = 1
 description = "test description"
 homepage = "https://example.com"
 license = "MIT"
+completed_at = "2026-03-10T12:34:56Z"
 provides = ["test-feature"]
 
 [dependencies]
@@ -2144,6 +2273,11 @@ optional = []
 
         let encoder = tar.into_inner().unwrap();
         encoder.finish().unwrap();
+        filetime::set_file_mtime(
+            &pkg_path,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
 
         let mut conn = Connection::open_in_memory().unwrap();
         let manager = RepoManager::new(repo_dir.to_path_buf());
@@ -2189,6 +2323,11 @@ optional = []
         assert_eq!(lic, Some("MIT".to_string()));
         assert_eq!(sha256.len(), 64);
         assert_eq!(sha512.len(), 128);
+
+        let completed_at: Option<i64> = conn
+            .query_row("SELECT completed_at FROM packages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(completed_at, Some(1_773_146_096));
 
         let provides_count: i64 = conn
             .query_row("SELECT count(*) FROM provides", [], |r| r.get(0))
@@ -2323,6 +2462,7 @@ license = ["MIT", "Apache-2.0"]
             name: "pkg".into(),
             version: "1.0".into(),
             revision: 1,
+            completed_at: None,
             filename: "pkg.depot.pkg.tar.zst".into(),
             size: 7,
             sha256,
@@ -2357,6 +2497,7 @@ license = ["MIT", "Apache-2.0"]
             name: "pkg".into(),
             version: "1.0".into(),
             revision: 1,
+            completed_at: None,
             filename: filename.to_string(),
             size: payload.len() as u64,
             sha256,

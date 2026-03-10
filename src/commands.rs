@@ -4,11 +4,15 @@ use crate::{
     signing, source, staging, ui,
 };
 use anyhow::{Context, Result};
+use git2::Direction;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use url::Url;
+use walkdir::WalkDir;
 
 fn rootfs_is_system_root(rootfs: &Path) -> bool {
     if rootfs == Path::new("/") {
@@ -20,7 +24,10 @@ fn rootfs_is_system_root(rootfs: &Path) -> bool {
 }
 
 fn command_requires_live_root(command: &Commands) -> bool {
-    matches!(command, Commands::Install { .. } | Commands::Remove { .. })
+    matches!(
+        command,
+        Commands::Install { .. } | Commands::Remove { .. } | Commands::Update { .. }
+    )
 }
 
 fn should_reexec_with_sudo(cli: &Cli) -> bool {
@@ -1166,6 +1173,37 @@ fn run_search_command(
     Ok(())
 }
 
+fn scan_package_specs(dir: &Path) -> Result<Vec<PathBuf>> {
+    let root = dir
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve scan root {}", dir.display()))?;
+    if !root.is_dir() {
+        anyhow::bail!("Scan root is not a directory: {}", root.display());
+    }
+
+    let mut specs = Vec::new();
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"))
+    {
+        let entry = entry.with_context(|| format!("Failed to walk {}", root.display()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+        let candidate = path.to_path_buf();
+        if package::PackageSpec::from_file(&candidate).is_ok() {
+            specs.push(candidate);
+        }
+    }
+    specs.sort();
+    Ok(specs)
+}
+
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -1200,6 +1238,1052 @@ fn merge_missing_dependencies(mut base: Vec<String>, extra: Vec<String>) -> Vec<
         }
     }
     base
+}
+
+#[derive(Clone, Copy)]
+struct UpdateCommandOptions<'a> {
+    rootfs: &'a Path,
+    no_deps: bool,
+    no_flags: bool,
+    cross_prefix: Option<&'a str>,
+    clean: bool,
+    dry_run: bool,
+    assume_yes: bool,
+}
+
+#[derive(Debug, Clone)]
+enum UpdateOrigin {
+    Source {
+        repo_name: String,
+        path: PathBuf,
+    },
+    Binary {
+        repo_name: String,
+        record: Box<db::repo::BinaryRepoPackageRecord>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct UpdateCandidate {
+    package: String,
+    installed_version: String,
+    installed_revision: u32,
+    installed_completed_at: Option<i64>,
+    candidate_version: String,
+    candidate_revision: u32,
+    candidate_completed_at: Option<i64>,
+    runtime_dependencies: Vec<String>,
+    provides: Vec<String>,
+    repo_priority: i32,
+    origin: UpdateOrigin,
+}
+
+#[derive(Debug, Clone)]
+struct SourceUpdateCandidate {
+    repo_name: String,
+    repo_priority: i32,
+    path: PathBuf,
+    completed_at: Option<i64>,
+    spec: package::PackageSpec,
+}
+
+fn compare_package_release(
+    left_version: &str,
+    left_revision: u32,
+    right_version: &str,
+    right_revision: u32,
+) -> Ordering {
+    compare_versions_for_updates(left_version, right_version)
+        .then_with(|| left_revision.cmp(&right_revision))
+}
+
+fn compare_completed_at(left: Option<i64>, right: Option<i64>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn update_candidate_is_newer_than_installed(
+    candidate_version: &str,
+    candidate_revision: u32,
+    candidate_completed_at: Option<i64>,
+    installed_version: &str,
+    installed_revision: u32,
+    installed_completed_at: Option<i64>,
+) -> bool {
+    match compare_package_release(
+        candidate_version,
+        candidate_revision,
+        installed_version,
+        installed_revision,
+    ) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => {
+            compare_completed_at(candidate_completed_at, installed_completed_at)
+                == Ordering::Greater
+        }
+    }
+}
+
+fn path_modified_unix_timestamp(path: &Path) -> Result<Option<i64>> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("Failed to read metadata for {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("Failed to read modification time for {}", path.display()))?;
+    Ok(Some(crate::metadata_time::system_time_to_unix(modified)?))
+}
+
+fn installed_package_completed_at(
+    installed: &db::InstalledPackageRecord,
+    db_path: &Path,
+    rootfs: &Path,
+) -> Result<Option<i64>> {
+    if installed.completed_at.is_some() {
+        return Ok(installed.completed_at);
+    }
+
+    let mut latest = None;
+    for relative_path in db::get_package_files(db_path, &installed.name)? {
+        let path = rootfs.join(&relative_path);
+        if !path.exists() {
+            continue;
+        }
+        if let Some(modified) = path_modified_unix_timestamp(&path)? {
+            latest = Some(latest.map_or(modified, |current: i64| current.max(modified)));
+        }
+    }
+
+    Ok(latest)
+}
+
+fn update_origin_is_binary(origin: &UpdateOrigin) -> bool {
+    matches!(origin, UpdateOrigin::Binary { .. })
+}
+
+fn update_origin_label(origin: &UpdateOrigin) -> String {
+    match origin {
+        UpdateOrigin::Source { repo_name, path } => {
+            format!("source:{repo_name}:{}", path.display())
+        }
+        UpdateOrigin::Binary { repo_name, record } => {
+            format!("binary:{repo_name}:{}", record.filename)
+        }
+    }
+}
+
+fn update_candidate_is_preferred(
+    candidate: &UpdateCandidate,
+    current: &UpdateCandidate,
+    prefer_binary: bool,
+) -> bool {
+    match compare_package_release(
+        &candidate.candidate_version,
+        candidate.candidate_revision,
+        &current.candidate_version,
+        current.candidate_revision,
+    ) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => match compare_completed_at(
+            candidate.candidate_completed_at,
+            current.candidate_completed_at,
+        ) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => match (
+                update_origin_is_binary(&candidate.origin),
+                update_origin_is_binary(&current.origin),
+            ) {
+                (true, false) => prefer_binary,
+                (false, true) => !prefer_binary,
+                _ => {
+                    if candidate.repo_priority != current.repo_priority {
+                        candidate.repo_priority < current.repo_priority
+                    } else {
+                        update_origin_label(&candidate.origin)
+                            < update_origin_label(&current.origin)
+                    }
+                }
+            },
+        },
+    }
+}
+
+fn candidate_request_path(
+    candidate: &UpdateCandidate,
+    config: &config::Config,
+    rootfs: &Path,
+) -> Result<PathBuf> {
+    match &candidate.origin {
+        UpdateOrigin::Source { path, .. } => Ok(path.clone()),
+        UpdateOrigin::Binary { repo_name, record } => {
+            let repo_cfg = config
+                .binary_repos
+                .get(repo_name)
+                .with_context(|| format!("Binary repo '{}' not found in config", repo_name))?;
+            db::repo::fetch_binary_package_archive(
+                repo_name,
+                repo_cfg,
+                rootfs,
+                record,
+                &config.package_cache_dir,
+            )
+        }
+    }
+}
+
+fn sync_source_repositories_for_update(config: &config::Config) -> Result<()> {
+    let mirrors = config.enabled_source_mirror_map();
+    if mirrors.is_empty() {
+        return Ok(());
+    }
+
+    let mut repo_lock = locking::open_lock(config)?;
+    let repo_lock_path = locking::lock_path(config);
+    let _repo_lock_guard = locking::try_write(&mut repo_lock, &repo_lock_path, "update sync")?;
+    db::repo::sync_mirrors(&config.repo_clone_dir, &mirrors)?;
+    Ok(())
+}
+
+fn configured_source_scan_roots(config: &config::Config) -> Vec<(String, i32, PathBuf)> {
+    let mut roots = Vec::new();
+    let mut repos: Vec<_> = config
+        .source_repos
+        .iter()
+        .filter(|(_, repo)| repo.enabled)
+        .collect();
+    repos.sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
+
+    for (repo_name, repo) in repos {
+        let repo_root = config.repo_clone_dir.join(repo_name);
+        if repo.subdirs.is_empty() {
+            roots.push((repo_name.clone(), repo.priority, repo_root));
+        } else {
+            for subdir in &repo.subdirs {
+                roots.push((repo_name.clone(), repo.priority, repo_root.join(subdir)));
+            }
+        }
+    }
+
+    roots
+}
+
+fn collect_best_source_update_candidates(
+    config: &config::Config,
+    target_names: &HashSet<String>,
+) -> Result<HashMap<String, SourceUpdateCandidate>> {
+    let mut best: HashMap<String, SourceUpdateCandidate> = HashMap::new();
+
+    for (repo_name, repo_priority, root) in configured_source_scan_roots(config) {
+        if !root.exists() {
+            continue;
+        }
+
+        for spec_path in scan_package_specs(&root)? {
+            let mut spec = package::PackageSpec::from_file(&spec_path)?;
+            spec.apply_config(config);
+            if !target_names.contains(&spec.package.name) {
+                continue;
+            }
+
+            let candidate = SourceUpdateCandidate {
+                repo_name: repo_name.clone(),
+                repo_priority,
+                path: spec_path.clone(),
+                completed_at: path_modified_unix_timestamp(&spec_path)?,
+                spec,
+            };
+
+            let replace = match best.get(&candidate.spec.package.name) {
+                Some(current) => match compare_package_release(
+                    &candidate.spec.package.version,
+                    candidate.spec.package.revision,
+                    &current.spec.package.version,
+                    current.spec.package.revision,
+                ) {
+                    Ordering::Greater => true,
+                    Ordering::Less => false,
+                    Ordering::Equal => {
+                        match compare_completed_at(candidate.completed_at, current.completed_at) {
+                            Ordering::Greater => true,
+                            Ordering::Less => false,
+                            Ordering::Equal => {
+                                if candidate.repo_priority != current.repo_priority {
+                                    candidate.repo_priority < current.repo_priority
+                                } else if candidate.repo_name != current.repo_name {
+                                    candidate.repo_name < current.repo_name
+                                } else {
+                                    candidate.path < current.path
+                                }
+                            }
+                        }
+                    }
+                },
+                None => true,
+            };
+
+            if replace {
+                best.insert(candidate.spec.package.name.clone(), candidate);
+            }
+        }
+    }
+
+    Ok(best)
+}
+
+fn collect_best_binary_update_candidates(
+    config: &config::Config,
+    rootfs: &Path,
+    target_names: &HashSet<String>,
+) -> Result<HashMap<String, (i32, db::repo::BinaryRepoPackageRecord)>> {
+    let mut best: HashMap<String, (i32, db::repo::BinaryRepoPackageRecord)> = HashMap::new();
+    let host_arch = std::env::consts::ARCH;
+    let mut repos: Vec<_> = config
+        .binary_repos
+        .iter()
+        .filter(|(_, repo)| repo.enabled && repo.supports_arch(host_arch))
+        .collect();
+    repos.sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
+
+    for (repo_name, repo_cfg) in repos {
+        let records = db::repo::list_binary_repo_packages(
+            repo_name,
+            repo_cfg,
+            rootfs,
+            &config.package_cache_dir,
+        )
+        .with_context(|| format!("Failed to list binary repo '{}'", repo_name))?;
+
+        for record in records {
+            if !target_names.contains(&record.name) {
+                continue;
+            }
+
+            let replace = match best.get(&record.name) {
+                Some((current_priority, current)) => match compare_package_release(
+                    &record.version,
+                    record.revision,
+                    &current.version,
+                    current.revision,
+                ) {
+                    Ordering::Greater => true,
+                    Ordering::Less => false,
+                    Ordering::Equal => {
+                        match compare_completed_at(record.completed_at, current.completed_at) {
+                            Ordering::Greater => true,
+                            Ordering::Less => false,
+                            Ordering::Equal => {
+                                if repo_cfg.priority != *current_priority {
+                                    repo_cfg.priority < *current_priority
+                                } else if repo_name != &current.repo_name {
+                                    repo_name < &current.repo_name
+                                } else {
+                                    record.filename < current.filename
+                                }
+                            }
+                        }
+                    }
+                },
+                None => true,
+            };
+
+            if replace {
+                best.insert(record.name.clone(), (repo_cfg.priority, record));
+            }
+        }
+    }
+
+    Ok(best)
+}
+
+fn select_update_candidate(
+    installed: &db::InstalledPackageRecord,
+    installed_completed_at: Option<i64>,
+    source_candidates: &HashMap<String, SourceUpdateCandidate>,
+    binary_candidates: &HashMap<String, (i32, db::repo::BinaryRepoPackageRecord)>,
+    prefer_binary: bool,
+) -> Option<UpdateCandidate> {
+    let mut best: Option<UpdateCandidate> = None;
+
+    if let Some(candidate) = source_candidates.get(&installed.name)
+        && update_candidate_is_newer_than_installed(
+            &candidate.spec.package.version,
+            candidate.spec.package.revision,
+            candidate.completed_at,
+            &installed.version,
+            installed.revision,
+            installed_completed_at,
+        )
+    {
+        best = Some(UpdateCandidate {
+            package: installed.name.clone(),
+            installed_version: installed.version.clone(),
+            installed_revision: installed.revision,
+            installed_completed_at,
+            candidate_version: candidate.spec.package.version.clone(),
+            candidate_revision: candidate.spec.package.revision,
+            candidate_completed_at: candidate.completed_at,
+            runtime_dependencies: candidate.spec.dependencies.runtime.clone(),
+            provides: candidate.spec.alternatives.provides.clone(),
+            repo_priority: candidate.repo_priority,
+            origin: UpdateOrigin::Source {
+                repo_name: candidate.repo_name.clone(),
+                path: candidate.path.clone(),
+            },
+        });
+    }
+
+    if let Some((repo_priority, record)) = binary_candidates.get(&installed.name)
+        && update_candidate_is_newer_than_installed(
+            &record.version,
+            record.revision,
+            record.completed_at,
+            &installed.version,
+            installed.revision,
+            installed_completed_at,
+        )
+    {
+        let binary_candidate = UpdateCandidate {
+            package: installed.name.clone(),
+            installed_version: installed.version.clone(),
+            installed_revision: installed.revision,
+            installed_completed_at,
+            candidate_version: record.version.clone(),
+            candidate_revision: record.revision,
+            candidate_completed_at: record.completed_at,
+            runtime_dependencies: record.runtime_dependencies.clone(),
+            provides: record.provides.clone(),
+            repo_priority: *repo_priority,
+            origin: UpdateOrigin::Binary {
+                repo_name: record.repo_name.clone(),
+                record: Box::new(record.clone()),
+            },
+        };
+
+        if best.as_ref().is_none_or(|current| {
+            update_candidate_is_preferred(&binary_candidate, current, prefer_binary)
+        }) {
+            best = Some(binary_candidate);
+        }
+    }
+
+    best
+}
+
+fn collect_update_candidates(
+    config: &config::Config,
+    rootfs: &Path,
+    requested_packages: &[String],
+) -> Result<Vec<UpdateCandidate>> {
+    let db_path = config.installed_db_path(rootfs);
+    let installed = db::list_installed_package_records(&db_path)?;
+    if installed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let installed_by_name: HashMap<_, _> = installed
+        .iter()
+        .cloned()
+        .map(|record| (record.name.clone(), record))
+        .collect();
+
+    let target_names: HashSet<String> = if requested_packages.is_empty() {
+        installed_by_name.keys().cloned().collect()
+    } else {
+        requested_packages.iter().cloned().collect()
+    };
+
+    for package in requested_packages {
+        if !installed_by_name.contains_key(package) {
+            ui::warn(format!("Package '{}' is not installed; skipping", package));
+        }
+    }
+
+    let source_candidates = collect_best_source_update_candidates(config, &target_names)?;
+    let binary_candidates = collect_best_binary_update_candidates(config, rootfs, &target_names)?;
+
+    let mut updates = Vec::new();
+    let mut targets: Vec<_> = target_names.into_iter().collect();
+    targets.sort();
+    for target in targets {
+        let Some(installed) = installed_by_name.get(&target) else {
+            continue;
+        };
+        let installed_completed_at = installed_package_completed_at(installed, &db_path, rootfs)?;
+        if let Some(candidate) = select_update_candidate(
+            installed,
+            installed_completed_at,
+            &source_candidates,
+            &binary_candidates,
+            config.repo_settings.prefer_binary,
+        ) {
+            updates.push(candidate);
+        }
+    }
+
+    Ok(updates)
+}
+
+fn collect_missing_update_dependencies(
+    candidates: &[UpdateCandidate],
+    db_path: &Path,
+) -> Result<Vec<String>> {
+    let mut planned_provides = HashSet::new();
+    for candidate in candidates {
+        planned_provides.insert(candidate.package.clone());
+        for provide in &candidate.provides {
+            planned_provides.insert(provide.clone());
+        }
+    }
+
+    let mut missing = Vec::new();
+    for candidate in candidates {
+        for dep in &candidate.runtime_dependencies {
+            if planned_provides.contains(deps::dep_name(dep)) {
+                continue;
+            }
+            if deps::is_dep_satisfied_in_db(dep, db_path)? {
+                continue;
+            }
+            if !missing.contains(dep) {
+                missing.push(dep.clone());
+            }
+        }
+    }
+
+    Ok(missing)
+}
+
+fn run_update_install_command(
+    program: &Path,
+    request: &Path,
+    options: UpdateCommandOptions<'_>,
+) -> Result<()> {
+    run_install_command_with_program(
+        program,
+        &[request.to_path_buf()],
+        options.rootfs,
+        ChildInstallCommandOptions {
+            no_deps: true,
+            assume_yes: true,
+            no_flags: options.no_flags,
+            cross_prefix: options.cross_prefix,
+            clean: options.clean,
+            dep_chain: None,
+        },
+    )
+}
+
+fn run_update_command(
+    packages: &[String],
+    config: &config::Config,
+    options: UpdateCommandOptions<'_>,
+) -> Result<()> {
+    sync_source_repositories_for_update(config)?;
+
+    let updates = collect_update_candidates(config, options.rootfs, packages)?;
+    if updates.is_empty() {
+        ui::info("All installed packages are up to date.");
+        return Ok(());
+    }
+
+    let targets: Vec<String> = updates
+        .iter()
+        .map(|candidate| {
+            let summary = format!(
+                "{} v{}-{} -> v{}-{}",
+                candidate.package,
+                candidate.installed_version,
+                candidate.installed_revision,
+                candidate.candidate_version,
+                candidate.candidate_revision
+            );
+            if candidate.installed_version == candidate.candidate_version
+                && candidate.installed_revision == candidate.candidate_revision
+                && compare_completed_at(
+                    candidate.candidate_completed_at,
+                    candidate.installed_completed_at,
+                ) == Ordering::Greater
+            {
+                format!("{summary} (newer UTC build timestamp)")
+            } else {
+                summary
+            }
+        })
+        .collect();
+
+    ui::info(format!("{} package(s) can be updated:", updates.len()));
+    for target in &targets {
+        ui::info(format!("  {}", target));
+    }
+
+    let db_path = config.installed_db_path(options.rootfs);
+    let missing_deps = if options.no_deps {
+        Vec::new()
+    } else {
+        collect_missing_update_dependencies(&updates, &db_path)?
+    };
+    if !missing_deps.is_empty() {
+        ui::info(format!(
+            "New dependencies required by updates: {}",
+            missing_deps.join(", ")
+        ));
+    }
+
+    if !options.dry_run && !ui::prompt_package_action("update", &targets, true)? {
+        anyhow::bail!("Aborted");
+    }
+
+    if !missing_deps.is_empty() {
+        let dep_plan = planner::build_dependency_install_plan(
+            config,
+            options.rootfs,
+            &missing_deps,
+            planner::PlannerOptions {
+                assume_yes: options.assume_yes,
+                prefer_binary: config.repo_settings.prefer_binary,
+                local_sibling_root: None,
+            },
+        )?;
+        print_plan_summary(&dep_plan);
+
+        if options.dry_run {
+            ui::info("Dry run enabled, stopping before dependency installation/update.");
+            return Ok(());
+        }
+
+        execute_install_plan_with_child_commands(
+            &dep_plan,
+            options.rootfs,
+            config,
+            InstallPlanExecutionOptions {
+                no_flags: options.no_flags,
+                cross_prefix: options.cross_prefix,
+                clean: options.clean,
+                dry_run: false,
+                confirm_installation: false,
+            },
+        )?;
+    } else if options.dry_run {
+        ui::info("Dry run enabled, stopping before update.");
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().context("Failed to locate depot executable")?;
+    for (idx, candidate) in updates.iter().enumerate() {
+        ui::info(format!(
+            "[{}/{}] updating {} v{}-{} -> v{}-{}",
+            idx + 1,
+            updates.len(),
+            candidate.package,
+            candidate.installed_version,
+            candidate.installed_revision,
+            candidate.candidate_version,
+            candidate.candidate_revision
+        ));
+        let request = candidate_request_path(candidate, config, options.rootfs)?;
+        run_update_install_command(&exe, &request, options)?;
+    }
+
+    if options.clean {
+        clean_build_workspace(config)?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VersionPattern {
+    prefix: String,
+    suffix: String,
+}
+
+#[derive(Debug, Clone)]
+enum CheckStatus {
+    UpdateAvailable { latest: String, source: String },
+    UpToDate { source: String },
+    Unknown { reason: String },
+}
+
+fn strip_known_archive_suffixes(input: &str) -> &str {
+    for suffix in [
+        ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz", ".txz", ".tbz2", ".zip", ".tar",
+        ".git",
+    ] {
+        if let Some(stripped) = input.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    input
+}
+
+fn extract_version_patterns(raw: &str) -> Vec<VersionPattern> {
+    let mut patterns = HashSet::new();
+    let mut start = 0usize;
+
+    while let Some(rel_idx) = raw[start..].find("$version") {
+        let idx = start + rel_idx;
+        let prefix_start = raw[..idx]
+            .rfind(['/', '#', '?', '&', '='])
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+        let suffix_end = raw[idx + "$version".len()..]
+            .find(['/', '#', '?', '&', '='])
+            .map(|pos| idx + "$version".len() + pos)
+            .unwrap_or(raw.len());
+        let prefix = raw[prefix_start..idx].to_string();
+        let suffix = strip_known_archive_suffixes(&raw[idx + "$version".len()..suffix_end]);
+        patterns.insert(VersionPattern {
+            prefix,
+            suffix: suffix.to_string(),
+        });
+        start = idx + "$version".len();
+    }
+
+    let mut out: Vec<_> = patterns.into_iter().collect();
+    out.sort_by(|a, b| {
+        a.prefix
+            .cmp(&b.prefix)
+            .then_with(|| a.suffix.cmp(&b.suffix))
+    });
+    out
+}
+
+fn is_version_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-')
+}
+
+fn looks_like_version(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate.len() <= 64
+        && candidate.chars().all(is_version_char)
+        && candidate.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn match_version_pattern<'a>(value: &'a str, pattern: &VersionPattern) -> Option<&'a str> {
+    if !value.starts_with(&pattern.prefix) || !value.ends_with(&pattern.suffix) {
+        return None;
+    }
+
+    let start = pattern.prefix.len();
+    let end = value.len().saturating_sub(pattern.suffix.len());
+    if end <= start {
+        return None;
+    }
+
+    let candidate = &value[start..end];
+    looks_like_version(candidate).then_some(candidate)
+}
+
+fn compare_version_fallback(left: &str, right: &str) -> Ordering {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut li = 0usize;
+    let mut ri = 0usize;
+
+    while li < left.len() && ri < right.len() {
+        let lch = left[li] as char;
+        let rch = right[ri] as char;
+        let l_digit = lch.is_ascii_digit();
+        let r_digit = rch.is_ascii_digit();
+
+        if l_digit && r_digit {
+            let l_start = li;
+            let r_start = ri;
+            while li < left.len() && (left[li] as char).is_ascii_digit() {
+                li += 1;
+            }
+            while ri < right.len() && (right[ri] as char).is_ascii_digit() {
+                ri += 1;
+            }
+
+            let l_num = &left[l_start..li];
+            let r_num = &right[r_start..ri];
+            let l_trimmed = std::str::from_utf8(l_num)
+                .unwrap_or_default()
+                .trim_start_matches('0');
+            let r_trimmed = std::str::from_utf8(r_num)
+                .unwrap_or_default()
+                .trim_start_matches('0');
+
+            let l_cmp = if l_trimmed.is_empty() { "0" } else { l_trimmed };
+            let r_cmp = if r_trimmed.is_empty() { "0" } else { r_trimmed };
+            match l_cmp.len().cmp(&r_cmp.len()) {
+                Ordering::Equal => match l_cmp.cmp(r_cmp) {
+                    Ordering::Equal => {}
+                    non_eq => return non_eq,
+                },
+                non_eq => return non_eq,
+            }
+            continue;
+        }
+
+        match lch.to_ascii_lowercase().cmp(&rch.to_ascii_lowercase()) {
+            Ordering::Equal => {
+                li += 1;
+                ri += 1;
+            }
+            non_eq => return non_eq,
+        }
+    }
+
+    left.len().cmp(&right.len())
+}
+
+fn compare_versions_for_updates(left: &str, right: &str) -> Ordering {
+    let left_semver = left.trim_start_matches('v');
+    let right_semver = right.trim_start_matches('v');
+    if let (Ok(left), Ok(right)) = (
+        semver::Version::parse(left_semver),
+        semver::Version::parse(right_semver),
+    ) {
+        return left.cmp(&right);
+    }
+
+    if left.len() == 8
+        && right.len() == 8
+        && left.chars().all(|ch| ch.is_ascii_digit())
+        && right.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return left.cmp(right);
+    }
+
+    compare_version_fallback(left, right)
+}
+
+fn best_newer_version<'a>(
+    current: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let mut best: Option<&str> = None;
+    for candidate in candidates {
+        if compare_versions_for_updates(candidate, current) != Ordering::Greater {
+            continue;
+        }
+        if let Some(existing) = best
+            && compare_versions_for_updates(candidate, existing) != Ordering::Greater
+        {
+            continue;
+        }
+        best = Some(candidate);
+    }
+    best.map(str::to_string)
+}
+
+fn remote_git_repository_from_source_url(expanded_url: &str) -> Option<String> {
+    if let Some((base, _)) = source_git_url_parts(expanded_url) {
+        return Some(base);
+    }
+
+    let parsed = Url::parse(expanded_url).ok()?;
+    let host = parsed.host_str()?;
+    let segments: Vec<_> = parsed.path_segments()?.collect();
+    if segments.len() < 3 {
+        return None;
+    }
+    let owner = segments[0];
+    let repo = segments[1].strip_suffix(".git").unwrap_or(segments[1]);
+    match segments[2] {
+        "releases" | "archive" => {
+            Some(format!("{}://{}/{owner}/{repo}.git", parsed.scheme(), host))
+        }
+        _ => None,
+    }
+}
+
+fn source_git_url_parts(url: &str) -> Option<(String, String)> {
+    if let Some((base, rev)) = url.split_once('#') {
+        let lower = base.to_ascii_lowercase();
+        let is_archive = lower.ends_with(".tar.gz")
+            || lower.ends_with(".tgz")
+            || lower.ends_with(".tar.xz")
+            || lower.ends_with(".txz")
+            || lower.ends_with(".tar.bz2")
+            || lower.ends_with(".tbz2")
+            || lower.ends_with(".zip")
+            || lower.ends_with(".tar");
+        if is_archive {
+            return None;
+        }
+        let resolved_rev = if rev.trim().is_empty() { "HEAD" } else { rev };
+        return Some((base.to_string(), resolved_rev.to_string()));
+    }
+
+    url.to_ascii_lowercase()
+        .ends_with(".git")
+        .then(|| (url.to_string(), "HEAD".to_string()))
+}
+
+fn list_remote_refs(url: &str) -> Result<Vec<String>> {
+    let mut remote = git2::Remote::create_detached(url)
+        .with_context(|| format!("Failed to create detached git remote for {}", url))?;
+    remote
+        .connect(Direction::Fetch)
+        .with_context(|| format!("Failed to connect to git remote {}", url))?;
+    let refs = remote
+        .list()
+        .with_context(|| format!("Failed to list refs for git remote {}", url))?
+        .iter()
+        .map(|head| head.name().trim_end_matches("^{}").to_string())
+        .collect();
+    remote.disconnect()?;
+    Ok(refs)
+}
+
+fn candidate_versions_from_refs(refs: &[String], patterns: &[VersionPattern]) -> Vec<String> {
+    let mut versions = HashSet::new();
+
+    for name in refs {
+        let short = name
+            .strip_prefix("refs/tags/")
+            .or_else(|| name.strip_prefix("refs/heads/"))
+            .unwrap_or(name.as_str());
+
+        for pattern in patterns {
+            if let Some(candidate) = match_version_pattern(short, pattern) {
+                versions.insert(candidate.to_string());
+            }
+        }
+    }
+
+    let mut out: Vec<_> = versions.into_iter().collect();
+    out.sort_by(|a, b| compare_versions_for_updates(a, b));
+    out
+}
+
+fn source_check_status(
+    spec: &package::PackageSpec,
+    source: &package::Source,
+) -> Result<CheckStatus> {
+    let patterns = extract_version_patterns(&source.url);
+    if patterns.is_empty() {
+        anyhow::bail!("source URL does not contain $version");
+    }
+
+    let expanded_url = spec.expand_vars(&source.url);
+    let repo_url = remote_git_repository_from_source_url(&expanded_url)
+        .ok_or_else(|| anyhow::anyhow!("could not derive a git remote from {}", expanded_url))?;
+    let refs = list_remote_refs(&repo_url)?;
+    let candidates = candidate_versions_from_refs(&refs, &patterns);
+
+    if candidates.is_empty() {
+        anyhow::bail!("no matching remote refs found in {}", repo_url);
+    }
+
+    let source_label = format!("git refs {}", repo_url);
+    if let Some(latest) =
+        best_newer_version(&spec.package.version, candidates.iter().map(String::as_str))
+    {
+        Ok(CheckStatus::UpdateAvailable {
+            latest,
+            source: source_label,
+        })
+    } else {
+        Ok(CheckStatus::UpToDate {
+            source: source_label,
+        })
+    }
+}
+
+fn check_package_spec(spec_path: &Path) -> CheckStatus {
+    let spec = match package::PackageSpec::from_file(spec_path) {
+        Ok(spec) => spec,
+        Err(err) => {
+            return CheckStatus::Unknown {
+                reason: err.to_string(),
+            };
+        }
+    };
+
+    let mut best_update: Option<(String, String)> = None;
+    let mut last_up_to_date_source: Option<String> = None;
+    let mut reasons = Vec::new();
+
+    for source in spec.sources() {
+        match source_check_status(&spec, source) {
+            Ok(CheckStatus::UpdateAvailable { latest, source }) => {
+                let replace = match &best_update {
+                    Some((current_best, _)) => {
+                        compare_versions_for_updates(&latest, current_best) == Ordering::Greater
+                    }
+                    None => true,
+                };
+                if replace {
+                    best_update = Some((latest, source));
+                }
+            }
+            Ok(CheckStatus::UpToDate { source }) => {
+                if last_up_to_date_source.is_none() {
+                    last_up_to_date_source = Some(source);
+                }
+            }
+            Ok(CheckStatus::Unknown { reason }) => reasons.push(reason),
+            Err(err) => reasons.push(err.to_string()),
+        }
+    }
+
+    if let Some((latest, source)) = best_update {
+        return CheckStatus::UpdateAvailable { latest, source };
+    }
+    if let Some(source) = last_up_to_date_source {
+        return CheckStatus::UpToDate { source };
+    }
+
+    CheckStatus::Unknown {
+        reason: reasons
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "no versioned sources found".to_string()),
+    }
+}
+
+fn run_check_command(dir: &Path) -> Result<()> {
+    let scan_root = dir
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve check root {}", dir.display()))?;
+    let specs = scan_package_specs(&scan_root)?;
+    if specs.is_empty() {
+        ui::info(format!(
+            "No depot package specs found under {}",
+            scan_root.display()
+        ));
+        return Ok(());
+    }
+
+    for spec_path in specs {
+        let spec = package::PackageSpec::from_file(&spec_path)?;
+        match check_package_spec(&spec_path) {
+            CheckStatus::UpdateAvailable { latest, source } => ui::warn(format!(
+                "{} {} -> {} [{}] ({})",
+                spec.package.name,
+                spec.package.version,
+                latest,
+                source,
+                spec_path.display()
+            )),
+            CheckStatus::UpToDate { source } => ui::info(format!(
+                "{} {} is up to date [{}] ({})",
+                spec.package.name,
+                spec.package.version,
+                source,
+                spec_path.display()
+            )),
+            CheckStatus::Unknown { reason } => ui::warn(format!(
+                "{} {} could not be checked: {} ({})",
+                spec.package.name,
+                spec.package.version,
+                reason,
+                spec_path.display()
+            )),
+        }
+    }
+
+    Ok(())
 }
 
 fn print_plan_summary(plan: &planner::ExecutionPlan) {
@@ -1660,7 +2744,7 @@ fn run_direct_archive_install_requests(
     }
 
     ui::info(format!(
-        "Installing {} binary archive payload(s) without staging transforms",
+        "Installing {} binary archive payload(s)",
         archive_paths.len()
     ));
 
@@ -1933,7 +3017,7 @@ fn run_direct_install_request(
             staging::process(&destdir, &pkg_spec)?;
         } else {
             // Binary archive path: install as-packaged without post-build transformations.
-            ui::info("Installing binary archive payload without staging transforms");
+            ui::info("Installing binary archive payload");
         }
 
         let output_plans =
@@ -2434,6 +3518,28 @@ pub fn run(cli: Cli) -> Result<()> {
             if cli.clean {
                 clean_build_workspace(&config)?;
             }
+        }
+        Commands::Update { packages } => {
+            if cli.lib32_only {
+                anyhow::bail!("--lib32-only is not supported with 'update'");
+            }
+            let config = config::Config::for_rootfs(&cli.rootfs);
+            run_update_command(
+                &packages,
+                &config,
+                UpdateCommandOptions {
+                    rootfs: &cli.rootfs,
+                    no_deps: cli.no_deps,
+                    no_flags: cli.no_flags,
+                    cross_prefix: cli.cross_prefix.as_deref(),
+                    clean: cli.clean,
+                    dry_run: cli.dry_run,
+                    assume_yes: cli.yes,
+                },
+            )?;
+        }
+        Commands::Check { dir } => {
+            run_check_command(&dir)?;
         }
         Commands::Info { package } => {
             // Try as file first, then as installed package name
@@ -3002,6 +4108,7 @@ mod tests {
             name: "pkg".into(),
             version: "1.0".into(),
             revision: 1,
+            completed_at: None,
             filename: archive_path
                 .file_name()
                 .and_then(|f| f.to_str())
@@ -3181,6 +4288,7 @@ mod tests {
             name: "sudo".into(),
             version: "1.0".into(),
             revision: 1,
+            completed_at: None,
             filename: archive_path
                 .file_name()
                 .and_then(|f| f.to_str())
@@ -3342,6 +4450,294 @@ optional = []
     }
 
     #[test]
+    fn update_candidate_prefers_binary_when_versions_match_and_config_does() {
+        let installed = db::InstalledPackageRecord {
+            name: "pkg".into(),
+            version: "1.0.0".into(),
+            revision: 1,
+            completed_at: None,
+        };
+        let source_spec = package::PackageSpec {
+            package: package::PackageInfo {
+                name: "pkg".into(),
+                version: "1.1.0".into(),
+                revision: 1,
+                description: "test".into(),
+                homepage: "https://example.test".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: package::Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: vec![package::Source {
+                url: "https://example.test/pkg-$version.tar.gz".into(),
+                sha256: "skip".into(),
+                extract_dir: "pkg-$version".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
+            }],
+            build: package::Build {
+                build_type: package::BuildType::Custom,
+                flags: package::BuildFlags::default(),
+            },
+            dependencies: package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+        let source_candidates = HashMap::from([(
+            "pkg".to_string(),
+            SourceUpdateCandidate {
+                repo_name: "source".into(),
+                repo_priority: 5,
+                path: PathBuf::from("/tmp/pkg.toml"),
+                completed_at: None,
+                spec: source_spec,
+            },
+        )]);
+        let binary_candidates = HashMap::from([(
+            "pkg".to_string(),
+            (
+                0,
+                db::repo::BinaryRepoPackageRecord {
+                    repo_name: "binary".into(),
+                    name: "pkg".into(),
+                    version: "1.1.0".into(),
+                    revision: 1,
+                    completed_at: None,
+                    filename: "pkg-1.1.0-1-x86_64.depot.pkg.tar.zst".into(),
+                    size: 1,
+                    sha256: String::new(),
+                    sha512: String::new(),
+                    description: None,
+                    homepage: None,
+                    license: None,
+                    provides: Vec::new(),
+                    runtime_dependencies: Vec::new(),
+                    optional_dependencies: Vec::new(),
+                },
+            ),
+        )]);
+
+        let selected = select_update_candidate(
+            &installed,
+            None,
+            &source_candidates,
+            &binary_candidates,
+            true,
+        )
+        .expect("expected update candidate");
+        assert!(matches!(selected.origin, UpdateOrigin::Binary { .. }));
+    }
+
+    #[test]
+    fn select_update_candidate_uses_newer_timestamp_when_versions_match() {
+        let installed = db::InstalledPackageRecord {
+            name: "pkg".into(),
+            version: "1.0.0".into(),
+            revision: 1,
+            completed_at: Some(100),
+        };
+        let source_spec = package::PackageSpec {
+            package: package::PackageInfo {
+                name: "pkg".into(),
+                version: "1.0.0".into(),
+                revision: 1,
+                description: "test".into(),
+                homepage: "https://example.test".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: package::Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: package::Build {
+                build_type: package::BuildType::Custom,
+                flags: package::BuildFlags::default(),
+            },
+            dependencies: package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+        let source_candidates = HashMap::from([(
+            "pkg".to_string(),
+            SourceUpdateCandidate {
+                repo_name: "source".into(),
+                repo_priority: 5,
+                path: PathBuf::from("/tmp/pkg.toml"),
+                completed_at: Some(200),
+                spec: source_spec,
+            },
+        )]);
+
+        let selected = select_update_candidate(
+            &installed,
+            Some(100),
+            &source_candidates,
+            &HashMap::new(),
+            true,
+        )
+        .expect("expected update candidate");
+        assert_eq!(selected.candidate_version, "1.0.0");
+        assert_eq!(selected.candidate_completed_at, Some(200));
+    }
+
+    #[test]
+    fn collect_missing_update_dependencies_skips_planned_provides_and_installed_deps() -> Result<()>
+    {
+        let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+        let db_path = temp.path().join("packages.db");
+
+        let libc_spec = package::PackageSpec {
+            package: package::PackageInfo {
+                name: "glibc".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "glibc".into(),
+                homepage: "https://example.test".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: package::Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: package::Build {
+                build_type: package::BuildType::Bin,
+                flags: package::BuildFlags::default(),
+            },
+            dependencies: package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(dest.join("usr/lib"))?;
+        fs::write(dest.join("usr/lib/libc.so"), "glibc")?;
+        db::register_package(&db_path, &libc_spec, &dest)?;
+
+        let missing = collect_missing_update_dependencies(
+            &[
+                UpdateCandidate {
+                    package: "pkg".into(),
+                    installed_version: "1.0".into(),
+                    installed_revision: 1,
+                    installed_completed_at: None,
+                    candidate_version: "2.0".into(),
+                    candidate_revision: 1,
+                    candidate_completed_at: None,
+                    runtime_dependencies: vec!["glibc".into(), "helper-virtual".into()],
+                    provides: Vec::new(),
+                    repo_priority: 0,
+                    origin: UpdateOrigin::Source {
+                        repo_name: "source".into(),
+                        path: PathBuf::from("/tmp/pkg.toml"),
+                    },
+                },
+                UpdateCandidate {
+                    package: "helper".into(),
+                    installed_version: "1.0".into(),
+                    installed_revision: 1,
+                    installed_completed_at: None,
+                    candidate_version: "2.0".into(),
+                    candidate_revision: 1,
+                    candidate_completed_at: None,
+                    runtime_dependencies: Vec::new(),
+                    provides: vec!["helper-virtual".into()],
+                    repo_priority: 0,
+                    origin: UpdateOrigin::Source {
+                        repo_name: "source".into(),
+                        path: PathBuf::from("/tmp/helper.toml"),
+                    },
+                },
+                UpdateCandidate {
+                    package: "tool".into(),
+                    installed_version: "1.0".into(),
+                    installed_revision: 1,
+                    installed_completed_at: None,
+                    candidate_version: "2.0".into(),
+                    candidate_revision: 1,
+                    candidate_completed_at: None,
+                    runtime_dependencies: vec!["newdep".into()],
+                    provides: Vec::new(),
+                    repo_priority: 0,
+                    origin: UpdateOrigin::Source {
+                        repo_name: "source".into(),
+                        path: PathBuf::from("/tmp/tool.toml"),
+                    },
+                },
+            ],
+            &db_path,
+        )?;
+
+        assert_eq!(missing, vec!["newdep".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn compare_versions_for_updates_handles_semver_and_date_versions() {
+        assert_eq!(
+            compare_versions_for_updates("10.8.4", "10.8.3"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions_for_updates("20260202", "20251231"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions_for_updates("1.10", "1.9"),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn extract_version_patterns_handles_git_and_release_urls() {
+        let git_patterns =
+            extract_version_patterns("https://codeberg.org/Limine/limine.git#v$version");
+        assert!(git_patterns.contains(&VersionPattern {
+            prefix: "v".into(),
+            suffix: String::new(),
+        }));
+
+        let release_patterns = extract_version_patterns(
+            "https://github.com/Mic92/iana-etc/releases/download/$version/iana-etc-$version.tar.gz",
+        );
+        assert!(release_patterns.contains(&VersionPattern {
+            prefix: String::new(),
+            suffix: String::new(),
+        }));
+    }
+
+    #[test]
+    fn candidate_versions_from_refs_matches_version_patterns() {
+        let refs = vec![
+            "refs/tags/v10.8.3".to_string(),
+            "refs/tags/v10.8.4".to_string(),
+            "refs/heads/main".to_string(),
+        ];
+        let patterns = extract_version_patterns("https://codeberg.org/Limine/limine.git#v$version");
+        let candidates = candidate_versions_from_refs(&refs, &patterns);
+
+        assert_eq!(candidates, vec!["10.8.3".to_string(), "10.8.4".to_string()]);
+        assert_eq!(
+            best_newer_version("10.8.3", candidates.iter().map(String::as_str)),
+            Some("10.8.4".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_git_repository_from_github_release_url_maps_to_repo_git_url() {
+        let repo_url = remote_git_repository_from_source_url(
+            "https://github.com/Mic92/iana-etc/releases/download/20260202/iana-etc-20260202.tar.gz",
+        );
+        assert_eq!(
+            repo_url,
+            Some("https://github.com/Mic92/iana-etc.git".to_string())
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn child_install_command_batches_multiple_requests_in_one_invocation() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -3406,13 +4802,16 @@ optional = []
     }
 
     #[test]
-    fn command_requires_live_root_only_for_install_and_remove() {
+    fn command_requires_live_root_for_install_remove_and_update() {
         assert!(command_requires_live_root(&Commands::Install {
             spec_or_archive: vec![PathBuf::from("foo")],
             spec: None,
         }));
         assert!(command_requires_live_root(&Commands::Remove {
             package: "foo".to_string(),
+        }));
+        assert!(command_requires_live_root(&Commands::Update {
+            packages: vec!["foo".to_string()],
         }));
         assert!(!command_requires_live_root(&Commands::Build {
             spec_pos: Some(PathBuf::from("foo.toml")),

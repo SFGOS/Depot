@@ -1,6 +1,7 @@
 //! Package creation and archive management
 
 use crate::config::Config;
+use crate::metadata_time;
 use crate::package::PackageSpec;
 use anyhow::{Context, Result};
 use std::fs;
@@ -125,6 +126,7 @@ impl Packager {
 
     fn generate_metadata_toml(&self) -> Result<()> {
         let metadata_path = self.destdir.join(".metadata.toml");
+        let completed_at = metadata_time::current_utc_timestamp_string()?;
 
         // Construct a simple metadata structure
         let mut map = toml::map::Map::new();
@@ -151,6 +153,10 @@ impl Packager {
         map.insert(
             "license".to_string(),
             license_value(&self.spec.package.license),
+        );
+        map.insert(
+            "completed_at".to_string(),
+            toml::Value::String(completed_at),
         );
 
         // Add provides
@@ -405,6 +411,10 @@ mod tests {
         assert_eq!(val.get("version").and_then(|v| v.as_str()), Some("1.0"));
         assert_eq!(val.get("revision").and_then(|v| v.as_integer()), Some(1));
         assert_eq!(val.get("license").and_then(|v| v.as_str()), Some("MIT"));
+        assert!(
+            crate::metadata_time::parse_completed_at_value(&val).is_some(),
+            "expected RFC3339 UTC completed_at"
+        );
 
         let deps = val.get("dependencies").unwrap();
         assert!(deps.get("runtime").unwrap().as_array().unwrap().is_empty());

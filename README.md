@@ -48,6 +48,12 @@ depot install zlib-1.2.11-1-x86_64.depot.pkg.tar.zst
 - `build <SPEC>`: Build a package and create an archive without installing.
   - Resolves and offers to install missing build dependencies before fetching/building.
   - Missing test dependencies automatically disable test execution for that build.
+- `update [PACKAGE ...]`: Update installed packages from configured repositories.
+  - With no package names, updates every installed package that has a newer repo version available.
+  - Refreshes source repos first, compares installed package version/revision and UTC completion time against repo metadata, and installs any newly introduced runtime dependencies before applying updates.
+- `check [DIR]`: Recursively scan `DIR` (default `.`) for package specs and report newer upstream versions when they can be inferred from versioned source URLs.
+  - Supports git tag-style sources such as `...git#v$version`.
+  - Also checks tag-style release URLs such as GitHub `releases/download/$version/...`.
 - `info <PACKAGE_OR_SPEC>`: Show information about a package.
 - `search <QUERY>`: Search enabled source/binary repos by package name and provided features.
   - Use `--files` to search binary repo metadata file lists.

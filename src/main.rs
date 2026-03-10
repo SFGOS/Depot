@@ -13,6 +13,7 @@ mod fakeroot;
 mod index;
 mod install;
 mod locking;
+mod metadata_time;
 mod package;
 mod planner;
 mod runtime_env;

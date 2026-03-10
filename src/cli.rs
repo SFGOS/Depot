@@ -90,6 +90,18 @@ pub enum Commands {
         #[arg(long)]
         install: bool,
     },
+    /// Update installed packages from configured repositories
+    Update {
+        /// Optional package names to update (defaults to all installed packages with upgrades)
+        #[arg(value_name = "PACKAGE", num_args = 0..)]
+        packages: Vec<String>,
+    },
+    /// Scan package specs for upstream version updates
+    Check {
+        /// Directory to scan recursively for package specs
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
     /// Show information about a package
     Info {
         /// Path to package spec or installed package name
@@ -267,6 +279,35 @@ mod tests {
                 assert_eq!(spec, Some(PathBuf::from("pkg.toml")));
             }
             _ => panic!("expected install command"),
+        }
+    }
+
+    #[test]
+    fn update_accepts_no_package_names() {
+        let cli = Cli::try_parse_from(["depot", "update"]).unwrap();
+        match cli.command {
+            Commands::Update { packages } => assert!(packages.is_empty()),
+            _ => panic!("expected update command"),
+        }
+    }
+
+    #[test]
+    fn update_accepts_multiple_package_names() {
+        let cli = Cli::try_parse_from(["depot", "update", "linux", "openssl"]).unwrap();
+        match cli.command {
+            Commands::Update { packages } => {
+                assert_eq!(packages, vec!["linux".to_string(), "openssl".to_string()])
+            }
+            _ => panic!("expected update command"),
+        }
+    }
+
+    #[test]
+    fn check_accepts_custom_directory() {
+        let cli = Cli::try_parse_from(["depot", "check", "packages"]).unwrap();
+        match cli.command {
+            Commands::Check { dir } => assert_eq!(dir, PathBuf::from("packages")),
+            _ => panic!("expected check command"),
         }
     }
 }
