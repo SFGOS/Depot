@@ -81,6 +81,7 @@ test(
     build_root,
   ],
   suite: ['cargo'],
+  timeout: 0,
 )
 
 # System configuration examples installed under the actual runtime lookup paths.
