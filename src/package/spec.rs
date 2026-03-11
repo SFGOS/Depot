@@ -62,8 +62,22 @@ impl PackageSpec {
             preprocess_spec_toml_appends(&content).with_context(|| {
                 format!("Failed to preprocess package spec: {}", abs_path.display())
             })?;
-        let mut spec: PackageSpec = toml::from_str(&base_content)
+        let mut unknown_key = None;
+        let deserializer = toml::Deserializer::parse(&base_content)
             .with_context(|| format!("Failed to parse package spec: {}", abs_path.display()))?;
+        let mut spec: PackageSpec = serde_ignored::deserialize(deserializer, |path| {
+            if unknown_key.is_none() {
+                unknown_key = Some(path.to_string());
+            }
+        })
+        .with_context(|| format!("Failed to parse package spec: {}", abs_path.display()))?;
+        if let Some(path) = unknown_key {
+            anyhow::bail!(
+                "Failed to parse package spec: {}: unknown key: {}",
+                abs_path.display(),
+                path
+            );
+        }
         spec.spec_dir = abs_path
             .parent()
             .map(PathBuf::from)
@@ -2419,6 +2433,43 @@ type = "autotools"
 
         let spec = PackageSpec::from_file(&path).unwrap();
         assert!(spec.build.flags.skip_tests);
+    }
+
+    #[test]
+    fn reject_unknown_nested_keys_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "autotools"
+
+[dependencies]
+runtime = ["glibc"]
+skip_tests = true
+"#,
+        )
+        .unwrap();
+
+        let err = PackageSpec::from_file(&path).expect_err("expected unknown nested key to fail");
+        assert!(
+            err.to_string()
+                .contains("unknown key: dependencies.skip_tests")
+        );
     }
 
     #[test]
