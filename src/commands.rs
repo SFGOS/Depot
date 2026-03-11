@@ -40,6 +40,26 @@ fn should_delegate_live_rootfs_installs(rootfs: &Path) -> bool {
     !crate::fakeroot::is_root() && rootfs_is_system_root(rootfs)
 }
 
+const DEPOT_INSTALL_CONTEXT_ENV: &str = "DEPOT_INSTALL_CONTEXT";
+const INSTALL_CONTEXT_UPDATE: &str = "update";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallInvocationContext {
+    Default,
+    Update,
+}
+
+fn current_install_invocation_context() -> InstallInvocationContext {
+    match std::env::var(DEPOT_INSTALL_CONTEXT_ENV).as_deref() {
+        Ok(INSTALL_CONTEXT_UPDATE) => InstallInvocationContext::Update,
+        _ => InstallInvocationContext::Default,
+    }
+}
+
+fn suppress_nested_install_output() -> bool {
+    current_install_invocation_context() == InstallInvocationContext::Update
+}
+
 fn install_test_deps_enabled(cli_test_deps: bool, config: &config::Config) -> bool {
     cli_test_deps || config.install_test_deps
 }
@@ -72,6 +92,7 @@ struct ChildInstallCommandOptions<'a> {
     cross_prefix: Option<&'a str>,
     clean: bool,
     install_test_deps: bool,
+    install_context: Option<&'a str>,
     dep_chain: Option<&'a str>,
 }
 
@@ -115,6 +136,9 @@ fn run_install_command_with_program(
     }
     cmd.arg("install");
     cmd.args(install_requests);
+    if let Some(context) = options.install_context {
+        cmd.env(DEPOT_INSTALL_CONTEXT_ENV, context);
+    }
     if let Some(dep_chain) = options.dep_chain {
         cmd.env("DEPOT_DEPCHAIN", dep_chain);
     }
@@ -153,6 +177,7 @@ fn run_child_install_command(
             cross_prefix: options.cross_prefix,
             clean: options.clean,
             install_test_deps: options.install_test_deps,
+            install_context: None,
             dep_chain: None,
         },
     )
@@ -737,6 +762,12 @@ struct PlannedPackageInstall {
 }
 
 #[derive(Debug, Clone)]
+struct InstalledPackageOutcome {
+    package: package::PackageInfo,
+    is_update: bool,
+}
+
+#[derive(Debug, Clone)]
 struct InstallConflictSubject {
     package: String,
     provides: Vec<String>,
@@ -1150,13 +1181,28 @@ fn install_planned_packages_to_rootfs(
     plans: &[PlannedPackageInstall],
     rootfs: &Path,
     config: &config::Config,
-) -> Result<Vec<package::PackageInfo>> {
+) -> Result<Vec<InstalledPackageOutcome>> {
     let mut installed = Vec::with_capacity(plans.len());
     for plan in plans {
         install_staged_to_rootfs(&plan.spec, &plan.destdir, rootfs, config, &plan.staged)?;
-        installed.push(plan.spec.package.clone());
+        installed.push(InstalledPackageOutcome {
+            package: plan.spec.package.clone(),
+            is_update: plan.staged.is_update,
+        });
     }
     Ok(installed)
+}
+
+fn log_install_success(outcome: &InstalledPackageOutcome) {
+    let action = install_success_action(outcome.is_update);
+    ui::success(format!(
+        "Successfully {} {} v{}",
+        action, outcome.package.name, outcome.package.version
+    ));
+}
+
+fn install_success_action(is_update: bool) -> &'static str {
+    if is_update { "updated" } else { "installed" }
 }
 
 #[cfg(test)]
@@ -1165,7 +1211,7 @@ fn install_package_outputs_to_rootfs(
     destdir: &Path,
     rootfs: &Path,
     config: &config::Config,
-) -> Result<Vec<package::PackageInfo>> {
+) -> Result<Vec<InstalledPackageOutcome>> {
     let plans = plan_package_outputs_for_install(pkg_spec, destdir, rootfs, config)?;
     run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Pre, &plans)?;
     let installed = install_planned_packages_to_rootfs(&plans, rootfs, config)?;
@@ -2067,6 +2113,7 @@ fn run_update_install_command(
             cross_prefix: options.cross_prefix,
             clean: options.clean,
             install_test_deps: options.install_test_deps,
+            install_context: Some(INSTALL_CONTEXT_UPDATE),
             dep_chain: None,
         },
     )
@@ -2974,7 +3021,7 @@ fn execute_install_plan_with_child_commands(
                 let installed = install_planned_packages_to_rootfs(&plans, rootfs, config)?;
                 binary_post_hook_plans.extend(plans);
                 for pkg in installed {
-                    ui::success(format!("Installed {} v{}", pkg.name, pkg.version));
+                    log_install_success(&pkg);
                 }
             }
             planner::PlanOrigin::Installed => {}
@@ -3041,12 +3088,15 @@ fn run_direct_archive_install_requests(
     let mut staged_dirs = Vec::with_capacity(archive_paths.len());
     let mut pkg_specs = Vec::with_capacity(archive_paths.len());
     let mut install_targets = Vec::with_capacity(archive_paths.len());
+    let suppress_output = suppress_nested_install_output();
 
     for archive_path in archive_paths {
-        ui::info(format!(
-            "Installing package from: {}",
-            archive_path.display()
-        ));
+        if !suppress_output {
+            ui::info(format!(
+                "Installing package from: {}",
+                archive_path.display()
+            ));
+        }
 
         let (pkg_spec, staging_dir) = load_package_archive_into_staging(config, archive_path)?;
         if options.lib32_only {
@@ -3077,14 +3127,19 @@ fn run_direct_archive_install_requests(
         return Ok(false);
     }
 
-    if confirm_installation && !ui::prompt_package_action("installation", &install_targets, true)? {
+    if confirm_installation
+        && !suppress_output
+        && !ui::prompt_package_action("installation", &install_targets, true)?
+    {
         anyhow::bail!("Aborted");
     }
 
-    ui::info(format!(
-        "Installing {} binary archive payload(s)",
-        archive_paths.len()
-    ));
+    if !suppress_output {
+        ui::info(format!(
+            "Installing {} binary archive payload(s)",
+            archive_paths.len()
+        ));
+    }
 
     let mut transaction_plans = Vec::new();
     for (pkg_spec, staging_dir) in pkg_specs.iter().zip(staged_dirs.iter()) {
@@ -3100,10 +3155,7 @@ fn run_direct_archive_install_requests(
     )?;
     let installed = install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
     for pkg in installed {
-        ui::success(format!(
-            "Successfully installed {} v{}",
-            pkg.name, pkg.version
-        ));
+        log_install_success(&pkg);
     }
     run_transaction_hooks_for_plans(
         options.rootfs,
@@ -3186,7 +3238,10 @@ fn run_direct_install_request(
         }
     }
 
-    ui::info(format!("Installing package from: {}", spec_path.display()));
+    let suppress_output = suppress_nested_install_output();
+    if !suppress_output {
+        ui::info(format!("Installing package from: {}", spec_path.display()));
+    }
 
     let (mut pkg_spec, staging_dir): (package::PackageSpec, Option<tempfile::TempDir>) =
         if spec_path.to_string_lossy().ends_with(".tar.zst") {
@@ -3204,7 +3259,7 @@ fn run_direct_install_request(
         anyhow::bail!("--lib32-only is only supported when installing from a package spec");
     }
 
-    if staging_dir.is_none() {
+    if staging_dir.is_none() && !suppress_output {
         ui::info(format!(
             "Package: {} v{}-{}",
             pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
@@ -3235,7 +3290,7 @@ fn run_direct_install_request(
         "{} v{}-{}",
         pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
     )];
-    if !ui::prompt_package_action("installation", &install_targets, true)? {
+    if !suppress_output && !ui::prompt_package_action("installation", &install_targets, true)? {
         anyhow::bail!("Aborted");
     }
 
@@ -3324,6 +3379,7 @@ fn run_direct_install_request(
                         cross_prefix: options.cross_prefix,
                         clean: options.clean,
                         install_test_deps: options.install_test_deps,
+                        install_context: None,
                         dep_chain: Some(&new_chain),
                     },
                 )?;
@@ -3382,7 +3438,9 @@ fn run_direct_install_request(
             staging::process(&destdir, &pkg_spec)?;
         } else {
             // Binary archive path: install as-packaged without post-build transformations.
-            ui::info("Installing binary archive payload");
+            if !suppress_output {
+                ui::info("Installing binary archive payload");
+            }
         }
 
         let output_plans =
@@ -3415,10 +3473,7 @@ fn run_direct_install_request(
     )?;
     let installed = install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
     for pkg in installed {
-        ui::success(format!(
-            "Successfully installed {} v{}",
-            pkg.name, pkg.version
-        ));
+        log_install_success(&pkg);
         // TODO(snapper): create post-install snapshot after install commit succeeds.
     }
     run_transaction_hooks_for_plans(
@@ -3829,10 +3884,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         &config,
                     )?;
                     for pkg in installed {
-                        ui::success(format!(
-                            "Successfully installed {} v{}",
-                            pkg.name, pkg.version
-                        ));
+                        log_install_success(&pkg);
                         // TODO(snapper): create post-install snapshot after --install commit succeeds.
                     }
                     run_transaction_hooks_for_plans(
@@ -4481,7 +4533,7 @@ mod tests {
             install_package_outputs_to_rootfs(&spec, staged.path(), rootfs.path(), &cfg)?;
 
         assert_eq!(installed.len(), 1);
-        assert_eq!(installed[0].name, "pkg");
+        assert_eq!(installed[0].package.name, "pkg");
         assert!(rootfs.path().join("usr/bin/hello").exists());
 
         let db_path = cfg.db_dir.join("packages.db");
@@ -5328,6 +5380,7 @@ optional = []
                 cross_prefix: Some("x86_64-linux-musl"),
                 clean: true,
                 install_test_deps: true,
+                install_context: None,
                 dep_chain: Some("parent"),
             },
         )?;
@@ -5351,6 +5404,50 @@ optional = []
         );
         assert_eq!(fs::read_to_string(&env_path)?, "parent");
         Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn child_install_command_propagates_install_context_env() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+        let script_path = temp.path().join("capture-child-install-context.sh");
+        let env_path = temp.path().join("context.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"${{{}:-}}\" > \"{}\"\n",
+            DEPOT_INSTALL_CONTEXT_ENV,
+            env_path.display()
+        );
+        fs::write(&script_path, script)
+            .with_context(|| format!("Failed to write {}", script_path.display()))?;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to chmod {}", script_path.display()))?;
+
+        run_install_command_with_program(
+            &script_path,
+            &[PathBuf::from("/tmp/pkg.toml")],
+            Path::new("/"),
+            ChildInstallCommandOptions {
+                no_deps: true,
+                assume_yes: true,
+                no_flags: false,
+                cross_prefix: None,
+                clean: false,
+                install_test_deps: false,
+                install_context: Some(INSTALL_CONTEXT_UPDATE),
+                dep_chain: None,
+            },
+        )?;
+
+        assert_eq!(fs::read_to_string(&env_path)?, INSTALL_CONTEXT_UPDATE);
+        Ok(())
+    }
+
+    #[test]
+    fn install_success_action_uses_updated_for_replacements() {
+        assert_eq!(install_success_action(false), "installed");
+        assert_eq!(install_success_action(true), "updated");
     }
 
     #[test]
