@@ -21,7 +21,15 @@ pub struct ShellHelpers {
 impl ShellHelpers {
     /// Create helper commands for a given staging tree (`DESTDIR`).
     pub fn new(destdir: &Path) -> Result<Self> {
-        let tempdir = tempfile::tempdir().context("Failed to create shell helper tempdir")?;
+        let helper_root = destdir.join(INTERNAL_DEPOT_DIR).join("helpers");
+        fs::create_dir_all(&helper_root).with_context(|| {
+            format!(
+                "Failed to create shell helper root dir: {}",
+                helper_root.display()
+            )
+        })?;
+        let tempdir =
+            tempfile::tempdir_in(&helper_root).context("Failed to create shell helper tempdir")?;
         let bin_dir = tempdir.path().join("bin");
         fs::create_dir_all(&bin_dir)
             .with_context(|| format!("Failed to create helper bin dir: {}", bin_dir.display()))?;
@@ -241,7 +249,8 @@ printf '%s\n' "$path"
 
 #[cfg(test)]
 mod tests {
-    use super::shell_ident_suffix;
+    use super::{INTERNAL_DEPOT_DIR, ShellHelpers, shell_ident_suffix};
+    use tempfile::tempdir;
 
     #[test]
     fn shell_ident_suffix_normalizes_package_names() {
@@ -249,5 +258,27 @@ mod tests {
         assert_eq!(shell_ident_suffix("llvm-libgcc"), "LLVM_LIBGCC");
         assert_eq!(shell_ident_suffix("3foo"), "_3FOO");
         assert_eq!(shell_ident_suffix("foo.bar+baz"), "FOO_BAR_BAZ");
+    }
+
+    #[test]
+    fn shell_helpers_use_destdir_internal_helper_dir() {
+        let destdir = tempdir().unwrap();
+        let helpers = ShellHelpers::new(destdir.path()).unwrap();
+        let mut envs = Vec::new();
+        helpers.apply_to_env_vars(&mut envs);
+
+        let path = envs
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value)
+            .unwrap();
+
+        let helper_prefix = destdir
+            .path()
+            .join(INTERNAL_DEPOT_DIR)
+            .join("helpers")
+            .to_string_lossy()
+            .into_owned();
+        assert!(path.starts_with(&helper_prefix));
     }
 }

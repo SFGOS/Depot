@@ -2,6 +2,7 @@ project(
   'depot',
   version: '0.16.1',
   meson_version: '>=0.60.0',
+  default_options: ['buildtype=release'],
 )
 
 fs = import('fs')
@@ -79,6 +80,8 @@ test(
     cargo.full_path(),
     src_root,
     build_root,
+    cargo_profile,
+    cargo_release ? '1' : '0',
   ],
   suite: ['cargo'],
   timeout: 0,
