@@ -142,7 +142,7 @@ fn is_dep_satisfied(
 fn build_type_runs_automatic_tests(spec: &PackageSpec) -> bool {
     matches!(
         spec.build.build_type,
-        BuildType::Autotools | BuildType::CMake | BuildType::Perl
+        BuildType::Autotools | BuildType::CMake | BuildType::Meson | BuildType::Perl
     )
 }
 
@@ -323,6 +323,47 @@ pub fn require_test_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_spec_with_build(
+        build_type: BuildType,
+        configure_test_target: Option<&str>,
+        configure_test_targets: &[&str],
+    ) -> PackageSpec {
+        let mut flags = crate::package::BuildFlags::default();
+        if let Some(target) = configure_test_target {
+            flags.make_test_target = target.to_string();
+        }
+        flags.make_test_targets = configure_test_targets
+            .iter()
+            .map(|target| (*target).to_string())
+            .collect();
+        PackageSpec {
+            package: crate::package::PackageInfo {
+                name: "foo".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Default::default(),
+            manual_sources: Vec::new(),
+            source: vec![crate::package::Source {
+                url: "https://example.test/foo.tar.gz".into(),
+                sha256: "skip".into(),
+                extract_dir: "foo".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
+            }],
+            build: crate::package::Build { build_type, flags },
+            dependencies: crate::package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: std::path::PathBuf::from("."),
+        }
+    }
 
     #[test]
     fn test_parse_dep() {
@@ -505,5 +546,29 @@ mod tests {
 
         let missing = check_runtime_deps(&spec, Path::new("/definitely/not/a/real/db")).unwrap();
         assert_eq!(missing, vec!["python".to_string()]);
+    }
+
+    #[test]
+    fn test_build_type_runs_automatic_tests_matches_builder_behavior() {
+        assert!(build_type_runs_automatic_tests(&test_spec_with_build(
+            BuildType::Autotools,
+            None,
+            &[]
+        )));
+        assert!(build_type_runs_automatic_tests(&test_spec_with_build(
+            BuildType::Perl,
+            None,
+            &[]
+        )));
+        assert!(build_type_runs_automatic_tests(&test_spec_with_build(
+            BuildType::Meson,
+            None,
+            &[]
+        )));
+        assert!(build_type_runs_automatic_tests(&test_spec_with_build(
+            BuildType::CMake,
+            None,
+            &[]
+        )));
     }
 }

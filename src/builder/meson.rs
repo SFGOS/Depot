@@ -83,6 +83,36 @@ pub fn build(
             anyhow::bail!("ninja build failed");
         }
 
+        if flags.skip_tests {
+            crate::log_info!("Skipping tests: disabled by build.flags.skip_tests");
+        } else {
+            let test_suites = meson_test_suites(flags);
+            if test_suites.is_empty() {
+                crate::log_info!("Running meson test...");
+            } else {
+                crate::log_info!("Running meson test suite(s): {}...", test_suites.join(" "));
+            }
+
+            let mut test_cmd = Command::new("meson");
+            test_cmd.current_dir(&build_dir);
+            test_cmd.arg("test");
+            test_cmd.arg("-C").arg(&build_dir);
+            test_cmd.arg("--num-processes").arg(num_cpus().to_string());
+            test_cmd.arg("--print-errorlogs");
+            for suite in &test_suites {
+                test_cmd.arg("--suite").arg(suite);
+            }
+
+            crate::builder::prepare_tool_command(&mut test_cmd, &env_vars);
+
+            let status = test_cmd
+                .status()
+                .with_context(|| format!("Failed to run meson test for {}", spec.package.name))?;
+            if !status.success() {
+                anyhow::bail!("meson test failed");
+            }
+        }
+
         crate::source::hooks::run_post_compile_commands(spec, &actual_src, destdir)?;
         state.mark_done(BuildStep::PostCompileDone)?;
     } else {
@@ -144,6 +174,21 @@ fn resolve_build_dir(actual_src: &Path, flags: &crate::package::BuildFlags) -> P
     } else {
         actual_src.join("builddir")
     }
+}
+
+fn meson_test_suites(flags: &crate::package::BuildFlags) -> Vec<String> {
+    let mut suites = Vec::new();
+    let single = flags.make_test_target.trim();
+    if !single.is_empty() {
+        suites.push(single.to_string());
+    }
+    for suite in &flags.make_test_targets {
+        let trimmed = suite.trim();
+        if !trimmed.is_empty() {
+            suites.push(trimmed.to_string());
+        }
+    }
+    suites
 }
 
 fn has_option(configure: &[String], long: &str) -> bool {
@@ -405,6 +450,28 @@ mod tests {
             resolve_build_dir(src, &flags),
             PathBuf::from("/tmp/src/build")
         );
+    }
+
+    #[test]
+    fn test_meson_test_suites_uses_single_and_multiple_targets() {
+        let flags = BuildFlags {
+            make_test_target: "unit".to_string(),
+            make_test_targets: vec!["integration".to_string(), " smoke ".to_string()],
+            ..BuildFlags::default()
+        };
+        assert_eq!(
+            meson_test_suites(&flags),
+            vec![
+                "unit".to_string(),
+                "integration".to_string(),
+                "smoke".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_meson_test_suites_empty_without_targets() {
+        assert!(meson_test_suites(&BuildFlags::default()).is_empty());
     }
 
     #[test]

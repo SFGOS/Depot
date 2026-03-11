@@ -128,7 +128,7 @@ pub fn build(
             crate::log_info!("Skipping tests: disabled by build.flags.skip_tests");
         } else {
             let test_targets = phase_targets(&flags.make_test_target, &flags.make_test_targets);
-            if !test_targets.is_empty() {
+            if !cmake_uses_default_ctest(flags) {
                 let joined = test_targets.join(" ");
                 crate::log_info!("Running cmake test target(s): {}...", joined);
                 let mut test_cmd = Command::new("cmake");
@@ -149,7 +149,20 @@ pub fn build(
                     anyhow::bail!("cmake test target(s) '{}' failed", joined);
                 }
             } else {
-                crate::log_info!("Skipping tests: no build.flags.make_test_target(s) for cmake");
+                crate::log_info!("Running ctest...");
+                let mut test_cmd = Command::new("ctest");
+                test_cmd.current_dir(&build_dir);
+                test_cmd.arg("--test-dir").arg(&build_dir);
+                test_cmd.arg("-j").arg(num_cpus().to_string());
+                test_cmd.arg("--output-on-failure");
+                crate::builder::prepare_tool_command(&mut test_cmd, &env_vars);
+
+                let status = test_cmd
+                    .status()
+                    .with_context(|| format!("Failed to run ctest for {}", spec.package.name))?;
+                if !status.success() {
+                    anyhow::bail!("ctest failed");
+                }
             }
         }
 
@@ -249,6 +262,10 @@ fn phase_targets(single: &str, many: &[String]) -> Vec<String> {
         }
     }
     targets
+}
+
+fn cmake_uses_default_ctest(flags: &crate::package::BuildFlags) -> bool {
+    phase_targets(&flags.make_test_target, &flags.make_test_targets).is_empty()
 }
 
 fn cmake_generator_for_make_exec(make_exec: &str) -> Option<&'static str> {
@@ -432,6 +449,23 @@ mod tests {
             ]
         );
         assert!(phase_targets("", &[]).is_empty());
+    }
+
+    #[test]
+    fn test_cmake_uses_default_ctest_without_explicit_targets() {
+        assert!(cmake_uses_default_ctest(&BuildFlags::default()));
+
+        let explicit_single = BuildFlags {
+            make_test_target: "test".into(),
+            ..BuildFlags::default()
+        };
+        assert!(!cmake_uses_default_ctest(&explicit_single));
+
+        let explicit_many = BuildFlags {
+            make_test_targets: vec!["check".into()],
+            ..BuildFlags::default()
+        };
+        assert!(!cmake_uses_default_ctest(&explicit_many));
     }
 
     #[test]

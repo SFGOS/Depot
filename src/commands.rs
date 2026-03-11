@@ -489,10 +489,13 @@ fn extract_package_archive_to_staging(
     Ok(tmp_dir)
 }
 
-fn build_type_runs_automatic_tests(build_type: package::BuildType) -> bool {
+fn build_type_runs_automatic_tests(spec: &package::PackageSpec) -> bool {
     matches!(
-        build_type,
-        package::BuildType::Autotools | package::BuildType::CMake | package::BuildType::Perl
+        spec.build.build_type,
+        package::BuildType::Autotools
+            | package::BuildType::CMake
+            | package::BuildType::Meson
+            | package::BuildType::Perl
     )
 }
 
@@ -501,7 +504,7 @@ fn maybe_disable_tests_for_missing_deps(
     db_path: &Path,
 ) -> Result<()> {
     if pkg_spec.build.flags.skip_tests
-        || !build_type_runs_automatic_tests(pkg_spec.build.build_type)
+        || !build_type_runs_automatic_tests(pkg_spec)
         || pkg_spec.dependencies.test.is_empty()
     {
         return Ok(());
@@ -4435,6 +4438,48 @@ pub fn run(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_package_spec(
+        build_type: package::BuildType,
+        make_test_target: Option<&str>,
+        make_test_targets: &[&str],
+    ) -> package::PackageSpec {
+        let mut flags = package::BuildFlags::default();
+        if let Some(target) = make_test_target {
+            flags.make_test_target = target.to_string();
+        }
+        flags.make_test_targets = make_test_targets
+            .iter()
+            .map(|target| (*target).to_string())
+            .collect();
+
+        package::PackageSpec {
+            package: package::PackageInfo {
+                name: "pkg".into(),
+                version: "1.0".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Default::default(),
+            manual_sources: Vec::new(),
+            source: vec![package::Source {
+                url: "https://example.test/pkg.tar.gz".into(),
+                sha256: "skip".into(),
+                extract_dir: "pkg".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
+            }],
+            build: package::Build { build_type, flags },
+            dependencies: package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        }
+    }
     use anyhow::Context;
     use std::io::Write;
 
@@ -5448,6 +5493,30 @@ optional = []
     fn install_success_action_uses_updated_for_replacements() {
         assert_eq!(install_success_action(false), "installed");
         assert_eq!(install_success_action(true), "updated");
+    }
+
+    #[test]
+    fn build_type_runs_automatic_tests_matches_builder_behavior() {
+        assert!(build_type_runs_automatic_tests(&test_package_spec(
+            package::BuildType::Autotools,
+            None,
+            &[]
+        )));
+        assert!(build_type_runs_automatic_tests(&test_package_spec(
+            package::BuildType::Perl,
+            None,
+            &[]
+        )));
+        assert!(build_type_runs_automatic_tests(&test_package_spec(
+            package::BuildType::Meson,
+            None,
+            &[]
+        )));
+        assert!(build_type_runs_automatic_tests(&test_package_spec(
+            package::BuildType::CMake,
+            None,
+            &[]
+        )));
     }
 
     #[test]
