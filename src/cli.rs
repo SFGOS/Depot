@@ -152,6 +152,33 @@ pub enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    #[command(hide = true)]
+    Internal {
+        #[command(subcommand)]
+        command: InternalCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum InternalCommands {
+    #[command(hide = true)]
+    PythonBuild {
+        #[arg(long, default_value = ".")]
+        src_dir: PathBuf,
+        #[arg(long, default_value = "dist")]
+        dist_dir: PathBuf,
+        #[arg(long = "config-setting")]
+        config_settings: Vec<String>,
+    },
+    #[command(hide = true)]
+    PythonInstall {
+        #[arg(long, default_value = "dist")]
+        dist_dir: PathBuf,
+        #[arg(long = "wheel", value_name = "FILE")]
+        wheels: Vec<PathBuf>,
+        #[arg(long, default_value = "/usr")]
+        prefix: String,
+    },
 }
 
 #[derive(Subcommand)]

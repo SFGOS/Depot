@@ -12,14 +12,20 @@ pub const INTERNAL_DEPOT_DIR: &str = ".depot";
 pub const INTERNAL_OUTPUTS_DIR: &str = ".depot/outputs";
 const DEPOT_HAUL_HELPER_ENV: &str = "DEPOT_HAUL_HELPER";
 const DEPOT_SUBDESTDIR_HELPER_ENV: &str = "DEPOT_SUBDESTDIR_HELPER";
+const DEPOT_PYTHON_BUILD_HELPER_ENV: &str = "DEPOT_PYTHON_BUILD_HELPER";
+const DEPOT_PYTHON_INSTALL_HELPER_ENV: &str = "DEPOT_PYTHON_INSTALL_HELPER";
+const DEPOT_EXECUTABLE_ENV: &str = "DEPOT_EXECUTABLE";
 
 /// Ephemeral helper command directory to prepend to PATH while running scripts.
 pub struct ShellHelpers {
     _tempdir: TempDir,
     path_value: String,
     outputs_dir: PathBuf,
+    depot_executable: PathBuf,
     haul_path: PathBuf,
     subdestdir_path: PathBuf,
+    python_build_path: PathBuf,
+    python_install_path: PathBuf,
 }
 
 impl ShellHelpers {
@@ -37,6 +43,8 @@ impl ShellHelpers {
         let bin_dir = tempdir.path().join("bin");
         fs::create_dir_all(&bin_dir)
             .with_context(|| format!("Failed to create helper bin dir: {}", bin_dir.display()))?;
+        let depot_executable = std::env::current_exe()
+            .context("Failed to locate depot executable for shell helpers")?;
 
         let haul_path = bin_dir.join("haul");
         fs::write(&haul_path, HAUL_SCRIPT).with_context(|| {
@@ -75,14 +83,57 @@ impl ShellHelpers {
             })?;
         }
 
+        let python_build_path = bin_dir.join("python_build");
+        fs::write(&python_build_path, PYTHON_BUILD_SCRIPT).with_context(|| {
+            format!(
+                "Failed to write shell helper command: {}",
+                python_build_path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python_build_path)
+                .with_context(|| format!("Failed to stat helper: {}", python_build_path.display()))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python_build_path, perms).with_context(|| {
+                format!("Failed to chmod helper: {}", python_build_path.display())
+            })?;
+        }
+
+        let python_install_path = bin_dir.join("python_install");
+        fs::write(&python_install_path, PYTHON_INSTALL_SCRIPT).with_context(|| {
+            format!(
+                "Failed to write shell helper command: {}",
+                python_install_path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python_install_path)
+                .with_context(|| {
+                    format!("Failed to stat helper: {}", python_install_path.display())
+                })?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python_install_path, perms).with_context(|| {
+                format!("Failed to chmod helper: {}", python_install_path.display())
+            })?;
+        }
+
         let path_value = crate::runtime_env::prepend_helper_to_safe_path(&bin_dir);
 
         Ok(Self {
             _tempdir: tempdir,
             path_value,
             outputs_dir: destdir.join(INTERNAL_OUTPUTS_DIR),
+            depot_executable,
             haul_path,
             subdestdir_path,
+            python_build_path,
+            python_install_path,
         })
     }
 
@@ -105,6 +156,21 @@ impl ShellHelpers {
             DEPOT_SUBDESTDIR_HELPER_ENV,
             self.subdestdir_path.to_string_lossy().into_owned(),
         );
+        set_env_var(
+            env_vars,
+            DEPOT_PYTHON_BUILD_HELPER_ENV,
+            self.python_build_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
+            DEPOT_PYTHON_INSTALL_HELPER_ENV,
+            self.python_install_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
+            DEPOT_EXECUTABLE_ENV,
+            self.depot_executable.to_string_lossy().into_owned(),
+        );
     }
 
     /// Apply helper-related variables directly to a `std::process::Command`.
@@ -113,7 +179,10 @@ impl ShellHelpers {
             .env("DEPOT_OUTPUTS_DIR", &self.outputs_dir)
             .env("DEPOT_INTERNAL_DIR", INTERNAL_DEPOT_DIR)
             .env(DEPOT_HAUL_HELPER_ENV, &self.haul_path)
-            .env(DEPOT_SUBDESTDIR_HELPER_ENV, &self.subdestdir_path);
+            .env(DEPOT_SUBDESTDIR_HELPER_ENV, &self.subdestdir_path)
+            .env(DEPOT_PYTHON_BUILD_HELPER_ENV, &self.python_build_path)
+            .env(DEPOT_PYTHON_INSTALL_HELPER_ENV, &self.python_install_path)
+            .env(DEPOT_EXECUTABLE_ENV, &self.depot_executable);
     }
 }
 
@@ -121,7 +190,7 @@ impl ShellHelpers {
 /// through `/bin/sh`, avoiding direct execution from mounts that may be `noexec`.
 pub fn wrap_shell_command(command: &str) -> String {
     format!(
-        "haul() {{ /bin/sh \"${{{DEPOT_HAUL_HELPER_ENV}:?}}\" \"$@\"; }}\nsubdestdir() {{ /bin/sh \"${{{DEPOT_SUBDESTDIR_HELPER_ENV}:?}}\" \"$@\"; }}\n{command}"
+        "haul() {{ /bin/sh \"${{{DEPOT_HAUL_HELPER_ENV}:?}}\" \"$@\"; }}\nsubdestdir() {{ /bin/sh \"${{{DEPOT_SUBDESTDIR_HELPER_ENV}:?}}\" \"$@\"; }}\npython_build() {{ /bin/sh \"${{{DEPOT_PYTHON_BUILD_HELPER_ENV}:?}}\" \"$@\"; }}\npython_install() {{ /bin/sh \"${{{DEPOT_PYTHON_INSTALL_HELPER_ENV}:?}}\" \"$@\"; }}\n{command}"
     )
 }
 
@@ -273,9 +342,36 @@ mkdir -p "$path"
 printf '%s\n' "$path"
 "#;
 
+const PYTHON_BUILD_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "python_build: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+
+exec "$DEPOT_EXECUTABLE" internal python-build "$@"
+"#;
+
+const PYTHON_INSTALL_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "python_install: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+[ "${DESTDIR:-}" != "" ] || fail "DESTDIR is not set"
+
+exec "$DEPOT_EXECUTABLE" internal python-install "$@"
+"#;
+
 #[cfg(test)]
 mod tests {
-    use super::{INTERNAL_DEPOT_DIR, ShellHelpers, shell_ident_suffix};
+    use super::{INTERNAL_DEPOT_DIR, ShellHelpers, shell_ident_suffix, wrap_shell_command};
     use tempfile::tempdir;
 
     #[test]
@@ -306,5 +402,30 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert!(path.starts_with(&helper_prefix));
+    }
+
+    #[test]
+    fn shell_helpers_export_python_helper_paths() {
+        let destdir = tempdir().unwrap();
+        let helpers = ShellHelpers::new(destdir.path()).unwrap();
+        let mut envs = Vec::new();
+        helpers.apply_to_env_vars(&mut envs);
+
+        assert!(
+            envs.iter()
+                .any(|(key, _)| key == "DEPOT_PYTHON_BUILD_HELPER")
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, _)| key == "DEPOT_PYTHON_INSTALL_HELPER")
+        );
+        assert!(envs.iter().any(|(key, _)| key == "DEPOT_EXECUTABLE"));
+    }
+
+    #[test]
+    fn wrap_shell_command_exposes_python_helpers() {
+        let wrapped = wrap_shell_command("python_build\npython_install");
+        assert!(wrapped.contains("python_build()"));
+        assert!(wrapped.contains("python_install()"));
     }
 }

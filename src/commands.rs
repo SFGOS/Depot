@@ -1,4 +1,4 @@
-use crate::cli::{Cli, Commands, RepoCommands, RepoKindArg};
+use crate::cli::{Cli, Commands, InternalCommands, RepoCommands, RepoKindArg};
 use crate::{
     builder, cli_assets, config, cross, db, deps, index, install, locking, package, planner,
     signing, source, staging, ui,
@@ -258,6 +258,43 @@ fn parse_keep_list(metadata: &toml::Value) -> Vec<String> {
             .collect();
     }
     Vec::new()
+}
+
+fn current_process_env_vars() -> Vec<(String, String)> {
+    std::env::vars().collect()
+}
+
+fn run_internal_command(command: InternalCommands) -> Result<()> {
+    match command {
+        InternalCommands::PythonBuild {
+            src_dir,
+            dist_dir,
+            config_settings,
+        } => {
+            let env_vars = current_process_env_vars();
+            crate::builder::python::build_wheels(&src_dir, &dist_dir, &env_vars, &config_settings)
+        }
+        InternalCommands::PythonInstall {
+            dist_dir,
+            wheels,
+            prefix,
+        } => {
+            let env_vars = current_process_env_vars();
+            let wheel_paths = if wheels.is_empty() {
+                crate::builder::python::collect_wheels(&dist_dir)?
+            } else {
+                wheels
+            };
+            let destdir = std::env::var("DESTDIR")
+                .context("DESTDIR must be set for internal python-install")?;
+            crate::builder::python::install_wheels(
+                &wheel_paths,
+                Path::new(&destdir),
+                &prefix,
+                &env_vars,
+            )
+        }
+    }
 }
 
 fn package_spec_from_archive_metadata(metadata: &toml::Value) -> package::PackageSpec {
@@ -4464,6 +4501,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 "Package specification saved to {}",
                 output_path.display()
             ));
+        }
+        Commands::Internal { command } => {
+            run_internal_command(command)?;
         }
     }
 

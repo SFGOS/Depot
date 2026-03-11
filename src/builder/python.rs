@@ -62,19 +62,7 @@ pub fn build(
         fs::create_dir_all(&dist_dir)
             .with_context(|| format!("Failed to create dist dir: {}", dist_dir.display()))?;
 
-        match detect_frontend(&actual_src)? {
-            BuildFrontend::Pep517(cfg) => {
-                build_wheel_pep517(&actual_src, &dist_dir, &env_vars, &cfg, &config_settings)?
-            }
-            BuildFrontend::LegacySetupPy => {
-                if !config_settings.is_empty() {
-                    bail!(
-                        "build.flags.config_setting is only supported for PEP 517 builds (pyproject.toml)"
-                    );
-                }
-                build_wheel_setup_py(&actual_src, &dist_dir, &env_vars)?;
-            }
-        }
+        build_wheels(&actual_src, &dist_dir, &env_vars, &config_settings)?;
 
         hooks::run_post_compile_commands(spec, &actual_src, destdir)?;
         state.mark_done(BuildStep::PostCompileDone)?;
@@ -84,11 +72,7 @@ pub fn build(
 
     if !state.is_done(BuildStep::PostInstallDone) {
         let wheels = collect_wheels(&dist_dir)?;
-        let py_version = detect_python_major_minor(&env_vars)?;
-        let prefix_rel = normalized_prefix(&flags.prefix)?;
-        for wheel in wheels {
-            install_wheel(&wheel, destdir, &prefix_rel, &py_version)?;
-        }
+        install_wheels(&wheels, destdir, &flags.prefix, &env_vars)?;
 
         hooks::run_post_install_commands(spec, &actual_src, destdir)?;
         state.mark_done(BuildStep::PostInstallDone)?;
@@ -356,7 +340,28 @@ fn build_wheel_pep517(
     Ok(())
 }
 
-fn collect_wheels(dist_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn build_wheels(
+    src_dir: &Path,
+    dist_dir: &Path,
+    env_vars: &[(String, String)],
+    config_settings: &[String],
+) -> Result<()> {
+    match detect_frontend(src_dir)? {
+        BuildFrontend::Pep517(cfg) => {
+            build_wheel_pep517(src_dir, dist_dir, env_vars, &cfg, config_settings)
+        }
+        BuildFrontend::LegacySetupPy => {
+            if !config_settings.is_empty() {
+                bail!(
+                    "build.flags.config_setting is only supported for PEP 517 builds (pyproject.toml)"
+                );
+            }
+            build_wheel_setup_py(src_dir, dist_dir, env_vars)
+        }
+    }
+}
+
+pub(crate) fn collect_wheels(dist_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut wheels = Vec::new();
     for entry in fs::read_dir(dist_dir).with_context(|| {
         format!(
@@ -510,6 +515,20 @@ fn install_wheel(
         write_entry_point_scripts(destdir, prefix_rel, &scripts)?;
     }
 
+    Ok(())
+}
+
+pub(crate) fn install_wheels(
+    wheel_paths: &[PathBuf],
+    destdir: &Path,
+    prefix: &str,
+    env_vars: &[(String, String)],
+) -> Result<()> {
+    let py_version = detect_python_major_minor(env_vars)?;
+    let prefix_rel = normalized_prefix(prefix)?;
+    for wheel in wheel_paths {
+        install_wheel(wheel, destdir, &prefix_rel, &py_version)?;
+    }
     Ok(())
 }
 

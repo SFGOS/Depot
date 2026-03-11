@@ -7,7 +7,7 @@ mod custom;
 mod makefile;
 mod meson;
 mod perl;
-mod python;
+pub(crate) mod python;
 mod rust;
 pub mod state;
 

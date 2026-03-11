@@ -15,12 +15,12 @@ pub fn is_root() -> bool {
 pub fn wrap_install_command(program: &str, destdir: &Path) -> Command {
     let script_path = shell_script_path(program);
     if is_root() {
-        build_command(program, script_path.as_deref())
+        build_command(program, script_path)
     } else {
         // Use system fakeroot command which handles LD_PRELOAD internally
         let mut cmd = Command::new("fakeroot");
         cmd.arg("--");
-        if let Some(script_path) = script_path.as_deref() {
+        if let Some(script_path) = script_path {
             cmd.arg("sh");
             cmd.arg(script_path);
         } else {
