@@ -48,7 +48,8 @@ pub fn build(
         let configure_script = resolve_perl_configure_script(spec, &actual_src);
         crate::log_info!("Running perl {}...", configure_script.display());
 
-        let mut configure_cmd = Command::new("perl");
+        let mut configure_cmd =
+            Command::new(resolved_command_path("perl").unwrap_or_else(|| PathBuf::from("perl")));
         configure_cmd.current_dir(&actual_src);
         configure_cmd.arg(&configure_script);
         if !has_assignment_prefix(&flags.configure, "INSTALLDIRS") {
@@ -307,13 +308,25 @@ fn resolved_script_path(cmd: &Command) -> Option<PathBuf> {
         return Some(program.to_path_buf());
     }
 
-    let path_value = cmd
-        .get_envs()
-        .find_map(|(key, value)| (key == "PATH").then_some(value))
-        .flatten()?;
-    std::env::split_paths(path_value)
+    let path_value = command_path_env(cmd)?;
+    std::env::split_paths(&path_value)
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
+}
+
+fn resolved_command_path(program: &str) -> Option<PathBuf> {
+    let path_value = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_value)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+fn command_path_env(cmd: &Command) -> Option<std::ffi::OsString> {
+    cmd.get_envs()
+        .find_map(|(key, value)| (key == "PATH").then_some(value))
+        .flatten()
+        .map(|value| value.to_os_string())
+        .or_else(|| std::env::var_os("PATH"))
 }
 
 fn has_assignment_prefix(args: &[String], name: &str) -> bool {
