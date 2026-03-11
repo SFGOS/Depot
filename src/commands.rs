@@ -143,7 +143,7 @@ fn run_install_command_with_program(
         cmd.env("DEPOT_DEPCHAIN", dep_chain);
     }
 
-    let status = cmd.status().with_context(|| {
+    let status = command_status_with_sh_fallback(&mut cmd).with_context(|| {
         format!(
             "Failed to spawn child install for {}",
             install_request_display(install_requests)
@@ -157,6 +157,41 @@ fn run_install_command_with_program(
             install_request_display(install_requests),
             status
         );
+    }
+}
+
+fn command_status_with_sh_fallback(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<std::process::ExitStatus> {
+    match cmd.status() {
+        Ok(status) => Ok(status),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            let program = cmd.get_program();
+            let contents = fs::read(program);
+            let is_script = contents.ok().is_some_and(|bytes| bytes.starts_with(b"#!"));
+            if !is_script {
+                return Err(err);
+            }
+
+            let mut fallback = std::process::Command::new("sh");
+            fallback.arg(program);
+            fallback.args(cmd.get_args());
+            if let Some(dir) = cmd.get_current_dir() {
+                fallback.current_dir(dir);
+            }
+            for (key, value) in cmd.get_envs() {
+                match value {
+                    Some(value) => {
+                        fallback.env(key, value);
+                    }
+                    None => {
+                        fallback.env_remove(key);
+                    }
+                }
+            }
+            fallback.status()
+        }
+        Err(err) => Err(err),
     }
 }
 

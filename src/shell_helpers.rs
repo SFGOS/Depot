@@ -10,12 +10,16 @@ use tempfile::TempDir;
 pub const INTERNAL_DEPOT_DIR: &str = ".depot";
 /// Internal split-output staging root inside `DESTDIR`.
 pub const INTERNAL_OUTPUTS_DIR: &str = ".depot/outputs";
+const DEPOT_HAUL_HELPER_ENV: &str = "DEPOT_HAUL_HELPER";
+const DEPOT_SUBDESTDIR_HELPER_ENV: &str = "DEPOT_SUBDESTDIR_HELPER";
 
 /// Ephemeral helper command directory to prepend to PATH while running scripts.
 pub struct ShellHelpers {
     _tempdir: TempDir,
     path_value: String,
     outputs_dir: PathBuf,
+    haul_path: PathBuf,
+    subdestdir_path: PathBuf,
 }
 
 impl ShellHelpers {
@@ -77,6 +81,8 @@ impl ShellHelpers {
             _tempdir: tempdir,
             path_value,
             outputs_dir: destdir.join(INTERNAL_OUTPUTS_DIR),
+            haul_path,
+            subdestdir_path,
         })
     }
 
@@ -89,14 +95,34 @@ impl ShellHelpers {
             self.outputs_dir.to_string_lossy().into_owned(),
         );
         set_env_var(env_vars, "DEPOT_INTERNAL_DIR", INTERNAL_DEPOT_DIR);
+        set_env_var(
+            env_vars,
+            DEPOT_HAUL_HELPER_ENV,
+            self.haul_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
+            DEPOT_SUBDESTDIR_HELPER_ENV,
+            self.subdestdir_path.to_string_lossy().into_owned(),
+        );
     }
 
     /// Apply helper-related variables directly to a `std::process::Command`.
     pub fn apply_to_command(&self, cmd: &mut std::process::Command) {
         cmd.env("PATH", &self.path_value)
             .env("DEPOT_OUTPUTS_DIR", &self.outputs_dir)
-            .env("DEPOT_INTERNAL_DIR", INTERNAL_DEPOT_DIR);
+            .env("DEPOT_INTERNAL_DIR", INTERNAL_DEPOT_DIR)
+            .env(DEPOT_HAUL_HELPER_ENV, &self.haul_path)
+            .env(DEPOT_SUBDESTDIR_HELPER_ENV, &self.subdestdir_path);
     }
+}
+
+/// Wrap a shell command with helper functions that invoke the helper scripts
+/// through `/bin/sh`, avoiding direct execution from mounts that may be `noexec`.
+pub fn wrap_shell_command(command: &str) -> String {
+    format!(
+        "haul() {{ /bin/sh \"${{{DEPOT_HAUL_HELPER_ENV}:?}}\" \"$@\"; }}\nsubdestdir() {{ /bin/sh \"${{{DEPOT_SUBDESTDIR_HELPER_ENV}:?}}\" \"$@\"; }}\n{command}"
+    )
 }
 
 /// Convert a package name into a safe shell identifier suffix.

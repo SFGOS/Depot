@@ -116,9 +116,14 @@ pub fn build(
             build_function_mode_command(spec, destdir, &abs_build_script)?
         } else {
             let mut cmd = fakeroot::wrap_install_command("sh", destdir);
-            // Run custom scripts with `-e` so command failures stop the build immediately
-            // instead of being masked by later shell commands.
-            cmd.arg("-e").arg(&abs_build_script);
+            let wrapper = crate::shell_helpers::wrap_shell_command(". \"$1\"");
+            // Run custom scripts through `sh -c` so helper commands like `haul`
+            // work even when the helper scripts live on a `noexec` mount.
+            cmd.arg("-eu")
+                .arg("-c")
+                .arg(wrapper)
+                .arg("sh")
+                .arg(&abs_build_script);
             cmd
         };
         cmd.current_dir(&build_dir);
@@ -179,8 +184,8 @@ fn build_function_mode_command(
     destdir: &Path,
     build_script: &Path,
 ) -> Result<Command> {
-    let mut wrapper = String::new();
-    wrapper.push_str("set -eu\n");
+    let mut wrapper = crate::shell_helpers::wrap_shell_command("");
+    wrapper.push_str("\nset -eu\n");
     wrapper.push_str("depot_has_function() {\n");
     wrapper.push_str("    case \"$(type \"$1\" 2>/dev/null || :)\" in\n");
     wrapper.push_str("        *function*) return 0 ;;\n");

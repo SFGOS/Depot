@@ -125,6 +125,7 @@ pub fn run_post_configure_commands(
     for cmd in commands {
         let cmd_str = spec.expand_vars(cmd);
         crate::log_info!("  post_configure: {}", cmd_str);
+        let wrapped_cmd = crate::shell_helpers::wrap_shell_command(&cmd_str);
 
         let mut shell_cmd = Command::new("sh");
         shell_cmd.current_dir(src_dir);
@@ -136,7 +137,7 @@ pub fn run_post_configure_commands(
             .env("CC", &spec.build.flags.cc)
             .env("AR", &spec.build.flags.ar)
             .arg("-c")
-            .arg(&cmd_str)
+            .arg(&wrapped_cmd)
             .status()
             .with_context(|| format!("Failed to run post_configure command: {}", cmd_str))?;
 
@@ -161,6 +162,7 @@ pub fn run_post_compile_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
     for cmd in commands {
         let cmd_str = spec.expand_vars(cmd);
         crate::log_info!("  post_compile: {}", cmd_str);
+        let wrapped_cmd = crate::shell_helpers::wrap_shell_command(&cmd_str);
 
         let mut shell_cmd = Command::new("sh");
         shell_cmd.current_dir(src_dir);
@@ -172,7 +174,7 @@ pub fn run_post_compile_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
             .env("CC", &spec.build.flags.cc)
             .env("AR", &spec.build.flags.ar)
             .arg("-c")
-            .arg(&cmd_str)
+            .arg(&wrapped_cmd)
             .status()
             .with_context(|| format!("Failed to run post_compile command: {}", cmd_str))?;
 
@@ -197,6 +199,7 @@ pub fn run_post_install_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
     for cmd in commands {
         let cmd_str = spec.expand_vars(cmd);
         crate::log_info!("  post_install: {}", cmd_str);
+        let wrapped_cmd = crate::shell_helpers::wrap_shell_command(&cmd_str);
 
         let mut shell_cmd = Command::new("sh");
         shell_cmd.current_dir(src_dir);
@@ -208,7 +211,7 @@ pub fn run_post_install_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
             .env("CC", &spec.build.flags.cc)
             .env("AR", &spec.build.flags.ar)
             .arg("-c")
-            .arg(&cmd_str)
+            .arg(&wrapped_cmd)
             .status()
             .with_context(|| format!("Failed to run post_install command: {}", cmd_str))?;
 

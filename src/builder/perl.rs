@@ -59,7 +59,7 @@ pub fn build(
         }
         crate::builder::prepare_tool_command(&mut configure_cmd, &env_vars);
 
-        let status = configure_cmd.status().with_context(|| {
+        let status = command_status_with_sh_fallback(&mut configure_cmd).with_context(|| {
             format!(
                 "Failed to run perl {} in {}",
                 configure_script.display(),
@@ -102,7 +102,7 @@ pub fn build(
             }
             crate::builder::prepare_tool_command(&mut make_cmd, &env_vars);
 
-            let status = make_cmd.status().with_context(|| {
+            let status = command_status_with_sh_fallback(&mut make_cmd).with_context(|| {
                 format!("Failed to run {} in {}", make_exec, build_dir.display())
             })?;
             if !status.success() {
@@ -148,7 +148,7 @@ pub fn build(
                 }
                 crate::builder::prepare_tool_command(&mut test_cmd, &env_vars);
 
-                let status = test_cmd.status().with_context(|| {
+                let status = command_status_with_sh_fallback(&mut test_cmd).with_context(|| {
                     format!(
                         "Failed to run {} {} in {}",
                         make_exec,
@@ -221,7 +221,7 @@ pub fn build(
             ));
             crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
 
-            let status = install_cmd.status().with_context(|| {
+            let status = command_status_with_sh_fallback(&mut install_cmd).with_context(|| {
                 format!(
                     "Failed to run {} {} for {} in {}",
                     make_exec,
@@ -263,6 +263,57 @@ fn resolve_perl_configure_script(spec: &PackageSpec, actual_src: &Path) -> PathB
     } else {
         actual_src.join(path)
     }
+}
+
+fn command_status_with_sh_fallback(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    match cmd.status() {
+        Ok(status) => Ok(status),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            let Some(script) = resolved_script_path(cmd) else {
+                return Err(err);
+            };
+            let contents = fs::read(&script);
+            let is_script = contents.ok().is_some_and(|bytes| bytes.starts_with(b"#!"));
+            if !is_script {
+                return Err(err);
+            }
+
+            let mut fallback = Command::new("sh");
+            fallback.arg(&script);
+            fallback.args(cmd.get_args());
+            if let Some(dir) = cmd.get_current_dir() {
+                fallback.current_dir(dir);
+            }
+            fallback.env_clear();
+            for (key, value) in cmd.get_envs() {
+                match value {
+                    Some(value) => {
+                        fallback.env(key, value);
+                    }
+                    None => {
+                        fallback.env_remove(key);
+                    }
+                }
+            }
+            fallback.status()
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn resolved_script_path(cmd: &Command) -> Option<PathBuf> {
+    let program = Path::new(cmd.get_program());
+    if program.components().count() > 1 || program.is_absolute() {
+        return Some(program.to_path_buf());
+    }
+
+    let path_value = cmd
+        .get_envs()
+        .find_map(|(key, value)| (key == "PATH").then_some(value))
+        .flatten()?;
+    std::env::split_paths(path_value)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
 }
 
 fn has_assignment_prefix(args: &[String], name: &str) -> bool {
