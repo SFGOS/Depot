@@ -791,10 +791,6 @@ fn lib32_package_name(name: &str) -> String {
     format!("lib32-{name}")
 }
 
-fn lib32_arch_name(arch: &str) -> String {
-    arch.replace("x86_64", "i686")
-}
-
 fn make_lib32_build_spec(base: &package::PackageSpec) -> package::PackageSpec {
     let mut spec = base.clone();
     let flags = &mut spec.build.flags;
@@ -4274,13 +4270,12 @@ pub fn run(cli: Cli) -> Result<()> {
                 !cli.no_flags,
                 cli.lib32_only,
             )? {
-                let lib32_arch = lib32_arch_name(arch);
                 let packager = package::Packager::new(
                     lib32_spec.clone(),
                     lib32_destdir.clone(),
                     config.clone(),
                 );
-                let pkg_file = packager.create_package(Path::new("."), &lib32_arch)?;
+                let pkg_file = packager.create_package(Path::new("."), arch)?;
                 if let Some(sig_path) =
                     signing::auto_sign_zst_file_detached(&cli.rootfs, &pkg_file)?
                 {
