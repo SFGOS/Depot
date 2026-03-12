@@ -105,6 +105,7 @@ pub(crate) struct PlannerOptions {
     pub prefer_binary: bool,
     pub local_sibling_root: Option<PathBuf>,
     pub include_test_deps: bool,
+    pub lib32_only_requested_specs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -267,11 +268,13 @@ impl<'a> Resolver<'a> {
         requested_by: String,
     ) -> Result<NodeIndex> {
         let include_test_deps = self.opts.include_test_deps;
+        let lib32_only =
+            self.opts.lib32_only_requested_specs && requested_by.starts_with("requested ");
         let (package_name, deps_needed) = {
             let spec = self.load_spec(path)?;
             (
                 spec.package.name.clone(),
-                source_deps_for_install(spec, include_test_deps),
+                source_deps_for_install(spec, include_test_deps, lib32_only),
             )
         };
         if let Some(&idx) = self.by_package.get(&package_name) {
@@ -613,31 +616,57 @@ impl<'a> Resolver<'a> {
     }
 }
 
-fn source_deps_for_install(spec: &PackageSpec, include_test_deps: bool) -> Vec<String> {
+fn source_deps_for_install(
+    spec: &PackageSpec,
+    include_test_deps: bool,
+    lib32_only: bool,
+) -> Vec<String> {
     let mut deps_all = Vec::new();
-    let local_provides = spec.local_dependency_provides();
-    if !spec.is_metapackage() {
+    let include_lib32 = lib32_only || spec.build.flags.build_32;
+    let local_provides = spec.local_dependency_provides_for_selection(!lib32_only, include_lib32);
+    if !lib32_only && !spec.is_metapackage() {
         for dep in &spec.dependencies.build {
             push_unique(&mut deps_all, dep.clone());
         }
     }
-    for dep in &spec.dependencies.runtime {
-        if !local_provides.contains(deps::dep_name(dep)) {
+    if include_lib32 && !spec.is_metapackage() {
+        for dep in &spec.lib32_dependencies().build {
             push_unique(&mut deps_all, dep.clone());
         }
     }
+    if !lib32_only {
+        for dep in &spec.dependencies.runtime {
+            if !local_provides.contains(deps::dep_name(dep)) {
+                push_unique(&mut deps_all, dep.clone());
+            }
+        }
 
-    for out in spec.outputs() {
-        let deps = spec.dependencies_for_output(&out.name);
-        for dep in deps.runtime {
-            if !local_provides.contains(deps::dep_name(&dep)) {
-                push_unique(&mut deps_all, dep);
+        for out in spec.outputs() {
+            let deps = spec.dependencies_for_output(&out.name);
+            for dep in deps.runtime {
+                if !local_provides.contains(deps::dep_name(&dep)) {
+                    push_unique(&mut deps_all, dep);
+                }
+            }
+        }
+    }
+    if include_lib32 {
+        for dep in &spec.lib32_dependencies().runtime {
+            if !local_provides.contains(deps::dep_name(dep)) {
+                push_unique(&mut deps_all, dep.clone());
             }
         }
     }
     if include_test_deps && !spec.build.flags.skip_tests {
-        for dep in &spec.dependencies.test {
-            push_unique(&mut deps_all, dep.clone());
+        if !lib32_only {
+            for dep in &spec.dependencies.test {
+                push_unique(&mut deps_all, dep.clone());
+            }
+        }
+        if include_lib32 {
+            for dep in &spec.lib32_dependencies().test {
+                push_unique(&mut deps_all, dep.clone());
+            }
         }
     }
     deps_all
@@ -809,6 +838,7 @@ mod tests {
                 runtime: vec!["foo-libs".into(), "zlib".into()],
                 test: vec!["bats".into()],
                 optional: vec!["docs-viewer".into()],
+                lib32: None,
             },
             package_alternatives: BTreeMap::from([(
                 "foo-libs".into(),
@@ -825,6 +855,7 @@ mod tests {
                     runtime: vec!["foo-libs".into(), "libfoo".into(), "openssl".into()],
                     test: Vec::new(),
                     optional: Vec::new(),
+                    lib32: None,
                 },
             )]),
             spec_dir: PathBuf::from("."),
@@ -888,7 +919,7 @@ mod tests {
     #[test]
     fn source_deps_for_install_excludes_local_runtime_outputs_and_provides() {
         let spec = mk_spec();
-        let deps = source_deps_for_install(&spec, false);
+        let deps = source_deps_for_install(&spec, false, false);
         assert!(deps.contains(&"make".to_string()));
         assert!(deps.contains(&"zlib".to_string()));
         assert!(deps.contains(&"openssl".to_string()));
@@ -899,15 +930,34 @@ mod tests {
     #[test]
     fn source_deps_for_install_does_not_include_test_deps() {
         let spec = mk_spec();
-        let deps = source_deps_for_install(&spec, false);
+        let deps = source_deps_for_install(&spec, false, false);
         assert!(!deps.contains(&"bats".to_string()));
     }
 
     #[test]
     fn source_deps_for_install_includes_test_deps_when_enabled() {
         let spec = mk_spec();
-        let deps = source_deps_for_install(&spec, true);
+        let deps = source_deps_for_install(&spec, true, false);
         assert!(deps.contains(&"bats".to_string()));
+    }
+
+    #[test]
+    fn source_deps_for_install_uses_lib32_only_dependencies_when_requested() {
+        let mut spec = mk_spec();
+        spec.dependencies.lib32 = Some(crate::package::DependencyGroup {
+            build: vec!["gcc-multilib".into()],
+            runtime: vec!["lib32-zlib".into()],
+            test: vec!["lib32-bats".into()],
+            optional: Vec::new(),
+        });
+
+        let deps = source_deps_for_install(&spec, true, true);
+        assert!(deps.contains(&"gcc-multilib".to_string()));
+        assert!(deps.contains(&"lib32-zlib".to_string()));
+        assert!(deps.contains(&"lib32-bats".to_string()));
+        assert!(!deps.contains(&"make".to_string()));
+        assert!(!deps.contains(&"zlib".to_string()));
+        assert!(!deps.contains(&"bats".to_string()));
     }
 
     #[test]
@@ -957,6 +1007,7 @@ mod tests {
                 prefer_binary: true,
                 local_sibling_root: None,
                 include_test_deps: false,
+                lib32_only_requested_specs: false,
             },
         )
         .unwrap();

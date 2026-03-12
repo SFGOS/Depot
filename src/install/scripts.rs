@@ -115,6 +115,11 @@ impl Hook {
         let compact = self.canonical_name().replace('_', "");
         [compact.clone(), format!("{}.sh", compact)]
     }
+
+    fn legacy_root_lib32_candidate_names(self) -> [String; 2] {
+        let compact = self.canonical_name().replace('_', "");
+        [format!("lib32-{compact}"), format!("lib32-{compact}.sh")]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +159,7 @@ pub fn stage_scripts_from_spec_dir(spec: &PackageSpec, destdir: &Path) -> Result
         );
     }
 
-    let legacy_hooks = collect_legacy_root_hooks(&spec.spec_dir)?;
+    let legacy_hooks = collect_legacy_root_hooks(&spec.spec_dir, &spec.package.name)?;
     if !has_scripts_dir && legacy_hooks.is_empty() {
         return Ok(false);
     }
@@ -749,48 +754,82 @@ fn is_lib32_package(pkg_name: &str) -> bool {
     pkg_name.starts_with("lib32-")
 }
 
-fn collect_legacy_root_hooks(spec_dir: &Path) -> Result<Vec<(Hook, PathBuf)>> {
-    let mut found = Vec::new();
-
-    for hook in ALL_HOOKS {
-        let mut hook_matches = Vec::new();
-        for candidate in hook.legacy_root_candidate_names() {
-            let path = spec_dir.join(candidate);
-            let metadata = match path.symlink_metadata() {
-                Ok(meta) => meta,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("Failed to inspect legacy hook script: {}", path.display())
-                    });
-                }
-            };
-
-            let file_type = metadata.file_type();
-            if !file_type.is_file() && !file_type.is_symlink() {
-                bail!(
-                    "Legacy lifecycle hook candidate exists but is not a file: {}",
-                    path.display()
-                );
+fn collect_legacy_root_hook_candidates<I>(
+    spec_dir: &Path,
+    hook_label: &str,
+    candidates: I,
+) -> Result<Option<PathBuf>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut matches = Vec::new();
+    for candidate in candidates {
+        let path = spec_dir.join(&candidate);
+        let metadata = match path.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to inspect legacy hook script: {}", path.display())
+                });
             }
+        };
 
-            hook_matches.push(path);
-        }
-
-        if hook_matches.len() > 1 {
-            let names = hook_matches
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
+        let file_type = metadata.file_type();
+        if !file_type.is_file() && !file_type.is_symlink() {
             bail!(
-                "Ambiguous legacy lifecycle hook '{}': multiple script candidates found: {}",
-                hook.canonical_name(),
-                names
+                "Legacy lifecycle hook candidate exists but is not a file: {}",
+                path.display()
             );
         }
 
-        if let Some(path) = hook_matches.into_iter().next() {
+        matches.push(path);
+    }
+
+    if matches.len() > 1 {
+        let names = matches
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "Ambiguous legacy lifecycle hook '{}': multiple script candidates found: {}",
+            hook_label,
+            names
+        );
+    }
+
+    Ok(matches.into_iter().next())
+}
+
+fn collect_legacy_root_hooks(spec_dir: &Path, pkg_name: &str) -> Result<Vec<(Hook, PathBuf)>> {
+    let mut found = Vec::new();
+
+    for hook in ALL_HOOKS {
+        let matched_path = if is_lib32_package(pkg_name) {
+            let lib32_label = format!("{} (lib32)", hook.canonical_name());
+            if let Some(path) = collect_legacy_root_hook_candidates(
+                spec_dir,
+                &lib32_label,
+                hook.legacy_root_lib32_candidate_names(),
+            )? {
+                Some(path)
+            } else {
+                collect_legacy_root_hook_candidates(
+                    spec_dir,
+                    hook.canonical_name(),
+                    hook.legacy_root_candidate_names(),
+                )?
+            }
+        } else {
+            collect_legacy_root_hook_candidates(
+                spec_dir,
+                hook.canonical_name(),
+                hook.legacy_root_candidate_names(),
+            )?
+        };
+
+        if let Some(path) = matched_path {
             found.push((hook, path));
         }
     }
@@ -1281,5 +1320,48 @@ mod tests {
                 .mode();
             assert_ne!(mode & 0o111, 0);
         }
+    }
+
+    #[test]
+    fn stage_scripts_from_spec_dir_stages_lib32_prefixed_legacy_root_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec_dir = tmp.path().join("spec");
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::create_dir_all(&destdir).unwrap();
+
+        std::fs::write(spec_dir.join("lib32-postinstall.sh"), "echo lib32-post").unwrap();
+
+        let mut spec = mk_spec(&spec_dir);
+        spec.package.name = "lib32-foo".into();
+        let staged = stage_scripts_from_spec_dir(&spec, &destdir).unwrap();
+        assert!(staged);
+        assert!(destdir.join("scripts/post_install").exists());
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(destdir.join("scripts/post_install"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0);
+        }
+    }
+
+    #[test]
+    fn stage_scripts_from_spec_dir_lib32_falls_back_to_generic_legacy_root_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec_dir = tmp.path().join("spec");
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::create_dir_all(&destdir).unwrap();
+
+        // No lib32-prefixed hook; the generic one should be staged for lib32 packages.
+        std::fs::write(spec_dir.join("postinstall.sh"), "echo fallback").unwrap();
+
+        let mut spec = mk_spec(&spec_dir);
+        spec.package.name = "lib32-foo".into();
+        let staged = stage_scripts_from_spec_dir(&spec, &destdir).unwrap();
+        assert!(staged);
+        assert!(destdir.join("scripts/post_install").exists());
     }
 }

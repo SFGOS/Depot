@@ -225,6 +225,14 @@ impl PackageSpec {
     ///
     /// If no per-output override exists, returns the top-level dependencies.
     pub fn dependencies_for_output(&self, pkg_name: &str) -> Dependencies {
+        if pkg_name == self.lib32_package_name() {
+            return self
+                .package_dependencies
+                .get(pkg_name)
+                .cloned()
+                .unwrap_or_else(|| self.lib32_dependencies());
+        }
+
         if let Some(parent_output) = self.docs_parent_output_name(pkg_name) {
             return self
                 .package_dependencies
@@ -240,16 +248,40 @@ impl PackageSpec {
         self.package_dependencies
             .get(pkg_name)
             .cloned()
-            .unwrap_or_else(|| self.dependencies.clone())
+            .unwrap_or_else(|| self.dependencies.primary_dependencies())
     }
 
-    /// Return all package names/provided features produced by this spec.
-    ///
-    /// This includes all output package names and per-output `provides` entries.
-    pub fn local_dependency_provides(&self) -> HashSet<String> {
+    /// Return the generated lib32 companion package name for this spec.
+    pub fn lib32_package_name(&self) -> String {
+        format!("lib32-{}", self.package.name)
+    }
+
+    /// Return the effective dependency set used by the generated lib32 companion package.
+    pub fn lib32_dependencies(&self) -> Dependencies {
+        self.dependencies
+            .lib32_dependencies()
+            .unwrap_or_else(|| self.dependencies.primary_dependencies())
+    }
+
+    /// Return local package names/provided features for the selected output set.
+    pub fn local_dependency_provides_for_selection(
+        &self,
+        include_primary_outputs: bool,
+        include_lib32_output: bool,
+    ) -> HashSet<String> {
         let mut names = HashSet::new();
-        for output in self.outputs() {
-            let output_name = output.name.clone();
+        if include_primary_outputs {
+            for output in self.outputs() {
+                let output_name = output.name.clone();
+                names.insert(output_name.clone());
+                let alternatives = self.alternatives_for_output(&output_name);
+                for provided in alternatives.provides {
+                    names.insert(provided);
+                }
+            }
+        }
+        if include_lib32_output {
+            let output_name = self.lib32_package_name();
             names.insert(output_name.clone());
             let alternatives = self.alternatives_for_output(&output_name);
             for provided in alternatives.provides {
@@ -1793,6 +1825,59 @@ runtime = ["llvm-libgcc", "zstd"]
         assert_eq!(
             spec.dependencies_for_output("llvm-libs").runtime,
             vec!["llvm-libgcc".to_string(), "zstd".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_lib32_dependencies_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "llvm"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/llvm.tar.gz"
+sha256 = "skip"
+extract_dir = "llvm"
+
+[build]
+type = "custom"
+
+[dependencies]
+runtime = ["base"]
+
+[dependencies.lib32]
+build = ["gcc-multilib"]
+runtime = ["lib32-zlib"]
+test = ["bats"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.dependencies_for_output("llvm").runtime,
+            vec!["base".to_string()]
+        );
+        assert_eq!(
+            spec.dependencies_for_output("lib32-llvm").build,
+            vec!["gcc-multilib".to_string()]
+        );
+        assert_eq!(
+            spec.dependencies_for_output("lib32-llvm").runtime,
+            vec!["lib32-zlib".to_string()]
+        );
+        assert_eq!(
+            spec.dependencies_for_output("lib32-llvm").test,
+            vec!["bats".to_string()]
         );
     }
 
@@ -4355,8 +4440,37 @@ fn default_cxx() -> String {
     }
 }
 
+/// Nested dependency override group for a specific output variant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct DependencyGroup {
+    /// Dependencies required for building packages.
+    #[serde(default)]
+    pub build: Vec<String>,
+    /// Dependencies required at runtime.
+    #[serde(default)]
+    pub runtime: Vec<String>,
+    /// Dependencies required to run package test suites.
+    #[serde(default)]
+    pub test: Vec<String>,
+    /// Optional runtime integrations that enhance functionality when installed.
+    #[serde(default)]
+    pub optional: Vec<String>,
+}
+
+impl DependencyGroup {
+    fn to_dependencies(&self) -> Dependencies {
+        Dependencies {
+            build: self.build.clone(),
+            runtime: self.runtime.clone(),
+            test: self.test.clone(),
+            optional: self.optional.clone(),
+            lib32: None,
+        }
+    }
+}
+
 /// Package dependencies
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Dependencies {
     /// Dependencies required for building packages.
     #[serde(default)]
@@ -4370,4 +4484,25 @@ pub struct Dependencies {
     /// Optional runtime integrations that enhance functionality when installed.
     #[serde(default)]
     pub optional: Vec<String>,
+    /// Optional dependency overrides used only for the generated `lib32-*` companion package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lib32: Option<DependencyGroup>,
+}
+
+impl Dependencies {
+    /// Return the top-level dependency set without any nested output-specific overrides.
+    pub fn primary_dependencies(&self) -> Dependencies {
+        Dependencies {
+            build: self.build.clone(),
+            runtime: self.runtime.clone(),
+            test: self.test.clone(),
+            optional: self.optional.clone(),
+            lib32: None,
+        }
+    }
+
+    /// Return the optional lib32-specific dependency override set.
+    pub fn lib32_dependencies(&self) -> Option<Dependencies> {
+        self.lib32.as_ref().map(DependencyGroup::to_dependencies)
+    }
 }

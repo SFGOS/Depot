@@ -91,6 +91,7 @@ struct ChildInstallCommandOptions<'a> {
     no_flags: bool,
     cross_prefix: Option<&'a str>,
     clean: bool,
+    lib32_only: bool,
     install_test_deps: bool,
     install_context: Option<&'a str>,
     dep_chain: Option<&'a str>,
@@ -130,6 +131,9 @@ fn run_install_command_with_program(
     }
     if options.clean {
         cmd.arg("--clean");
+    }
+    if options.lib32_only {
+        cmd.arg("--lib32-only");
     }
     if options.install_test_deps {
         cmd.arg("--test-deps");
@@ -214,6 +218,7 @@ fn run_child_install_command(
             no_flags: options.no_flags,
             cross_prefix: options.cross_prefix,
             clean: options.clean,
+            lib32_only: false,
             install_test_deps: options.install_test_deps,
             install_context: None,
             dep_chain: None,
@@ -381,6 +386,7 @@ fn package_spec_from_archive_metadata(metadata: &toml::Value) -> package::Packag
             runtime: parse_dependency_list(metadata, "runtime"),
             test: Vec::new(),
             optional: parse_dependency_list(metadata, "optional"),
+            lib32: None,
         },
         package_alternatives: Default::default(),
         package_dependencies: Default::default(),
@@ -454,6 +460,7 @@ fn package_spec_from_repo_record(
             runtime: record.runtime_dependencies.clone(),
             test: Vec::new(),
             optional: record.optional_dependencies.clone(),
+            lib32: None,
         },
         package_alternatives: Default::default(),
         package_dependencies: Default::default(),
@@ -613,15 +620,16 @@ fn build_type_runs_automatic_tests(spec: &package::PackageSpec) -> bool {
 fn maybe_disable_tests_for_missing_deps(
     pkg_spec: &mut package::PackageSpec,
     db_path: &Path,
+    requested_outputs: deps::RequestedOutputs,
 ) -> Result<()> {
     if pkg_spec.build.flags.skip_tests
         || !build_type_runs_automatic_tests(pkg_spec)
-        || pkg_spec.dependencies.test.is_empty()
+        || deps::declared_test_deps(pkg_spec, requested_outputs).is_empty()
     {
         return Ok(());
     }
 
-    let missing_test = deps::check_test_deps(pkg_spec, db_path)?;
+    let missing_test = deps::check_test_deps_for_outputs(pkg_spec, db_path, requested_outputs)?;
     if !missing_test.is_empty() {
         ui::warn(format!(
             "Missing test dependencies: {}. Tests will be skipped.",
@@ -655,8 +663,24 @@ fn maybe_prompt_to_skip_tests_for_missing_requested_deps(
     Ok(false)
 }
 
-fn should_install_test_deps(pkg_spec: &package::PackageSpec, install_test_deps: bool) -> bool {
-    install_test_deps && !pkg_spec.build.flags.skip_tests && !pkg_spec.dependencies.test.is_empty()
+fn requested_outputs(pkg_spec: &package::PackageSpec, lib32_only: bool) -> deps::RequestedOutputs {
+    if lib32_only {
+        deps::RequestedOutputs::Lib32Only
+    } else if pkg_spec.build.flags.build_32 {
+        deps::RequestedOutputs::PrimaryAndLib32
+    } else {
+        deps::RequestedOutputs::PrimaryOnly
+    }
+}
+
+fn should_install_test_deps(
+    pkg_spec: &package::PackageSpec,
+    install_test_deps: bool,
+    requested_outputs: deps::RequestedOutputs,
+) -> bool {
+    install_test_deps
+        && !pkg_spec.build.flags.skip_tests
+        && !deps::declared_test_deps(pkg_spec, requested_outputs).is_empty()
 }
 
 fn clean_build_workspace(config: &config::Config) -> Result<()> {
@@ -817,9 +841,12 @@ fn make_lib32_build_spec(base: &package::PackageSpec) -> package::PackageSpec {
 
 fn make_lib32_package_spec(base: &package::PackageSpec) -> package::PackageSpec {
     let mut spec = base.clone();
-    spec.package.name = lib32_package_name(&base.package.name);
+    let lib32_name = lib32_package_name(&base.package.name);
+    spec.package.name = lib32_name.clone();
     // The lib32 pass currently emits a single companion package from /usr/lib32.
     spec.packages.clear();
+    spec.alternatives = base.alternatives_for_output(&lib32_name);
+    spec.dependencies = base.dependencies_for_output(&lib32_name);
     spec
 }
 
@@ -2312,6 +2339,7 @@ fn run_update_install_command(
             no_flags: options.no_flags,
             cross_prefix: options.cross_prefix,
             clean: options.clean,
+            lib32_only: false,
             install_test_deps: options.install_test_deps,
             install_context: Some(INSTALL_CONTEXT_UPDATE),
             dep_chain: None,
@@ -2406,6 +2434,7 @@ fn run_update_command(
                 prefer_binary: config.repo_settings.prefer_binary,
                 local_sibling_root: None,
                 include_test_deps: options.install_test_deps,
+                lib32_only_requested_specs: false,
             },
         )?;
         print_plan_summary(&dep_plan);
@@ -2425,6 +2454,7 @@ fn run_update_command(
                 clean: options.clean,
                 dry_run: false,
                 confirm_installation: false,
+                lib32_only_requested_specs: false,
                 install_test_deps: options.install_test_deps,
             },
         )?;
@@ -2901,7 +2931,19 @@ struct InstallPlanExecutionOptions<'a> {
     clean: bool,
     dry_run: bool,
     confirm_installation: bool,
+    lib32_only_requested_specs: bool,
     install_test_deps: bool,
+}
+
+fn step_requests_only_lib32(
+    step: &planner::PlannedStep,
+    options: &InstallPlanExecutionOptions<'_>,
+) -> bool {
+    options.lib32_only_requested_specs
+        && step
+            .requested_by
+            .iter()
+            .any(|reason| reason.starts_with("requested "))
 }
 
 fn execute_install_plan_with_child_commands(
@@ -2946,10 +2988,11 @@ fn execute_install_plan_with_child_commands(
                 let mut spec = package::PackageSpec::from_file(path)
                     .with_context(|| format!("Failed to parse spec {}", path.display()))?;
                 spec.apply_config(config);
+                let lib32_only = step_requests_only_lib32(step, &options);
                 conflict_subjects.extend(install_conflict_subjects_for_spec(
                     &spec,
-                    true,
-                    spec.build.flags.build_32,
+                    !lib32_only,
+                    spec.build.flags.build_32 || lib32_only,
                 ));
             }
             planner::PlanOrigin::Binary { record, .. } => {
@@ -2966,29 +3009,40 @@ fn execute_install_plan_with_child_commands(
     }
 
     if should_delegate_live_rootfs_installs(rootfs) {
-        let mut install_requests = Vec::new();
         for step in actionable_steps {
-            match &step.origin {
-                planner::PlanOrigin::Source { path, .. } => {
-                    install_requests.push(path.clone());
-                }
+            let install_request = match &step.origin {
+                planner::PlanOrigin::Source { path, .. } => path.clone(),
                 planner::PlanOrigin::Binary { repo_name, record } => {
                     let repo_cfg = config.binary_repos.get(repo_name).with_context(|| {
                         format!("Binary repo '{}' not found in config", repo_name)
                     })?;
-                    let archive_path = db::repo::fetch_binary_package_archive(
+                    db::repo::fetch_binary_package_archive(
                         repo_name,
                         repo_cfg,
                         rootfs,
                         record,
                         &config.package_cache_dir,
-                    )?;
-                    install_requests.push(archive_path);
+                    )?
                 }
-                planner::PlanOrigin::Installed => {}
-            }
+                planner::PlanOrigin::Installed => continue,
+            };
+            run_install_command_with_program(
+                &std::env::current_exe().context("Failed to locate depot executable")?,
+                &[install_request],
+                rootfs,
+                ChildInstallCommandOptions {
+                    no_deps: true,
+                    assume_yes: true,
+                    no_flags: options.no_flags,
+                    cross_prefix: options.cross_prefix,
+                    clean: options.clean,
+                    lib32_only: step_requests_only_lib32(step, &options),
+                    install_test_deps: options.install_test_deps,
+                    install_context: None,
+                    dep_chain: None,
+                },
+            )?;
         }
-        run_child_install_command(&install_requests, rootfs, options)?;
         return Ok(());
     }
 
@@ -3196,6 +3250,9 @@ fn execute_install_plan_with_child_commands(
                 }
                 if options.clean {
                     cmd.arg("--clean");
+                }
+                if step_requests_only_lib32(step, &options) {
+                    cmd.arg("--lib32-only");
                 }
                 cmd.arg("install").arg(path);
 
@@ -3466,6 +3523,8 @@ fn run_direct_install_request(
         ));
     }
 
+    let requested_outputs = requested_outputs(&pkg_spec, options.lib32_only);
+
     let mut conflict_subjects = install_conflict_subjects_for_spec(
         &pkg_spec,
         !options.lib32_only,
@@ -3506,8 +3565,11 @@ fn run_direct_install_request(
     let db_path = config.installed_db_path(options.rootfs);
 
     if staging_dir.is_none() {
-        if options.no_deps && should_install_test_deps(&pkg_spec, options.install_test_deps) {
-            let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+        if options.no_deps
+            && should_install_test_deps(&pkg_spec, options.install_test_deps, requested_outputs)
+        {
+            let missing_test =
+                deps::check_test_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
             if !missing_test.is_empty()
                 && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
                     &mut pkg_spec,
@@ -3517,19 +3579,20 @@ fn run_direct_install_request(
             {
                 anyhow::bail!("Missing test dependencies: {}", missing_test.join(", "));
             }
-        } else if options.no_deps || !should_install_test_deps(&pkg_spec, options.install_test_deps)
+        } else if options.no_deps
+            || !should_install_test_deps(&pkg_spec, options.install_test_deps, requested_outputs)
         {
-            maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
+            maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path, requested_outputs)?;
         }
     }
 
     // Check dependencies and prompt for auto-install if needed
     if !options.no_deps {
-        deps::print_dep_status(&pkg_spec, &db_path)?;
+        deps::print_dep_status_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
 
         let missing_required = merge_missing_dependencies(
-            deps::check_build_deps(&pkg_spec, &db_path)?,
-            deps::check_runtime_deps(&pkg_spec, &db_path)?,
+            deps::check_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?,
+            deps::check_runtime_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?,
         );
         if !missing_required.is_empty() {
             // Check for dependency cycles via DEPOT_DEPCHAIN env var
@@ -3587,6 +3650,7 @@ fn run_direct_install_request(
                         no_flags: options.no_flags,
                         cross_prefix: options.cross_prefix,
                         clean: options.clean,
+                        lib32_only: false,
                         install_test_deps: options.install_test_deps,
                         install_context: None,
                         dep_chain: Some(&new_chain),
@@ -3596,10 +3660,11 @@ fn run_direct_install_request(
         }
 
         // Enforce required dependencies before building/installing.
-        deps::require_build_deps(&pkg_spec, &db_path)?;
-        deps::require_runtime_deps(&pkg_spec, &db_path)?;
-        if should_install_test_deps(&pkg_spec, options.install_test_deps) {
-            let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+        deps::require_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
+        deps::require_runtime_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
+        if should_install_test_deps(&pkg_spec, options.install_test_deps, requested_outputs) {
+            let missing_test =
+                deps::check_test_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
             if !missing_test.is_empty() {
                 let pkg_index =
                     index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
@@ -3645,6 +3710,7 @@ fn run_direct_install_request(
                                 no_flags: options.no_flags,
                                 cross_prefix: options.cross_prefix,
                                 clean: options.clean,
+                                lib32_only: false,
                                 install_test_deps: options.install_test_deps,
                                 install_context: None,
                                 dep_chain: None,
@@ -3661,8 +3727,9 @@ fn run_direct_install_request(
             }
         }
 
-        if should_install_test_deps(&pkg_spec, options.install_test_deps) {
-            let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+        if should_install_test_deps(&pkg_spec, options.install_test_deps, requested_outputs) {
+            let missing_test =
+                deps::check_test_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
             if !missing_test.is_empty()
                 && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
                     &mut pkg_spec,
@@ -3670,7 +3737,7 @@ fn run_direct_install_request(
                     "Requested test dependencies are still missing",
                 )?
             {
-                deps::require_test_deps(&pkg_spec, &db_path)?;
+                deps::require_test_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
             }
         }
     }
@@ -3817,6 +3884,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     prefer_binary: config.repo_settings.prefer_binary,
                     local_sibling_root: shared_local_sibling_root(&planned_spec_paths),
                     include_test_deps: install_test_deps,
+                    lib32_only_requested_specs: cli.lib32_only,
                 };
                 let plan = if planned_targets.len() == 1 {
                     planner::build_install_plan(
@@ -3844,6 +3912,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         clean: cli.clean,
                         dry_run: cli.dry_run,
                         confirm_installation: true,
+                        lib32_only_requested_specs: cli.lib32_only,
                         install_test_deps,
                     },
                 )?;
@@ -3913,6 +3982,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
             // Apply system overrides
             pkg_spec.apply_config(&config);
+            let requested_outputs = requested_outputs(&pkg_spec, cli.lib32_only);
 
             // Ensure database directory exists
             std::fs::create_dir_all(&config.db_dir).with_context(|| {
@@ -3923,8 +3993,11 @@ pub fn run(cli: Cli) -> Result<()> {
             })?;
             let db_path = config.installed_db_path(&cli.rootfs);
 
-            if cli.no_deps && should_install_test_deps(&pkg_spec, install_test_deps) {
-                let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+            if cli.no_deps
+                && should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs)
+            {
+                let missing_test =
+                    deps::check_test_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
                 if !missing_test.is_empty()
                     && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
                         &mut pkg_spec,
@@ -3934,16 +4007,18 @@ pub fn run(cli: Cli) -> Result<()> {
                 {
                     anyhow::bail!("Missing test dependencies: {}", missing_test.join(", "));
                 }
-            } else if cli.no_deps || !should_install_test_deps(&pkg_spec, install_test_deps) {
-                maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
+            } else if cli.no_deps
+                || !should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs)
+            {
+                maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path, requested_outputs)?;
             }
 
             // Check build dependencies
             if !cli.no_deps {
-                deps::print_dep_status(&pkg_spec, &db_path)?;
+                deps::print_dep_status_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
                 let missing_required = merge_missing_dependencies(
-                    deps::check_build_deps(&pkg_spec, &db_path)?,
-                    deps::check_runtime_deps(&pkg_spec, &db_path)?,
+                    deps::check_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?,
+                    deps::check_runtime_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?,
                 );
                 if !missing_required.is_empty() {
                     ui::warn(format!(
@@ -3963,6 +4038,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             prefer_binary: config.repo_settings.prefer_binary,
                             local_sibling_root,
                             include_test_deps: install_test_deps,
+                            lib32_only_requested_specs: false,
                         },
                     )?;
                     print_plan_summary(&dep_plan);
@@ -3987,14 +4063,16 @@ pub fn run(cli: Cli) -> Result<()> {
                             clean: cli.clean,
                             dry_run: cli.dry_run,
                             confirm_installation: false,
+                            lib32_only_requested_specs: false,
                             install_test_deps,
                         },
                     )?;
                 }
-                deps::require_build_deps(&pkg_spec, &db_path)?;
-                deps::require_runtime_deps(&pkg_spec, &db_path)?;
-                if should_install_test_deps(&pkg_spec, install_test_deps) {
-                    let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+                deps::require_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
+                deps::require_runtime_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
+                if should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs) {
+                    let missing_test =
+                        deps::check_test_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
                     if !missing_test.is_empty() {
                         let local_sibling_root = spec_path
                             .parent()
@@ -4009,6 +4087,7 @@ pub fn run(cli: Cli) -> Result<()> {
                                 prefer_binary: config.repo_settings.prefer_binary,
                                 local_sibling_root,
                                 include_test_deps: install_test_deps,
+                                lib32_only_requested_specs: false,
                             },
                         ) {
                             Ok(plan) => plan,
@@ -4053,14 +4132,20 @@ pub fn run(cli: Cli) -> Result<()> {
                                         clean: cli.clean,
                                         dry_run: cli.dry_run,
                                         confirm_installation: false,
+                                        lib32_only_requested_specs: false,
                                         install_test_deps,
                                     },
                                 )?;
                             }
                         }
 
-                        if should_install_test_deps(&pkg_spec, install_test_deps) {
-                            let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+                        if should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs)
+                        {
+                            let missing_test = deps::check_test_deps_for_outputs(
+                                &pkg_spec,
+                                &db_path,
+                                requested_outputs,
+                            )?;
                             if !missing_test.is_empty()
                                 && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
                                     &mut pkg_spec,
@@ -4068,7 +4153,11 @@ pub fn run(cli: Cli) -> Result<()> {
                                     "Requested test dependencies are still missing",
                                 )?
                             {
-                                deps::require_test_deps(&pkg_spec, &db_path)?;
+                                deps::require_test_deps_for_outputs(
+                                    &pkg_spec,
+                                    &db_path,
+                                    requested_outputs,
+                                )?;
                             }
                         }
                     }
@@ -4217,6 +4306,7 @@ pub fn run(cli: Cli) -> Result<()> {
                                 clean: cli.clean,
                                 dry_run: cli.dry_run,
                                 confirm_installation: false,
+                                lib32_only_requested_specs: false,
                                 install_test_deps,
                             },
                         )?;
@@ -5798,6 +5888,7 @@ optional = []
                 no_flags: true,
                 cross_prefix: Some("x86_64-linux-musl"),
                 clean: true,
+                lib32_only: false,
                 install_test_deps: true,
                 install_context: None,
                 dep_chain: Some("parent"),
@@ -5822,6 +5913,46 @@ optional = []
             ]
         );
         assert_eq!(fs::read_to_string(&env_path)?, "parent");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn child_install_command_includes_lib32_only_flag_when_requested() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+        let script_path = temp.path().join("capture-lib32-child-install.sh");
+        let args_path = temp.path().join("args.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+            args_path.display()
+        );
+        fs::write(&script_path, script)
+            .with_context(|| format!("Failed to write {}", script_path.display()))?;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to chmod {}", script_path.display()))?;
+
+        run_install_command_with_program(
+            &script_path,
+            &[PathBuf::from("/tmp/pkg.toml")],
+            Path::new("/"),
+            ChildInstallCommandOptions {
+                no_deps: true,
+                assume_yes: true,
+                no_flags: false,
+                cross_prefix: None,
+                clean: false,
+                lib32_only: true,
+                install_test_deps: false,
+                install_context: None,
+                dep_chain: None,
+            },
+        )?;
+
+        let captured_args = fs::read_to_string(&args_path)
+            .with_context(|| format!("Failed to read {}", args_path.display()))?;
+        assert!(captured_args.lines().any(|line| line == "--lib32-only"));
         Ok(())
     }
 
@@ -5853,6 +5984,7 @@ optional = []
                 no_flags: false,
                 cross_prefix: None,
                 clean: false,
+                lib32_only: false,
                 install_test_deps: false,
                 install_context: Some(INSTALL_CONTEXT_UPDATE),
                 dep_chain: None,
@@ -5994,5 +6126,24 @@ optional = []
             lib32.build.flags.replace_cxxflags,
             vec!["-O2=>-O3", "-fno-rtti=>-fno-exceptions"]
         );
+    }
+
+    #[test]
+    fn make_lib32_package_spec_uses_lib32_dependency_override() {
+        let mut base = test_package_spec(package::BuildType::Custom, None, &[]);
+        base.dependencies.runtime = vec!["zlib".into()];
+        base.dependencies.lib32 = Some(package::DependencyGroup {
+            build: vec!["gcc-multilib".into()],
+            runtime: vec!["lib32-zlib".into()],
+            test: Vec::new(),
+            optional: vec!["lib32-gtk-doc".into()],
+        });
+
+        let lib32 = make_lib32_package_spec(&base);
+
+        assert_eq!(lib32.package.name, "lib32-pkg");
+        assert_eq!(lib32.dependencies.build, vec!["gcc-multilib"]);
+        assert_eq!(lib32.dependencies.runtime, vec!["lib32-zlib"]);
+        assert_eq!(lib32.dependencies.optional, vec!["lib32-gtk-doc"]);
     }
 }

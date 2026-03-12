@@ -12,6 +12,7 @@ use crate::db;
 use crate::package::{BuildType, PackageSpec};
 use crate::ui;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Version comparison operator
@@ -30,6 +31,13 @@ struct ParsedDep<'a> {
     name: &'a str,
     version: Option<&'a str>,
     op: VersionOp,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RequestedOutputs {
+    PrimaryOnly,
+    PrimaryAndLib32,
+    Lib32Only,
 }
 
 /// Parse a dependency string into name, version, and operator
@@ -157,18 +165,85 @@ pub fn is_dep_satisfied_in_db(dep: &str, db_path: &Path) -> Result<bool> {
     is_dep_satisfied(dep, &installed, &provides, db_path)
 }
 
-/// Check if all build dependencies are satisfied
-pub fn check_build_deps(spec: &PackageSpec, db_path: &Path) -> Result<Vec<String>> {
+fn push_unique(v: &mut Vec<String>, item: String) {
+    if !v.contains(&item) {
+        v.push(item);
+    }
+}
+
+fn requested_dependency_sets(
+    spec: &PackageSpec,
+    outputs: RequestedOutputs,
+) -> Vec<crate::package::Dependencies> {
+    match outputs {
+        RequestedOutputs::PrimaryOnly => vec![spec.dependencies.primary_dependencies()],
+        RequestedOutputs::PrimaryAndLib32 => {
+            vec![
+                spec.dependencies.primary_dependencies(),
+                spec.lib32_dependencies(),
+            ]
+        }
+        RequestedOutputs::Lib32Only => vec![spec.lib32_dependencies()],
+    }
+}
+
+fn requested_local_provides(spec: &PackageSpec, outputs: RequestedOutputs) -> HashSet<String> {
+    match outputs {
+        RequestedOutputs::PrimaryOnly => spec.local_dependency_provides_for_selection(true, false),
+        RequestedOutputs::PrimaryAndLib32 => {
+            spec.local_dependency_provides_for_selection(true, true)
+        }
+        RequestedOutputs::Lib32Only => spec.local_dependency_provides_for_selection(false, true),
+    }
+}
+
+fn collect_build_deps(spec: &PackageSpec, outputs: RequestedOutputs) -> Vec<String> {
+    let mut deps = Vec::new();
+    for dep_set in requested_dependency_sets(spec, outputs) {
+        for dep in dep_set.build {
+            push_unique(&mut deps, dep);
+        }
+    }
+    deps
+}
+
+fn collect_runtime_deps(spec: &PackageSpec, outputs: RequestedOutputs) -> Vec<String> {
+    let mut deps = Vec::new();
+    for dep_set in requested_dependency_sets(spec, outputs) {
+        for dep in dep_set.runtime {
+            push_unique(&mut deps, dep);
+        }
+    }
+    deps
+}
+
+pub(crate) fn declared_test_deps(spec: &PackageSpec, outputs: RequestedOutputs) -> Vec<String> {
+    let mut deps = Vec::new();
+    for dep_set in requested_dependency_sets(spec, outputs) {
+        for dep in dep_set.test {
+            push_unique(&mut deps, dep);
+        }
+    }
+    deps
+}
+
+/// Check if all build dependencies are satisfied for the selected outputs.
+pub(crate) fn check_build_deps_for_outputs(
+    spec: &PackageSpec,
+    db_path: &Path,
+    outputs: RequestedOutputs,
+) -> Result<Vec<String>> {
     let mut missing = Vec::new();
+    let build_deps = collect_build_deps(spec, outputs);
 
     if !db_path.exists() {
-        return Ok(spec.dependencies.build.clone());
+        return Ok(build_deps);
     }
 
     let installed = db::get_installed_packages(db_path)?;
     let provides = db::get_all_provides(db_path)?;
 
-    for dep in &spec.dependencies.build {
+    for dep in &build_deps {
         if !is_dep_satisfied(dep, &installed, &provides, db_path)? {
             missing.push(dep.clone());
         }
@@ -177,13 +252,18 @@ pub fn check_build_deps(spec: &PackageSpec, db_path: &Path) -> Result<Vec<String
     Ok(missing)
 }
 
-/// Check if all runtime dependencies are satisfied
-pub fn check_runtime_deps(spec: &PackageSpec, db_path: &Path) -> Result<Vec<String>> {
+/// Check if all runtime dependencies are satisfied for the selected outputs.
+pub(crate) fn check_runtime_deps_for_outputs(
+    spec: &PackageSpec,
+    db_path: &Path,
+    outputs: RequestedOutputs,
+) -> Result<Vec<String>> {
     let mut missing = Vec::new();
-    let local_provides = spec.local_dependency_provides();
+    let runtime_deps = collect_runtime_deps(spec, outputs);
+    let local_provides = requested_local_provides(spec, outputs);
 
     if !db_path.exists() {
-        for dep in &spec.dependencies.runtime {
+        for dep in &runtime_deps {
             if !local_provides.contains(dep_name(dep)) {
                 missing.push(dep.clone());
             }
@@ -194,7 +274,7 @@ pub fn check_runtime_deps(spec: &PackageSpec, db_path: &Path) -> Result<Vec<Stri
     let installed = db::get_installed_packages(db_path)?;
     let provides = db::get_all_provides(db_path)?;
 
-    for dep in &spec.dependencies.runtime {
+    for dep in &runtime_deps {
         if local_provides.contains(dep_name(dep)) {
             continue;
         }
@@ -206,18 +286,23 @@ pub fn check_runtime_deps(spec: &PackageSpec, db_path: &Path) -> Result<Vec<Stri
     Ok(missing)
 }
 
-/// Check if all test dependencies are satisfied
-pub fn check_test_deps(spec: &PackageSpec, db_path: &Path) -> Result<Vec<String>> {
+/// Check if all test dependencies are satisfied for the selected outputs.
+pub(crate) fn check_test_deps_for_outputs(
+    spec: &PackageSpec,
+    db_path: &Path,
+    outputs: RequestedOutputs,
+) -> Result<Vec<String>> {
     let mut missing = Vec::new();
+    let test_deps = declared_test_deps(spec, outputs);
 
     if !db_path.exists() {
-        return Ok(spec.dependencies.test.clone());
+        return Ok(test_deps);
     }
 
     let installed = db::get_installed_packages(db_path)?;
     let provides = db::get_all_provides(db_path)?;
 
-    for dep in &spec.dependencies.test {
+    for dep in &test_deps {
         if !is_dep_satisfied(dep, &installed, &provides, db_path)? {
             missing.push(dep.clone());
         }
@@ -228,59 +313,109 @@ pub fn check_test_deps(spec: &PackageSpec, db_path: &Path) -> Result<Vec<String>
 
 /// Print dependency status
 pub fn print_dep_status(spec: &PackageSpec, db_path: &Path) -> Result<()> {
-    let missing_build = check_build_deps(spec, db_path)?;
-    let missing_runtime = check_runtime_deps(spec, db_path)?;
-    let missing_test = check_test_deps(spec, db_path)?;
+    print_dep_status_for_outputs(spec, db_path, RequestedOutputs::PrimaryOnly)
+}
 
-    if !spec.dependencies.build.is_empty() {
-        ui::info(format!(
-            "Build dependencies: {}",
-            spec.dependencies.build.join(", ")
-        ));
-        if !missing_build.is_empty() {
-            ui::warn(format!("Build deps missing: {}", missing_build.join(", ")));
-        }
+fn print_named_dep_status(label: &str, deps: &[String], missing: &[String], warn_on_missing: bool) {
+    if deps.is_empty() {
+        return;
     }
 
-    if !spec.dependencies.runtime.is_empty() {
-        ui::info(format!(
-            "Runtime dependencies: {}",
-            spec.dependencies.runtime.join(", ")
-        ));
-        if !missing_runtime.is_empty() {
-            ui::warn(format!(
-                "Runtime deps missing: {}",
-                missing_runtime.join(", ")
+    ui::info(format!("{label}: {}", deps.join(", ")));
+    if warn_on_missing && !missing.is_empty() {
+        ui::warn(format!("{label} missing: {}", missing.join(", ")));
+    }
+}
+
+/// Print dependency status for the selected outputs.
+pub(crate) fn print_dep_status_for_outputs(
+    spec: &PackageSpec,
+    db_path: &Path,
+    outputs: RequestedOutputs,
+) -> Result<()> {
+    let primary = spec.dependencies.primary_dependencies();
+    let lib32 = spec.lib32_dependencies();
+
+    if matches!(
+        outputs,
+        RequestedOutputs::PrimaryOnly | RequestedOutputs::PrimaryAndLib32
+    ) {
+        let missing_build =
+            check_build_deps_for_outputs(spec, db_path, RequestedOutputs::PrimaryOnly)?;
+        let missing_runtime =
+            check_runtime_deps_for_outputs(spec, db_path, RequestedOutputs::PrimaryOnly)?;
+        let missing_test =
+            check_test_deps_for_outputs(spec, db_path, RequestedOutputs::PrimaryOnly)?;
+
+        print_named_dep_status("Build dependencies", &primary.build, &missing_build, true);
+        print_named_dep_status(
+            "Runtime dependencies",
+            &primary.runtime,
+            &missing_runtime,
+            true,
+        );
+        print_named_dep_status(
+            "Test dependencies",
+            &primary.test,
+            &missing_test,
+            !spec.build.flags.skip_tests && build_type_runs_automatic_tests(spec),
+        );
+        if !primary.optional.is_empty() {
+            ui::info(format!(
+                "Optional dependencies: {}",
+                primary.optional.join(", ")
             ));
         }
     }
 
-    if !spec.dependencies.test.is_empty() {
-        ui::info(format!(
-            "Test dependencies: {}",
-            spec.dependencies.test.join(", ")
-        ));
-        if !spec.build.flags.skip_tests
-            && build_type_runs_automatic_tests(spec)
-            && !missing_test.is_empty()
-        {
-            ui::warn(format!("Test deps missing: {}", missing_test.join(", ")));
-        }
-    }
+    if matches!(
+        outputs,
+        RequestedOutputs::PrimaryAndLib32 | RequestedOutputs::Lib32Only
+    ) {
+        let missing_build =
+            check_build_deps_for_outputs(spec, db_path, RequestedOutputs::Lib32Only)?;
+        let missing_runtime =
+            check_runtime_deps_for_outputs(spec, db_path, RequestedOutputs::Lib32Only)?;
+        let missing_test = check_test_deps_for_outputs(spec, db_path, RequestedOutputs::Lib32Only)?;
 
-    if !spec.dependencies.optional.is_empty() {
-        ui::info(format!(
-            "Optional dependencies: {}",
-            spec.dependencies.optional.join(", ")
-        ));
+        if outputs == RequestedOutputs::Lib32Only || lib32 != primary {
+            print_named_dep_status(
+                "Lib32 build dependencies",
+                &lib32.build,
+                &missing_build,
+                true,
+            );
+            print_named_dep_status(
+                "Lib32 runtime dependencies",
+                &lib32.runtime,
+                &missing_runtime,
+                true,
+            );
+            print_named_dep_status(
+                "Lib32 test dependencies",
+                &lib32.test,
+                &missing_test,
+                !spec.build.flags.skip_tests && build_type_runs_automatic_tests(spec),
+            );
+            if !lib32.optional.is_empty() {
+                ui::info(format!(
+                    "Lib32 optional dependencies: {}",
+                    lib32.optional.join(", ")
+                ));
+            }
+        }
     }
 
     Ok(())
 }
 
-/// Verify all build dependencies are installed, error if not
-pub fn require_build_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
-    let missing = check_build_deps(spec, db_path)?;
+/// Verify all build dependencies are installed for the selected outputs.
+pub(crate) fn require_build_deps_for_outputs(
+    spec: &PackageSpec,
+    db_path: &Path,
+    outputs: RequestedOutputs,
+) -> Result<()> {
+    let missing = check_build_deps_for_outputs(spec, db_path, outputs)?;
 
     if !missing.is_empty() {
         anyhow::bail!(
@@ -292,9 +427,13 @@ pub fn require_build_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Verify all runtime dependencies are installed, error if not.
-pub fn require_runtime_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
-    let missing = check_runtime_deps(spec, db_path)?;
+/// Verify all runtime dependencies are installed for the selected outputs.
+pub(crate) fn require_runtime_deps_for_outputs(
+    spec: &PackageSpec,
+    db_path: &Path,
+    outputs: RequestedOutputs,
+) -> Result<()> {
+    let missing = check_runtime_deps_for_outputs(spec, db_path, outputs)?;
 
     if !missing.is_empty() {
         anyhow::bail!(
@@ -306,9 +445,13 @@ pub fn require_runtime_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Verify all test dependencies are installed, error if not.
-pub fn require_test_deps(spec: &PackageSpec, db_path: &Path) -> Result<()> {
-    let missing = check_test_deps(spec, db_path)?;
+/// Verify all test dependencies are installed for the selected outputs.
+pub(crate) fn require_test_deps_for_outputs(
+    spec: &PackageSpec,
+    db_path: &Path,
+    outputs: RequestedOutputs,
+) -> Result<()> {
+    let missing = check_test_deps_for_outputs(spec, db_path, outputs)?;
 
     if !missing.is_empty() {
         anyhow::bail!(
@@ -441,13 +584,19 @@ mod tests {
                 runtime: Vec::new(),
                 test: vec!["bats".into(), "python".into()],
                 optional: Vec::new(),
+                lib32: None,
             },
             package_alternatives: Default::default(),
             package_dependencies: Default::default(),
             spec_dir: std::path::PathBuf::from("."),
         };
 
-        let missing = check_test_deps(&spec, Path::new("/definitely/not/a/real/db")).unwrap();
+        let missing = check_test_deps_for_outputs(
+            &spec,
+            Path::new("/definitely/not/a/real/db"),
+            RequestedOutputs::PrimaryOnly,
+        )
+        .unwrap();
         assert_eq!(missing, vec!["bats".to_string(), "python".to_string()]);
     }
 
@@ -482,14 +631,19 @@ mod tests {
                 runtime: vec!["python".into()],
                 test: Vec::new(),
                 optional: Vec::new(),
+                lib32: None,
             },
             package_alternatives: Default::default(),
             package_dependencies: Default::default(),
             spec_dir: std::path::PathBuf::from("."),
         };
 
-        let err = require_runtime_deps(&spec, Path::new("/definitely/not/a/real/db"))
-            .expect_err("runtime deps should be required");
+        let err = require_runtime_deps_for_outputs(
+            &spec,
+            Path::new("/definitely/not/a/real/db"),
+            RequestedOutputs::PrimaryOnly,
+        )
+        .expect_err("runtime deps should be required");
         assert!(err.to_string().contains("Missing runtime dependencies"));
     }
 
@@ -531,6 +685,7 @@ mod tests {
                 runtime: vec!["foo-libs".into(), "libfoo".into(), "python".into()],
                 test: Vec::new(),
                 optional: Vec::new(),
+                lib32: None,
             },
             package_alternatives: std::collections::BTreeMap::from([(
                 "foo-libs".to_string(),
@@ -544,8 +699,32 @@ mod tests {
             spec_dir: std::path::PathBuf::from("."),
         };
 
-        let missing = check_runtime_deps(&spec, Path::new("/definitely/not/a/real/db")).unwrap();
+        let missing = check_runtime_deps_for_outputs(
+            &spec,
+            Path::new("/definitely/not/a/real/db"),
+            RequestedOutputs::PrimaryOnly,
+        )
+        .unwrap();
         assert_eq!(missing, vec!["python".to_string()]);
+    }
+
+    #[test]
+    fn test_check_runtime_deps_for_lib32_only_does_not_treat_primary_output_as_local() {
+        let mut spec = test_spec_with_build(BuildType::Custom, None, &[]);
+        spec.dependencies.lib32 = Some(crate::package::DependencyGroup {
+            build: Vec::new(),
+            runtime: vec!["foo".into()],
+            test: Vec::new(),
+            optional: Vec::new(),
+        });
+
+        let missing = check_runtime_deps_for_outputs(
+            &spec,
+            Path::new("/definitely/not/a/real/db"),
+            RequestedOutputs::Lib32Only,
+        )
+        .unwrap();
+        assert_eq!(missing, vec!["foo".to_string()]);
     }
 
     #[test]
