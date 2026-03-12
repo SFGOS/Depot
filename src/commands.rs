@@ -165,7 +165,10 @@ fn command_status_with_sh_fallback(
 ) -> std::io::Result<std::process::ExitStatus> {
     match cmd.status() {
         Ok(status) => Ok(status),
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+        Err(err)
+            if err.kind() == std::io::ErrorKind::PermissionDenied
+                || err.raw_os_error() == Some(26) =>
+        {
             let program = cmd.get_program();
             let contents = fs::read(program);
             let is_script = contents.ok().is_some_and(|bytes| bytes.starts_with(b"#!"));
@@ -261,7 +264,43 @@ fn parse_keep_list(metadata: &toml::Value) -> Vec<String> {
 }
 
 fn current_process_env_vars() -> Vec<(String, String)> {
-    std::env::vars().collect()
+    const ALLOWED_ENV_VARS: &[&str] = &[
+        "AR",
+        "CARCH",
+        "CBUILD",
+        "CC",
+        "CHOST",
+        "CPP",
+        "CROSS_COMPILE",
+        "CROSS_PREFIX",
+        "CFLAGS",
+        "CXX",
+        "CXXFLAGS",
+        "DEPOT_ROOTFS",
+        "DEPOT_SPECDIR",
+        "DESTDIR",
+        "LD",
+        "LDFLAGS",
+        "LTOFLAGS",
+        "MAKEFLAGS",
+        "NM",
+        "PREFIX",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONNOUSERSITE",
+        "RANLIB",
+        "RUSTFLAGS",
+        "SETUPTOOLS_USE_DISTUTILS",
+        "STRIP",
+    ];
+
+    ALLOWED_ENV_VARS
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect()
 }
 
 fn run_internal_command(command: InternalCommands) -> Result<()> {
@@ -592,6 +631,28 @@ fn maybe_disable_tests_for_missing_deps(
     }
 
     Ok(())
+}
+
+fn maybe_prompt_to_skip_tests_for_missing_requested_deps(
+    pkg_spec: &mut package::PackageSpec,
+    missing_test: &[String],
+    reason: &str,
+) -> Result<bool> {
+    if pkg_spec.build.flags.skip_tests
+        || !build_type_runs_automatic_tests(pkg_spec)
+        || missing_test.is_empty()
+    {
+        return Ok(false);
+    }
+
+    ui::warn(format!("{reason}: {}", missing_test.join(", ")));
+    if ui::prompt_yes_no("Continue without tests?", false)? {
+        pkg_spec.build.flags.skip_tests = true;
+        ui::warn("Tests will be skipped for this build.");
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 fn should_install_test_deps(pkg_spec: &package::PackageSpec, install_test_deps: bool) -> bool {
@@ -3380,27 +3441,33 @@ fn run_direct_install_request(
     })?;
     let db_path = config.installed_db_path(options.rootfs);
 
-    if staging_dir.is_none()
-        && (options.no_deps || !should_install_test_deps(&pkg_spec, options.install_test_deps))
-    {
-        maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
+    if staging_dir.is_none() {
+        if options.no_deps && should_install_test_deps(&pkg_spec, options.install_test_deps) {
+            let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+            if !missing_test.is_empty()
+                && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                    &mut pkg_spec,
+                    &missing_test,
+                    "Requested test dependencies are missing",
+                )?
+            {
+                anyhow::bail!("Missing test dependencies: {}", missing_test.join(", "));
+            }
+        } else if options.no_deps || !should_install_test_deps(&pkg_spec, options.install_test_deps)
+        {
+            maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
+        }
     }
 
     // Check dependencies and prompt for auto-install if needed
     if !options.no_deps {
         deps::print_dep_status(&pkg_spec, &db_path)?;
 
-        // Collect all missing dependencies (build + runtime)
-        let missing = merge_missing_dependencies(
+        let missing_required = merge_missing_dependencies(
             deps::check_build_deps(&pkg_spec, &db_path)?,
             deps::check_runtime_deps(&pkg_spec, &db_path)?,
         );
-        let missing = if should_install_test_deps(&pkg_spec, options.install_test_deps) {
-            merge_missing_dependencies(missing, deps::check_test_deps(&pkg_spec, &db_path)?)
-        } else {
-            missing
-        };
-        if !missing.is_empty() {
+        if !missing_required.is_empty() {
             // Check for dependency cycles via DEPOT_DEPCHAIN env var
             let dep_chain = std::env::var("DEPOT_DEPCHAIN").unwrap_or_default();
             let chain_set: std::collections::HashSet<&str> =
@@ -3414,8 +3481,11 @@ fn run_direct_install_request(
                 );
             }
 
-            ui::warn(format!("Missing dependencies: {}", missing.join(", ")));
-            if ui::prompt_package_action("dependency installation", &missing, true)? {
+            ui::warn(format!(
+                "Missing dependencies: {}",
+                missing_required.join(", ")
+            ));
+            if ui::prompt_package_action("dependency installation", &missing_required, true)? {
                 // Build package index for fast lookups
                 let pkg_index =
                     index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
@@ -3428,7 +3498,7 @@ fn run_direct_install_request(
                 };
 
                 let mut dep_spec_paths = Vec::new();
-                for dep in missing {
+                for dep in missing_required {
                     // Use package index for O(1) lookup
                     let candidate = pkg_index.find(&dep);
 
@@ -3465,7 +3535,79 @@ fn run_direct_install_request(
         deps::require_build_deps(&pkg_spec, &db_path)?;
         deps::require_runtime_deps(&pkg_spec, &db_path)?;
         if should_install_test_deps(&pkg_spec, options.install_test_deps) {
-            deps::require_test_deps(&pkg_spec, &db_path)?;
+            let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+            if !missing_test.is_empty() {
+                let pkg_index =
+                    index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
+                let mut dep_spec_paths = Vec::new();
+                let mut unavailable_test = Vec::new();
+                for dep in &missing_test {
+                    if let Some(dep_spec_path) = pkg_index.find(dep) {
+                        dep_spec_paths.push(dep_spec_path);
+                    } else {
+                        unavailable_test.push(dep.clone());
+                    }
+                }
+
+                if !unavailable_test.is_empty()
+                    && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                        &mut pkg_spec,
+                        &unavailable_test,
+                        "Requested test dependencies could not be resolved",
+                    )?
+                {
+                    anyhow::bail!("Missing test dependencies: {}", unavailable_test.join(", "));
+                }
+
+                if !pkg_spec.build.flags.skip_tests && !dep_spec_paths.is_empty() {
+                    ui::warn(format!(
+                        "Missing test dependencies: {}",
+                        missing_test.join(", ")
+                    ));
+                    if ui::prompt_package_action("dependency installation", &missing_test, true)? {
+                        ui::info(format!(
+                            "Installing test dependencies: {}",
+                            install_request_display(&dep_spec_paths)
+                        ));
+                        let exe =
+                            std::env::current_exe().context("Failed to locate depot executable")?;
+                        run_install_command_with_program(
+                            &exe,
+                            &dep_spec_paths,
+                            options.rootfs,
+                            ChildInstallCommandOptions {
+                                no_deps: options.no_deps,
+                                assume_yes: false,
+                                no_flags: options.no_flags,
+                                cross_prefix: options.cross_prefix,
+                                clean: options.clean,
+                                install_test_deps: options.install_test_deps,
+                                install_context: None,
+                                dep_chain: None,
+                            },
+                        )?;
+                    } else if !maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                        &mut pkg_spec,
+                        &missing_test,
+                        "Requested test dependencies were not installed",
+                    )? {
+                        anyhow::bail!("Aborted");
+                    }
+                }
+            }
+        }
+
+        if should_install_test_deps(&pkg_spec, options.install_test_deps) {
+            let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+            if !missing_test.is_empty()
+                && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                    &mut pkg_spec,
+                    &missing_test,
+                    "Requested test dependencies are still missing",
+                )?
+            {
+                deps::require_test_deps(&pkg_spec, &db_path)?;
+            }
         }
     }
 
@@ -3717,24 +3859,33 @@ pub fn run(cli: Cli) -> Result<()> {
             })?;
             let db_path = config.installed_db_path(&cli.rootfs);
 
-            if cli.no_deps || !should_install_test_deps(&pkg_spec, install_test_deps) {
+            if cli.no_deps && should_install_test_deps(&pkg_spec, install_test_deps) {
+                let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+                if !missing_test.is_empty()
+                    && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                        &mut pkg_spec,
+                        &missing_test,
+                        "Requested test dependencies are missing",
+                    )?
+                {
+                    anyhow::bail!("Missing test dependencies: {}", missing_test.join(", "));
+                }
+            } else if cli.no_deps || !should_install_test_deps(&pkg_spec, install_test_deps) {
                 maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path)?;
             }
 
             // Check build dependencies
             if !cli.no_deps {
                 deps::print_dep_status(&pkg_spec, &db_path)?;
-                let missing = merge_missing_dependencies(
+                let missing_required = merge_missing_dependencies(
                     deps::check_build_deps(&pkg_spec, &db_path)?,
                     deps::check_runtime_deps(&pkg_spec, &db_path)?,
                 );
-                let missing = if should_install_test_deps(&pkg_spec, install_test_deps) {
-                    merge_missing_dependencies(missing, deps::check_test_deps(&pkg_spec, &db_path)?)
-                } else {
-                    missing
-                };
-                if !missing.is_empty() {
-                    ui::warn(format!("Missing dependencies: {}", missing.join(", ")));
+                if !missing_required.is_empty() {
+                    ui::warn(format!(
+                        "Missing dependencies: {}",
+                        missing_required.join(", ")
+                    ));
                     let local_sibling_root = spec_path
                         .parent()
                         .and_then(|p| p.parent())
@@ -3742,7 +3893,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     let dep_plan = planner::build_dependency_install_plan(
                         &config,
                         &cli.rootfs,
-                        &missing,
+                        &missing_required,
                         planner::PlannerOptions {
                             assume_yes: cli.yes,
                             prefer_binary: config.repo_settings.prefer_binary,
@@ -3751,7 +3902,11 @@ pub fn run(cli: Cli) -> Result<()> {
                         },
                     )?;
                     print_plan_summary(&dep_plan);
-                    if !ui::prompt_package_action("dependency installation", &missing, true)? {
+                    if !ui::prompt_package_action(
+                        "dependency installation",
+                        &missing_required,
+                        true,
+                    )? {
                         anyhow::bail!("Aborted");
                     }
                     if cli.dry_run {
@@ -3775,7 +3930,84 @@ pub fn run(cli: Cli) -> Result<()> {
                 deps::require_build_deps(&pkg_spec, &db_path)?;
                 deps::require_runtime_deps(&pkg_spec, &db_path)?;
                 if should_install_test_deps(&pkg_spec, install_test_deps) {
-                    deps::require_test_deps(&pkg_spec, &db_path)?;
+                    let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+                    if !missing_test.is_empty() {
+                        let local_sibling_root = spec_path
+                            .parent()
+                            .and_then(|p| p.parent())
+                            .map(Path::to_path_buf);
+                        let dep_plan = match planner::build_dependency_install_plan(
+                            &config,
+                            &cli.rootfs,
+                            &missing_test,
+                            planner::PlannerOptions {
+                                assume_yes: cli.yes,
+                                prefer_binary: config.repo_settings.prefer_binary,
+                                local_sibling_root,
+                                include_test_deps: install_test_deps,
+                            },
+                        ) {
+                            Ok(plan) => plan,
+                            Err(err)
+                                if maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                                    &mut pkg_spec,
+                                    &missing_test,
+                                    "Requested test dependencies could not be resolved",
+                                )? =>
+                            {
+                                planner::ExecutionPlan { steps: Vec::new() }
+                            }
+                            Err(err) => return Err(err),
+                        };
+
+                        if !pkg_spec.build.flags.skip_tests && !dep_plan.steps.is_empty() {
+                            ui::warn(format!(
+                                "Missing test dependencies: {}",
+                                missing_test.join(", ")
+                            ));
+                            print_plan_summary(&dep_plan);
+                            if !ui::prompt_package_action(
+                                "dependency installation",
+                                &missing_test,
+                                true,
+                            )? {
+                                if !maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                                    &mut pkg_spec,
+                                    &missing_test,
+                                    "Requested test dependencies were not installed",
+                                )? {
+                                    anyhow::bail!("Aborted");
+                                }
+                            } else if !cli.dry_run {
+                                execute_install_plan_with_child_commands(
+                                    &dep_plan,
+                                    &cli.rootfs,
+                                    &config,
+                                    InstallPlanExecutionOptions {
+                                        no_flags: cli.no_flags,
+                                        cross_prefix: cli.cross_prefix.as_deref(),
+                                        clean: cli.clean,
+                                        dry_run: cli.dry_run,
+                                        confirm_installation: false,
+                                        install_test_deps,
+                                    },
+                                )?;
+                            }
+                        }
+
+                        if should_install_test_deps(&pkg_spec, install_test_deps) {
+                            let missing_test = deps::check_test_deps(&pkg_spec, &db_path)?;
+                            if !missing_test.is_empty()
+                                && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                                    &mut pkg_spec,
+                                    &missing_test,
+                                    "Requested test dependencies are still missing",
+                                )?
+                            {
+                                deps::require_test_deps(&pkg_spec, &db_path)?;
+                            }
+                        }
+                    }
                 }
             } else if cli.dry_run {
                 ui::info("Dry run enabled, stopping before build.");
@@ -5592,6 +5824,42 @@ optional = []
             None,
             &[]
         )));
+    }
+
+    #[test]
+    fn requested_test_deps_prompt_can_disable_tests() -> Result<()> {
+        let mut spec = test_package_spec(package::BuildType::Meson, None, &[]);
+        spec.dependencies.test = vec!["pytest".into()];
+
+        ui::set_assume_yes(true);
+        let prompted = maybe_prompt_to_skip_tests_for_missing_requested_deps(
+            &mut spec,
+            &["pytest".into()],
+            "Requested test dependencies are missing",
+        )?;
+        ui::set_assume_yes(false);
+
+        assert!(prompted);
+        assert!(spec.build.flags.skip_tests);
+        Ok(())
+    }
+
+    #[test]
+    fn requested_test_deps_prompt_is_ignored_for_non_automatic_test_builders() -> Result<()> {
+        let mut spec = test_package_spec(package::BuildType::Custom, None, &[]);
+        spec.dependencies.test = vec!["pytest".into()];
+
+        ui::set_assume_yes(true);
+        let prompted = maybe_prompt_to_skip_tests_for_missing_requested_deps(
+            &mut spec,
+            &["pytest".into()],
+            "Requested test dependencies are missing",
+        )?;
+        ui::set_assume_yes(false);
+
+        assert!(!prompted);
+        assert!(!spec.build.flags.skip_tests);
+        Ok(())
     }
 
     #[test]

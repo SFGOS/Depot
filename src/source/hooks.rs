@@ -10,6 +10,15 @@ use std::process::Command;
 
 use crate::builder::state::{BuildStep, StateTracker};
 
+fn hook_env_vars(
+    spec: &PackageSpec,
+    shell_helpers: &crate::shell_helpers::ShellHelpers,
+) -> crate::builder::EnvVars {
+    let mut env_vars = crate::builder::standard_build_env(spec, None, true, true);
+    shell_helpers.apply_to_env_vars(&mut env_vars);
+    env_vars
+}
+
 /// Apply patches and run `post_extract` commands in the extracted source tree.
 pub fn post_extract(
     spec: &PackageSpec,
@@ -85,23 +94,27 @@ fn run_post_extract_commands(spec: &PackageSpec, source: &Source, src_dir: &Path
         "Running {} post-extract command(s)...",
         source.post_extract.len()
     );
+    let helper_root = tempfile::tempdir().context("Failed to create post-extract helper root")?;
+    let shell_helpers = crate::shell_helpers::ShellHelpers::new(helper_root.path())?;
+    let env_vars = hook_env_vars(spec, &shell_helpers);
 
     for cmd in &source.post_extract {
-        let cmd = spec.expand_vars(cmd);
-        crate::log_info!("  post_extract: {}", cmd);
+        let cmd_str = spec.expand_vars(cmd);
+        crate::log_info!("  post_extract: {}", cmd_str);
+        let wrapped_cmd = crate::shell_helpers::wrap_shell_command(&cmd_str);
 
         // Use a shell for convenience; this is a package manager, so specs are trusted input.
-        let status = Command::new("sh")
-            .current_dir(src_dir)
-            .env("DEPOT_SPECDIR", &spec.spec_dir)
-            .env("PATH", crate::runtime_env::safe_script_path())
+        let mut shell_cmd = Command::new("sh");
+        shell_cmd.current_dir(src_dir);
+        crate::builder::prepare_command(&mut shell_cmd, &env_vars);
+        let status = shell_cmd
             .arg("-c")
-            .arg(&cmd)
+            .arg(&wrapped_cmd)
             .status()
-            .with_context(|| format!("Failed to run post_extract command: {}", cmd))?;
+            .with_context(|| format!("Failed to run post_extract command: {}", cmd_str))?;
 
         if !status.success() {
-            bail!("post_extract command failed: {}", cmd);
+            bail!("post_extract command failed: {}", cmd_str);
         }
     }
 
@@ -121,6 +134,12 @@ pub fn run_post_configure_commands(
 
     crate::log_info!("Running {} post-configure command(s)...", commands.len());
     let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
+    let mut env_vars = hook_env_vars(spec, &shell_helpers);
+    crate::builder::set_env_var(
+        &mut env_vars,
+        "DESTDIR",
+        destdir.to_string_lossy().into_owned(),
+    );
 
     for cmd in commands {
         let cmd_str = spec.expand_vars(cmd);
@@ -129,13 +148,8 @@ pub fn run_post_configure_commands(
 
         let mut shell_cmd = Command::new("sh");
         shell_cmd.current_dir(src_dir);
-        shell_helpers.apply_to_command(&mut shell_cmd);
+        crate::builder::prepare_command(&mut shell_cmd, &env_vars);
         let status = shell_cmd
-            .env("DEPOT_SPECDIR", &spec.spec_dir)
-            .env("DESTDIR", destdir)
-            .env("DEPOT_ROOTFS", &spec.build.flags.rootfs)
-            .env("CC", &spec.build.flags.cc)
-            .env("AR", &spec.build.flags.ar)
             .arg("-c")
             .arg(&wrapped_cmd)
             .status()
@@ -158,6 +172,12 @@ pub fn run_post_compile_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
 
     crate::log_info!("Running {} post-compile command(s)...", commands.len());
     let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
+    let mut env_vars = hook_env_vars(spec, &shell_helpers);
+    crate::builder::set_env_var(
+        &mut env_vars,
+        "DESTDIR",
+        destdir.to_string_lossy().into_owned(),
+    );
 
     for cmd in commands {
         let cmd_str = spec.expand_vars(cmd);
@@ -166,13 +186,8 @@ pub fn run_post_compile_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
 
         let mut shell_cmd = Command::new("sh");
         shell_cmd.current_dir(src_dir);
-        shell_helpers.apply_to_command(&mut shell_cmd);
+        crate::builder::prepare_command(&mut shell_cmd, &env_vars);
         let status = shell_cmd
-            .env("DEPOT_SPECDIR", &spec.spec_dir)
-            .env("DESTDIR", destdir)
-            .env("DEPOT_ROOTFS", &spec.build.flags.rootfs)
-            .env("CC", &spec.build.flags.cc)
-            .env("AR", &spec.build.flags.ar)
             .arg("-c")
             .arg(&wrapped_cmd)
             .status()
@@ -195,6 +210,12 @@ pub fn run_post_install_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
 
     crate::log_info!("Running {} post-install command(s)...", commands.len());
     let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
+    let mut env_vars = hook_env_vars(spec, &shell_helpers);
+    crate::builder::set_env_var(
+        &mut env_vars,
+        "DESTDIR",
+        destdir.to_string_lossy().into_owned(),
+    );
 
     for cmd in commands {
         let cmd_str = spec.expand_vars(cmd);
@@ -203,13 +224,8 @@ pub fn run_post_install_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
 
         let mut shell_cmd = Command::new("sh");
         shell_cmd.current_dir(src_dir);
-        shell_helpers.apply_to_command(&mut shell_cmd);
+        crate::builder::prepare_command(&mut shell_cmd, &env_vars);
         let status = shell_cmd
-            .env("DEPOT_SPECDIR", &spec.spec_dir)
-            .env("DESTDIR", destdir)
-            .env("DEPOT_ROOTFS", &spec.build.flags.rootfs)
-            .env("CC", &spec.build.flags.cc)
-            .env("AR", &spec.build.flags.ar)
             .arg("-c")
             .arg(&wrapped_cmd)
             .status()
@@ -291,7 +307,7 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_patch_path, run_post_install_commands};
+    use super::{resolve_patch_path, run_post_extract_commands, run_post_install_commands};
     use crate::package::{
         Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source,
     };
@@ -385,5 +401,53 @@ mod tests {
                 .join(".depot/outputs/llvm-libs/usr/lib/libLLVM.so.1")
                 .exists()
         );
+    }
+
+    #[test]
+    fn post_extract_commands_can_call_python_build_helper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec_dir = tmp.path().join("spec");
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let fake_depot = tmp.path().join("fake-depot");
+        let log_path = tmp.path().join("python-build.log");
+        std::fs::write(
+            &fake_depot,
+            format!(
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > '{}'\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_depot).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_depot, perms).unwrap();
+        }
+
+        let spec = dummy_spec(&spec_dir);
+        let source = Source {
+            url: "https://example.com/foo.tar.gz".into(),
+            sha256: "skip".into(),
+            extract_dir: "foo".into(),
+            patches: Vec::new(),
+            post_extract: vec![format!(
+                "DEPOT_EXECUTABLE='{}' python_build --src-dir . --dist-dir dist",
+                fake_depot.display()
+            )],
+            cherry_pick: Vec::new(),
+        };
+
+        run_post_extract_commands(&spec, &source, &src_dir).unwrap();
+
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(logged.contains("internal"));
+        assert!(logged.contains("python-build"));
+        assert!(logged.contains("--src-dir"));
+        assert!(logged.contains("--dist-dir"));
     }
 }

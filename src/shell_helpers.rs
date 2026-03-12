@@ -172,18 +172,6 @@ impl ShellHelpers {
             self.depot_executable.to_string_lossy().into_owned(),
         );
     }
-
-    /// Apply helper-related variables directly to a `std::process::Command`.
-    pub fn apply_to_command(&self, cmd: &mut std::process::Command) {
-        cmd.env("PATH", &self.path_value)
-            .env("DEPOT_OUTPUTS_DIR", &self.outputs_dir)
-            .env("DEPOT_INTERNAL_DIR", INTERNAL_DEPOT_DIR)
-            .env(DEPOT_HAUL_HELPER_ENV, &self.haul_path)
-            .env(DEPOT_SUBDESTDIR_HELPER_ENV, &self.subdestdir_path)
-            .env(DEPOT_PYTHON_BUILD_HELPER_ENV, &self.python_build_path)
-            .env(DEPOT_PYTHON_INSTALL_HELPER_ENV, &self.python_install_path)
-            .env(DEPOT_EXECUTABLE_ENV, &self.depot_executable);
-    }
 }
 
 /// Wrap a shell command with helper functions that invoke the helper scripts
