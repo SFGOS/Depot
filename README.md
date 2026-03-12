@@ -48,6 +48,7 @@ depot install zlib-1.2.11-1-x86_64.depot.pkg.tar.zst
 - `remove <PACKAGE>`: Remove an installed package.
 - `build <SPEC>`: Build a package and create an archive without installing.
   - Use `--install-deps` to automatically install missing build/runtime/test dependencies before fetching/building.
+  - Use `--cleanup-deps` to remove dependencies auto-installed for the build after the command finishes; when combined with `--install`, runtime dependencies are kept.
   - Missing test dependencies automatically disable test execution unless `--test-deps` or `[install].test_deps = true` is set.
 - `update [PACKAGE ...]`: Update installed packages from configured repositories.
   - With no package names, updates every installed package that has a newer repo version available.

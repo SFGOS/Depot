@@ -111,10 +111,33 @@ fn apply_replacement_rules(current: &mut [String], replacements: &[String], labe
     }
 }
 
+fn sanitize_flag_list(values: Vec<String>, label: &str) -> Vec<String> {
+    let mut sanitized = Vec::with_capacity(values.len());
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "-" {
+            crate::log_warn!(
+                "Dropping invalid {} entry '-'; compiler/linker flag lists cannot contain a bare dash",
+                label
+            );
+            continue;
+        }
+        sanitized.push(trimmed.to_string());
+    }
+    sanitized
+}
+
 fn replaced_flags(values: &[String], replacements: &[String], label: &str) -> Vec<String> {
     let mut current = values.to_vec();
-    apply_replacement_rules(&mut current, replacements, label);
-    current
+    apply_replacement_rules(
+        &mut current,
+        replacements,
+        &format!("{label} replacement rules"),
+    );
+    sanitize_flag_list(current, label)
 }
 
 pub(crate) fn install_dirs(flags: &crate::package::BuildFlags) -> InstallDirs {
@@ -145,25 +168,21 @@ pub(crate) fn install_dirs(flags: &crate::package::BuildFlags) -> InstallDirs {
 fn compiler_flag_sets(
     flags: &crate::package::BuildFlags,
 ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    let mut cflags = replaced_flags(
-        &flags.cflags,
-        &flags.replace_cflags,
-        "build.flags.replace_cflags",
-    );
+    let mut cflags = replaced_flags(&flags.cflags, &flags.replace_cflags, "build.flags.cflags");
     let mut cxxflags = replaced_flags(
         &flags.cxxflags,
         &flags.replace_cxxflags,
-        "build.flags.replace_cxxflags",
+        "build.flags.cxxflags",
     );
     let mut ldflags = replaced_flags(
         &flags.ldflags,
         &flags.replace_ldflags,
-        "build.flags.replace_ldflags",
+        "build.flags.ldflags",
     );
     let ltoflags = replaced_flags(
         &flags.ltoflags,
         &flags.replace_ltoflags,
-        "build.flags.replace_ltoflags",
+        "build.flags.ltoflags",
     );
 
     if flags.use_lto && !ltoflags.is_empty() {
@@ -179,7 +198,7 @@ pub(crate) fn effective_rustflags(flags: &crate::package::BuildFlags) -> Vec<Str
     replaced_flags(
         &flags.rustflags,
         &flags.replace_rustflags,
-        "build.flags.replace_rustflags",
+        "build.flags.rustflags",
     )
 }
 
@@ -660,6 +679,36 @@ mod tests {
             env.iter()
                 .any(|(k, v)| k == "LTOFLAGS" && v == "-flto=thin"),
             "expected replace_ltoflags to affect exported LTOFLAGS"
+        );
+    }
+
+    #[test]
+    fn test_standard_build_env_drops_bare_dash_flags() {
+        let mut spec = mk_spec(vec!["-O2", "-", ""], vec!["-Wl,--as-needed", "  "]);
+        spec.build.flags.cxxflags = vec!["-O2".into(), "-".into(), "-fno-exceptions".into()];
+        spec.build.flags.ltoflags = vec!["-".into(), "-flto=thin".into()];
+        spec.build.flags.use_lto = true;
+
+        let env = standard_build_env(&spec, None, true, true);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CFLAGS" && v == "-O2 -flto=thin"),
+            "expected bare dash entries to be removed from CFLAGS"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CXXFLAGS" && v == "-O2 -fno-exceptions -flto=thin"),
+            "expected bare dash entries to be removed from CXXFLAGS"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "LDFLAGS" && v == "-Wl,--as-needed -flto=thin"),
+            "expected blank and bare dash entries to be removed from LDFLAGS"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "LTOFLAGS" && v == "-flto=thin"),
+            "expected bare dash entries to be removed from LTOFLAGS"
         );
     }
 

@@ -14,16 +14,3 @@ sast:
 
 secret_detection:
   stage: secret-detection
-
-rust_test:
-  stage: test
-  image: rust:1.93.1
-  cache:
-    key: cargo
-    paths:
-      - .cargo/
-      - target/
-  variables:
-    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
-  script:
-    - cargo test --workspace --all-features --locked

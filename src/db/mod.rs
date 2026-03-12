@@ -14,6 +14,10 @@ fn format_licenses(licenses: &[String]) -> String {
     licenses.join(", ")
 }
 
+fn verbose_remove_output() -> bool {
+    std::env::var_os("DEPOT_VERBOSE_REMOVE").is_some()
+}
+
 /// Installed package row from the local package database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPackageRecord {
@@ -268,7 +272,9 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
         let path = rootfs.join(file);
         match fs::remove_file(&path) {
             Ok(()) => {
-                crate::log_info!("  Removed file: {}", file);
+                if verbose_remove_output() {
+                    crate::log_info!("  Removed file: {}", file);
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Already gone, keep going.
@@ -297,14 +303,15 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
         )?;
 
         if other_owners > 0 {
-            crate::log_info!("  Keeping directory (owned by other package): {}", dir);
             continue;
         }
 
         // Try to remove (will fail if not empty, which is fine)
         match fs::remove_dir(&path) {
             Ok(()) => {
-                crate::log_info!("  Removed directory: {}", dir);
+                if verbose_remove_output() {
+                    crate::log_info!("  Removed directory: {}", dir);
+                }
                 dirs_removed += 1;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -312,7 +319,9 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
             }
             Err(e) if e.raw_os_error() == Some(39) || e.raw_os_error() == Some(66) => {
                 // ENOTEMPTY (39 on Linux, 66 on macOS) - directory not empty
-                crate::log_info!("  Keeping directory (not empty): {}", dir);
+                if verbose_remove_output() {
+                    crate::log_info!("  Keeping directory (not empty): {}", dir);
+                }
             }
             Err(_) => {
                 // Other errors (permission, etc.) - just skip silently

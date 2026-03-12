@@ -6,11 +6,14 @@ use crate::{
 use anyhow::{Context, Result};
 use git2::Direction;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use signal_hook::consts::SIGINT;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use url::Url;
 use walkdir::WalkDir;
 
@@ -42,22 +45,28 @@ fn should_delegate_live_rootfs_installs(rootfs: &Path) -> bool {
 
 const DEPOT_INSTALL_CONTEXT_ENV: &str = "DEPOT_INSTALL_CONTEXT";
 const INSTALL_CONTEXT_UPDATE: &str = "update";
+const INSTALL_CONTEXT_PLANNED: &str = "planned";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstallInvocationContext {
     Default,
     Update,
+    Planned,
 }
 
 fn current_install_invocation_context() -> InstallInvocationContext {
     match std::env::var(DEPOT_INSTALL_CONTEXT_ENV).as_deref() {
         Ok(INSTALL_CONTEXT_UPDATE) => InstallInvocationContext::Update,
+        Ok(INSTALL_CONTEXT_PLANNED) => InstallInvocationContext::Planned,
         _ => InstallInvocationContext::Default,
     }
 }
 
 fn suppress_nested_install_output() -> bool {
-    current_install_invocation_context() == InstallInvocationContext::Update
+    matches!(
+        current_install_invocation_context(),
+        InstallInvocationContext::Update | InstallInvocationContext::Planned
+    )
 }
 
 fn install_test_deps_enabled(cli_test_deps: bool, config: &config::Config) -> bool {
@@ -220,10 +229,181 @@ fn run_child_install_command(
             clean: options.clean,
             lib32_only: false,
             install_test_deps: options.install_test_deps,
-            install_context: None,
+            install_context: Some(INSTALL_CONTEXT_PLANNED),
             dep_chain: None,
         },
     )
+}
+
+#[derive(Clone)]
+struct InterruptWatcher {
+    interrupted: Arc<AtomicBool>,
+}
+
+impl InterruptWatcher {
+    fn install() -> Result<Self> {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        signal_hook::flag::register(SIGINT, interrupted.clone())
+            .context("Failed to register Ctrl-C handler")?;
+        Ok(Self { interrupted })
+    }
+
+    fn was_interrupted(&self) -> bool {
+        self.interrupted.load(AtomicOrdering::Relaxed)
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.was_interrupted() {
+            anyhow::bail!("Interrupted by Ctrl-C");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AutoInstalledDependencyKind {
+    Build,
+    Runtime,
+    Test,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AutoInstalledDependencyTracker {
+    install_order: Vec<String>,
+    build: BTreeSet<String>,
+    runtime: BTreeSet<String>,
+    test: BTreeSet<String>,
+}
+
+impl AutoInstalledDependencyTracker {
+    fn record_plan(
+        &mut self,
+        plan: &planner::ExecutionPlan,
+        requested_deps: &[String],
+        kind: AutoInstalledDependencyKind,
+    ) {
+        if requested_deps.is_empty() {
+            return;
+        }
+
+        for step in plan.actionable_steps() {
+            if !self.install_order.contains(&step.package) {
+                self.install_order.push(step.package.clone());
+            }
+        }
+
+        let closure = plan_dependency_closure_for_requested_deps(plan, requested_deps);
+        let target = match kind {
+            AutoInstalledDependencyKind::Build => &mut self.build,
+            AutoInstalledDependencyKind::Runtime => &mut self.runtime,
+            AutoInstalledDependencyKind::Test => &mut self.test,
+        };
+        target.extend(closure);
+    }
+
+    fn cleanup_targets(&self, include_runtime: bool) -> Vec<String> {
+        let mut remove = self.build.clone();
+        remove.extend(self.test.iter().cloned());
+        if include_runtime {
+            remove.extend(self.runtime.iter().cloned());
+        } else {
+            remove.retain(|package| !self.runtime.contains(package));
+        }
+
+        self.install_order
+            .iter()
+            .rev()
+            .filter(|package| remove.contains(*package))
+            .cloned()
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.build.is_empty() && self.runtime.is_empty() && self.test.is_empty()
+    }
+}
+
+fn plan_dependency_closure_for_requested_deps(
+    plan: &planner::ExecutionPlan,
+    requested_deps: &[String],
+) -> HashSet<String> {
+    let requested: HashSet<_> = requested_deps.iter().map(String::as_str).collect();
+    let mut roots = Vec::new();
+    let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+
+    for step in plan.actionable_steps() {
+        if step.requested_by.iter().any(|reason| {
+            reason
+                .strip_prefix("dependency ")
+                .is_some_and(|dep| requested.contains(dep))
+        }) {
+            roots.push(step.package.clone());
+        }
+
+        for reason in &step.requested_by {
+            if let Some((parent, _dep)) = reason.split_once(" needs ") {
+                let children = children_by_parent.entry(parent.to_string()).or_default();
+                if !children.contains(&step.package) {
+                    children.push(step.package.clone());
+                }
+            }
+        }
+    }
+
+    let mut stack = roots;
+    let mut closure = HashSet::new();
+    while let Some(package) = stack.pop() {
+        if !closure.insert(package.clone()) {
+            continue;
+        }
+        if let Some(children) = children_by_parent.get(&package) {
+            stack.extend(children.iter().cloned());
+        }
+    }
+
+    closure
+}
+
+fn prompt_for_dependency_cleanup(packages: &[String]) -> Result<bool> {
+    let assume_yes = ui::assume_yes_enabled();
+    ui::set_assume_yes(false);
+    let result = ui::prompt_package_action("dependency cleanup", packages, true);
+    ui::set_assume_yes(assume_yes);
+    result
+}
+
+fn cleanup_auto_installed_dependencies(
+    tracker: &AutoInstalledDependencyTracker,
+    rootfs: &Path,
+    config: &config::Config,
+    include_runtime: bool,
+    prompt: bool,
+) -> Result<()> {
+    let db_path = config.installed_db_path(rootfs);
+    let installed = db::get_installed_packages(&db_path)?;
+    let targets: Vec<String> = tracker
+        .cleanup_targets(include_runtime)
+        .into_iter()
+        .filter(|package| installed.contains(package))
+        .collect();
+
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    if prompt && !prompt_for_dependency_cleanup(&targets)? {
+        return Ok(());
+    }
+
+    ui::info(format!(
+        "Removing auto-installed dependencies: {}",
+        targets.join(", ")
+    ));
+    for package in targets {
+        remove_installed_package_with_hooks(&package, rootfs, config)?;
+    }
+
+    Ok(())
 }
 
 fn parse_licenses_from_toml(metadata: &toml::Value) -> Vec<String> {
@@ -3180,7 +3360,7 @@ fn execute_install_plan_with_child_commands(
                     clean: options.clean,
                     lib32_only: batch.lib32_only,
                     install_test_deps: options.install_test_deps,
-                    install_context: None,
+                    install_context: Some(INSTALL_CONTEXT_PLANNED),
                     dep_chain: None,
                 },
             )?;
@@ -3977,6 +4157,7 @@ pub fn run(cli: Cli) -> Result<()> {
             spec,
             install,
             install_deps,
+            cleanup_deps,
         } => {
             warn_if_running_as_root_for_build("build", &cli.rootfs);
             let spec_path = spec.or(spec_pos).context("No spec file provided")?;
@@ -3985,122 +4166,82 @@ pub fn run(cli: Cli) -> Result<()> {
 
             let config = config::Config::for_rootfs(&cli.rootfs);
             let install_test_deps = install_test_deps_enabled(cli_test_deps, &config);
+            let interrupt_watcher = if cleanup_deps {
+                Some(InterruptWatcher::install()?)
+            } else {
+                None
+            };
+            let mut auto_installed_deps = AutoInstalledDependencyTracker::default();
+            let build_result: Result<()> = (|| {
+                // Apply system overrides
+                pkg_spec.apply_config(&config);
+                let requested_outputs = requested_outputs(&pkg_spec, cli.lib32_only);
 
-            // Apply system overrides
-            pkg_spec.apply_config(&config);
-            let requested_outputs = requested_outputs(&pkg_spec, cli.lib32_only);
+                let build_targets = vec![format!(
+                    "{} v{}-{}",
+                    pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
+                )];
+                if !ui::prompt_package_action("build", &build_targets, true)? {
+                    anyhow::bail!("Aborted");
+                }
 
-            let build_targets = vec![format!(
-                "{} v{}-{}",
-                pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
-            )];
-            if !ui::prompt_package_action("build", &build_targets, true)? {
-                anyhow::bail!("Aborted");
-            }
+                // Ensure database directory exists
+                std::fs::create_dir_all(&config.db_dir).with_context(|| {
+                    format!(
+                        "Failed to create database directory: {}",
+                        config.db_dir.display()
+                    )
+                })?;
+                let db_path = config.installed_db_path(&cli.rootfs);
 
-            // Ensure database directory exists
-            std::fs::create_dir_all(&config.db_dir).with_context(|| {
-                format!(
-                    "Failed to create database directory: {}",
-                    config.db_dir.display()
-                )
-            })?;
-            let db_path = config.installed_db_path(&cli.rootfs);
-
-            if cli.no_deps
-                && should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs)
-            {
-                let missing_test =
-                    deps::check_test_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
-                if !missing_test.is_empty()
-                    && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
-                        &mut pkg_spec,
-                        &missing_test,
-                        "Requested test dependencies are missing",
-                    )?
+                if cli.no_deps
+                    && should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs)
                 {
-                    anyhow::bail!("Missing test dependencies: {}", missing_test.join(", "));
-                }
-            } else if cli.no_deps
-                || !should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs)
-            {
-                maybe_disable_tests_for_missing_deps(&mut pkg_spec, &db_path, requested_outputs)?;
-            }
-
-            // Check build dependencies
-            if !cli.no_deps {
-                deps::print_dep_status_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
-                let missing_required = merge_missing_dependencies(
-                    deps::check_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?,
-                    deps::check_runtime_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?,
-                );
-                if !missing_required.is_empty() {
-                    ui::warn(format!(
-                        "Missing dependencies: {}",
-                        missing_required.join(", ")
-                    ));
-                    let local_sibling_root = spec_path
-                        .parent()
-                        .and_then(|p| p.parent())
-                        .map(Path::to_path_buf);
-                    let dep_plan = planner::build_dependency_install_plan(
-                        &config,
-                        &cli.rootfs,
-                        &missing_required,
-                        planner::PlannerOptions {
-                            assume_yes: cli.yes,
-                            prefer_binary: config.repo_settings.prefer_binary,
-                            local_sibling_root,
-                            include_test_deps: install_test_deps,
-                            lib32_only_requested_specs: false,
-                        },
-                    )?;
-                    print_plan_summary(&dep_plan);
-                    if !install_deps {
-                        if cli.dry_run {
-                            ui::info(
-                                "Dry run enabled, stopping before dependency installation/build.",
-                            );
-                            return Ok(());
-                        }
-                        anyhow::bail!(
-                            "Missing dependencies: {}. Re-run with --install-deps to install them automatically, or install them manually.",
-                            missing_required.join(", ")
-                        );
-                    }
-                    if cli.dry_run {
-                        ui::info("Dry run enabled, stopping before dependency installation/build.");
-                        return Ok(());
-                    }
-                    execute_install_plan_with_child_commands(
-                        &dep_plan,
-                        &cli.rootfs,
-                        &config,
-                        InstallPlanExecutionOptions {
-                            no_flags: cli.no_flags,
-                            cross_prefix: cli.cross_prefix.as_deref(),
-                            clean: cli.clean,
-                            dry_run: cli.dry_run,
-                            confirm_installation: false,
-                            lib32_only_requested_specs: false,
-                            install_test_deps,
-                        },
-                    )?;
-                }
-                deps::require_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
-                deps::require_runtime_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
-                if should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs) {
                     let missing_test =
                         deps::check_test_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
-                    if !missing_test.is_empty() {
+                    if !missing_test.is_empty()
+                        && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                            &mut pkg_spec,
+                            &missing_test,
+                            "Requested test dependencies are missing",
+                        )?
+                    {
+                        anyhow::bail!("Missing test dependencies: {}", missing_test.join(", "));
+                    }
+                } else if cli.no_deps
+                    || !should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs)
+                {
+                    maybe_disable_tests_for_missing_deps(
+                        &mut pkg_spec,
+                        &db_path,
+                        requested_outputs,
+                    )?;
+                }
+
+                if !cli.no_deps {
+                    deps::print_dep_status_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
+                    let missing_build =
+                        deps::check_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
+                    let missing_runtime = deps::check_runtime_deps_for_outputs(
+                        &pkg_spec,
+                        &db_path,
+                        requested_outputs,
+                    )?;
+                    let missing_required =
+                        merge_missing_dependencies(missing_build.clone(), missing_runtime.clone());
+                    if !missing_required.is_empty() {
+                        ui::warn(format!(
+                            "Missing dependencies: {}",
+                            missing_required.join(", ")
+                        ));
                         let local_sibling_root = spec_path
                             .parent()
                             .and_then(|p| p.parent())
                             .map(Path::to_path_buf);
-                        let dep_plan = match planner::build_dependency_install_plan(
+                        let dep_plan = planner::build_dependency_install_plan(
                             &config,
                             &cli.rootfs,
-                            &missing_test,
+                            &missing_required,
                             planner::PlannerOptions {
                                 assume_yes: cli.yes,
                                 prefer_binary: config.repo_settings.prefer_binary,
@@ -4108,144 +4249,267 @@ pub fn run(cli: Cli) -> Result<()> {
                                 include_test_deps: install_test_deps,
                                 lib32_only_requested_specs: false,
                             },
-                        ) {
-                            Ok(plan) => plan,
-                            Err(_err)
-                                if maybe_prompt_to_skip_tests_for_missing_requested_deps(
-                                    &mut pkg_spec,
-                                    &missing_test,
-                                    "Requested test dependencies could not be resolved",
-                                )? =>
-                            {
-                                planner::ExecutionPlan { steps: Vec::new() }
-                            }
-                            Err(err) => return Err(err),
-                        };
-
-                        if !pkg_spec.build.flags.skip_tests && !dep_plan.steps.is_empty() {
-                            ui::warn(format!(
-                                "Missing test dependencies: {}",
-                                missing_test.join(", ")
-                            ));
-                            print_plan_summary(&dep_plan);
-                            if !install_deps {
-                                if cli.dry_run {
-                                    ui::info(
-                                        "Dry run enabled, stopping before dependency installation/build.",
-                                    );
-                                    return Ok(());
-                                }
-                                if !maybe_prompt_to_skip_tests_for_missing_requested_deps(
-                                    &mut pkg_spec,
-                                    &missing_test,
-                                    "Requested test dependencies were not installed",
-                                )? {
-                                    anyhow::bail!(
-                                        "Missing test dependencies: {}. Re-run with --install-deps to install them automatically, or install them manually.",
-                                        missing_test.join(", ")
-                                    );
-                                }
-                            } else if !cli.dry_run {
-                                execute_install_plan_with_child_commands(
-                                    &dep_plan,
-                                    &cli.rootfs,
-                                    &config,
-                                    InstallPlanExecutionOptions {
-                                        no_flags: cli.no_flags,
-                                        cross_prefix: cli.cross_prefix.as_deref(),
-                                        clean: cli.clean,
-                                        dry_run: cli.dry_run,
-                                        confirm_installation: false,
-                                        lib32_only_requested_specs: false,
-                                        install_test_deps,
-                                    },
-                                )?;
-                            }
+                        )?;
+                        if cleanup_deps {
+                            auto_installed_deps.record_plan(
+                                &dep_plan,
+                                &missing_build,
+                                AutoInstalledDependencyKind::Build,
+                            );
+                            auto_installed_deps.record_plan(
+                                &dep_plan,
+                                &missing_runtime,
+                                AutoInstalledDependencyKind::Runtime,
+                            );
                         }
+                        print_plan_summary(&dep_plan);
+                        if !install_deps {
+                            if cli.dry_run {
+                                ui::info(
+                                    "Dry run enabled, stopping before dependency installation/build.",
+                                );
+                                return Ok(());
+                            }
+                            anyhow::bail!(
+                                "Missing dependencies: {}. Re-run with --install-deps to install them automatically, or install them manually.",
+                                missing_required.join(", ")
+                            );
+                        }
+                        if cli.dry_run {
+                            ui::info(
+                                "Dry run enabled, stopping before dependency installation/build.",
+                            );
+                            return Ok(());
+                        }
+                        execute_install_plan_with_child_commands(
+                            &dep_plan,
+                            &cli.rootfs,
+                            &config,
+                            InstallPlanExecutionOptions {
+                                no_flags: cli.no_flags,
+                                cross_prefix: cli.cross_prefix.as_deref(),
+                                clean: cli.clean,
+                                dry_run: cli.dry_run,
+                                confirm_installation: false,
+                                lib32_only_requested_specs: false,
+                                install_test_deps,
+                            },
+                        )?;
+                    }
+                    deps::require_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
+                    deps::require_runtime_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
+                    if should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs) {
+                        let missing_test = deps::check_test_deps_for_outputs(
+                            &pkg_spec,
+                            &db_path,
+                            requested_outputs,
+                        )?;
+                        if !missing_test.is_empty() {
+                            let local_sibling_root = spec_path
+                                .parent()
+                                .and_then(|p| p.parent())
+                                .map(Path::to_path_buf);
+                            let dep_plan = match planner::build_dependency_install_plan(
+                                &config,
+                                &cli.rootfs,
+                                &missing_test,
+                                planner::PlannerOptions {
+                                    assume_yes: cli.yes,
+                                    prefer_binary: config.repo_settings.prefer_binary,
+                                    local_sibling_root,
+                                    include_test_deps: install_test_deps,
+                                    lib32_only_requested_specs: false,
+                                },
+                            ) {
+                                Ok(plan) => plan,
+                                Err(_err)
+                                    if maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                                        &mut pkg_spec,
+                                        &missing_test,
+                                        "Requested test dependencies could not be resolved",
+                                    )? =>
+                                {
+                                    planner::ExecutionPlan { steps: Vec::new() }
+                                }
+                                Err(err) => return Err(err),
+                            };
 
-                        if should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs)
-                        {
-                            let missing_test = deps::check_test_deps_for_outputs(
-                                &pkg_spec,
-                                &db_path,
-                                requested_outputs,
-                            )?;
-                            if !missing_test.is_empty()
-                                && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
-                                    &mut pkg_spec,
+                            if cleanup_deps && !pkg_spec.build.flags.skip_tests {
+                                auto_installed_deps.record_plan(
+                                    &dep_plan,
                                     &missing_test,
-                                    "Requested test dependencies are still missing",
-                                )?
-                            {
-                                deps::require_test_deps_for_outputs(
+                                    AutoInstalledDependencyKind::Test,
+                                );
+                            }
+
+                            if !pkg_spec.build.flags.skip_tests && !dep_plan.steps.is_empty() {
+                                ui::warn(format!(
+                                    "Missing test dependencies: {}",
+                                    missing_test.join(", ")
+                                ));
+                                print_plan_summary(&dep_plan);
+                                if !install_deps {
+                                    if cli.dry_run {
+                                        ui::info(
+                                            "Dry run enabled, stopping before dependency installation/build.",
+                                        );
+                                        return Ok(());
+                                    }
+                                    if !maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                                        &mut pkg_spec,
+                                        &missing_test,
+                                        "Requested test dependencies were not installed",
+                                    )? {
+                                        anyhow::bail!(
+                                            "Missing test dependencies: {}. Re-run with --install-deps to install them automatically, or install them manually.",
+                                            missing_test.join(", ")
+                                        );
+                                    }
+                                } else if !cli.dry_run {
+                                    execute_install_plan_with_child_commands(
+                                        &dep_plan,
+                                        &cli.rootfs,
+                                        &config,
+                                        InstallPlanExecutionOptions {
+                                            no_flags: cli.no_flags,
+                                            cross_prefix: cli.cross_prefix.as_deref(),
+                                            clean: cli.clean,
+                                            dry_run: cli.dry_run,
+                                            confirm_installation: false,
+                                            lib32_only_requested_specs: false,
+                                            install_test_deps,
+                                        },
+                                    )?;
+                                }
+                            }
+
+                            if should_install_test_deps(
+                                &pkg_spec,
+                                install_test_deps,
+                                requested_outputs,
+                            ) {
+                                let missing_test = deps::check_test_deps_for_outputs(
                                     &pkg_spec,
                                     &db_path,
                                     requested_outputs,
                                 )?;
+                                if !missing_test.is_empty()
+                                    && !maybe_prompt_to_skip_tests_for_missing_requested_deps(
+                                        &mut pkg_spec,
+                                        &missing_test,
+                                        "Requested test dependencies are still missing",
+                                    )?
+                                {
+                                    deps::require_test_deps_for_outputs(
+                                        &pkg_spec,
+                                        &db_path,
+                                        requested_outputs,
+                                    )?;
+                                }
                             }
                         }
                     }
+                } else if cli.dry_run {
+                    ui::info("Dry run enabled, stopping before build.");
+                    return Ok(());
                 }
-            } else if cli.dry_run {
-                ui::info("Dry run enabled, stopping before build.");
-                return Ok(());
-            }
 
-            let mut build_lock = locking::open_lock(&config)?;
-            let build_lock_path = locking::lock_path(&config);
-            let _build_lock_guard = locking::try_write(&mut build_lock, &build_lock_path, "build")?;
+                let mut build_lock = locking::open_lock(&config)?;
+                let build_lock_path = locking::lock_path(&config);
+                let _build_lock_guard =
+                    locking::try_write(&mut build_lock, &build_lock_path, "build")?;
 
-            if cli.dry_run {
-                ui::info("Dry run enabled, stopping before fetch/build.");
-                return Ok(());
-            }
+                if cli.dry_run {
+                    ui::info("Dry run enabled, stopping before fetch/build.");
+                    return Ok(());
+                }
 
-            // TODO(snapper): create pre-build snapshot before fetch/build starts.
-            let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
+                if let Some(watcher) = interrupt_watcher.as_ref() {
+                    watcher.check()?;
+                }
 
-            let destdir = config
-                .build_dir
-                .join("destdir")
-                .join(&pkg_spec.package.name);
-            // Build with optional cross-compilation
-            let cross_config = cli
-                .cross_prefix
-                .as_ref()
-                .map(|p| cross::CrossConfig::from_prefix(p))
-                .transpose()?;
-            if !cli.lib32_only {
-                builder::build(
+                let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
+                if let Some(watcher) = interrupt_watcher.as_ref() {
+                    watcher.check()?;
+                }
+
+                let destdir = config
+                    .build_dir
+                    .join("destdir")
+                    .join(&pkg_spec.package.name);
+                let cross_config = cli
+                    .cross_prefix
+                    .as_ref()
+                    .map(|p| cross::CrossConfig::from_prefix(p))
+                    .transpose()?;
+                if !cli.lib32_only {
+                    builder::build(
+                        &pkg_spec,
+                        &src_dir,
+                        &destdir,
+                        cross_config.as_ref(),
+                        !cli.no_flags,
+                    )?;
+                    if let Some(watcher) = interrupt_watcher.as_ref() {
+                        watcher.check()?;
+                    }
+                }
+
+                if !cli.lib32_only {
+                    staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
+                    install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
+                    staging::process(&destdir, &pkg_spec)?;
+                    if let Some(watcher) = interrupt_watcher.as_ref() {
+                        watcher.check()?;
+                    }
+                }
+
+                let arch = cli
+                    .cross_prefix
+                    .as_deref()
+                    .unwrap_or(std::env::consts::ARCH);
+
+                let mut created_files = Vec::new();
+                let staged_outputs = if !cli.lib32_only {
+                    staged_output_specs(&pkg_spec, &destdir)?
+                } else {
+                    Vec::new()
+                };
+                if !cli.lib32_only {
+                    for (spec_for_out, out_destdir) in &staged_outputs {
+                        let packager = package::Packager::new(
+                            spec_for_out.clone(),
+                            out_destdir.clone(),
+                            config.clone(),
+                        );
+                        let pkg_file = packager.create_package(Path::new("."), arch)?;
+                        if let Some(sig_path) =
+                            signing::auto_sign_zst_file_detached(&cli.rootfs, &pkg_file)?
+                        {
+                            ui::success(format!(
+                                "Created detached signature: {}",
+                                sig_path.display()
+                            ));
+                        }
+                        created_files.push(pkg_file);
+                        if let Some(watcher) = interrupt_watcher.as_ref() {
+                            watcher.check()?;
+                        }
+                    }
+                }
+
+                let mut lib32_install_bundle: Option<(package::PackageSpec, PathBuf)> = None;
+                if let Some((lib32_spec, lib32_destdir)) = build_lib32_companion_package(
                     &pkg_spec,
                     &src_dir,
-                    &destdir,
+                    &config,
                     cross_config.as_ref(),
                     !cli.no_flags,
-                )?;
-            }
-
-            if !cli.lib32_only {
-                staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
-                install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
-                staging::process(&destdir, &pkg_spec)?;
-            }
-
-            // Create package archive(s) — support multiple outputs from a single spec.
-            let arch = cli
-                .cross_prefix
-                .as_deref()
-                .unwrap_or(std::env::consts::ARCH);
-
-            let mut created_files = Vec::new();
-            let staged_outputs = if !cli.lib32_only {
-                staged_output_specs(&pkg_spec, &destdir)?
-            } else {
-                Vec::new()
-            };
-            if !cli.lib32_only {
-                for (spec_for_out, out_destdir) in &staged_outputs {
+                    cli.lib32_only,
+                )? {
                     let packager = package::Packager::new(
-                        spec_for_out.clone(),
-                        out_destdir.clone(),
+                        lib32_spec.clone(),
+                        lib32_destdir.clone(),
                         config.clone(),
                     );
                     let pkg_file = packager.create_package(Path::new("."), arch)?;
@@ -4258,143 +4522,163 @@ pub fn run(cli: Cli) -> Result<()> {
                         ));
                     }
                     created_files.push(pkg_file);
-                }
-            }
-
-            let mut lib32_install_bundle: Option<(package::PackageSpec, PathBuf)> = None;
-            if let Some((lib32_spec, lib32_destdir)) = build_lib32_companion_package(
-                &pkg_spec,
-                &src_dir,
-                &config,
-                cross_config.as_ref(),
-                !cli.no_flags,
-                cli.lib32_only,
-            )? {
-                let packager = package::Packager::new(
-                    lib32_spec.clone(),
-                    lib32_destdir.clone(),
-                    config.clone(),
-                );
-                let pkg_file = packager.create_package(Path::new("."), arch)?;
-                if let Some(sig_path) =
-                    signing::auto_sign_zst_file_detached(&cli.rootfs, &pkg_file)?
-                {
-                    ui::success(format!(
-                        "Created detached signature: {}",
-                        sig_path.display()
-                    ));
-                }
-                created_files.push(pkg_file);
-                lib32_install_bundle = Some((lib32_spec, lib32_destdir));
-            }
-
-            for f in &created_files {
-                ui::success(format!("Build complete. Package created: {}", f.display()));
-            }
-            // TODO(snapper): create post-build snapshot after package build completes.
-
-            if install {
-                let mut install_targets = Vec::new();
-                if !cli.lib32_only {
-                    for (spec_for_out, _) in &staged_outputs {
-                        let out = &spec_for_out.package;
-                        install_targets
-                            .push(format!("{} v{}-{}", out.name, out.version, out.revision));
+                    lib32_install_bundle = Some((lib32_spec, lib32_destdir));
+                    if let Some(watcher) = interrupt_watcher.as_ref() {
+                        watcher.check()?;
                     }
                 }
-                if let Some((lib32_spec, _)) = &lib32_install_bundle {
-                    install_targets.push(format!(
-                        "{} v{}-{}",
-                        lib32_spec.package.name,
-                        lib32_spec.package.version,
-                        lib32_spec.package.revision
-                    ));
+
+                for f in &created_files {
+                    ui::success(format!("Build complete. Package created: {}", f.display()));
                 }
-                if ui::prompt_package_action("installation", &install_targets, false)? {
-                    if should_delegate_live_rootfs_installs(&cli.rootfs) {
-                        run_child_install_command(
-                            &created_files,
-                            &cli.rootfs,
-                            InstallPlanExecutionOptions {
-                                no_flags: cli.no_flags,
-                                cross_prefix: cli.cross_prefix.as_deref(),
-                                clean: cli.clean,
-                                dry_run: cli.dry_run,
-                                confirm_installation: false,
-                                lib32_only_requested_specs: false,
-                                install_test_deps,
-                            },
-                        )?;
-                        if cli.clean {
-                            clean_build_workspace(&config)?;
-                        }
-                        return Ok(());
-                    }
 
-                    let mut transaction_plans = Vec::new();
-                    if !cli.lib32_only {
-                        let output_plans = plan_package_outputs_for_install(
-                            &pkg_spec,
-                            &destdir,
-                            &cli.rootfs,
-                            &config,
-                        )?;
-                        transaction_plans.extend(output_plans);
-                    }
-                    if let Some((lib32_spec, lib32_destdir)) = &lib32_install_bundle {
-                        let staged =
-                            plan_staged_install(lib32_spec, lib32_destdir, &cli.rootfs, &config)?;
-                        transaction_plans.push(PlannedPackageInstall {
-                            spec: lib32_spec.clone(),
-                            destdir: lib32_destdir.clone(),
-                            staged,
-                        });
-                    }
-
-                    run_transaction_hooks_for_plans(
-                        &cli.rootfs,
-                        install::hooks::HookPhase::Pre,
-                        &transaction_plans,
-                    )?;
-                    let installed = install_planned_packages_to_rootfs(
-                        &transaction_plans,
-                        &cli.rootfs,
-                        &config,
-                    )?;
-                    for pkg in installed {
-                        log_install_success(&pkg);
-                        // TODO(snapper): create post-install snapshot after --install commit succeeds.
-                    }
-                    run_transaction_hooks_for_plans(
-                        &cli.rootfs,
-                        install::hooks::HookPhase::Post,
-                        &transaction_plans,
-                    )?;
-
-                    install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
-                } else {
+                if install {
+                    let mut install_targets = Vec::new();
                     if !cli.lib32_only {
                         for (spec_for_out, _) in &staged_outputs {
                             let out = &spec_for_out.package;
-                            ui::success(format!(
-                                "Built successfully: {}-{}-{}",
-                                out.name, out.version, out.revision
-                            ));
+                            install_targets
+                                .push(format!("{} v{}-{}", out.name, out.version, out.revision));
                         }
                     }
                     if let Some((lib32_spec, _)) = &lib32_install_bundle {
-                        ui::success(format!(
-                            "Built successfully: {}-{}-{}",
+                        install_targets.push(format!(
+                            "{} v{}-{}",
                             lib32_spec.package.name,
                             lib32_spec.package.version,
                             lib32_spec.package.revision
                         ));
                     }
-                }
-            }
+                    if ui::prompt_package_action("installation", &install_targets, false)? {
+                        if let Some(watcher) = interrupt_watcher.as_ref() {
+                            watcher.check()?;
+                        }
+                        if should_delegate_live_rootfs_installs(&cli.rootfs) {
+                            run_child_install_command(
+                                &created_files,
+                                &cli.rootfs,
+                                InstallPlanExecutionOptions {
+                                    no_flags: cli.no_flags,
+                                    cross_prefix: cli.cross_prefix.as_deref(),
+                                    clean: cli.clean,
+                                    dry_run: cli.dry_run,
+                                    confirm_installation: false,
+                                    lib32_only_requested_specs: false,
+                                    install_test_deps,
+                                },
+                            )?;
+                            return Ok(());
+                        }
 
-            if cli.clean {
-                clean_build_workspace(&config)?;
+                        let mut transaction_plans = Vec::new();
+                        if !cli.lib32_only {
+                            let output_plans = plan_package_outputs_for_install(
+                                &pkg_spec,
+                                &destdir,
+                                &cli.rootfs,
+                                &config,
+                            )?;
+                            transaction_plans.extend(output_plans);
+                        }
+                        if let Some((lib32_spec, lib32_destdir)) = &lib32_install_bundle {
+                            let staged = plan_staged_install(
+                                lib32_spec,
+                                lib32_destdir,
+                                &cli.rootfs,
+                                &config,
+                            )?;
+                            transaction_plans.push(PlannedPackageInstall {
+                                spec: lib32_spec.clone(),
+                                destdir: lib32_destdir.clone(),
+                                staged,
+                            });
+                        }
+
+                        run_transaction_hooks_for_plans(
+                            &cli.rootfs,
+                            install::hooks::HookPhase::Pre,
+                            &transaction_plans,
+                        )?;
+                        let installed = install_planned_packages_to_rootfs(
+                            &transaction_plans,
+                            &cli.rootfs,
+                            &config,
+                        )?;
+                        for pkg in installed {
+                            log_install_success(&pkg);
+                        }
+                        run_transaction_hooks_for_plans(
+                            &cli.rootfs,
+                            install::hooks::HookPhase::Post,
+                            &transaction_plans,
+                        )?;
+
+                        install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
+                    } else {
+                        if !cli.lib32_only {
+                            for (spec_for_out, _) in &staged_outputs {
+                                let out = &spec_for_out.package;
+                                ui::success(format!(
+                                    "Built successfully: {}-{}-{}",
+                                    out.name, out.version, out.revision
+                                ));
+                            }
+                        }
+                        if let Some((lib32_spec, _)) = &lib32_install_bundle {
+                            ui::success(format!(
+                                "Built successfully: {}-{}-{}",
+                                lib32_spec.package.name,
+                                lib32_spec.package.version,
+                                lib32_spec.package.revision
+                            ));
+                        }
+                    }
+                }
+
+                Ok(())
+            })();
+
+            let interrupted = interrupt_watcher
+                .as_ref()
+                .is_some_and(InterruptWatcher::was_interrupted);
+            match build_result {
+                Ok(()) => {
+                    if cleanup_deps && !auto_installed_deps.is_empty() {
+                        cleanup_auto_installed_dependencies(
+                            &auto_installed_deps,
+                            &cli.rootfs,
+                            &config,
+                            !install,
+                            false,
+                        )?;
+                    }
+                    if cli.clean {
+                        clean_build_workspace(&config)?;
+                    }
+                }
+                Err(err) => {
+                    if cleanup_deps && !auto_installed_deps.is_empty() {
+                        if interrupted {
+                            ui::warn("Build interrupted by Ctrl-C.");
+                        }
+                        if let Err(clean_err) = cleanup_auto_installed_dependencies(
+                            &auto_installed_deps,
+                            &cli.rootfs,
+                            &config,
+                            !install,
+                            interrupted,
+                        ) {
+                            ui::warn(format!(
+                                "Failed to remove auto-installed dependencies: {}",
+                                clean_err
+                            ));
+                        }
+                    }
+                    if interrupted {
+                        anyhow::bail!("Build interrupted by Ctrl-C");
+                    }
+                    return Err(err);
+                }
             }
         }
         Commands::Update { packages } => {
@@ -4917,6 +5201,7 @@ pub fn run(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestEnv;
     use std::sync::Mutex;
 
     static ASSUME_YES_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -6035,6 +6320,126 @@ optional = []
     }
 
     #[test]
+    fn suppress_nested_install_output_for_planned_context() {
+        let mut env = TestEnv::new();
+        env.set_var(DEPOT_INSTALL_CONTEXT_ENV, INSTALL_CONTEXT_PLANNED);
+
+        assert!(suppress_nested_install_output());
+        assert_eq!(
+            current_install_invocation_context(),
+            InstallInvocationContext::Planned
+        );
+    }
+
+    #[test]
+    fn plan_dependency_closure_tracks_requested_dependency_roots() {
+        let plan = planner::ExecutionPlan {
+            steps: vec![
+                planner::PlannedStep {
+                    package: "zlib".into(),
+                    action: planner::PlanAction::InstallBinary,
+                    origin: planner::PlanOrigin::Source {
+                        path: PathBuf::from("packages/core/zlib/zlib.toml"),
+                        local_sibling: false,
+                    },
+                    requested_by: vec!["cmake needs zlib".into()],
+                },
+                planner::PlannedStep {
+                    package: "cmake".into(),
+                    action: planner::PlanAction::InstallBinary,
+                    origin: planner::PlanOrigin::Source {
+                        path: PathBuf::from("packages/core/cmake/cmake.toml"),
+                        local_sibling: false,
+                    },
+                    requested_by: vec!["dependency cmake".into()],
+                },
+                planner::PlannedStep {
+                    package: "libffi".into(),
+                    action: planner::PlanAction::InstallBinary,
+                    origin: planner::PlanOrigin::Source {
+                        path: PathBuf::from("packages/core/libffi/libffi.toml"),
+                        local_sibling: false,
+                    },
+                    requested_by: vec!["python needs libffi".into()],
+                },
+                planner::PlannedStep {
+                    package: "python".into(),
+                    action: planner::PlanAction::InstallBinary,
+                    origin: planner::PlanOrigin::Source {
+                        path: PathBuf::from("packages/core/python/python.toml"),
+                        local_sibling: false,
+                    },
+                    requested_by: vec!["dependency python".into()],
+                },
+            ],
+        };
+
+        let cmake_closure = plan_dependency_closure_for_requested_deps(&plan, &["cmake".into()]);
+        assert_eq!(
+            cmake_closure,
+            HashSet::from(["cmake".to_string(), "zlib".to_string()])
+        );
+
+        let python_closure = plan_dependency_closure_for_requested_deps(&plan, &["python".into()]);
+        assert_eq!(
+            python_closure,
+            HashSet::from(["python".to_string(), "libffi".to_string()])
+        );
+    }
+
+    #[test]
+    fn cleanup_targets_keep_runtime_dependencies_for_build_install() {
+        let plan = planner::ExecutionPlan {
+            steps: vec![
+                planner::PlannedStep {
+                    package: "zlib".into(),
+                    action: planner::PlanAction::InstallBinary,
+                    origin: planner::PlanOrigin::Source {
+                        path: PathBuf::from("packages/core/zlib/zlib.toml"),
+                        local_sibling: false,
+                    },
+                    requested_by: vec!["cmake needs zlib".into(), "llvm-runtime needs zlib".into()],
+                },
+                planner::PlannedStep {
+                    package: "cmake".into(),
+                    action: planner::PlanAction::InstallBinary,
+                    origin: planner::PlanOrigin::Source {
+                        path: PathBuf::from("packages/core/cmake/cmake.toml"),
+                        local_sibling: false,
+                    },
+                    requested_by: vec!["dependency cmake".into()],
+                },
+                planner::PlannedStep {
+                    package: "llvm-runtime".into(),
+                    action: planner::PlanAction::InstallBinary,
+                    origin: planner::PlanOrigin::Source {
+                        path: PathBuf::from("packages/core/llvm-runtime/llvm-runtime.toml"),
+                        local_sibling: false,
+                    },
+                    requested_by: vec!["dependency llvm-runtime".into()],
+                },
+            ],
+        };
+        let mut tracker = AutoInstalledDependencyTracker::default();
+        tracker.record_plan(&plan, &["cmake".into()], AutoInstalledDependencyKind::Build);
+        tracker.record_plan(
+            &plan,
+            &["llvm-runtime".into()],
+            AutoInstalledDependencyKind::Runtime,
+        );
+
+        assert_eq!(tracker.cleanup_targets(false), vec!["cmake".to_string()]);
+        assert_eq!(
+            tracker.cleanup_targets(true),
+            vec![
+                "llvm-runtime".to_string(),
+                "cmake".to_string(),
+                "zlib".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn install_success_action_uses_updated_for_replacements() {
         assert_eq!(install_success_action(false), "installed");
         assert_eq!(install_success_action(true), "updated");
@@ -6125,6 +6530,7 @@ optional = []
             spec: None,
             install: false,
             install_deps: false,
+            cleanup_deps: false,
         }));
         assert!(!command_requires_live_root(&Commands::Search {
             query: "foo".to_string(),
@@ -6335,6 +6741,7 @@ optional = []
                 spec: None,
                 install: false,
                 install_deps: false,
+                cleanup_deps: false,
             },
         });
         ui::set_assume_yes(false);

@@ -97,6 +97,10 @@ pub enum Commands {
         /// Automatically install missing dependencies before building
         #[arg(long)]
         install_deps: bool,
+
+        /// Remove dependencies auto-installed for this build after the command finishes
+        #[arg(long)]
+        cleanup_deps: bool,
     },
     /// Update installed packages from configured repositories
     Update {
@@ -357,6 +361,15 @@ mod tests {
         let cli = Cli::try_parse_from(["depot", "build", "--install-deps", "pkg.toml"]).unwrap();
         match cli.command {
             Commands::Build { install_deps, .. } => assert!(install_deps),
+            _ => panic!("expected build command"),
+        }
+    }
+
+    #[test]
+    fn build_cleanup_deps_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["depot", "build", "--cleanup-deps", "pkg.toml"]).unwrap();
+        match cli.command {
+            Commands::Build { cleanup_deps, .. } => assert!(cleanup_deps),
             _ => panic!("expected build command"),
         }
     }

@@ -96,6 +96,10 @@ pub fn set_assume_yes(assume_yes: bool) {
     ASSUME_YES.store(assume_yes, Ordering::Relaxed);
 }
 
+pub fn assume_yes_enabled() -> bool {
+    ASSUME_YES.load(Ordering::Relaxed)
+}
+
 pub fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
     if ASSUME_YES.load(Ordering::Relaxed) {
         info(format!("{} [auto-yes]", prompt));
