@@ -3948,7 +3948,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             },
                         ) {
                             Ok(plan) => plan,
-                            Err(err)
+                            Err(_err)
                                 if maybe_prompt_to_skip_tests_for_missing_requested_deps(
                                     &mut pkg_spec,
                                     &missing_test,
