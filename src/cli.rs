@@ -93,6 +93,10 @@ pub enum Commands {
         /// Install package to rootfs after creating package archive(s)
         #[arg(long)]
         install: bool,
+
+        /// Automatically install missing dependencies before building
+        #[arg(long)]
+        install_deps: bool,
     },
     /// Update installed packages from configured repositories
     Update {
@@ -346,5 +350,14 @@ mod tests {
     fn global_test_deps_flag_is_parsed() {
         let cli = Cli::try_parse_from(["depot", "--test-deps", "install", "foo"]).unwrap();
         assert!(cli.test_deps);
+    }
+
+    #[test]
+    fn build_install_deps_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["depot", "build", "--install-deps", "pkg.toml"]).unwrap();
+        match cli.command {
+            Commands::Build { install_deps, .. } => assert!(install_deps),
+            _ => panic!("expected build command"),
+        }
     }
 }

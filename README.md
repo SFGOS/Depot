@@ -47,7 +47,7 @@ depot install zlib-1.2.11-1-x86_64.depot.pkg.tar.zst
   - Binary package installs verify both checksums and detached minisign signatures (`.sig`).
 - `remove <PACKAGE>`: Remove an installed package.
 - `build <SPEC>`: Build a package and create an archive without installing.
-  - Resolves and offers to install missing build dependencies before fetching/building.
+  - Use `--install-deps` to automatically install missing build/runtime/test dependencies before fetching/building.
   - Missing test dependencies automatically disable test execution unless `--test-deps` or `[install].test_deps = true` is set.
 - `update [PACKAGE ...]`: Update installed packages from configured repositories.
   - With no package names, updates every installed package that has a newer repo version available.

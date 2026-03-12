@@ -2867,6 +2867,12 @@ struct InstallPlanExecutionOptions<'a> {
     install_test_deps: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildInstallBatch {
+    requests: Vec<PathBuf>,
+    lib32_only: bool,
+}
+
 fn step_requests_only_lib32(
     step: &planner::PlannedStep,
     options: &InstallPlanExecutionOptions<'_>,
@@ -2876,6 +2882,71 @@ fn step_requests_only_lib32(
             .requested_by
             .iter()
             .any(|reason| reason.starts_with("requested "))
+}
+
+fn build_live_rootfs_child_install_batches(
+    steps: &[&planner::PlannedStep],
+    options: &InstallPlanExecutionOptions<'_>,
+    binary_archives: &HashMap<(String, String), db::repo::BinaryRepoCachedArchive>,
+) -> Result<Vec<ChildInstallBatch>> {
+    let mut batches = Vec::new();
+    let mut pending_binary_requests = Vec::new();
+
+    for step in steps {
+        match &step.origin {
+            planner::PlanOrigin::Source { path, .. } => {
+                if !pending_binary_requests.is_empty() {
+                    batches.push(ChildInstallBatch {
+                        requests: std::mem::take(&mut pending_binary_requests),
+                        lib32_only: false,
+                    });
+                }
+                batches.push(ChildInstallBatch {
+                    requests: vec![path.clone()],
+                    lib32_only: step_requests_only_lib32(step, options),
+                });
+            }
+            planner::PlanOrigin::Binary { repo_name, record } => {
+                let cached = binary_archives
+                    .get(&(repo_name.clone(), record.filename.clone()))
+                    .with_context(|| {
+                        format!(
+                            "Cached archive missing for planned binary step '{}' from repo '{}'",
+                            record.filename, repo_name
+                        )
+                    })?;
+                pending_binary_requests.push(cached.package_path.clone());
+            }
+            planner::PlanOrigin::Installed => {}
+        }
+    }
+
+    if !pending_binary_requests.is_empty() {
+        batches.push(ChildInstallBatch {
+            requests: pending_binary_requests,
+            lib32_only: false,
+        });
+    }
+
+    Ok(batches)
+}
+
+fn flush_binary_install_batch(
+    pending_plans: &mut Vec<PlannedPackageInstall>,
+    pending_staging_dirs: &mut Vec<tempfile::TempDir>,
+    installed_outcomes: &mut Vec<InstalledPackageOutcome>,
+    rootfs: &Path,
+    config: &config::Config,
+) -> Result<()> {
+    if pending_plans.is_empty() {
+        return Ok(());
+    }
+
+    let installed = install_planned_packages_to_rootfs(pending_plans, rootfs, config)?;
+    installed_outcomes.extend(installed);
+    pending_plans.clear();
+    pending_staging_dirs.clear();
+    Ok(())
 }
 
 fn execute_install_plan_with_child_commands(
@@ -2940,44 +3011,8 @@ fn execute_install_plan_with_child_commands(
         return Ok(());
     }
 
-    if should_delegate_live_rootfs_installs(rootfs) {
-        for step in actionable_steps {
-            let install_request = match &step.origin {
-                planner::PlanOrigin::Source { path, .. } => path.clone(),
-                planner::PlanOrigin::Binary { repo_name, record } => {
-                    let repo_cfg = config.binary_repos.get(repo_name).with_context(|| {
-                        format!("Binary repo '{}' not found in config", repo_name)
-                    })?;
-                    db::repo::fetch_binary_package_archive(
-                        repo_name,
-                        repo_cfg,
-                        rootfs,
-                        record,
-                        &config.package_cache_dir,
-                    )?
-                }
-                planner::PlanOrigin::Installed => continue,
-            };
-            run_install_command_with_program(
-                &std::env::current_exe().context("Failed to locate depot executable")?,
-                &[install_request],
-                rootfs,
-                ChildInstallCommandOptions {
-                    no_deps: true,
-                    assume_yes: true,
-                    no_flags: options.no_flags,
-                    cross_prefix: options.cross_prefix,
-                    clean: options.clean,
-                    lib32_only: step_requests_only_lib32(step, &options),
-                    install_test_deps: options.install_test_deps,
-                    install_context: None,
-                    dep_chain: None,
-                },
-            )?;
-        }
-        return Ok(());
-    }
-
+    let mut binary_archives: HashMap<(String, String), db::repo::BinaryRepoCachedArchive> =
+        HashMap::new();
     let mut binary_phase_items = Vec::new();
     for step in &actionable_steps {
         if let planner::PlanOrigin::Binary { repo_name, record } = &step.origin {
@@ -2988,8 +3023,6 @@ fn execute_install_plan_with_child_commands(
         }
     }
 
-    let mut binary_archives: HashMap<(String, String), db::repo::BinaryRepoCachedArchive> =
-        HashMap::new();
     if !binary_phase_items.is_empty() {
         ui::info(format!(
             "Downloading {} binary package(s) and detached signatures...",
@@ -3134,6 +3167,31 @@ fn execute_install_plan_with_child_commands(
         signature_pb.finish_and_clear();
     }
 
+    if should_delegate_live_rootfs_installs(rootfs) {
+        let exe = std::env::current_exe().context("Failed to locate depot executable")?;
+        let batches =
+            build_live_rootfs_child_install_batches(&actionable_steps, &options, &binary_archives)?;
+        for batch in batches {
+            run_install_command_with_program(
+                &exe,
+                &batch.requests,
+                rootfs,
+                ChildInstallCommandOptions {
+                    no_deps: true,
+                    assume_yes: true,
+                    no_flags: options.no_flags,
+                    cross_prefix: options.cross_prefix,
+                    clean: options.clean,
+                    lib32_only: batch.lib32_only,
+                    install_test_deps: options.install_test_deps,
+                    install_context: None,
+                    dep_chain: None,
+                },
+            )?;
+        }
+        return Ok(());
+    }
+
     let mut binary_pre_hook_plans = Vec::new();
     for step in &actionable_steps {
         if let planner::PlanOrigin::Binary { repo_name, record } = &step.origin {
@@ -3160,9 +3218,19 @@ fn execute_install_plan_with_child_commands(
     let exe = std::env::current_exe().context("Failed to locate depot executable")?;
     let total_steps = actionable_steps.len();
     let mut binary_post_hook_plans = Vec::new();
+    let mut pending_binary_install_plans = Vec::new();
+    let mut pending_binary_install_staging_dirs = Vec::new();
+    let mut installed_binary_outcomes = Vec::new();
     for (idx, step) in actionable_steps.into_iter().enumerate() {
         match &step.origin {
             planner::PlanOrigin::Source { path, .. } => {
+                flush_binary_install_batch(
+                    &mut pending_binary_install_plans,
+                    &mut pending_binary_install_staging_dirs,
+                    &mut installed_binary_outcomes,
+                    rootfs,
+                    config,
+                )?;
                 ui::info(format!(
                     "[{}/{}] building+installing {} from source",
                     idx + 1,
@@ -3207,14 +3275,23 @@ fn execute_install_plan_with_child_commands(
                 let staged = extract_package_archive_to_staging(config, &cached.package_path)?;
                 let spec = load_package_spec_from_staging_or_repo_record(staged.path(), record)?;
                 let plans = plan_package_outputs_for_install(&spec, staged.path(), rootfs, config)?;
-                let installed = install_planned_packages_to_rootfs(&plans, rootfs, config)?;
-                binary_post_hook_plans.extend(plans);
-                for pkg in installed {
-                    log_install_success(&pkg);
-                }
+                binary_post_hook_plans.extend(plans.iter().cloned());
+                pending_binary_install_plans.extend(plans);
+                pending_binary_install_staging_dirs.push(staged);
             }
             planner::PlanOrigin::Installed => {}
         }
+    }
+
+    flush_binary_install_batch(
+        &mut pending_binary_install_plans,
+        &mut pending_binary_install_staging_dirs,
+        &mut installed_binary_outcomes,
+        rootfs,
+        config,
+    )?;
+    for pkg in installed_binary_outcomes {
+        log_install_success(&pkg);
     }
 
     run_transaction_hooks_for_plans(
@@ -3903,6 +3980,7 @@ pub fn run(cli: Cli) -> Result<()> {
             spec_pos,
             spec,
             install,
+            install_deps,
         } => {
             warn_if_running_as_root_for_build("build", &cli.rootfs);
             let spec_path = spec.or(spec_pos).context("No spec file provided")?;
@@ -3915,6 +3993,14 @@ pub fn run(cli: Cli) -> Result<()> {
             // Apply system overrides
             pkg_spec.apply_config(&config);
             let requested_outputs = requested_outputs(&pkg_spec, cli.lib32_only);
+
+            let build_targets = vec![format!(
+                "{} v{}-{}",
+                pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
+            )];
+            if !ui::prompt_package_action("build", &build_targets, true)? {
+                anyhow::bail!("Aborted");
+            }
 
             // Ensure database directory exists
             std::fs::create_dir_all(&config.db_dir).with_context(|| {
@@ -3974,12 +4060,17 @@ pub fn run(cli: Cli) -> Result<()> {
                         },
                     )?;
                     print_plan_summary(&dep_plan);
-                    if !ui::prompt_package_action(
-                        "dependency installation",
-                        &missing_required,
-                        true,
-                    )? {
-                        anyhow::bail!("Aborted");
+                    if !install_deps {
+                        if cli.dry_run {
+                            ui::info(
+                                "Dry run enabled, stopping before dependency installation/build.",
+                            );
+                            return Ok(());
+                        }
+                        anyhow::bail!(
+                            "Missing dependencies: {}. Re-run with --install-deps to install them automatically, or install them manually.",
+                            missing_required.join(", ")
+                        );
                     }
                     if cli.dry_run {
                         ui::info("Dry run enabled, stopping before dependency installation/build.");
@@ -4041,17 +4132,22 @@ pub fn run(cli: Cli) -> Result<()> {
                                 missing_test.join(", ")
                             ));
                             print_plan_summary(&dep_plan);
-                            if !ui::prompt_package_action(
-                                "dependency installation",
-                                &missing_test,
-                                true,
-                            )? {
+                            if !install_deps {
+                                if cli.dry_run {
+                                    ui::info(
+                                        "Dry run enabled, stopping before dependency installation/build.",
+                                    );
+                                    return Ok(());
+                                }
                                 if !maybe_prompt_to_skip_tests_for_missing_requested_deps(
                                     &mut pkg_spec,
                                     &missing_test,
                                     "Requested test dependencies were not installed",
                                 )? {
-                                    anyhow::bail!("Aborted");
+                                    anyhow::bail!(
+                                        "Missing test dependencies: {}. Re-run with --install-deps to install them automatically, or install them manually.",
+                                        missing_test.join(", ")
+                                    );
                                 }
                             } else if !cli.dry_run {
                                 execute_install_plan_with_child_commands(
@@ -4102,14 +4198,6 @@ pub fn run(cli: Cli) -> Result<()> {
             let mut build_lock = locking::open_lock(&config)?;
             let build_lock_path = locking::lock_path(&config);
             let _build_lock_guard = locking::try_write(&mut build_lock, &build_lock_path, "build")?;
-
-            let build_targets = vec![format!(
-                "{} v{}-{}",
-                pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
-            )];
-            if !ui::prompt_package_action("build", &build_targets, true)? {
-                anyhow::bail!("Aborted");
-            }
 
             if cli.dry_run {
                 ui::info("Dry run enabled, stopping before fetch/build.");
@@ -4834,6 +4922,30 @@ pub fn run(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ASSUME_YES_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_binary_repo_record(name: &str, filename: &str) -> db::repo::BinaryRepoPackageRecord {
+        db::repo::BinaryRepoPackageRecord {
+            repo_name: "core".into(),
+            name: name.into(),
+            version: "1.0".into(),
+            revision: 1,
+            completed_at: None,
+            filename: filename.into(),
+            size: 1,
+            sha256: "sha256".into(),
+            sha512: "sha512".into(),
+            description: None,
+            homepage: None,
+            license: None,
+            provides: Vec::new(),
+            conflicts: Vec::new(),
+            runtime_dependencies: Vec::new(),
+            optional_dependencies: Vec::new(),
+        }
+    }
 
     fn test_package_spec(
         build_type: package::BuildType,
@@ -5959,6 +6071,7 @@ optional = []
 
     #[test]
     fn requested_test_deps_prompt_can_disable_tests() -> Result<()> {
+        let _guard = ASSUME_YES_TEST_LOCK.lock().expect("assume-yes test lock");
         let mut spec = test_package_spec(package::BuildType::Meson, None, &[]);
         spec.dependencies.test = vec!["pytest".into()];
 
@@ -5977,6 +6090,7 @@ optional = []
 
     #[test]
     fn requested_test_deps_prompt_is_ignored_for_non_automatic_test_builders() -> Result<()> {
+        let _guard = ASSUME_YES_TEST_LOCK.lock().expect("assume-yes test lock");
         let mut spec = test_package_spec(package::BuildType::Custom, None, &[]);
         spec.dependencies.test = vec!["pytest".into()];
 
@@ -6015,6 +6129,7 @@ optional = []
             spec_pos: Some(PathBuf::from("foo.toml")),
             spec: None,
             install: false,
+            install_deps: false,
         }));
         assert!(!command_requires_live_root(&Commands::Search {
             query: "foo".to_string(),
@@ -6031,6 +6146,207 @@ optional = []
         assert!(!should_delegate_live_rootfs_installs(Path::new(
             "/tmp/depot-test-rootfs"
         )));
+    }
+
+    #[test]
+    fn live_rootfs_child_install_batches_group_consecutive_binary_steps() -> Result<()> {
+        let source_path = PathBuf::from("/tmp/requested.toml");
+        let expat_archive = PathBuf::from("/tmp/expat.pkg.tar.zst");
+        let python_archive = PathBuf::from("/tmp/python.pkg.tar.zst");
+        let compiler_rt_archive = PathBuf::from("/tmp/lib32-compiler-rt.pkg.tar.zst");
+
+        let expat_record = test_binary_repo_record("expat", "expat-1.0-1-x86_64.depot.pkg.tar.zst");
+        let python_record =
+            test_binary_repo_record("python", "python-1.0-1-x86_64.depot.pkg.tar.zst");
+        let compiler_rt_record = test_binary_repo_record(
+            "lib32-compiler-rt",
+            "lib32-compiler-rt-1.0-1-x86_64.depot.pkg.tar.zst",
+        );
+
+        let steps = vec![
+            planner::PlannedStep {
+                package: "expat".into(),
+                action: planner::PlanAction::InstallBinary,
+                origin: planner::PlanOrigin::Binary {
+                    repo_name: "core".into(),
+                    record: Box::new(expat_record.clone()),
+                },
+                requested_by: vec!["pkg needs expat".into()],
+            },
+            planner::PlannedStep {
+                package: "python".into(),
+                action: planner::PlanAction::InstallBinary,
+                origin: planner::PlanOrigin::Binary {
+                    repo_name: "core".into(),
+                    record: Box::new(python_record.clone()),
+                },
+                requested_by: vec!["pkg needs python".into()],
+            },
+            planner::PlannedStep {
+                package: "pkg".into(),
+                action: planner::PlanAction::BuildAndInstall,
+                origin: planner::PlanOrigin::Source {
+                    path: source_path.clone(),
+                    local_sibling: false,
+                },
+                requested_by: vec!["requested spec".into()],
+            },
+            planner::PlannedStep {
+                package: "lib32-compiler-rt".into(),
+                action: planner::PlanAction::InstallBinary,
+                origin: planner::PlanOrigin::Binary {
+                    repo_name: "core".into(),
+                    record: Box::new(compiler_rt_record.clone()),
+                },
+                requested_by: vec!["pkg needs lib32-compiler-rt".into()],
+            },
+        ];
+        let step_refs = steps.iter().collect::<Vec<_>>();
+
+        let mut binary_archives = HashMap::new();
+        binary_archives.insert(
+            ("core".to_string(), expat_record.filename.clone()),
+            db::repo::BinaryRepoCachedArchive {
+                package_path: expat_archive.clone(),
+                signature_path: PathBuf::from("/tmp/expat.sig"),
+            },
+        );
+        binary_archives.insert(
+            ("core".to_string(), python_record.filename.clone()),
+            db::repo::BinaryRepoCachedArchive {
+                package_path: python_archive.clone(),
+                signature_path: PathBuf::from("/tmp/python.sig"),
+            },
+        );
+        binary_archives.insert(
+            ("core".to_string(), compiler_rt_record.filename.clone()),
+            db::repo::BinaryRepoCachedArchive {
+                package_path: compiler_rt_archive.clone(),
+                signature_path: PathBuf::from("/tmp/lib32-compiler-rt.sig"),
+            },
+        );
+
+        let options = InstallPlanExecutionOptions {
+            no_flags: false,
+            cross_prefix: None,
+            clean: false,
+            dry_run: false,
+            confirm_installation: false,
+            lib32_only_requested_specs: true,
+            install_test_deps: false,
+        };
+
+        let batches =
+            build_live_rootfs_child_install_batches(&step_refs, &options, &binary_archives)?;
+
+        assert_eq!(
+            batches,
+            vec![
+                ChildInstallBatch {
+                    requests: vec![expat_archive, python_archive],
+                    lib32_only: false,
+                },
+                ChildInstallBatch {
+                    requests: vec![source_path],
+                    lib32_only: true,
+                },
+                ChildInstallBatch {
+                    requests: vec![compiler_rt_archive],
+                    lib32_only: false,
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_command_requires_install_deps_flag_for_missing_dependencies() -> Result<()> {
+        let _guard = ASSUME_YES_TEST_LOCK.lock().expect("assume-yes test lock");
+        let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+        let rootfs = temp.path().join("rootfs");
+        let repo_root = temp.path().join("packages");
+        let app_dir = repo_root.join("app");
+        let dep_dir = repo_root.join("dep");
+        fs::create_dir_all(&rootfs)?;
+        fs::create_dir_all(&app_dir)?;
+        fs::create_dir_all(&dep_dir)?;
+
+        let app_spec = app_dir.join("app.toml");
+        fs::write(
+            &app_spec,
+            r#"[package]
+name = "app"
+version = "1.0.0"
+revision = 1
+description = "app"
+homepage = "https://example.test/app"
+license = "MIT"
+
+[[source]]
+url = "https://example.test/app-1.0.0.tar.gz"
+sha256 = "skip"
+extract_dir = "app-1.0.0"
+
+[build]
+type = "custom"
+
+[dependencies]
+build = ["dep"]
+runtime = []
+optional = []
+"#,
+        )
+        .with_context(|| format!("Failed to write {}", app_spec.display()))?;
+
+        let dep_spec = dep_dir.join("dep.toml");
+        fs::write(
+            &dep_spec,
+            r#"[package]
+name = "dep"
+version = "1.0.0"
+revision = 1
+description = "dep"
+homepage = "https://example.test/dep"
+license = "MIT"
+
+[[source]]
+url = "https://example.test/dep-1.0.0.tar.gz"
+sha256 = "skip"
+extract_dir = "dep-1.0.0"
+
+[build]
+type = "custom"
+
+[dependencies]
+build = []
+runtime = []
+optional = []
+"#,
+        )
+        .with_context(|| format!("Failed to write {}", dep_spec.display()))?;
+
+        let result = run(Cli {
+            rootfs: rootfs.clone(),
+            no_deps: false,
+            no_flags: false,
+            cross_prefix: None,
+            clean: false,
+            yes: true,
+            dry_run: false,
+            test_deps: false,
+            lib32_only: false,
+            command: Commands::Build {
+                spec_pos: Some(app_spec),
+                spec: None,
+                install: false,
+                install_deps: false,
+            },
+        });
+        ui::set_assume_yes(false);
+
+        let err = result.expect_err("build should require --install-deps when deps are missing");
+        assert!(err.to_string().contains("Re-run with --install-deps"));
+        Ok(())
     }
 
     #[test]
