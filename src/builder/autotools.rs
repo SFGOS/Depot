@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use walkdir::WalkDir;
 
 pub fn build(
     spec: &PackageSpec,
@@ -290,6 +291,24 @@ pub fn build(
             }
         );
 
+        let install_destdir = install_destdir_path(&build_dir, destdir, flags.lib32_variant);
+        if flags.lib32_variant {
+            if install_destdir.exists() {
+                fs::remove_dir_all(&install_destdir).with_context(|| {
+                    format!(
+                        "Failed to clean temporary lib32 install dir: {}",
+                        install_destdir.display()
+                    )
+                })?;
+            }
+            fs::create_dir_all(&install_destdir).with_context(|| {
+                format!(
+                    "Failed to create temporary lib32 install dir: {}",
+                    install_destdir.display()
+                )
+            })?;
+        }
+
         let install_dirs = resolve_make_dirs(
             &build_dir,
             &flags.make_install_dirs,
@@ -301,12 +320,12 @@ pub fn build(
             Some("install"),
         );
         for install_dir in install_dirs {
-            let mut install_cmd = fakeroot::wrap_install_command(make_exec, destdir);
+            let mut install_cmd = fakeroot::wrap_install_command(make_exec, &install_destdir);
             install_cmd.current_dir(&install_dir);
             if make_exec_supports_make_assignments(make_exec)
                 && !has_make_variable_override(&flags.make_install_vars, "DESTDIR")
             {
-                install_cmd.arg(format!("DESTDIR={}", destdir.to_string_lossy()));
+                install_cmd.arg(format!("DESTDIR={}", install_destdir.to_string_lossy()));
             }
             add_make_variable_overrides_if_supported(
                 &mut install_cmd,
@@ -321,7 +340,7 @@ pub fn build(
             let mut install_env = env_vars.clone();
             install_env.push((
                 "DESTDIR".to_string(),
-                destdir.to_string_lossy().into_owned(),
+                install_destdir.to_string_lossy().into_owned(),
             ));
             crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
 
@@ -346,8 +365,16 @@ pub fn build(
             }
         }
 
-        // Run post-install hooks (after make install)
-        hooks::run_post_install_commands(spec, &actual_src, destdir)?;
+        if flags.lib32_variant {
+            let staged_lib32 = install_destdir.join("usr/lib32");
+            if !staged_lib32.exists() {
+                anyhow::bail!("lib32 install did not populate {}", staged_lib32.display());
+            }
+            copy_tree_preserving_links(&staged_lib32, &destdir.join("usr/lib32"))?;
+            hooks::run_post_install_commands_in_dir(spec, &build_dir, destdir)?;
+        } else {
+            hooks::run_post_install_commands(spec, &actual_src, destdir)?;
+        }
         state.mark_done(BuildStep::PostInstallDone)?;
     } else {
         crate::log_info!("Skipping make install and post-install hooks (already done)");
@@ -466,6 +493,71 @@ fn default_configure_install_dirs(
         .filter(|(option, _)| !has_configure_option_prefix(&flags.configure, option))
         .map(|(option, value)| format!("{option}={value}"))
         .collect()
+}
+
+fn install_destdir_path(build_dir: &Path, destdir: &Path, lib32_variant: bool) -> PathBuf {
+    if lib32_variant {
+        build_dir.join("destdir")
+    } else {
+        destdir.to_path_buf()
+    }
+}
+
+fn copy_tree_preserving_links(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)
+        .with_context(|| format!("Failed to create destination dir: {}", dst.display()))?;
+
+    for entry in WalkDir::new(src) {
+        let entry = entry?;
+        let rel = entry
+            .path()
+            .strip_prefix(src)
+            .with_context(|| format!("Failed to strip prefix: {}", src.display()))?;
+        let target = dst.join(rel);
+
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)
+                .with_context(|| format!("Failed to create dir: {}", target.display()))?;
+            continue;
+        }
+
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create dir: {}", parent.display()))?;
+        }
+
+        if entry.file_type().is_symlink() {
+            let link_target = fs::read_link(entry.path())
+                .with_context(|| format!("Failed to read symlink: {}", entry.path().display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs as unix_fs;
+                unix_fs::symlink(&link_target, &target).with_context(|| {
+                    format!(
+                        "Failed to create symlink {} -> {}",
+                        target.display(),
+                        link_target.display()
+                    )
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!(
+                    "Symlink-preserving lib32 staging copy is only supported on unix hosts"
+                );
+            }
+        } else {
+            fs::copy(entry.path(), &target).with_context(|| {
+                format!(
+                    "Failed to copy {} to {}",
+                    entry.path().display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn lib32_host_triple(host: &str) -> String {
@@ -902,6 +994,20 @@ mod tests {
         let flags = BuildFlags::default();
         let args = default_configure_install_dirs(&flags, Some("--prefix=PREFIX"));
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_install_destdir_path_uses_build_dir_for_lib32() {
+        let build_dir = Path::new("/tmp/build");
+        let destdir = Path::new("/tmp/pkg");
+        assert_eq!(
+            install_destdir_path(build_dir, destdir, false),
+            destdir.to_path_buf()
+        );
+        assert_eq!(
+            install_destdir_path(build_dir, destdir, true),
+            build_dir.join("destdir")
+        );
     }
 
     #[test]

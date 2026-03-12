@@ -843,70 +843,11 @@ fn make_lib32_package_spec(base: &package::PackageSpec) -> package::PackageSpec 
     let mut spec = base.clone();
     let lib32_name = lib32_package_name(&base.package.name);
     spec.package.name = lib32_name.clone();
-    // The lib32 pass currently emits a single companion package from /usr/lib32.
+    // The lib32 pass currently emits a single companion package.
     spec.packages.clear();
     spec.alternatives = base.alternatives_for_output(&lib32_name);
     spec.dependencies = base.dependencies_for_output(&lib32_name);
     spec
-}
-
-fn copy_tree_preserving_links(src: &Path, dst: &Path) -> Result<()> {
-    use walkdir::WalkDir;
-
-    fs::create_dir_all(dst)
-        .with_context(|| format!("Failed to create destination dir: {}", dst.display()))?;
-
-    for entry in WalkDir::new(src) {
-        let entry = entry?;
-        let rel = entry
-            .path()
-            .strip_prefix(src)
-            .with_context(|| format!("Failed to strip prefix: {}", src.display()))?;
-        let target = dst.join(rel);
-
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)
-                .with_context(|| format!("Failed to create dir: {}", target.display()))?;
-            continue;
-        }
-
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create dir: {}", parent.display()))?;
-        }
-
-        if entry.file_type().is_symlink() {
-            let link_target = fs::read_link(entry.path())
-                .with_context(|| format!("Failed to read symlink: {}", entry.path().display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs as unix_fs;
-                unix_fs::symlink(&link_target, &target).with_context(|| {
-                    format!(
-                        "Failed to create symlink {} -> {}",
-                        target.display(),
-                        link_target.display()
-                    )
-                })?;
-            }
-            #[cfg(not(unix))]
-            {
-                anyhow::bail!(
-                    "Symlink-preserving lib32 staging copy is only supported on unix hosts"
-                );
-            }
-        } else {
-            fs::copy(entry.path(), &target).with_context(|| {
-                format!(
-                    "Failed to copy {} to {}",
-                    entry.path().display(),
-                    target.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(())
 }
 
 fn build_lib32_companion_package(
@@ -932,29 +873,6 @@ fn build_lib32_companion_package(
     let mut lib32_input = pkg_spec.clone();
     lib32_input.build.flags.build_32 = true;
     let lib32_build_spec = make_lib32_build_spec(&lib32_input);
-    let lib32_install_destdir = config
-        .build_dir
-        .join("destdir")
-        .join(".lib32-build")
-        .join(&pkg_spec.package.name)
-        .join("lib32-dest");
-
-    builder::build(
-        &lib32_build_spec,
-        src_dir,
-        &lib32_install_destdir,
-        cross_config,
-        export_compiler_flags,
-    )?;
-
-    let lib32_src = lib32_install_destdir.join("usr/lib32");
-    if !lib32_src.exists() {
-        anyhow::bail!(
-            "lib32 build completed but did not install usr/lib32 into {}",
-            lib32_install_destdir.display()
-        );
-    }
-
     let lib32_pkg_spec = make_lib32_package_spec(pkg_spec);
     let lib32_destdir = config
         .build_dir
@@ -972,7 +890,21 @@ fn build_lib32_companion_package(
         )
     })?;
 
-    copy_tree_preserving_links(&lib32_src, &lib32_destdir.join("usr/lib32"))?;
+    builder::build(
+        &lib32_build_spec,
+        src_dir,
+        &lib32_destdir,
+        cross_config,
+        export_compiler_flags,
+    )?;
+
+    let lib32_src = lib32_destdir.join("usr/lib32");
+    if !lib32_src.exists() {
+        anyhow::bail!(
+            "lib32 build completed but did not install usr/lib32 into {}",
+            lib32_destdir.display()
+        );
+    }
     staging::add_licenses(src_dir, &lib32_destdir, &lib32_pkg_spec.package.name)?;
     install::scripts::stage_scripts_from_spec_dir(&lib32_pkg_spec, &lib32_destdir)?;
     staging::process(&lib32_destdir, &lib32_pkg_spec)?;

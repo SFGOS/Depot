@@ -201,8 +201,12 @@ pub fn run_post_compile_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
     Ok(())
 }
 
-/// Run post-install commands (after make install).
-pub fn run_post_install_commands(spec: &PackageSpec, src_dir: &Path, destdir: &Path) -> Result<()> {
+/// Run post-install commands (after make install) from the provided working directory.
+pub fn run_post_install_commands_in_dir(
+    spec: &PackageSpec,
+    work_dir: &Path,
+    destdir: &Path,
+) -> Result<()> {
     let commands = &spec.build.flags.post_install;
     if commands.is_empty() {
         return Ok(());
@@ -223,7 +227,7 @@ pub fn run_post_install_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
         let wrapped_cmd = crate::shell_helpers::wrap_shell_command(&cmd_str);
 
         let mut shell_cmd = Command::new("sh");
-        shell_cmd.current_dir(src_dir);
+        shell_cmd.current_dir(work_dir);
         crate::builder::prepare_command(&mut shell_cmd, &env_vars);
         let status = shell_cmd
             .arg("-c")
@@ -237,6 +241,11 @@ pub fn run_post_install_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
     }
 
     Ok(())
+}
+
+/// Run post-install commands (after make install).
+pub fn run_post_install_commands(spec: &PackageSpec, src_dir: &Path, destdir: &Path) -> Result<()> {
+    run_post_install_commands_in_dir(spec, src_dir, destdir)
 }
 
 fn resolve_patch_path(spec: &PackageSpec, patch: &str, patch_cache_dir: &Path) -> Result<PathBuf> {
@@ -307,7 +316,10 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_patch_path, run_post_extract_commands, run_post_install_commands};
+    use super::{
+        resolve_patch_path, run_post_extract_commands, run_post_install_commands,
+        run_post_install_commands_in_dir,
+    };
     use crate::package::{
         Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source,
     };
@@ -399,6 +411,39 @@ mod tests {
         assert!(
             destdir
                 .join(".depot/outputs/llvm-libs/usr/lib/libLLVM.so.1")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn post_install_commands_can_run_from_build_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec_dir = tmp.path().join("spec");
+        let src_dir = tmp.path().join("src");
+        let build_dir = tmp.path().join("build");
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(build_dir.join("destdir/usr/include/gnu")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/include/gnu")).unwrap();
+        std::fs::write(
+            build_dir.join("destdir/usr/include/gnu/lib-names-32.h"),
+            "lib32",
+        )
+        .unwrap();
+
+        let mut spec = dummy_spec(&spec_dir);
+        spec.build.flags.post_install = vec![
+            "install -m644 destdir/usr/include/gnu/lib-names-32.h \"$DESTDIR/usr/include/gnu/\""
+                .into(),
+        ];
+
+        run_post_install_commands_in_dir(&spec, &build_dir, &destdir).unwrap();
+
+        assert!(destdir.join("usr/include/gnu/lib-names-32.h").exists());
+        assert!(
+            !src_dir
+                .join("destdir/usr/include/gnu/lib-names-32.h")
                 .exists()
         );
     }
