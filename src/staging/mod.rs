@@ -208,6 +208,202 @@ fn is_manpage_rel_path(rel_path: &str) -> bool {
     rel.starts_with("usr/share/man/") && !has_known_compressed_suffix(rel)
 }
 
+fn normalize_doc_dir(path: &str) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("doc_dirs entries must not be empty");
+    }
+
+    let relative = trimmed.trim_start_matches('/');
+    if relative.is_empty() {
+        anyhow::bail!("doc_dirs entries must not resolve to the filesystem root");
+    }
+
+    let p = Path::new(relative);
+    let mut normalized = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::Normal(seg) => normalized.push(seg),
+            Component::CurDir => {}
+            _ => {
+                anyhow::bail!(
+                    "doc_dirs entries must not contain traversal or root components: {}",
+                    trimmed
+                );
+            }
+        }
+    }
+
+    let normalized = normalized
+        .to_str()
+        .context("doc_dirs entries must be valid UTF-8")?
+        .to_string();
+    if normalized.is_empty() {
+        anyhow::bail!(
+            "doc_dirs entries must not resolve to an empty path: {}",
+            trimmed
+        );
+    }
+    Ok(normalized)
+}
+
+fn cleanup_empty_parent_dirs(root: &Path, start: &Path) -> Result<()> {
+    let mut current = start.parent();
+    while let Some(dir) = current {
+        if dir == root {
+            break;
+        }
+
+        match fs::remove_dir(dir) {
+            Ok(()) => current = dir.parent(),
+            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => current = dir.parent(),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to prune empty dir {}", dir.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn move_tree_preserving_layout(src: &Path, dst: &Path) -> Result<()> {
+    let metadata = src
+        .symlink_metadata()
+        .with_context(|| format!("Failed to inspect {}", src.display()))?;
+    let file_type = metadata.file_type();
+
+    if file_type.is_dir() {
+        match dst.symlink_metadata() {
+            Ok(dst_meta) => {
+                if !dst_meta.file_type().is_dir() {
+                    anyhow::bail!(
+                        "Failed to move {} into {}: destination exists and is not a directory",
+                        src.display(),
+                        dst.display()
+                    );
+                }
+                for entry in fs::read_dir(src)
+                    .with_context(|| format!("Failed to read {}", src.display()))?
+                {
+                    let entry = entry?;
+                    let child_src = entry.path();
+                    let child_dst = dst.join(entry.file_name());
+                    move_tree_preserving_layout(&child_src, &child_dst)?;
+                }
+                fs::remove_dir(src)
+                    .with_context(|| format!("Failed to remove {}", src.display()))?;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("Failed to create {}", parent.display()))?;
+                }
+                fs::rename(src, dst).with_context(|| {
+                    format!(
+                        "Failed to move documentation tree {} -> {}",
+                        src.display(),
+                        dst.display()
+                    )
+                })?;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to inspect {}", dst.display()));
+            }
+        }
+    } else {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        if dst.symlink_metadata().is_ok() {
+            anyhow::bail!(
+                "Failed to move {} into {}: destination already exists",
+                src.display(),
+                dst.display()
+            );
+        }
+        fs::rename(src, dst).with_context(|| {
+            format!(
+                "Failed to move documentation path {} -> {}",
+                src.display(),
+                dst.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn split_docs_for_output(
+    output_destdir: &Path,
+    docs_destdir: &Path,
+    doc_dirs: &[String],
+) -> Result<usize> {
+    let mut moved = 0usize;
+
+    for rel_dir in doc_dirs {
+        let src = output_destdir.join(rel_dir);
+        let metadata = match src.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to inspect {}", src.display()));
+            }
+        };
+
+        if !metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let dst = docs_destdir.join(rel_dir);
+        move_tree_preserving_layout(&src, &dst)?;
+        cleanup_empty_parent_dirs(output_destdir, &src)?;
+        moved += 1;
+    }
+
+    Ok(moved)
+}
+
+fn split_docs_outputs(destdir: &Path, spec: &PackageSpec) -> Result<usize> {
+    if !spec.build.flags.split_docs {
+        return Ok(0);
+    }
+
+    let mut doc_dirs = vec![
+        normalize_doc_dir("/usr/share/doc")?,
+        normalize_doc_dir("/usr/share/gtk-doc")?,
+    ];
+    for custom in &spec.build.flags.doc_dirs {
+        let normalized = normalize_doc_dir(custom)?;
+        if !doc_dirs.contains(&normalized) {
+            doc_dirs.push(normalized);
+        }
+    }
+
+    let mut moved = 0usize;
+    for output in spec.outputs() {
+        if output.name.ends_with("-docs") {
+            continue;
+        }
+
+        let output_destdir = if output.name == spec.package.name {
+            destdir.to_path_buf()
+        } else {
+            output_staging_dir(destdir, &output.name)
+        };
+        if !output_destdir.exists() {
+            continue;
+        }
+
+        let docs_pkg = spec.docs_package_for_output(&output);
+        let docs_destdir = output_staging_dir(destdir, &docs_pkg.name);
+        moved += split_docs_for_output(&output_destdir, &docs_destdir, &doc_dirs)?;
+    }
+
+    Ok(moved)
+}
+
 fn append_os_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = OsString::from(path.as_os_str());
     s.push(suffix);
@@ -460,6 +656,14 @@ pub fn process(destdir: &Path, spec: &PackageSpec) -> Result<()> {
         }
     }
 
+    let moved_docs = split_docs_outputs(destdir, spec)?;
+    if moved_docs > 0 {
+        crate::log_info!(
+            "Moved {} documentation tree(s) into docs outputs",
+            moved_docs
+        );
+    }
+
     Ok(())
 }
 
@@ -528,6 +732,111 @@ pub struct FsTransaction {
     removed: Vec<String>,
 }
 
+fn is_directory_empty(path: &Path) -> Result<bool> {
+    let mut entries = fs::read_dir(path)
+        .with_context(|| format!("Failed to read directory {}", path.display()))?;
+    Ok(entries.next().transpose()?.is_none())
+}
+
+fn backup_existing_path(src: &Path, backup_path: &Path, rel: &str) -> Result<()> {
+    let metadata = src
+        .symlink_metadata()
+        .with_context(|| format!("Failed to inspect existing path {}", rel))?;
+
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create backup dir {}", parent.display()))?;
+    }
+
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(src)
+            .with_context(|| format!("Failed to read existing symlink target {}", rel))?;
+        std::os::unix::fs::symlink(&target, backup_path)
+            .with_context(|| format!("Failed to backup symlink {}", rel))?;
+    } else if metadata.file_type().is_dir() {
+        fs::create_dir_all(backup_path)
+            .with_context(|| format!("Failed to backup directory {}", rel))?;
+        apply_unix_mode(backup_path, &metadata)?;
+    } else {
+        fs::copy(src, backup_path).with_context(|| format!("Failed to backup file {}", rel))?;
+    }
+
+    Ok(())
+}
+
+fn remove_path_in_place(path: &Path, rel: &str) -> Result<()> {
+    let metadata = path
+        .symlink_metadata()
+        .with_context(|| format!("Failed to inspect existing path {}", rel))?;
+
+    if metadata.file_type().is_dir() {
+        fs::remove_dir(path)
+            .with_context(|| format!("Failed to remove obsolete directory {}", rel))?;
+    } else {
+        fs::remove_file(path)
+            .with_context(|| format!("Failed to remove obsolete file/symlink {}", rel))?;
+    }
+
+    Ok(())
+}
+
+fn backup_and_remove_obsolete_path(
+    tx: &mut FsTransaction,
+    rootfs: &Path,
+    rel: &str,
+    require_empty_dir: bool,
+) -> Result<bool> {
+    let dest_path = rootfs.join(rel);
+    let metadata = match dest_path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("Failed to inspect obsolete path before removal: {}", rel)
+            });
+        }
+    };
+
+    if metadata.file_type().is_dir() {
+        let empty = is_directory_empty(&dest_path)?;
+        if !empty {
+            if require_empty_dir {
+                anyhow::bail!(
+                    "Refusing to replace existing non-empty directory with packaged file/symlink: {}",
+                    rel
+                );
+            }
+            return Ok(false);
+        }
+    }
+
+    let backup_path = tx.removed_backup_path(rel);
+    backup_existing_path(&dest_path, &backup_path, rel)?;
+    remove_path_in_place(&dest_path, rel)?;
+    tx.removed.push(rel.to_string());
+    Ok(true)
+}
+
+fn remove_obsolete_children_for_dir(
+    tx: &mut FsTransaction,
+    rootfs: &Path,
+    dir_rel: &str,
+    remove_paths: &[String],
+) -> Result<()> {
+    let prefix = format!("{dir_rel}/");
+    let mut nested_paths: Vec<&str> = remove_paths
+        .iter()
+        .filter_map(|path| path.strip_prefix(&prefix).map(|_| path.as_str()))
+        .collect();
+    nested_paths.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+
+    for rel in nested_paths {
+        let _ = backup_and_remove_obsolete_path(tx, rootfs, rel, false)?;
+    }
+
+    Ok(())
+}
+
 impl FsTransaction {
     fn backup_path(&self, rel: &str) -> PathBuf {
         self.tx_dir.join("backup").join(rel)
@@ -537,44 +846,78 @@ impl FsTransaction {
         self.tx_dir.join("removed").join(rel)
     }
 
-    /// Roll back file operations performed by `install_atomic`.
-    pub fn rollback(&self) -> Result<()> {
-        // Restore removed files
-        for rel in &self.removed {
-            let src = self.removed_backup_path(rel);
-            let dst = self.rootfs.join(rel);
-            if src.symlink_metadata().is_ok() {
-                if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                // Best-effort remove if something exists now.
-                let _ = fs::remove_file(&dst);
-                match fs::rename(&src, &dst) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        fs::copy(&src, &dst)?;
-                        fs::remove_file(&src)?;
-                    }
-                }
-            }
+    fn restore_backup_entry(&self, src: &Path, dst: &Path) -> Result<()> {
+        let metadata = src
+            .symlink_metadata()
+            .with_context(|| format!("Failed to inspect backup entry {}", src.display()))?;
+
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create restore dir {}", parent.display()))?;
         }
 
-        // Restore overwritten files
+        if metadata.file_type().is_dir() {
+            match dst.symlink_metadata() {
+                Ok(dst_meta) if dst_meta.file_type().is_dir() => {}
+                Ok(dst_meta) if dst_meta.file_type().is_symlink() => {
+                    fs::remove_file(dst)
+                        .with_context(|| format!("Failed to remove {}", dst.display()))?;
+                }
+                Ok(_) => {
+                    fs::remove_file(dst)
+                        .with_context(|| format!("Failed to remove {}", dst.display()))?;
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("Failed to inspect {}", dst.display()));
+                }
+            }
+            fs::create_dir_all(dst)
+                .with_context(|| format!("Failed to restore directory {}", dst.display()))?;
+            apply_unix_mode(dst, &metadata)?;
+            return Ok(());
+        }
+
+        let _ = fs::remove_file(dst);
+        match fs::rename(src, dst) {
+            Ok(()) => Ok(()),
+            Err(_) if metadata.file_type().is_symlink() => {
+                let target = fs::read_link(src)
+                    .with_context(|| format!("Failed to read backup symlink {}", src.display()))?;
+                std::os::unix::fs::symlink(&target, dst)
+                    .with_context(|| format!("Failed to restore symlink {}", dst.display()))
+            }
+            Err(_) => {
+                fs::copy(src, dst).with_context(|| {
+                    format!(
+                        "Failed to restore file {} from {}",
+                        dst.display(),
+                        src.display()
+                    )
+                })?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Roll back file operations performed by `install_atomic`.
+    pub fn rollback(&self) -> Result<()> {
+        // Restore overwritten paths first so removed children have their original parent layout.
         for rel in &self.backed_up {
             let src = self.backup_path(rel);
             let dst = self.rootfs.join(rel);
             if src.symlink_metadata().is_ok() {
-                if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let _ = fs::remove_file(&dst);
-                match fs::rename(&src, &dst) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        fs::copy(&src, &dst)?;
-                        fs::remove_file(&src)?;
-                    }
-                }
+                self.restore_backup_entry(&src, &dst)?;
+            }
+        }
+
+        // Restore removed files/directories.
+        for rel in &self.removed {
+            let src = self.removed_backup_path(rel);
+            let dst = self.rootfs.join(rel);
+            if src.symlink_metadata().is_ok() {
+                self.restore_backup_entry(&src, &dst)?;
             }
         }
 
@@ -618,6 +961,7 @@ pub fn install_atomic(
             KeepMatcher::Pattern(_) => None,
         })
         .collect();
+    let remove_set: HashSet<&str> = remove_paths.iter().map(String::as_str).collect();
 
     fs::create_dir_all(tx_base_dir)
         .with_context(|| format!("Failed to create tx dir: {}", tx_base_dir.display()))?;
@@ -640,6 +984,7 @@ pub fn install_atomic(
         created: Vec::new(),
         removed: Vec::new(),
     };
+    let mut staged_paths = HashSet::new();
 
     let result: Result<()> = (|| {
         // First, create all directories from destdir (for packages with only directories)
@@ -664,6 +1009,7 @@ pub fn install_atomic(
                 fs::create_dir_all(&dest_path)?;
                 apply_unix_mode(&dest_path, &src_path.symlink_metadata()?)?;
             }
+            staged_paths.insert(rel_path_str);
         }
 
         // Copy in new files.
@@ -708,26 +1054,22 @@ pub fn install_atomic(
             }
 
             if let Ok(dest_meta) = dest_path.symlink_metadata() {
-                // lexists checks existence without following symlinks
-                // Backup existing
                 let backup_path = tx.backup_path(&install_rel_path);
-                if let Some(parent) = backup_path.parent() {
-                    fs::create_dir_all(parent)?;
+                if dest_meta.file_type().is_dir() {
+                    if !remove_set.contains(install_rel_path.as_str()) {
+                        anyhow::bail!(
+                            "Refusing to replace existing directory with packaged file/symlink: {}",
+                            install_rel_path
+                        );
+                    }
+                    remove_obsolete_children_for_dir(
+                        &mut tx,
+                        rootfs,
+                        &install_rel_path,
+                        remove_paths,
+                    )?;
                 }
-
-                // Fallback: if symlink, read link and recreate at backup.
-                if dest_meta.file_type().is_symlink() {
-                    let target = fs::read_link(&dest_path)?;
-                    std::os::unix::fs::symlink(&target, &backup_path)?;
-                } else if dest_meta.file_type().is_dir() {
-                    anyhow::bail!(
-                        "Refusing to replace existing directory with packaged file/symlink: {}",
-                        install_rel_path
-                    );
-                } else {
-                    fs::copy(&dest_path, &backup_path)?;
-                }
-
+                backup_existing_path(&dest_path, &backup_path, &install_rel_path)?;
                 tx.backed_up.push(install_rel_path.clone());
             } else {
                 tx.created.push(install_rel_path.clone());
@@ -737,12 +1079,22 @@ pub fn install_atomic(
             // Remove destination if it exists (we backed it up) so we can overwrite
             if let Ok(dest_meta) = dest_path.symlink_metadata() {
                 if dest_meta.file_type().is_dir() {
-                    anyhow::bail!(
-                        "Refusing to replace existing directory with packaged file/symlink: {}",
-                        install_rel_path
-                    );
+                    if !remove_set.contains(install_rel_path.as_str()) {
+                        anyhow::bail!(
+                            "Refusing to replace existing directory with packaged file/symlink: {}",
+                            install_rel_path
+                        );
+                    }
+                    if !is_directory_empty(&dest_path)? {
+                        anyhow::bail!(
+                            "Refusing to replace existing non-empty directory with packaged file/symlink: {}",
+                            install_rel_path
+                        );
+                    }
+                    fs::remove_dir(&dest_path)?;
+                } else {
+                    fs::remove_file(&dest_path)?;
                 }
-                fs::remove_file(&dest_path)?;
             }
 
             if file_type.is_symlink() {
@@ -754,45 +1106,15 @@ pub fn install_atomic(
                     .with_context(|| format!("Failed to install: {}", install_rel_path))?;
                 apply_unix_mode(&dest_path, &metadata)?;
             }
+            staged_paths.insert(install_rel_path);
         }
 
-        // Remove obsolete files (update only)
+        // Remove obsolete files/directories left behind by the previous version.
         for rel in remove_paths {
-            let rel = rel.as_str();
-            let dest_path = rootfs.join(rel);
-            let dest_meta = match dest_path.symlink_metadata() {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("Failed to inspect obsolete path before removal: {}", rel)
-                    });
-                }
-            };
-
-            if dest_meta.file_type().is_dir() {
-                // Only obsolete files/symlinks are removed here.
+            if staged_paths.contains(rel) || tx.removed.iter().any(|removed| removed == rel) {
                 continue;
             }
-
-            let backup_path = tx.removed_backup_path(rel);
-            if let Some(parent) = backup_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            if dest_meta.file_type().is_symlink() {
-                let target = fs::read_link(&dest_path)
-                    .with_context(|| format!("Failed to read obsolete symlink target: {}", rel))?;
-                std::os::unix::fs::symlink(&target, &backup_path)
-                    .with_context(|| format!("Failed to backup removed symlink: {}", rel))?;
-            } else {
-                fs::copy(&dest_path, &backup_path)
-                    .with_context(|| format!("Failed to backup removed file: {}", rel))?;
-            }
-
-            fs::remove_file(&dest_path)
-                .with_context(|| format!("Failed to remove obsolete file/symlink: {}", rel))?;
-            tx.removed.push(rel.to_string());
+            let _ = backup_and_remove_obsolete_path(&mut tx, rootfs, rel, false)?;
         }
 
         Ok(())
@@ -872,6 +1194,72 @@ mod tests {
 
         assert!(destdir.join("usr/lib/libfoo.a").exists());
         assert!(!destdir.join("usr/lib/libfoo.la").exists());
+    }
+
+    #[test]
+    fn process_splits_docs_into_docs_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/share/doc/foo")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/share/gtk-doc/html/foo")).unwrap();
+        std::fs::create_dir_all(destdir.join("opt/foo-docs")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::write(destdir.join("usr/share/doc/foo/README"), "doc").unwrap();
+        std::fs::write(destdir.join("usr/share/gtk-doc/html/foo/index.html"), "gtk").unwrap();
+        std::fs::write(destdir.join("opt/foo-docs/guide.txt"), "guide").unwrap();
+        std::fs::write(destdir.join("usr/bin/foo"), "bin").unwrap();
+
+        let mut spec = mk_spec_for_stage_processing();
+        spec.build.flags.split_docs = true;
+        spec.build.flags.doc_dirs = vec!["/opt/foo-docs".to_string()];
+
+        process(&destdir, &spec).unwrap();
+
+        let docs_destdir = output_staging_dir(&destdir, "foo-docs");
+        assert!(docs_destdir.join("usr/share/doc/foo/README").exists());
+        assert!(
+            docs_destdir
+                .join("usr/share/gtk-doc/html/foo/index.html")
+                .exists()
+        );
+        assert!(docs_destdir.join("opt/foo-docs/guide.txt").exists());
+        assert!(destdir.join("usr/bin/foo").exists());
+        assert!(!destdir.join("usr/share/doc/foo/README").exists());
+        assert!(
+            !destdir
+                .join("usr/share/gtk-doc/html/foo/index.html")
+                .exists()
+        );
+        assert!(!destdir.join("opt/foo-docs/guide.txt").exists());
+    }
+
+    #[test]
+    fn process_splits_docs_for_additional_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        let dev_destdir = output_staging_dir(&destdir, "foo-dev");
+        std::fs::create_dir_all(dev_destdir.join("usr/share/doc/foo-dev")).unwrap();
+        std::fs::create_dir_all(dev_destdir.join("usr/include")).unwrap();
+        std::fs::write(dev_destdir.join("usr/share/doc/foo-dev/README"), "doc").unwrap();
+        std::fs::write(dev_destdir.join("usr/include/foo.h"), "header").unwrap();
+
+        let mut spec = mk_spec_for_stage_processing();
+        spec.packages.push(PackageInfo {
+            name: "foo-dev".into(),
+            version: "1.0".into(),
+            revision: 1,
+            description: "dev".into(),
+            homepage: "h".into(),
+            license: vec!["MIT".into()],
+        });
+        spec.build.flags.split_docs = true;
+
+        process(&destdir, &spec).unwrap();
+
+        let docs_destdir = output_staging_dir(&destdir, "foo-dev-docs");
+        assert!(docs_destdir.join("usr/share/doc/foo-dev/README").exists());
+        assert!(dev_destdir.join("usr/include/foo.h").exists());
+        assert!(!dev_destdir.join("usr/share/doc/foo-dev/README").exists());
     }
 
     #[test]
@@ -1053,6 +1441,43 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Refusing to replace existing directory with packaged file/symlink")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_atomic_replaces_obsolete_directory_with_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(rootfs.join("usr/sbin")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr")).unwrap();
+        std::fs::write(rootfs.join("usr/sbin/legacy"), "old").unwrap();
+        std::fs::write(destdir.join("usr/bin/legacy"), "new").unwrap();
+        std::os::unix::fs::symlink("bin", destdir.join("usr/sbin")).unwrap();
+
+        let remove_paths = vec!["usr/sbin/legacy".to_string(), "usr/sbin".to_string()];
+        let tx = install_atomic(&destdir, &rootfs, &tx_base, &remove_paths, &[]).unwrap();
+
+        let sbin_meta = rootfs.join("usr/sbin").symlink_metadata().unwrap();
+        assert!(sbin_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(rootfs.join("usr/sbin")).unwrap(),
+            PathBuf::from("bin")
+        );
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/bin/legacy")).unwrap(),
+            "new"
+        );
+
+        tx.rollback().unwrap();
+        let restored = rootfs.join("usr/sbin").symlink_metadata().unwrap();
+        assert!(restored.file_type().is_dir());
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/sbin/legacy")).unwrap(),
+            "old"
         );
     }
 

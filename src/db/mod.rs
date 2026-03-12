@@ -199,6 +199,36 @@ pub fn get_package_files(db_path: &Path, name: &str) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// Return the list of directories owned by an installed package.
+pub fn get_package_directories(db_path: &Path, name: &str) -> Result<Vec<String>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+
+    let pkg_id_res: rusqlite::Result<i64> = conn.query_row(
+        "SELECT id FROM packages WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    );
+
+    let pkg_id = match pkg_id_res {
+        Ok(id) => id,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut stmt = conn.prepare("SELECT path FROM directories WHERE package_id = ?1")?;
+    let mut directories: Vec<String> = stmt
+        .query_map(params![pkg_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+    Ok(directories)
+}
+
 /// Remove a package from the database and filesystem
 pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
     if !db_path.exists() {
@@ -510,18 +540,24 @@ fn detect_rootfs_from_db_path(db_path: &Path) -> Option<std::path::PathBuf> {
 pub fn calculate_upgrade_paths(
     db_path: &Path,
     name: &str,
-    new_files: &[String],
+    new_manifest: &staging::Manifest,
 ) -> Result<Vec<String>> {
     let old_files = get_package_files(db_path, name)?;
-    let mut new_set = std::collections::HashSet::new();
-    for f in new_files {
-        new_set.insert(f);
-    }
+    let old_directories = get_package_directories(db_path, name)?;
+    let new_files: std::collections::HashSet<_> = new_manifest.files.iter().cloned().collect();
+    let new_directories: std::collections::HashSet<_> =
+        new_manifest.directories.iter().cloned().collect();
 
-    let remove_paths: Vec<String> = old_files
+    let mut remove_paths: Vec<String> = old_files
         .into_iter()
-        .filter(|p| !new_set.contains(p))
+        .filter(|p| !new_files.contains(p))
         .collect();
+    remove_paths.extend(
+        old_directories
+            .into_iter()
+            .filter(|p| !new_directories.contains(p)),
+    );
+    remove_paths.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
 
     Ok(remove_paths)
 }
@@ -871,9 +907,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("packages.db");
         std::fs::File::create(&db_path).unwrap();
+        let manifest = staging::Manifest {
+            files: vec!["usr/bin/foo".to_string()],
+            directories: Vec::new(),
+        };
 
-        let remove_paths =
-            calculate_upgrade_paths(&db_path, "nonexistent", &["usr/bin/foo".to_string()]).unwrap();
+        let remove_paths = calculate_upgrade_paths(&db_path, "nonexistent", &manifest).unwrap();
         assert!(remove_paths.is_empty());
     }
 
@@ -943,11 +982,14 @@ mod tests {
         std::fs::write(dest2.join("usr/bin/new_file"), "new").unwrap();
 
         let manifest2 = crate::staging::generate_manifest_with_dirs(&dest2).unwrap();
-        let remove_paths = calculate_upgrade_paths(&db_path, "foo", &manifest2.files).unwrap();
+        let remove_paths = calculate_upgrade_paths(&db_path, "foo", &manifest2).unwrap();
 
         assert_eq!(
             remove_paths,
-            vec!["usr/bin/shared_dir/old_file".to_string()]
+            vec![
+                "usr/bin/shared_dir/old_file".to_string(),
+                "usr/bin/shared_dir".to_string()
+            ]
         );
 
         let tx =

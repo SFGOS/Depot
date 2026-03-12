@@ -188,7 +188,7 @@ impl PackageSpec {
         matches!(self.build.build_type, BuildType::Meta)
     }
 
-    /// Return all package outputs this spec will produce (primary + any extras)
+    /// Return all declared package outputs for this spec (primary + any extras).
     pub fn outputs(&self) -> Vec<PackageInfo> {
         let mut v = Vec::new();
         v.push(self.package.clone());
@@ -196,10 +196,47 @@ impl PackageSpec {
         v
     }
 
+    /// Return the derived documentation package name for an output package.
+    pub fn docs_package_name(pkg_name: &str) -> String {
+        format!("{pkg_name}-docs")
+    }
+
+    /// Build package metadata for an automatically generated documentation output.
+    pub fn docs_package_for_output(&self, output: &PackageInfo) -> PackageInfo {
+        let mut docs = output.clone();
+        docs.name = Self::docs_package_name(&output.name);
+        docs.description = format!("Documentation for {}", output.name);
+        docs
+    }
+
+    fn docs_parent_output_name(&self, pkg_name: &str) -> Option<String> {
+        if !self.build.flags.split_docs {
+            return None;
+        }
+
+        let base = pkg_name.strip_suffix("-docs")?;
+        self.outputs()
+            .into_iter()
+            .find(|output| output.name == base)
+            .map(|output| output.name)
+    }
+
     /// Return dependencies for a specific output package name.
     ///
     /// If no per-output override exists, returns the top-level dependencies.
     pub fn dependencies_for_output(&self, pkg_name: &str) -> Dependencies {
+        if let Some(parent_output) = self.docs_parent_output_name(pkg_name) {
+            return self
+                .package_dependencies
+                .get(pkg_name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut deps = Dependencies::default();
+                    deps.runtime.push(parent_output);
+                    deps
+                });
+        }
+
         self.package_dependencies
             .get(pkg_name)
             .cloned()
@@ -226,6 +263,14 @@ impl PackageSpec {
     ///
     /// If no per-output override exists, returns the top-level alternatives.
     pub fn alternatives_for_output(&self, pkg_name: &str) -> Alternatives {
+        if self.docs_parent_output_name(pkg_name).is_some() {
+            return self
+                .package_alternatives
+                .get(pkg_name)
+                .cloned()
+                .unwrap_or_default();
+        }
+
         self.package_alternatives
             .get(pkg_name)
             .cloned()
@@ -422,6 +467,22 @@ impl PackageSpec {
                             .collect();
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.keep = vec![s.to_string()];
+                    }
+                }
+                "split_docs" | "split-docs" => {
+                    if let Some(b) = toml_value_as_boolish(v) {
+                        self.build.flags.split_docs = b;
+                    }
+                }
+                "doc_dirs" | "doc-dirs" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.doc_dirs = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.doc_dirs = vec![s.to_string()];
                     }
                 }
                 "cc" => {
@@ -978,6 +1039,18 @@ impl PackageSpec {
                     }
                 }
             }
+            "doc_dirs" | "doc-dirs" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .doc_dirs
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.doc_dirs.push(s.to_string());
+                    }
+                }
+            }
             "configure" => {
                 for v in values {
                     if let Some(arr) = v.as_array() {
@@ -1450,6 +1523,11 @@ impl PackageSpec {
             "build_32" | "build-32" => {
                 if let Some(b) = values.last().and_then(toml_value_as_boolish) {
                     self.build.flags.build_32 = b;
+                }
+            }
+            "split_docs" | "split-docs" => {
+                if let Some(b) = values.last().and_then(toml_value_as_boolish) {
+                    self.build.flags.split_docs = b;
                 }
             }
             _ => {}
@@ -2937,6 +3015,44 @@ keep = ["etc/locale.gen", "etc/resolv.conf"]
     }
 
     #[test]
+    fn parse_split_docs_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+split_docs = true
+doc_dirs = ["/opt/docs", "usr/share/devhelp"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert!(spec.build.flags.split_docs);
+        assert_eq!(
+            spec.build.flags.doc_dirs,
+            vec!["/opt/docs".to_string(), "usr/share/devhelp".to_string()]
+        );
+    }
+
+    #[test]
     fn parse_build_flags_appends_from_spec_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -3289,6 +3405,31 @@ type = "custom"
         assert_eq!(outputs[1].name, "foo-dev");
     }
 
+    #[test]
+    fn docs_output_uses_runtime_dependency_on_parent_package() {
+        let mut spec = mk_spec("foo", "1.0");
+        spec.build.flags.split_docs = true;
+        let docs_name = PackageSpec::docs_package_name("foo");
+
+        let deps = spec.dependencies_for_output(&docs_name);
+        assert_eq!(deps.runtime, vec!["foo".to_string()]);
+
+        let alternatives = spec.alternatives_for_output(&docs_name);
+        assert!(alternatives.provides.is_empty());
+        assert!(alternatives.conflicts.is_empty());
+    }
+
+    #[test]
+    fn docs_package_for_output_derives_name_and_description() {
+        let mut spec = mk_spec("foo", "1.0");
+        spec.build.flags.split_docs = true;
+
+        let docs = spec.docs_package_for_output(&spec.package);
+        assert_eq!(docs.name, "foo-docs");
+        assert_eq!(docs.description, "Documentation for foo");
+        assert_eq!(docs.version, "1.0");
+    }
+
     fn mk_spec(name: &str, version: &str) -> PackageSpec {
         PackageSpec {
             package: PackageInfo {
@@ -3625,6 +3766,21 @@ pub struct BuildFlags {
     /// Keep existing files and install package-provided replacement as `<path>.depotnew`.
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub keep: Vec<String>,
+    /// Split documentation trees into a derived `<package>-docs` output during staging.
+    #[serde(
+        default,
+        alias = "split-docs",
+        deserialize_with = "deserialize_boolish"
+    )]
+    pub split_docs: bool,
+    /// Additional documentation directories to move into `<package>-docs`.
+    #[serde(
+        default,
+        alias = "doc-dirs",
+        alias = "doc_dirs",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub doc_dirs: Vec<String>,
     /// Disable automatic LTOFLAGS injection into CFLAGS/CXXFLAGS/LDFLAGS.
     #[serde(
         default = "default_use_lto",
@@ -3960,6 +4116,8 @@ impl Default for BuildFlags {
             ltoflags: Vec::new(),
             replace_ltoflags: Vec::new(),
             keep: Vec::new(),
+            split_docs: false,
+            doc_dirs: Vec::new(),
             use_lto: default_use_lto(),
             no_flags: false,
             no_strip: false,

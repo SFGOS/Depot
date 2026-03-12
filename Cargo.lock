@@ -418,7 +418,7 @@ checksum = "807800ff3288b621186fe0a8f3392c4652068257302709c24efd918c3dffcdc2"
 
 [[package]]
 name = "depot"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "ar",

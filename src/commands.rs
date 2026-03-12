@@ -703,6 +703,66 @@ fn output_destdir_for(base_destdir: &Path, primary_pkg: &str, output_pkg: &str) 
     }
 }
 
+fn spec_for_output(
+    pkg_spec: &package::PackageSpec,
+    output: package::PackageInfo,
+) -> package::PackageSpec {
+    let output_name = output.name.clone();
+    let mut spec_for_out = pkg_spec.clone();
+    spec_for_out.package = output;
+    spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
+    spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
+    spec_for_out
+}
+
+fn destdir_has_packagable_content(destdir: &Path) -> Result<bool> {
+    if !destdir.exists() {
+        return Ok(false);
+    }
+
+    let manifest = staging::generate_manifest_with_dirs(destdir)?;
+    Ok(!manifest.files.is_empty() || !manifest.directories.is_empty())
+}
+
+fn staged_output_specs(
+    pkg_spec: &package::PackageSpec,
+    destdir: &Path,
+) -> Result<Vec<(package::PackageSpec, PathBuf)>> {
+    let declared_outputs = pkg_spec.outputs();
+    let declared_names: HashSet<String> = declared_outputs
+        .iter()
+        .map(|output| output.name.clone())
+        .collect();
+    let mut outputs = Vec::new();
+    let mut seen = HashSet::new();
+
+    for output in declared_outputs {
+        let output_name = output.name.clone();
+        let out_destdir = output_destdir_for(destdir, &pkg_spec.package.name, &output_name);
+        outputs.push((spec_for_output(pkg_spec, output.clone()), out_destdir));
+        seen.insert(output_name.clone());
+
+        if !pkg_spec.build.flags.split_docs || output_name.ends_with("-docs") {
+            continue;
+        }
+
+        let docs_pkg = pkg_spec.docs_package_for_output(&output);
+        if declared_names.contains(&docs_pkg.name) || seen.contains(&docs_pkg.name) {
+            continue;
+        }
+
+        let docs_destdir = output_destdir_for(destdir, &pkg_spec.package.name, &docs_pkg.name);
+        if !destdir_has_packagable_content(&docs_destdir)? {
+            continue;
+        }
+
+        seen.insert(docs_pkg.name.clone());
+        outputs.push((spec_for_output(pkg_spec, docs_pkg), docs_destdir));
+    }
+
+    Ok(outputs)
+}
+
 fn lib32_package_name(name: &str) -> String {
     format!("lib32-{name}")
 }
@@ -1187,15 +1247,15 @@ fn plan_staged_install(
     let db_path = config.installed_db_path(rootfs);
 
     let is_update = db::get_package_version(&db_path, &pkg_spec.package.name)?.is_some();
-    let new_files = staging::generate_manifest_with_dirs(destdir)?;
+    let new_manifest = staging::generate_manifest_with_dirs(destdir)?;
     let remove_paths =
-        db::calculate_upgrade_paths(&db_path, &pkg_spec.package.name, &new_files.files)?;
+        db::calculate_upgrade_paths(&db_path, &pkg_spec.package.name, &new_manifest)?;
     let operation = if is_update {
         install::hooks::HookOperation::Update
     } else {
         install::hooks::HookOperation::Install
     };
-    let mut affected_paths = new_files.files.clone();
+    let mut affected_paths = new_manifest.files.clone();
     affected_paths.extend(remove_paths.iter().cloned());
     affected_paths.sort();
     affected_paths.dedup();
@@ -1218,13 +1278,7 @@ fn plan_package_outputs_for_install(
     config: &config::Config,
 ) -> Result<Vec<PlannedPackageInstall>> {
     let mut plans = Vec::new();
-    for out in pkg_spec.outputs() {
-        let mut spec_for_out = pkg_spec.clone();
-        let output_name = out.name.clone();
-        spec_for_out.package = out;
-        spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
-        spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
-        let out_destdir = output_destdir_for(destdir, &pkg_spec.package.name, &output_name);
+    for (spec_for_out, out_destdir) in staged_output_specs(pkg_spec, destdir)? {
         let staged = plan_staged_install(&spec_for_out, &out_destdir, rootfs, config)?;
         plans.push(PlannedPackageInstall {
             spec: spec_for_out,
@@ -4077,17 +4131,18 @@ pub fn run(cli: Cli) -> Result<()> {
                 .unwrap_or(std::env::consts::ARCH);
 
             let mut created_files = Vec::new();
+            let staged_outputs = if !cli.lib32_only {
+                staged_output_specs(&pkg_spec, &destdir)?
+            } else {
+                Vec::new()
+            };
             if !cli.lib32_only {
-                for out in pkg_spec.outputs() {
-                    let mut spec_for_out = pkg_spec.clone();
-                    let output_name = out.name.clone();
-                    spec_for_out.package = out;
-                    spec_for_out.alternatives = pkg_spec.alternatives_for_output(&output_name);
-                    spec_for_out.dependencies = pkg_spec.dependencies_for_output(&output_name);
-                    let out_destdir =
-                        output_destdir_for(&destdir, &pkg_spec.package.name, &output_name);
-                    let packager =
-                        package::Packager::new(spec_for_out.clone(), out_destdir, config.clone());
+                for (spec_for_out, out_destdir) in &staged_outputs {
+                    let packager = package::Packager::new(
+                        spec_for_out.clone(),
+                        out_destdir.clone(),
+                        config.clone(),
+                    );
                     let pkg_file = packager.create_package(Path::new("."), arch)?;
                     if let Some(sig_path) =
                         signing::auto_sign_zst_file_detached(&cli.rootfs, &pkg_file)?
@@ -4137,7 +4192,8 @@ pub fn run(cli: Cli) -> Result<()> {
             if install {
                 let mut install_targets = Vec::new();
                 if !cli.lib32_only {
-                    for out in pkg_spec.outputs() {
+                    for (spec_for_out, _) in &staged_outputs {
+                        let out = &spec_for_out.package;
                         install_targets
                             .push(format!("{} v{}-{}", out.name, out.version, out.revision));
                     }
@@ -4213,7 +4269,8 @@ pub fn run(cli: Cli) -> Result<()> {
                     install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
                 } else {
                     if !cli.lib32_only {
-                        for out in pkg_spec.outputs() {
+                        for (spec_for_out, _) in &staged_outputs {
+                            let out = &spec_for_out.package;
                             ui::success(format!(
                                 "Built successfully: {}-{}-{}",
                                 out.name, out.version, out.revision
