@@ -50,8 +50,9 @@ pub fn build(
         crate::builder::standard_build_env(spec, cross, false, export_compiler_flags);
 
     // RUSTFLAGS
-    if !flags.rustflags.is_empty() {
-        crate::builder::set_env_var(&mut env_vars, "RUSTFLAGS", flags.rustflags.join(" "));
+    let rustflags = crate::builder::effective_rustflags(flags);
+    if !rustflags.is_empty() {
+        crate::builder::set_env_var(&mut env_vars, "RUSTFLAGS", rustflags.join(" "));
     }
 
     // If cross-compiling, set linker via CARGO_TARGET_*_LINKER

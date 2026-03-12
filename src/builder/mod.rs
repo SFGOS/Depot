@@ -62,6 +62,61 @@ fn configured_install_dir(value: &str, default: &str) -> String {
     }
 }
 
+fn split_replacement_spec<'a>(current: &[String], spec: &'a str) -> Option<(&'a str, &'a str)> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((from, to)) = trimmed.split_once("=>") {
+        return (!from.is_empty() && !to.is_empty()).then_some((from, to));
+    }
+
+    let eq_positions: Vec<usize> = trimmed.match_indices('=').map(|(idx, _)| idx).collect();
+    if eq_positions.is_empty() {
+        return None;
+    }
+    if eq_positions.len() == 1 {
+        let (from, to) = trimmed.split_once('=')?;
+        return (!from.is_empty() && !to.is_empty()).then_some((from, to));
+    }
+
+    eq_positions
+        .into_iter()
+        .filter_map(|idx| {
+            let from = &trimmed[..idx];
+            let to = &trimmed[idx + 1..];
+            (!from.is_empty() && !to.is_empty() && current.iter().any(|flag| flag.contains(from)))
+                .then_some((from, to))
+        })
+        .max_by_key(|(from, _)| from.len())
+}
+
+fn apply_replacement_rules(current: &mut [String], replacements: &[String], label: &str) {
+    for spec in replacements {
+        let Some((from, to)) = split_replacement_spec(current, spec) else {
+            if !spec.trim().is_empty() && !current.is_empty() {
+                crate::log_warn!(
+                    "Skipping invalid {} entry '{}'; expected 'old=>new' or an unambiguous 'old=new'",
+                    label,
+                    spec
+                );
+            }
+            continue;
+        };
+
+        for flag in current.iter_mut() {
+            *flag = flag.replace(from, to);
+        }
+    }
+}
+
+fn replaced_flags(values: &[String], replacements: &[String], label: &str) -> Vec<String> {
+    let mut current = values.to_vec();
+    apply_replacement_rules(&mut current, replacements, label);
+    current
+}
+
 pub(crate) fn install_dirs(flags: &crate::package::BuildFlags) -> InstallDirs {
     let libdir = configured_install_dir(
         &flags.libdir,
@@ -90,10 +145,26 @@ pub(crate) fn install_dirs(flags: &crate::package::BuildFlags) -> InstallDirs {
 fn compiler_flag_sets(
     flags: &crate::package::BuildFlags,
 ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    let mut cflags = flags.cflags.clone();
-    let mut cxxflags = flags.cxxflags.clone();
-    let mut ldflags = flags.ldflags.clone();
-    let ltoflags = flags.ltoflags.clone();
+    let mut cflags = replaced_flags(
+        &flags.cflags,
+        &flags.replace_cflags,
+        "build.flags.replace_cflags",
+    );
+    let mut cxxflags = replaced_flags(
+        &flags.cxxflags,
+        &flags.replace_cxxflags,
+        "build.flags.replace_cxxflags",
+    );
+    let mut ldflags = replaced_flags(
+        &flags.ldflags,
+        &flags.replace_ldflags,
+        "build.flags.replace_ldflags",
+    );
+    let ltoflags = replaced_flags(
+        &flags.ltoflags,
+        &flags.replace_ltoflags,
+        "build.flags.replace_ltoflags",
+    );
 
     if flags.use_lto && !ltoflags.is_empty() {
         cflags.extend(ltoflags.iter().cloned());
@@ -102,6 +173,14 @@ fn compiler_flag_sets(
     }
 
     (cflags, cxxflags, ldflags, ltoflags)
+}
+
+pub(crate) fn effective_rustflags(flags: &crate::package::BuildFlags) -> Vec<String> {
+    replaced_flags(
+        &flags.rustflags,
+        &flags.replace_rustflags,
+        "build.flags.replace_rustflags",
+    )
 }
 
 pub fn standard_build_env(
@@ -551,6 +630,40 @@ mod tests {
     }
 
     #[test]
+    fn test_standard_build_env_applies_replace_flag_rules() {
+        let mut spec = mk_spec(vec!["-D_FORTIFY_SOURCE=3", "-O2"], vec!["-Wl,-O3"]);
+        spec.build.flags.cxxflags = vec!["-O2".into(), "-stdlib=libc++".into()];
+        spec.build.flags.replace_cflags = vec!["_FORTIFY_SOURCE=3=_FORTIFY_SOURCE=2".into()];
+        spec.build.flags.replace_cxxflags = vec!["-stdlib=libc++=>-stdlib=libstdc++".into()];
+        spec.build.flags.replace_ldflags = vec!["-O3=>-O2".into()];
+        spec.build.flags.ltoflags = vec!["-flto=auto".into()];
+        spec.build.flags.replace_ltoflags = vec!["auto=>thin".into()];
+        spec.build.flags.use_lto = true;
+
+        let env = standard_build_env(&spec, None, true, true);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CFLAGS" && v == "-D_FORTIFY_SOURCE=2 -O2 -flto=thin"),
+            "expected replace_cflags and replace_ltoflags to be applied"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| { k == "CXXFLAGS" && v == "-O2 -stdlib=libstdc++ -flto=thin" }),
+            "expected replace_cxxflags to be applied"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "LDFLAGS" && v == "-Wl,-O2 -flto=thin"),
+            "expected replace_ldflags to be applied"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "LTOFLAGS" && v == "-flto=thin"),
+            "expected replace_ltoflags to affect exported LTOFLAGS"
+        );
+    }
+
+    #[test]
     fn test_standard_build_env_skips_lto_injection_when_disabled() {
         let mut spec = mk_spec(vec!["-O2"], vec!["-Wl,--as-needed"]);
         spec.build.flags.cxxflags = vec!["-O2".into()];
@@ -605,6 +718,15 @@ mod tests {
                 .any(|(k, v)| k == "RUSTFLAGS" && v == "-C target-cpu=native"),
             "expected RUSTFLAGS to be copied from parent environment"
         );
+    }
+
+    #[test]
+    fn test_effective_rustflags_applies_replace_rules() {
+        let mut flags = BuildFlags::default();
+        flags.rustflags = vec!["-C".into(), "debuginfo=2".into()];
+        flags.replace_rustflags = vec!["debuginfo=2=>opt-level=2".into()];
+
+        assert_eq!(effective_rustflags(&flags), vec!["-C", "opt-level=2"]);
     }
 
     #[test]

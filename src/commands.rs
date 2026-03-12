@@ -719,8 +719,18 @@ fn make_lib32_build_spec(base: &package::PackageSpec) -> package::PackageSpec {
     if !flags.cflags_lib32.is_empty() {
         flags.cflags.extend(flags.cflags_lib32.clone());
     }
+    if !flags.replace_cflags_lib32.is_empty() {
+        flags
+            .replace_cflags
+            .extend(flags.replace_cflags_lib32.clone());
+    }
     if !flags.cxxflags_lib32.is_empty() {
         flags.cxxflags.extend(flags.cxxflags_lib32.clone());
+    }
+    if !flags.replace_cxxflags_lib32.is_empty() {
+        flags
+            .replace_cxxflags
+            .extend(flags.replace_cxxflags_lib32.clone());
     }
     if !flags.configure_lib32.is_empty() {
         flags.configure = flags.configure_lib32.clone();
@@ -5900,5 +5910,32 @@ optional = []
         assert!(!should_delegate_live_rootfs_installs(Path::new(
             "/tmp/depot-test-rootfs"
         )));
+    }
+
+    #[test]
+    fn make_lib32_build_spec_merges_replace_flag_rules() {
+        let mut base = test_package_spec(package::BuildType::Custom, None, &[]);
+        base.build.flags.cflags = vec!["-O2".into()];
+        base.build.flags.replace_cflags = vec!["-O2=>-O3".into()];
+        base.build.flags.cflags_lib32 = vec!["-m32".into()];
+        base.build.flags.replace_cflags_lib32 = vec!["-m32=>-mstackrealign".into()];
+        base.build.flags.cxxflags = vec!["-O2".into()];
+        base.build.flags.replace_cxxflags = vec!["-O2=>-O3".into()];
+        base.build.flags.cxxflags_lib32 = vec!["-fno-rtti".into()];
+        base.build.flags.replace_cxxflags_lib32 = vec!["-fno-rtti=>-fno-exceptions".into()];
+
+        let lib32 = make_lib32_build_spec(&base);
+
+        assert!(lib32.build.flags.lib32_variant);
+        assert_eq!(lib32.build.flags.cflags, vec!["-O2", "-m32"]);
+        assert_eq!(
+            lib32.build.flags.replace_cflags,
+            vec!["-O2=>-O3", "-m32=>-mstackrealign"]
+        );
+        assert_eq!(lib32.build.flags.cxxflags, vec!["-O2", "-fno-rtti"]);
+        assert_eq!(
+            lib32.build.flags.replace_cxxflags,
+            vec!["-O2=>-O3", "-fno-rtti=>-fno-exceptions"]
+        );
     }
 }

@@ -270,6 +270,17 @@ impl PackageSpec {
                         self.build.flags.cflags = vec![s.to_string()];
                     }
                 }
+                "replace_cflags" | "replace-cflags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.replace_cflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_cflags = vec![s.to_string()];
+                    }
+                }
                 "cflags-lib32" | "cflags_lib32" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.cflags_lib32 = arr
@@ -279,6 +290,17 @@ impl PackageSpec {
                             .collect();
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.cflags_lib32 = vec![s.to_string()];
+                    }
+                }
+                "replace_cflags-lib32" | "replace_cflags_lib32" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.replace_cflags_lib32 = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_cflags_lib32 = vec![s.to_string()];
                     }
                 }
                 "cxxflags" => {
@@ -292,6 +314,17 @@ impl PackageSpec {
                         self.build.flags.cxxflags = vec![s.to_string()];
                     }
                 }
+                "replace_cxxflags" | "replace-cxxflags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.replace_cxxflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_cxxflags = vec![s.to_string()];
+                    }
+                }
                 "cxxflags-lib32" | "cxxflags_lib32" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.cxxflags_lib32 = arr
@@ -301,6 +334,17 @@ impl PackageSpec {
                             .collect();
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.cxxflags_lib32 = vec![s.to_string()];
+                    }
+                }
+                "replace_cxxflags-lib32" | "replace_cxxflags_lib32" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.replace_cxxflags_lib32 = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_cxxflags_lib32 = vec![s.to_string()];
                     }
                 }
                 "ldflags" => {
@@ -314,6 +358,17 @@ impl PackageSpec {
                         self.build.flags.ldflags = vec![s.to_string()];
                     }
                 }
+                "replace_ldflags" | "replace-ldflags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.replace_ldflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_ldflags = vec![s.to_string()];
+                    }
+                }
                 "ltoflags" | "lto_flags" | "lto-flags" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.ltoflags = arr
@@ -323,6 +378,39 @@ impl PackageSpec {
                             .collect();
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.ltoflags = vec![s.to_string()];
+                    }
+                }
+                "replace_ltoflags" | "replace_lto-flags" | "replace_lto_flags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.replace_ltoflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_ltoflags = vec![s.to_string()];
+                    }
+                }
+                "rustflags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.rustflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.rustflags = vec![s.to_string()];
+                    }
+                }
+                "replace_rustflags" | "replace-rustflags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.replace_rustflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_rustflags = vec![s.to_string()];
                     }
                 }
                 "keep" => {
@@ -746,6 +834,18 @@ impl PackageSpec {
                     }
                 }
             }
+            "replace_cflags" | "replace-cflags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .replace_cflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_cflags.push(s.to_string());
+                    }
+                }
+            }
             "cflags-lib32" | "cflags_lib32" => {
                 for v in values {
                     if let Some(arr) = v.as_array() {
@@ -755,6 +855,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.cflags_lib32.push(s.to_string());
+                    }
+                }
+            }
+            "replace_cflags-lib32" | "replace_cflags_lib32" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .replace_cflags_lib32
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_cflags_lib32.push(s.to_string());
                     }
                 }
             }
@@ -770,6 +882,18 @@ impl PackageSpec {
                     }
                 }
             }
+            "replace_cxxflags" | "replace-cxxflags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .replace_cxxflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_cxxflags.push(s.to_string());
+                    }
+                }
+            }
             "cxxflags-lib32" | "cxxflags_lib32" => {
                 for v in values {
                     if let Some(arr) = v.as_array() {
@@ -779,6 +903,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.cxxflags_lib32.push(s.to_string());
+                    }
+                }
+            }
+            "replace_cxxflags-lib32" | "replace_cxxflags_lib32" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .replace_cxxflags_lib32
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_cxxflags_lib32.push(s.to_string());
                     }
                 }
             }
@@ -794,6 +930,18 @@ impl PackageSpec {
                     }
                 }
             }
+            "replace_ldflags" | "replace-ldflags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .replace_ldflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_ldflags.push(s.to_string());
+                    }
+                }
+            }
             "ltoflags" | "lto_flags" | "lto-flags" => {
                 for v in values {
                     if let Some(arr) = v.as_array() {
@@ -803,6 +951,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.ltoflags.push(s.to_string());
+                    }
+                }
+            }
+            "replace_ltoflags" | "replace_lto-flags" | "replace_lto_flags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .replace_ltoflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_ltoflags.push(s.to_string());
                     }
                 }
             }
@@ -952,6 +1112,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.rustflags.push(s.to_string());
+                    }
+                }
+            }
+            "replace_rustflags" | "replace-rustflags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .replace_rustflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.replace_rustflags.push(s.to_string());
                     }
                 }
             }
@@ -1941,7 +2113,9 @@ cc = "my-cc"
 ld = "ld.lld"
 CPP = "clang-cpp"
 cflags = ["-O2"]
+replace_cflags = ["-O2=>-O3"]
 cxxflags = ["-O2", "-pipe"]
+replace_cxxflags = ["-pipe=>-fPIC"]
 passthrough_env = ["RUSTFLAGS"]
 bindir = "/opt/bin"
 sbindir = "/opt/sbin"
@@ -1954,6 +2128,9 @@ make_dirs = ["lib"]
 make_test_dirs = ["tests"]
 make_install_dirs = ["lib"]
 ltoflags = ["-flto=auto"]
+replace_ltoflags = ["auto=>thin"]
+rustflags = ["-C", "debuginfo=2"]
+replace_rustflags = ["debuginfo=2=>opt-level=2"]
 use_lto = true
 no_flags = true
 no_strip = true
@@ -1972,8 +2149,20 @@ post_configure = ["echo configured"]
             vec![toml::Value::String("-g".to_string())],
         );
         config.appends.insert(
+            "build.flags.replace_cflags".to_string(),
+            vec![toml::Value::String(
+                "-D_FORTIFY_SOURCE=3=_FORTIFY_SOURCE=2".to_string(),
+            )],
+        );
+        config.appends.insert(
             "build.flags.cxxflags".to_string(),
             vec![toml::Value::String("-stdlib=libc++".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.replace_cxxflags".to_string(),
+            vec![toml::Value::String(
+                "-stdlib=libc++=>-stdlib=libstdc++".to_string(),
+            )],
         );
         config.appends.insert(
             "build.flags.rustflags".to_string(),
@@ -1981,6 +2170,10 @@ post_configure = ["echo configured"]
                 toml::Value::String("-C".to_string()),
                 toml::Value::String("opt-level=3".to_string()),
             ])],
+        );
+        config.appends.insert(
+            "build.flags.replace_rustflags".to_string(),
+            vec![toml::Value::String("opt-level=3=>opt-level=z".to_string())],
         );
         config.appends.insert(
             "build.flags.keep".to_string(),
@@ -1993,6 +2186,12 @@ post_configure = ["echo configured"]
             vec![toml::Value::Array(vec![toml::Value::String(
                 "-fno-fat-lto-objects".to_string(),
             )])],
+        );
+        config.appends.insert(
+            "build.flags.replace_ltoflags".to_string(),
+            vec![toml::Value::String(
+                "-fno-fat-lto-objects=>-flto-jobs=8".to_string(),
+            )],
         );
         config.appends.insert(
             "build.flags.use_lto".to_string(),
@@ -2068,6 +2267,18 @@ post_configure = ["echo configured"]
         assert_eq!(spec.build.flags.cpp, "clang-cpp");
         assert!(spec.build.flags.cflags.contains(&"-O2".to_string()));
         assert!(spec.build.flags.cflags.contains(&"-g".to_string()));
+        assert!(
+            spec.build
+                .flags
+                .replace_cflags
+                .contains(&"-O2=>-O3".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .replace_cflags
+                .contains(&"-D_FORTIFY_SOURCE=3=_FORTIFY_SOURCE=2".to_string())
+        );
         assert!(spec.build.flags.cxxflags.contains(&"-O2".to_string()));
         assert!(spec.build.flags.cxxflags.contains(&"-pipe".to_string()));
         assert!(
@@ -2076,12 +2287,42 @@ post_configure = ["echo configured"]
                 .cxxflags
                 .contains(&"-stdlib=libc++".to_string())
         );
+        assert!(
+            spec.build
+                .flags
+                .replace_cxxflags
+                .contains(&"-pipe=>-fPIC".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .replace_cxxflags
+                .contains(&"-stdlib=libc++=>-stdlib=libstdc++".to_string())
+        );
         assert!(spec.build.flags.rustflags.contains(&"-C".to_string()));
         assert!(
             spec.build
                 .flags
                 .rustflags
+                .contains(&"debuginfo=2".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .rustflags
                 .contains(&"opt-level=3".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .replace_rustflags
+                .contains(&"debuginfo=2=>opt-level=2".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .replace_rustflags
+                .contains(&"opt-level=3=>opt-level=z".to_string())
         );
         assert!(
             spec.build
@@ -2094,6 +2335,18 @@ post_configure = ["echo configured"]
                 .flags
                 .ltoflags
                 .contains(&"-fno-fat-lto-objects".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .replace_ltoflags
+                .contains(&"auto=>thin".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .replace_ltoflags
+                .contains(&"-fno-fat-lto-objects=>-flto-jobs=8".to_string())
         );
         assert!(!spec.build.flags.use_lto);
         assert!(spec.build.flags.no_flags);
@@ -2707,9 +2960,13 @@ extract_dir = "foo"
 type = "custom"
 
 [build.flags]
+replace_cflags = ["-O2=>-O3"]
+replace_rustflags = ["debuginfo=2=>opt-level=2"]
 cxxflags = ["-O2"]
 cxxflags += [ "-Wno-gnu-statement-expression-from-macro-expansion" ]
 ldflags += "-Wl,--as-needed"
+replace_cflags += [ "_FORTIFY_SOURCE=3=_FORTIFY_SOURCE=2" ]
+replace_rustflags += "opt-level=3=>opt-level=z"
 "#,
         )
         .unwrap();
@@ -2725,6 +2982,20 @@ ldflags += "-Wl,--as-needed"
         assert_eq!(
             spec.build.flags.ldflags,
             vec!["-Wl,--as-needed".to_string()]
+        );
+        assert_eq!(
+            spec.build.flags.replace_cflags,
+            vec![
+                "-O2=>-O3".to_string(),
+                "_FORTIFY_SOURCE=3=_FORTIFY_SOURCE=2".to_string()
+            ]
+        );
+        assert_eq!(
+            spec.build.flags.replace_rustflags,
+            vec![
+                "debuginfo=2=>opt-level=2".to_string(),
+                "opt-level=3=>opt-level=z".to_string()
+            ]
         );
     }
 
@@ -3259,8 +3530,19 @@ pub enum BuildType {
 /// Build flags and toolchain configuration
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct BuildFlags {
+    /// Extra flags exported to `CFLAGS`.
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub cflags: Vec<String>,
+    /// Ordered replacement rules applied to `cflags` before export.
+    ///
+    /// Each entry may use `old=>new`. Plain `old=new` is also accepted and
+    /// disambiguated against the current flag set when possible.
+    #[serde(
+        default,
+        alias = "replace-cflags",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub replace_cflags: Vec<String>,
     /// Extra flags exported to `CFLAGS` only for the lib32 build variant.
     #[serde(
         default,
@@ -3271,9 +3553,25 @@ pub struct BuildFlags {
         deserialize_with = "deserialize_string_or_array"
     )]
     pub cflags_lib32: Vec<String>,
+    /// Ordered replacement rules applied to lib32-only `cflags`.
+    #[serde(
+        default,
+        alias = "replace-cflags-lib32",
+        alias = "replace_cflags-lib32",
+        alias = "replace_cflags_lib32",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub replace_cflags_lib32: Vec<String>,
     /// Extra flags exported to `CXXFLAGS`.
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub cxxflags: Vec<String>,
+    /// Ordered replacement rules applied to `cxxflags` before export.
+    #[serde(
+        default,
+        alias = "replace-cxxflags",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub replace_cxxflags: Vec<String>,
     /// Extra flags exported to `CXXFLAGS` only for the lib32 build variant.
     #[serde(
         default,
@@ -3284,8 +3582,25 @@ pub struct BuildFlags {
         deserialize_with = "deserialize_string_or_array"
     )]
     pub cxxflags_lib32: Vec<String>,
+    /// Ordered replacement rules applied to lib32-only `cxxflags`.
+    #[serde(
+        default,
+        alias = "replace-cxxflags-lib32",
+        alias = "replace_cxxflags-lib32",
+        alias = "replace_cxxflags_lib32",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub replace_cxxflags_lib32: Vec<String>,
+    /// Extra flags exported to `LDFLAGS`.
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub ldflags: Vec<String>,
+    /// Ordered replacement rules applied to `ldflags` before export.
+    #[serde(
+        default,
+        alias = "replace-ldflags",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub replace_ldflags: Vec<String>,
     /// Link-time optimization flags exported to `LTOFLAGS`.
     ///
     /// When `use_lto` is true (default), these flags are also appended to
@@ -3298,6 +3613,15 @@ pub struct BuildFlags {
         deserialize_with = "deserialize_string_or_array"
     )]
     pub ltoflags: Vec<String>,
+    /// Ordered replacement rules applied to `ltoflags` before export/injection.
+    #[serde(
+        default,
+        alias = "replace-ltoflags",
+        alias = "replace_lto-flags",
+        alias = "replace_lto_flags",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub replace_ltoflags: Vec<String>,
     /// Keep existing files and install package-provided replacement as `<path>.depotnew`.
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub keep: Vec<String>,
@@ -3552,6 +3876,13 @@ pub struct BuildFlags {
     /// RUSTFLAGS environment variable
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub rustflags: Vec<String>,
+    /// Ordered replacement rules applied to `rustflags` before export.
+    #[serde(
+        default,
+        alias = "replace-rustflags",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub replace_rustflags: Vec<String>,
     /// Additional cargo arguments (short name)
     #[serde(default)]
     pub cargs: Vec<String>,
@@ -3617,11 +3948,17 @@ impl Default for BuildFlags {
     fn default() -> Self {
         BuildFlags {
             cflags: Vec::new(),
+            replace_cflags: Vec::new(),
             cflags_lib32: Vec::new(),
+            replace_cflags_lib32: Vec::new(),
             cxxflags: Vec::new(),
+            replace_cxxflags: Vec::new(),
             cxxflags_lib32: Vec::new(),
+            replace_cxxflags_lib32: Vec::new(),
             ldflags: Vec::new(),
+            replace_ldflags: Vec::new(),
             ltoflags: Vec::new(),
+            replace_ltoflags: Vec::new(),
             keep: Vec::new(),
             use_lto: default_use_lto(),
             no_flags: false,
@@ -3671,6 +4008,7 @@ impl Default for BuildFlags {
             profile: default_profile(),
             target: String::new(),
             rustflags: Vec::new(),
+            replace_rustflags: Vec::new(),
             cargs: Vec::new(),
             bindir: default_bindir(),
             sbindir: String::new(),
