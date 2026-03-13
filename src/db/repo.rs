@@ -4,6 +4,7 @@ use crate::metadata_time;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256, Sha512};
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -440,7 +441,8 @@ impl RepoManager {
                     continue;
                 }
 
-                if entry.header().entry_type().is_file() {
+                let entry_type = entry.header().entry_type();
+                if entry_type.is_file() || entry_type.is_symlink() || entry_type.is_hard_link() {
                     let normalized = path_str.trim_start_matches("./").to_string();
                     if normalized == ".metadata.toml" {
                         continue;
@@ -1469,6 +1471,46 @@ pub fn cached_binary_repo_owns_path(
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+fn repo_owns_query_candidates(rootfs: &Path, path: &str) -> Vec<String> {
+    let normalized = path.trim_start_matches('/').trim_start_matches("./");
+    let mut candidates = BTreeSet::new();
+    if !normalized.is_empty() {
+        candidates.insert(normalized.to_string());
+    }
+
+    let query_path = Path::new(path);
+    let fs_path = if query_path.is_absolute() {
+        rootfs.join(query_path.strip_prefix("/").unwrap_or(query_path))
+    } else {
+        rootfs.join(query_path)
+    };
+
+    if let Ok(resolved) = fs::canonicalize(&fs_path)
+        && let Some(rel) = resolved_repo_owns_path(rootfs, &resolved)
+        && !rel.is_empty()
+    {
+        candidates.insert(rel);
+    }
+
+    candidates.into_iter().collect()
+}
+
+fn resolved_repo_owns_path(rootfs: &Path, resolved: &Path) -> Option<String> {
+    if rootfs == Path::new("/") {
+        return Some(
+            resolved
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_string(),
+        );
+    }
+
+    resolved
+        .strip_prefix(rootfs)
+        .ok()
+        .map(|rel| rel.to_string_lossy().trim_start_matches('/').to_string())
+}
+
 /// Fetch repo metadata and resolve file ownership in a binary repo.
 pub fn binary_repo_owns_path(
     repo_name: &str,
@@ -1478,7 +1520,20 @@ pub fn binary_repo_owns_path(
     path: &str,
 ) -> Result<Vec<BinaryRepoFileSearchHit>> {
     let db_path = fetch_binary_repo_db(repo_name, repo, rootfs, package_cache_dir)?;
-    cached_binary_repo_owns_path(repo_name, &db_path, path)
+    let mut hits = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in repo_owns_query_candidates(rootfs, path) {
+        for hit in cached_binary_repo_owns_path(repo_name, &db_path, &candidate)? {
+            let key = format!(
+                "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+                hit.repo_name, hit.package_name, hit.version, hit.revision, hit.path
+            );
+            if seen.insert(key) {
+                hits.push(hit);
+            }
+        }
+    }
+    Ok(hits)
 }
 
 fn query_package_provides(conn: &Connection, package_id: i64) -> Result<Vec<String>> {
@@ -2417,6 +2472,68 @@ license = ["MIT", "Apache-2.0"]
     }
 
     #[test]
+    fn test_index_package_records_symlink_paths_for_repo_owns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path();
+        let pkg_path = repo_dir.join("test-1.0-1-x86_64.depot.pkg.tar.zst");
+
+        let file = fs::File::create(&pkg_path).unwrap();
+        let encoder = zstd::stream::write::Encoder::new(file, 3).unwrap();
+        let mut tar = tar::Builder::new(encoder);
+
+        let metadata = r#"
+name = "test"
+version = "1.0"
+revision = 1
+"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_path(".metadata.toml").unwrap();
+        header.set_size(metadata.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append(&header, metadata.as_bytes()).unwrap();
+
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_path("usr/bin/coreutils").unwrap();
+        file_header.set_size(4);
+        file_header.set_mode(0o755);
+        file_header.set_cksum();
+        tar.append(&file_header, &b"test"[..]).unwrap();
+
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_path("usr/bin/ls").unwrap();
+        link_header.set_link_name("coreutils").unwrap();
+        link_header.set_size(0);
+        link_header.set_mode(0o777);
+        link_header.set_cksum();
+        tar.append(&link_header, std::io::empty()).unwrap();
+
+        let encoder = tar.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        let manager = RepoManager::new(repo_dir.to_path_buf());
+        manager.init_repo_schema(&mut conn).unwrap();
+        let indexed = manager.read_indexed_package(&pkg_path).unwrap();
+        manager.insert_indexed_package(&mut conn, indexed).unwrap();
+
+        let db_path = repo_dir.join("repo.db");
+        let mut file_conn = Connection::open(&db_path).unwrap();
+        manager.init_repo_schema(&mut file_conn).unwrap();
+        let indexed = manager.read_indexed_package(&pkg_path).unwrap();
+        manager
+            .insert_indexed_package(&mut file_conn, indexed)
+            .unwrap();
+        drop(file_conn);
+
+        let hits = cached_binary_repo_owns_path("repo", &db_path, "usr/bin/ls").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].package_name, "test");
+        assert_eq!(hits[0].path, "usr/bin/ls");
+    }
+
+    #[test]
     fn test_search_cached_binary_repo_db_matches_name_and_provides() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("repo.db");
@@ -2446,6 +2563,37 @@ license = ["MIT", "Apache-2.0"]
         let provide_hits = search_cached_binary_repo_db("testrepo", &db_path, "libfoo").unwrap();
         assert_eq!(provide_hits.len(), 1);
         assert_eq!(provide_hits[0].name, "foo");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_repo_owns_query_candidates_follow_rootfs_symlink_targets() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let usr_bin = rootfs.path().join("usr/bin");
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::write(usr_bin.join("coreutils"), b"payload").unwrap();
+        std::os::unix::fs::symlink("coreutils", usr_bin.join("ls")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", rootfs.path().join("bin")).unwrap();
+
+        let ls_candidates = repo_owns_query_candidates(rootfs.path(), "/usr/bin/ls");
+        assert!(
+            ls_candidates
+                .iter()
+                .any(|candidate| candidate == "usr/bin/ls")
+        );
+        assert!(
+            ls_candidates
+                .iter()
+                .any(|candidate| candidate == "usr/bin/coreutils")
+        );
+
+        let bin_candidates = repo_owns_query_candidates(rootfs.path(), "/bin/ls");
+        assert!(bin_candidates.iter().any(|candidate| candidate == "bin/ls"));
+        assert!(
+            bin_candidates
+                .iter()
+                .any(|candidate| candidate == "usr/bin/coreutils")
+        );
     }
 
     #[test]
