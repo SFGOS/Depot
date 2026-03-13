@@ -1034,23 +1034,10 @@ fn make_lib32_build_spec(base: &package::PackageSpec) -> package::PackageSpec {
     let mut spec = base.clone();
     let flags = &mut spec.build.flags;
     flags.lib32_variant = true;
-
-    if !flags.cflags_lib32.is_empty() {
-        flags.cflags.extend(flags.cflags_lib32.clone());
-    }
-    if !flags.replace_cflags_lib32.is_empty() {
-        flags
-            .replace_cflags
-            .extend(flags.replace_cflags_lib32.clone());
-    }
-    if !flags.cxxflags_lib32.is_empty() {
-        flags.cxxflags.extend(flags.cxxflags_lib32.clone());
-    }
-    if !flags.replace_cxxflags_lib32.is_empty() {
-        flags
-            .replace_cxxflags
-            .extend(flags.replace_cxxflags_lib32.clone());
-    }
+    flags.cflags = flags.cflags_lib32.clone();
+    flags.replace_cflags = flags.replace_cflags_lib32.clone();
+    flags.cxxflags = flags.cxxflags_lib32.clone();
+    flags.replace_cxxflags = flags.replace_cxxflags_lib32.clone();
     if !flags.configure_lib32.is_empty() {
         flags.configure = flags.configure_lib32.clone();
     }
@@ -3801,7 +3788,8 @@ fn run_direct_install_request(
         anyhow::bail!("Aborted");
     }
 
-    // TODO(snapper): create pre-install snapshot before install work starts.
+    let _snapper_pre_install_snapshot_todo: fn() -> ! =
+        || todo!("snapper: create pre-install snapshot before install work starts");
 
     // Ensure database directory exists
     std::fs::create_dir_all(&config.db_dir).with_context(|| {
@@ -4070,10 +4058,11 @@ fn run_direct_install_request(
         install::hooks::HookPhase::Pre,
         &transaction_plans,
     )?;
+    let _snapper_post_install_snapshot_todo: fn() -> ! =
+        || todo!("snapper: create post-install snapshot after install commit succeeds");
     let installed = install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
     for pkg in installed {
         log_install_success(&pkg);
-        // TODO(snapper): create post-install snapshot after install commit succeeds.
     }
     run_transaction_hooks_for_plans(
         options.rootfs,
@@ -6921,7 +6910,7 @@ optional = []
     }
 
     #[test]
-    fn make_lib32_build_spec_merges_replace_flag_rules() {
+    fn make_lib32_build_spec_uses_only_lib32_flag_rules() {
         let mut base = test_package_spec(package::BuildType::Custom, None, &[]);
         base.build.flags.cflags = vec!["-O2".into()];
         base.build.flags.replace_cflags = vec!["-O2=>-O3".into()];
@@ -6935,15 +6924,15 @@ optional = []
         let lib32 = make_lib32_build_spec(&base);
 
         assert!(lib32.build.flags.lib32_variant);
-        assert_eq!(lib32.build.flags.cflags, vec!["-O2", "-m32"]);
+        assert_eq!(lib32.build.flags.cflags, vec!["-m32"]);
         assert_eq!(
             lib32.build.flags.replace_cflags,
-            vec!["-O2=>-O3", "-m32=>-mstackrealign"]
+            vec!["-m32=>-mstackrealign"]
         );
-        assert_eq!(lib32.build.flags.cxxflags, vec!["-O2", "-fno-rtti"]);
+        assert_eq!(lib32.build.flags.cxxflags, vec!["-fno-rtti"]);
         assert_eq!(
             lib32.build.flags.replace_cxxflags,
-            vec!["-O2=>-O3", "-fno-rtti=>-fno-exceptions"]
+            vec!["-fno-rtti=>-fno-exceptions"]
         );
     }
 

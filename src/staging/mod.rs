@@ -894,6 +894,7 @@ pub struct FsTransaction {
     tx_dir: PathBuf,
     backed_up: Vec<String>,
     created: Vec<String>,
+    relocated: Vec<String>,
     removed: Vec<String>,
 }
 
@@ -924,6 +925,112 @@ fn backup_existing_path(src: &Path, backup_path: &Path, rel: &str) -> Result<()>
         apply_unix_mode(backup_path, &metadata)?;
     } else {
         fs::copy(src, backup_path).with_context(|| format!("Failed to backup file {}", rel))?;
+    }
+
+    Ok(())
+}
+
+fn move_directory_contents(src_dir: &Path, dst_dir: &Path) -> Result<()> {
+    fs::create_dir_all(dst_dir)
+        .with_context(|| format!("Failed to create directory {}", dst_dir.display()))?;
+
+    for entry in
+        fs::read_dir(src_dir).with_context(|| format!("Failed to read {}", src_dir.display()))?
+    {
+        let entry = entry?;
+        move_tree_preserving_layout(&entry.path(), &dst_dir.join(entry.file_name()))?;
+    }
+
+    fs::remove_dir(src_dir).with_context(|| format!("Failed to remove {}", src_dir.display()))?;
+    Ok(())
+}
+
+fn copy_tree_preserving_layout_no_overwrite(
+    src_root: &Path,
+    dst_root: &Path,
+    logical_root: &str,
+    created: &mut Vec<String>,
+) -> Result<()> {
+    for entry in WalkDir::new(src_root).follow_links(false) {
+        let entry = entry
+            .with_context(|| format!("Failed to walk relocation tree {}", src_root.display()))?;
+        let src_path = entry.path();
+        let rel = src_path
+            .strip_prefix(src_root)
+            .with_context(|| format!("Failed to strip relocation root {}", src_root.display()))?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+
+        let dst_path = dst_root.join(rel);
+        let metadata = src_path
+            .symlink_metadata()
+            .with_context(|| format!("Failed to inspect {}", src_path.display()))?;
+        let file_type = metadata.file_type();
+
+        if file_type.is_dir() {
+            match dst_path.symlink_metadata() {
+                Ok(dst_meta) => {
+                    if !dst_meta.file_type().is_dir() {
+                        anyhow::bail!(
+                            "Failed to replay relocated directory into {}: destination exists and is not a directory",
+                            dst_path.display()
+                        );
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir_all(&dst_path).with_context(|| {
+                        format!("Failed to create directory {}", dst_path.display())
+                    })?;
+                    apply_unix_mode(&dst_path, &metadata)?;
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("Failed to inspect {}", dst_path.display()));
+                }
+            }
+            continue;
+        }
+
+        if let Some(parent) = dst_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+        }
+
+        if dst_path.symlink_metadata().is_ok() {
+            anyhow::bail!(
+                "Failed to replay relocated path into {}: destination already exists",
+                dst_path.display()
+            );
+        }
+
+        if file_type.is_symlink() {
+            let target = fs::read_link(src_path)
+                .with_context(|| format!("Failed to read symlink {}", src_path.display()))?;
+            std::os::unix::fs::symlink(&target, &dst_path).with_context(|| {
+                format!(
+                    "Failed to create relocated symlink {} -> {}",
+                    dst_path.display(),
+                    target.display()
+                )
+            })?;
+        } else {
+            fs::copy(src_path, &dst_path).with_context(|| {
+                format!(
+                    "Failed to copy relocated path {} to {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+            apply_unix_mode(&dst_path, &metadata)?;
+        }
+
+        let logical = Path::new(logical_root).join(rel);
+        let logical = logical
+            .to_str()
+            .context("Relocated install paths must be valid UTF-8")?
+            .to_string();
+        created.push(logical);
     }
 
     Ok(())
@@ -1011,6 +1118,83 @@ impl FsTransaction {
         self.tx_dir.join("removed").join(rel)
     }
 
+    fn relocated_path(&self, rel: &str) -> PathBuf {
+        self.tx_dir.join("relocated").join(rel)
+    }
+
+    fn relocate_directory_for_symlink_swap(&mut self, rel: &str) -> Result<()> {
+        let src = self.rootfs.join(rel);
+        let relocated = self.relocated_path(rel);
+        move_directory_contents(&src, &relocated)?;
+        self.relocated.push(rel.to_string());
+        Ok(())
+    }
+
+    fn replay_relocated_dir_if_present(&mut self, rel: &str) -> Result<()> {
+        let relocated = self.relocated_path(rel);
+        match relocated.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                anyhow::bail!(
+                    "Relocation staging path is not a directory: {}",
+                    relocated.display()
+                );
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to inspect {}", relocated.display()));
+            }
+        }
+
+        copy_tree_preserving_layout_no_overwrite(
+            &relocated,
+            &self.rootfs.join(rel),
+            rel,
+            &mut self.created,
+        )
+    }
+
+    fn restore_relocated_dir(&self, rel: &str) -> Result<()> {
+        let relocated = self.relocated_path(rel);
+        match relocated.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                anyhow::bail!(
+                    "Relocation staging path is not a directory: {}",
+                    relocated.display()
+                );
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to inspect {}", relocated.display()));
+            }
+        }
+
+        let dst = self.rootfs.join(rel);
+        match dst.symlink_metadata() {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                anyhow::bail!(
+                    "Failed to restore relocated directory contents into {}: destination is not a directory",
+                    dst.display()
+                );
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(&dst)
+                    .with_context(|| format!("Failed to create directory {}", dst.display()))?;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to inspect {}", dst.display()));
+            }
+        }
+
+        move_directory_contents(&relocated, &dst)?;
+        cleanup_empty_parent_dirs(&self.tx_dir, &relocated)?;
+        Ok(())
+    }
+
     fn restore_backup_entry(&self, src: &Path, dst: &Path) -> Result<()> {
         let metadata = src
             .symlink_metadata()
@@ -1068,13 +1252,23 @@ impl FsTransaction {
 
     /// Roll back file operations performed by `install_atomic`.
     pub fn rollback(&self) -> Result<()> {
-        // Restore overwritten paths first so removed children have their original parent layout.
+        // Remove files that were newly created
+        for rel in &self.created {
+            let dst = self.rootfs.join(rel);
+            let _ = fs::remove_file(dst);
+        }
+
+        // Restore overwritten paths first so relocated and removed children have their parent layout.
         for rel in &self.backed_up {
             let src = self.backup_path(rel);
             let dst = self.rootfs.join(rel);
             if src.symlink_metadata().is_ok() {
                 self.restore_backup_entry(&src, &dst)?;
             }
+        }
+
+        for rel in &self.relocated {
+            self.restore_relocated_dir(rel)?;
         }
 
         // Restore removed files/directories.
@@ -1084,12 +1278,6 @@ impl FsTransaction {
             if src.symlink_metadata().is_ok() {
                 self.restore_backup_entry(&src, &dst)?;
             }
-        }
-
-        // Remove files that were newly created
-        for rel in &self.created {
-            let dst = self.rootfs.join(rel);
-            let _ = fs::remove_file(dst);
         }
 
         Ok(())
@@ -1147,6 +1335,7 @@ pub fn install_atomic(
         tx_dir,
         backed_up: Vec::new(),
         created: Vec::new(),
+        relocated: Vec::new(),
         removed: Vec::new(),
     };
     let mut staged_paths = HashSet::new();
@@ -1227,15 +1416,21 @@ pub fn install_atomic(
                             install_rel_path
                         );
                     }
+                    backup_existing_path(&dest_path, &backup_path, &install_rel_path)?;
+                    tx.backed_up.push(install_rel_path.clone());
                     remove_obsolete_children_for_dir(
                         &mut tx,
                         rootfs,
                         &install_rel_path,
                         remove_paths,
                     )?;
+                    if file_type.is_symlink() {
+                        tx.relocate_directory_for_symlink_swap(&install_rel_path)?;
+                    }
+                } else {
+                    backup_existing_path(&dest_path, &backup_path, &install_rel_path)?;
+                    tx.backed_up.push(install_rel_path.clone());
                 }
-                backup_existing_path(&dest_path, &backup_path, &install_rel_path)?;
-                tx.backed_up.push(install_rel_path.clone());
             } else {
                 tx.created.push(install_rel_path.clone());
             }
@@ -1266,6 +1461,7 @@ pub fn install_atomic(
                 let target = fs::read_link(src_path)?;
                 std::os::unix::fs::symlink(target, &dest_path)
                     .with_context(|| format!("Failed to create symlink: {}", install_rel_path))?;
+                tx.replay_relocated_dir_if_present(&install_rel_path)?;
             } else {
                 fs::copy(src_path, &dest_path)
                     .with_context(|| format!("Failed to install: {}", install_rel_path))?;
@@ -1721,6 +1917,82 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(rootfs.join("usr/sbin/legacy")).unwrap(),
             "old"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_atomic_preserves_non_obsolete_directory_contents_when_replacing_with_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(rootfs.join("usr/sbin")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr")).unwrap();
+        std::fs::write(rootfs.join("usr/sbin/keep"), "keep-me").unwrap();
+        std::fs::write(rootfs.join("usr/sbin/legacy"), "old").unwrap();
+        std::fs::write(destdir.join("usr/bin/legacy"), "new").unwrap();
+        std::os::unix::fs::symlink("bin", destdir.join("usr/sbin")).unwrap();
+
+        let remove_paths = vec!["usr/sbin/legacy".to_string(), "usr/sbin".to_string()];
+        let tx = install_atomic(&destdir, &rootfs, &tx_base, &remove_paths, &[]).unwrap();
+
+        let sbin_meta = rootfs.join("usr/sbin").symlink_metadata().unwrap();
+        assert!(sbin_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/bin/keep")).unwrap(),
+            "keep-me"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/sbin/keep")).unwrap(),
+            "keep-me"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/bin/legacy")).unwrap(),
+            "new"
+        );
+
+        tx.rollback().unwrap();
+        let restored = rootfs.join("usr/sbin").symlink_metadata().unwrap();
+        assert!(restored.file_type().is_dir());
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/sbin/keep")).unwrap(),
+            "keep-me"
+        );
+        assert!(!rootfs.join("usr/bin/keep").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_atomic_rejects_symlink_swap_when_relocated_contents_conflict_with_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(rootfs.join("usr/sbin")).unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr")).unwrap();
+        std::fs::write(rootfs.join("usr/sbin/keep"), "keep-me").unwrap();
+        std::fs::write(rootfs.join("usr/bin/keep"), "target-conflict").unwrap();
+        std::os::unix::fs::symlink("bin", destdir.join("usr/sbin")).unwrap();
+
+        let remove_paths = vec!["usr/sbin".to_string()];
+        let err = install_atomic(&destdir, &rootfs, &tx_base, &remove_paths, &[]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to replay relocated path into")
+        );
+
+        let restored = rootfs.join("usr/sbin").symlink_metadata().unwrap();
+        assert!(restored.file_type().is_dir());
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/sbin/keep")).unwrap(),
+            "keep-me"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/bin/keep")).unwrap(),
+            "target-conflict"
         );
     }
 

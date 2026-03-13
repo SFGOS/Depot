@@ -15,7 +15,7 @@ Stubs are not allowed.
 Do **not**:
 
 - Add placeholder functions
-- Add `todo!()` or `unimplemented!()`
+- Add `todo!()` or `unimplemented!()` (unless asked to do so)
 - Leave partially implemented logic
 - Add empty modules “for later”
 - Return dummy values to satisfy the compiler
