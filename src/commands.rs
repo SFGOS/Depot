@@ -184,6 +184,7 @@ fn run_install_command_with_program(
     }
 
     let mut cmd = std::process::Command::new(program);
+    cmd.arg("install");
     cmd.arg("-r").arg(rootfs);
     if options.no_deps {
         cmd.arg("--no-deps");
@@ -206,7 +207,6 @@ fn run_install_command_with_program(
     if options.install_test_deps {
         cmd.arg("--test-deps");
     }
-    cmd.arg("install");
     cmd.args(install_requests);
     if let Some(context) = options.install_context {
         cmd.env(DEPOT_INSTALL_CONTEXT_ENV, context);
@@ -6382,6 +6382,7 @@ optional = []
         assert_eq!(
             captured_args.lines().collect::<Vec<_>>(),
             vec![
+                "install",
                 "-r",
                 "/",
                 "--no-flags",
@@ -6389,7 +6390,6 @@ optional = []
                 "x86_64-linux-musl",
                 "--clean",
                 "--test-deps",
-                "install",
                 "/tmp/pkg-a.toml",
                 "/tmp/pkg-b.toml",
             ]
