@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 const PUBLIC_KEYS_DIR_REL: &str = "usr/share/depot/keys/public";
 const SIGN_KEYS_DIR_REL: &str = "usr/share/depot/keys/sign";
 const SIGNING_PASSWORD_ENV: &str = "DEPOT_MINISIGN_PASSWORD";
+const MAX_SIGNING_PASSWORD_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct KeyLocations {
@@ -210,9 +211,13 @@ fn load_signing_material(keys: &KeyLocations) -> Result<SigningMaterial> {
 }
 
 fn load_secret_key(signing_key_path: &Path, secret_key_box: SecretKeyBox) -> Result<SecretKey> {
-    load_secret_key_with_password_override(signing_key_path, secret_key_box, None)
+    match secret_key_box.clone().into_unencrypted_secret_key() {
+        Ok(sk) => Ok(sk),
+        Err(_) => load_secret_key_interactive(signing_key_path, secret_key_box),
+    }
 }
 
+#[cfg(test)]
 fn load_secret_key_with_password_override(
     signing_key_path: &Path,
     secret_key_box: SecretKeyBox,
@@ -223,7 +228,7 @@ fn load_secret_key_with_password_override(
         Err(_) => {
             let password = match password_override {
                 Some(password) => password,
-                None => signing_key_password(signing_key_path)?,
+                None => signing_key_password(signing_key_path, 1)?,
             };
             secret_key_box
                 .into_secret_key(Some(password))
@@ -237,9 +242,19 @@ fn load_secret_key_with_password_override(
     }
 }
 
-fn signing_key_password(signing_key_path: &Path) -> Result<String> {
+fn load_secret_key_interactive(
+    signing_key_path: &Path,
+    secret_key_box: SecretKeyBox,
+) -> Result<SecretKey> {
     if let Some(password) = std::env::var_os(SIGNING_PASSWORD_ENV) {
-        return Ok(password.to_string_lossy().into_owned());
+        return secret_key_box
+            .into_secret_key(Some(password.to_string_lossy().into_owned()))
+            .with_context(|| {
+                format!(
+                    "Failed to load minisign signing key: {}",
+                    signing_key_path.display()
+                )
+            });
     }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         anyhow::bail!(
@@ -249,9 +264,40 @@ fn signing_key_password(signing_key_path: &Path) -> Result<String> {
         );
     }
 
+    let mut last_error = None;
+    for attempt in 1..=MAX_SIGNING_PASSWORD_ATTEMPTS {
+        let password = signing_key_password(signing_key_path, attempt)?;
+        match secret_key_box.clone().into_secret_key(Some(password)) {
+            Ok(secret_key) => return Ok(secret_key),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt < MAX_SIGNING_PASSWORD_ATTEMPTS {
+                    crate::log_warn!(
+                        "Invalid minisign password for {} ({}/{})",
+                        signing_key_path.display(),
+                        attempt,
+                        MAX_SIGNING_PASSWORD_ATTEMPTS
+                    );
+                }
+            }
+        }
+    }
+
+    Err(last_error.expect("last minisign password error should exist")).with_context(|| {
+        format!(
+            "Failed to load minisign signing key after {} attempt(s): {}",
+            MAX_SIGNING_PASSWORD_ATTEMPTS,
+            signing_key_path.display()
+        )
+    })
+}
+
+fn signing_key_password(signing_key_path: &Path, attempt: usize) -> Result<String> {
     Password::new(&format!(
-        "Minisign password for {}:",
-        signing_key_path.display()
+        "Minisign password for {} ({}/{}):",
+        signing_key_path.display(),
+        attempt,
+        MAX_SIGNING_PASSWORD_ATTEMPTS
     ))
     .without_confirmation()
     .prompt()
@@ -344,7 +390,14 @@ pub fn verify_zst_file_detached_with_public_key(
 
 /// Sign one or more `.zst` files with detached minisign signatures written to `<file>.sig`.
 pub fn sign_zst_files_detached(rootfs: &Path, inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    if inputs.is_empty() {
+    let signable_inputs = collect_signable_inputs(inputs, true)?;
+    let keys = locate_keys(rootfs)?;
+    let signing_material = load_signing_material(&keys)?;
+    sign_signable_inputs_detached(&signable_inputs, &signing_material)
+}
+
+fn collect_signable_inputs(inputs: &[PathBuf], require_any: bool) -> Result<Vec<&PathBuf>> {
+    if inputs.is_empty() && require_any {
         anyhow::bail!("No input files provided for signing");
     }
 
@@ -364,40 +417,51 @@ pub fn sign_zst_files_detached(rootfs: &Path, inputs: &[PathBuf]) -> Result<Vec<
         }
         signable_inputs.push(input);
     }
-    if signable_inputs.is_empty() {
+
+    if signable_inputs.is_empty() && require_any {
         anyhow::bail!("No signable .zst files were provided");
     }
 
-    let keys = locate_keys(rootfs)?;
-    let signing_material = load_signing_material(&keys)?;
-    let mut sig_paths = Vec::with_capacity(signable_inputs.len());
+    Ok(signable_inputs)
+}
 
+fn sign_signable_inputs_detached(
+    signable_inputs: &[&PathBuf],
+    signing_material: &SigningMaterial,
+) -> Result<Vec<PathBuf>> {
+    let mut sig_paths = Vec::with_capacity(signable_inputs.len());
     for input in signable_inputs {
         let sig_path = detached_sig_path(input);
-        sign_detached_with_material(input, &sig_path, &signing_material)?;
+        sign_detached_with_material(input, &sig_path, signing_material)?;
         sig_paths.push(sig_path);
     }
-
     Ok(sig_paths)
+}
+
+/// Attempt to sign one or more `.zst` files using discovered keys; skip if no signing key exists.
+pub fn auto_sign_zst_files_detached(rootfs: &Path, inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let signable_inputs = collect_signable_inputs(inputs, false)?;
+    if signable_inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let keys = locate_keys(rootfs)?;
+    if keys.signing_key.is_none() {
+        crate::log_info!("No minisign signing key found; skipping detached signatures");
+        return Ok(Vec::new());
+    }
+
+    let signing_material = load_signing_material(&keys)?;
+    sign_signable_inputs_detached(&signable_inputs, &signing_material)
 }
 
 /// Attempt to sign a `.zst` file using discovered keys; skip if no signing key exists.
 pub fn auto_sign_zst_file_detached(rootfs: &Path, input: &Path) -> Result<Option<PathBuf>> {
-    if !is_zst_file(input) {
-        return Ok(None);
-    }
-    let keys = locate_keys(rootfs)?;
-    if keys.signing_key.is_none() {
-        crate::log_info!(
-            "No minisign signing key found; skipping detached signature for {}",
-            input.display()
-        );
-        return Ok(None);
-    }
-    let signing_material = load_signing_material(&keys)?;
-    let sig_path = detached_sig_path(input);
-    sign_detached_with_material(input, &sig_path, &signing_material)?;
-    Ok(Some(sig_path))
+    Ok(
+        auto_sign_zst_files_detached(rootfs, &[input.to_path_buf()])?
+            .into_iter()
+            .next(),
+    )
 }
 
 #[cfg(test)]

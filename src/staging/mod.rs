@@ -203,6 +203,30 @@ fn has_known_compressed_suffix(path: &str) -> bool {
         || lower.ends_with(".z")
 }
 
+fn logical_payload_rel_path(destdir: &Path, path: &Path) -> Result<Option<String>> {
+    let rel = path
+        .strip_prefix(destdir)
+        .context("Failed to strip destdir prefix during path normalization")?;
+    let output_root = Path::new(INTERNAL_OUTPUTS_DIR);
+    if !rel.starts_with(output_root) {
+        let rel = rel.to_string_lossy().to_string();
+        if rel.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(rel));
+    }
+
+    let mut comps = rel.components();
+    let _internal = comps.next();
+    let _outputs = comps.next();
+    let _package = comps.next();
+    let logical = comps.as_path();
+    if logical.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(logical.to_string_lossy().to_string()))
+}
+
 fn is_manpage_rel_path(rel_path: &str) -> bool {
     let rel = rel_path.trim_start_matches('/');
     rel.starts_with("usr/share/man/") && !has_known_compressed_suffix(rel)
@@ -497,11 +521,9 @@ fn compress_manpages_zstd(destdir: &Path) -> Result<usize> {
 
     for entry in WalkDir::new(destdir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path().to_path_buf();
-        let rel = path
-            .strip_prefix(destdir)
-            .context("Failed to strip destdir prefix during manpage compression")?
-            .to_string_lossy()
-            .to_string();
+        let Some(rel) = logical_payload_rel_path(destdir, &path)? else {
+            continue;
+        };
         if !is_manpage_rel_path(&rel) {
             continue;
         }
@@ -604,6 +626,149 @@ fn compress_manpages_zstd(destdir: &Path) -> Result<usize> {
     }
 
     Ok(compressed)
+}
+
+fn normalized_licenses(licenses: &[String]) -> Vec<String> {
+    let mut normalized: Vec<String> = licenses
+        .iter()
+        .map(|license| license.trim().to_string())
+        .collect();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn licenses_match(left: &[String], right: &[String]) -> bool {
+    normalized_licenses(left) == normalized_licenses(right)
+}
+
+fn supplemental_output_license_targets(
+    spec: &PackageSpec,
+    destdir: &Path,
+) -> Vec<(crate::package::PackageInfo, PathBuf)> {
+    let declared_names: HashSet<String> = spec
+        .outputs()
+        .into_iter()
+        .map(|output| output.name)
+        .collect();
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+
+    for output in spec.outputs() {
+        if output.name != spec.package.name {
+            let out_destdir = output_staging_dir(destdir, &output.name);
+            if out_destdir.exists() && seen.insert(output.name.clone()) {
+                targets.push((output.clone(), out_destdir));
+            }
+        }
+
+        if !spec.build.flags.split_docs || output.name.ends_with("-docs") {
+            continue;
+        }
+
+        let docs_pkg = spec.docs_package_for_output(&output);
+        if declared_names.contains(&docs_pkg.name) && !seen.contains(&docs_pkg.name) {
+            let docs_destdir = output_staging_dir(destdir, &docs_pkg.name);
+            if docs_destdir.exists() && seen.insert(docs_pkg.name.clone()) {
+                targets.push((docs_pkg, docs_destdir));
+            }
+            continue;
+        }
+
+        let docs_destdir = output_staging_dir(destdir, &docs_pkg.name);
+        if docs_destdir.exists() && seen.insert(docs_pkg.name.clone()) {
+            targets.push((docs_pkg, docs_destdir));
+        }
+    }
+
+    targets
+}
+
+/// Stage license payloads for split package outputs.
+///
+/// Outputs that share the primary package license reuse the primary license directory via symlink.
+/// Outputs with distinct metadata licenses receive copied license files from `src_dir`.
+pub fn stage_split_package_licenses(
+    src_dir: &Path,
+    destdir: &Path,
+    spec: &PackageSpec,
+) -> Result<()> {
+    let primary_license_dir = destdir.join("usr/share/licenses").join(&spec.package.name);
+    if !primary_license_dir.exists() {
+        return Ok(());
+    }
+
+    for (output, output_destdir) in supplemental_output_license_targets(spec, destdir) {
+        if licenses_match(&output.license, &spec.package.license) {
+            symlink_package_license(&output_destdir, &output.name, &spec.package.name)?;
+        } else {
+            add_licenses(src_dir, &output_destdir, &output.name)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Stage a package license directory as a symlink to another package's license directory.
+pub fn symlink_package_license(destdir: &Path, pkgname: &str, target_pkgname: &str) -> Result<()> {
+    let licenses_dir = destdir.join("usr/share/licenses");
+    fs::create_dir_all(&licenses_dir)
+        .with_context(|| format!("Failed to create {}", licenses_dir.display()))?;
+    let link_path = licenses_dir.join(pkgname);
+
+    match link_path.symlink_metadata() {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                && fs::read_link(&link_path)? == Path::new(target_pkgname)
+            {
+                return Ok(());
+            }
+            if metadata.file_type().is_dir() {
+                fs::remove_dir_all(&link_path).with_context(|| {
+                    format!(
+                        "Failed to remove existing license dir {}",
+                        link_path.display()
+                    )
+                })?;
+            } else {
+                fs::remove_file(&link_path).with_context(|| {
+                    format!(
+                        "Failed to remove existing license path {}",
+                        link_path.display()
+                    )
+                })?;
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect existing license path {}",
+                    link_path.display()
+                )
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target_pkgname, &link_path).with_context(|| {
+            format!(
+                "Failed to create package license symlink {} -> {}",
+                link_path.display(),
+                target_pkgname
+            )
+        })?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!(
+            "Package license symlinks are only supported on unix hosts: {}",
+            link_path.display()
+        );
+    }
 }
 
 /// Process staged files - remove .la files/static libs, strip binaries, etc.
@@ -1132,6 +1297,7 @@ pub fn install_atomic(
 mod tests {
     use super::*;
     use crate::package::{Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec};
+    use std::io::Read;
 
     fn mk_spec_for_stage_processing() -> PackageSpec {
         let flags = BuildFlags {
@@ -1281,6 +1447,83 @@ mod tests {
         assert!(lic_dir.join("LICENSE").exists());
         assert!(lic_dir.join("COPYING.md").exists());
         assert!(!lic_dir.join("README").exists());
+    }
+
+    #[test]
+    fn compress_manpages_zstd_detects_split_output_payload_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let page = output_staging_dir(&dest, "clang").join("usr/share/man/man1/clang.1");
+        std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+        std::fs::write(&page, b"clang manpage\n").unwrap();
+
+        let count = compress_manpages_zstd(&dest).unwrap();
+        assert_eq!(count, 1);
+        assert!(!page.exists());
+
+        let compressed = page.with_extension("1.zst");
+        assert!(compressed.exists());
+        let encoded = std::fs::read(&compressed).unwrap();
+        let decoded = zstd::stream::decode_all(std::io::Cursor::new(encoded)).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "clang manpage\n");
+    }
+
+    #[test]
+    fn stage_split_package_licenses_symlinks_matching_outputs_and_copies_distinct_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&destdir).unwrap();
+        std::fs::write(src_dir.join("LICENSE"), "license text").unwrap();
+        add_licenses(&src_dir, &destdir, "foo").unwrap();
+
+        let mut spec = mk_spec_for_stage_processing();
+        spec.packages.push(PackageInfo {
+            name: "foo-dev".into(),
+            version: "1.0".into(),
+            revision: 1,
+            description: "dev".into(),
+            homepage: "h".into(),
+            license: vec!["MIT".into()],
+        });
+        spec.packages.push(PackageInfo {
+            name: "foo-extras".into(),
+            version: "1.0".into(),
+            revision: 1,
+            description: "extras".into(),
+            homepage: "h".into(),
+            license: vec!["Apache-2.0".into()],
+        });
+
+        let dev_dest = output_staging_dir(&destdir, "foo-dev").join("usr/bin");
+        let extras_dest = output_staging_dir(&destdir, "foo-extras").join("usr/bin");
+        std::fs::create_dir_all(&dev_dest).unwrap();
+        std::fs::create_dir_all(&extras_dest).unwrap();
+        std::fs::write(dev_dest.join("foo-dev"), "bin").unwrap();
+        std::fs::write(extras_dest.join("foo-extras"), "bin").unwrap();
+
+        stage_split_package_licenses(&src_dir, &destdir, &spec).unwrap();
+
+        let dev_license =
+            output_staging_dir(&destdir, "foo-dev").join("usr/share/licenses/foo-dev");
+        let dev_meta = std::fs::symlink_metadata(&dev_license).unwrap();
+        assert!(dev_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&dev_license).unwrap(),
+            PathBuf::from("foo")
+        );
+
+        let extras_license =
+            output_staging_dir(&destdir, "foo-extras").join("usr/share/licenses/foo-extras");
+        let extras_meta = std::fs::symlink_metadata(&extras_license).unwrap();
+        assert!(extras_meta.is_dir());
+        let mut text = String::new();
+        std::fs::File::open(extras_license.join("LICENSE"))
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "license text");
     }
 
     #[test]

@@ -258,9 +258,14 @@ impl PackageSpec {
 
     /// Return the effective dependency set used by the generated lib32 companion package.
     pub fn lib32_dependencies(&self) -> Dependencies {
-        self.dependencies
+        let mut deps = self
+            .dependencies
             .lib32_dependencies()
-            .unwrap_or_else(|| self.dependencies.primary_dependencies())
+            .unwrap_or_else(|| self.dependencies.primary_dependencies());
+        if !deps.runtime.iter().any(|dep| dep == &self.package.name) {
+            deps.runtime.push(self.package.name.clone());
+        }
+        deps
     }
 
     /// Return local package names/provided features for the selected output set.
@@ -1873,7 +1878,7 @@ test = ["bats"]
         );
         assert_eq!(
             spec.dependencies_for_output("lib32-llvm").runtime,
-            vec!["lib32-zlib".to_string()]
+            vec!["lib32-zlib".to_string(), "llvm".to_string()]
         );
         assert_eq!(
             spec.dependencies_for_output("lib32-llvm").test,

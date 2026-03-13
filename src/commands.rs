@@ -1,4 +1,7 @@
-use crate::cli::{Cli, Commands, InternalCommands, RepoCommands, RepoKindArg};
+use crate::cli::{
+    BuildArgs, Cli, Commands, ConfigArgs, InfoArgs, InstallArgs, InternalCommands, ListArgs,
+    OwnsArgs, RemoveArgs, RepoArgs, RepoCommands, RepoKindArg, SearchArgs, SignArgs, UpdateArgs,
+};
 use crate::{
     builder, cli_assets, config, cross, db, deps, index, install, locking, package, planner,
     signing, source, staging, ui,
@@ -29,13 +32,69 @@ fn rootfs_is_system_root(rootfs: &Path) -> bool {
 fn command_requires_live_root(command: &Commands) -> bool {
     matches!(
         command,
-        Commands::Install { .. } | Commands::Remove { .. } | Commands::Update { .. }
+        Commands::Install(_) | Commands::Remove(_) | Commands::Update(_)
     )
+}
+
+fn repo_command_rootfs(command: &RepoCommands) -> &Path {
+    match command {
+        RepoCommands::Create { args, .. }
+        | RepoCommands::Sync { args }
+        | RepoCommands::Update { args, .. }
+        | RepoCommands::Index { args, .. }
+        | RepoCommands::List { args }
+        | RepoCommands::Add { args, .. }
+        | RepoCommands::Remove { args, .. }
+        | RepoCommands::Enable { args, .. }
+        | RepoCommands::Disable { args, .. }
+        | RepoCommands::Owns { args, .. }
+        | RepoCommands::Status { args } => &args.rootfs_args.rootfs,
+    }
+}
+
+fn command_rootfs(command: &Commands) -> Option<&Path> {
+    match command {
+        Commands::Install(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Remove(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Build(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Update(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Info(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Search(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Owns(args) => Some(&args.rootfs_args.rootfs),
+        Commands::List(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Sign(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Repo(args) => Some(repo_command_rootfs(&args.command)),
+        Commands::Config(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Check(_)
+        | Commands::GenerateArtifacts(_)
+        | Commands::MakeSpec(_)
+        | Commands::Internal(_) => None,
+    }
+}
+
+fn command_assume_yes(command: &Commands) -> bool {
+    match command {
+        Commands::Install(args) => args.prompt_args.yes,
+        Commands::Remove(args) => args.prompt_args.yes,
+        Commands::Build(args) => args.prompt_args.yes,
+        Commands::Update(args) => args.prompt_args.yes,
+        Commands::Check(_)
+        | Commands::Info(_)
+        | Commands::Search(_)
+        | Commands::Owns(_)
+        | Commands::List(_)
+        | Commands::Sign(_)
+        | Commands::Repo(_)
+        | Commands::Config(_)
+        | Commands::GenerateArtifacts(_)
+        | Commands::MakeSpec(_)
+        | Commands::Internal(_) => false,
+    }
 }
 
 fn should_reexec_with_sudo(cli: &Cli) -> bool {
     !crate::fakeroot::is_root()
-        && rootfs_is_system_root(&cli.rootfs)
+        && command_rootfs(&cli.command).is_some_and(rootfs_is_system_root)
         && command_requires_live_root(&cli.command)
 }
 
@@ -1081,9 +1140,13 @@ fn build_lib32_companion_package(
             lib32_destdir.display()
         );
     }
-    staging::add_licenses(src_dir, &lib32_destdir, &lib32_pkg_spec.package.name)?;
     install::scripts::stage_scripts_from_spec_dir(&lib32_pkg_spec, &lib32_destdir)?;
     staging::process(&lib32_destdir, &lib32_pkg_spec)?;
+    staging::symlink_package_license(
+        &lib32_destdir,
+        &lib32_pkg_spec.package.name,
+        &pkg_spec.package.name,
+    )?;
 
     Ok(Some((lib32_pkg_spec, lib32_destdir)))
 }
@@ -3969,6 +4032,9 @@ fn run_direct_install_request(
         if staging_dir.is_none() {
             // Source-build path: apply staging transforms (strip/compress/static cleanup).
             staging::process(&destdir, &pkg_spec)?;
+            if let Some(src_dir) = built_src_dir.as_deref() {
+                staging::stage_split_package_licenses(src_dir, &destdir, &pkg_spec)?;
+            }
         } else {
             // Binary archive path: install as-packaged without post-build transformations.
             if !suppress_output {
@@ -4019,30 +4085,58 @@ fn run_direct_install_request(
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    ui::set_assume_yes(cli.yes);
+    ui::set_assume_yes(command_assume_yes(&cli.command));
     if maybe_reexec_with_sudo(&cli)? {
         return Ok(());
     }
 
-    let cli_test_deps = cli.test_deps;
+    let cli_test_deps = match &cli.command {
+        Commands::Install(args) => args.build_exec_args.test_deps,
+        Commands::Build(args) => args.build_exec_args.test_deps,
+        Commands::Update(args) => args.build_exec_args.test_deps,
+        Commands::Check(_)
+        | Commands::Remove(_)
+        | Commands::Info(_)
+        | Commands::Search(_)
+        | Commands::Owns(_)
+        | Commands::List(_)
+        | Commands::Sign(_)
+        | Commands::Repo(_)
+        | Commands::Config(_)
+        | Commands::GenerateArtifacts(_)
+        | Commands::MakeSpec(_)
+        | Commands::Internal(_) => false,
+    };
     match cli.command {
-        Commands::Install {
+        Commands::Install(InstallArgs {
+            rootfs_args,
+            prompt_args,
+            build_exec_args,
+            lib32_args,
             spec_or_archive,
             spec,
-        } => {
+        }) => {
+            let rootfs = rootfs_args.rootfs;
+            let yes = prompt_args.yes;
+            let no_deps = build_exec_args.no_deps;
+            let no_flags = build_exec_args.no_flags;
+            let cross_prefix = build_exec_args.cross_prefix;
+            let clean = build_exec_args.clean;
+            let dry_run = build_exec_args.dry_run;
+            let lib32_only = lib32_args.lib32_only;
             let install_requests = match spec {
                 Some(spec_path) => vec![spec_path],
                 None => spec_or_archive,
             };
 
             // Load configuration early so we can use configured repos/paths.
-            let config = config::Config::for_rootfs(&cli.rootfs);
+            let config = config::Config::for_rootfs(&rootfs);
             let install_test_deps = install_test_deps_enabled(cli_test_deps, &config);
             let mut planned_targets = Vec::new();
             let mut planned_spec_paths = Vec::new();
             let mut direct_requests = Vec::new();
 
-            if cli.no_deps {
+            if no_deps {
                 direct_requests = install_requests;
             } else {
                 for request in install_requests {
@@ -4065,23 +4159,23 @@ pub fn run(cli: Cli) -> Result<()> {
             if !planned_targets.is_empty() {
                 ran_plan_mode = true;
                 let planner_opts = planner::PlannerOptions {
-                    assume_yes: cli.yes,
+                    assume_yes: yes,
                     prefer_binary: config.repo_settings.prefer_binary,
                     local_sibling_root: shared_local_sibling_root(&planned_spec_paths),
                     include_test_deps: install_test_deps,
-                    lib32_only_requested_specs: cli.lib32_only,
+                    lib32_only_requested_specs: lib32_only,
                 };
                 let plan = if planned_targets.len() == 1 {
                     planner::build_install_plan(
                         &config,
-                        &cli.rootfs,
+                        &rootfs,
                         planned_targets[0].clone(),
                         planner_opts,
                     )?
                 } else {
                     planner::build_install_plan_for_targets(
                         &config,
-                        &cli.rootfs,
+                        &rootfs,
                         &planned_targets,
                         planner_opts,
                     )?
@@ -4089,15 +4183,15 @@ pub fn run(cli: Cli) -> Result<()> {
                 print_plan_summary(&plan);
                 execute_install_plan_with_child_commands(
                     &plan,
-                    &cli.rootfs,
+                    &rootfs,
                     &config,
                     InstallPlanExecutionOptions {
-                        no_flags: cli.no_flags,
-                        cross_prefix: cli.cross_prefix.as_deref(),
-                        clean: cli.clean,
-                        dry_run: cli.dry_run,
+                        no_flags,
+                        cross_prefix: cross_prefix.as_deref(),
+                        clean,
+                        dry_run,
                         confirm_installation: true,
-                        lib32_only_requested_specs: cli.lib32_only,
+                        lib32_only_requested_specs: lib32_only,
                         install_test_deps,
                     },
                 )?;
@@ -4105,13 +4199,13 @@ pub fn run(cli: Cli) -> Result<()> {
 
             let mut ran_direct_install = false;
             let direct_install_options = DirectInstallOptions {
-                rootfs: &cli.rootfs,
-                no_deps: cli.no_deps,
-                no_flags: cli.no_flags,
-                cross_prefix: cli.cross_prefix.as_deref(),
-                clean: cli.clean,
-                dry_run: cli.dry_run,
-                lib32_only: cli.lib32_only,
+                rootfs: &rootfs,
+                no_deps,
+                no_flags,
+                cross_prefix: cross_prefix.as_deref(),
+                clean,
+                dry_run,
+                lib32_only,
                 install_test_deps,
             };
             if direct_requests.len() > 1
@@ -4132,16 +4226,21 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
             if ran_direct_install {
-                install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
+                install::scripts::run_deferred_hooks_if_possible(&rootfs)?;
             }
 
-            if cli.clean && (ran_plan_mode || ran_direct_install) {
+            if clean && (ran_plan_mode || ran_direct_install) {
                 clean_build_workspace(&config)?;
             }
         }
-        Commands::Remove { package } => {
+        Commands::Remove(RemoveArgs {
+            rootfs_args,
+            package,
+            ..
+        }) => {
+            let rootfs = rootfs_args.rootfs;
             ui::info(format!("Removing package: {}", package));
-            let config = config::Config::for_rootfs(&cli.rootfs);
+            let config = config::Config::for_rootfs(&rootfs);
             let mut remove_lock = locking::open_lock(&config)?;
             let remove_lock_path = locking::lock_path(&config);
             let _remove_lock_guard =
@@ -4150,21 +4249,33 @@ pub fn run(cli: Cli) -> Result<()> {
             if !ui::prompt_package_action("removal", &removal_targets, true)? {
                 anyhow::bail!("Aborted");
             }
-            remove_installed_package_with_hooks(&package, &cli.rootfs, &config)?;
+            remove_installed_package_with_hooks(&package, &rootfs, &config)?;
         }
-        Commands::Build {
+        Commands::Build(BuildArgs {
+            rootfs_args,
+            prompt_args,
+            build_exec_args,
+            lib32_args,
             spec_pos,
             spec,
             install,
             install_deps,
             cleanup_deps,
-        } => {
-            warn_if_running_as_root_for_build("build", &cli.rootfs);
+        }) => {
+            let rootfs = rootfs_args.rootfs;
+            let yes = prompt_args.yes;
+            let no_deps = build_exec_args.no_deps;
+            let no_flags = build_exec_args.no_flags;
+            let cross_prefix = build_exec_args.cross_prefix;
+            let clean = build_exec_args.clean;
+            let dry_run = build_exec_args.dry_run;
+            let lib32_only = lib32_args.lib32_only;
+            warn_if_running_as_root_for_build("build", &rootfs);
             let spec_path = spec.or(spec_pos).context("No spec file provided")?;
             ui::info(format!("Building package from: {}", spec_path.display()));
             let mut pkg_spec = package::PackageSpec::from_file(&spec_path)?;
 
-            let config = config::Config::for_rootfs(&cli.rootfs);
+            let config = config::Config::for_rootfs(&rootfs);
             let install_test_deps = install_test_deps_enabled(cli_test_deps, &config);
             let interrupt_watcher = if cleanup_deps {
                 Some(InterruptWatcher::install()?)
@@ -4175,7 +4286,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let build_result: Result<()> = (|| {
                 // Apply system overrides
                 pkg_spec.apply_config(&config);
-                let requested_outputs = requested_outputs(&pkg_spec, cli.lib32_only);
+                let requested_outputs = requested_outputs(&pkg_spec, lib32_only);
 
                 let build_targets = vec![format!(
                     "{} v{}-{}",
@@ -4192,9 +4303,9 @@ pub fn run(cli: Cli) -> Result<()> {
                         config.db_dir.display()
                     )
                 })?;
-                let db_path = config.installed_db_path(&cli.rootfs);
+                let db_path = config.installed_db_path(&rootfs);
 
-                if cli.no_deps
+                if no_deps
                     && should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs)
                 {
                     let missing_test =
@@ -4208,7 +4319,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     {
                         anyhow::bail!("Missing test dependencies: {}", missing_test.join(", "));
                     }
-                } else if cli.no_deps
+                } else if no_deps
                     || !should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs)
                 {
                     maybe_disable_tests_for_missing_deps(
@@ -4218,7 +4329,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     )?;
                 }
 
-                if !cli.no_deps {
+                if !no_deps {
                     deps::print_dep_status_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
                     let missing_build =
                         deps::check_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
@@ -4240,10 +4351,10 @@ pub fn run(cli: Cli) -> Result<()> {
                             .map(Path::to_path_buf);
                         let dep_plan = planner::build_dependency_install_plan(
                             &config,
-                            &cli.rootfs,
+                            &rootfs,
                             &missing_required,
                             planner::PlannerOptions {
-                                assume_yes: cli.yes,
+                                assume_yes: yes,
                                 prefer_binary: config.repo_settings.prefer_binary,
                                 local_sibling_root,
                                 include_test_deps: install_test_deps,
@@ -4264,7 +4375,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
                         print_plan_summary(&dep_plan);
                         if !install_deps {
-                            if cli.dry_run {
+                            if dry_run {
                                 ui::info(
                                     "Dry run enabled, stopping before dependency installation/build.",
                                 );
@@ -4275,7 +4386,7 @@ pub fn run(cli: Cli) -> Result<()> {
                                 missing_required.join(", ")
                             );
                         }
-                        if cli.dry_run {
+                        if dry_run {
                             ui::info(
                                 "Dry run enabled, stopping before dependency installation/build.",
                             );
@@ -4283,13 +4394,13 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
                         execute_install_plan_with_child_commands(
                             &dep_plan,
-                            &cli.rootfs,
+                            &rootfs,
                             &config,
                             InstallPlanExecutionOptions {
-                                no_flags: cli.no_flags,
-                                cross_prefix: cli.cross_prefix.as_deref(),
-                                clean: cli.clean,
-                                dry_run: cli.dry_run,
+                                no_flags,
+                                cross_prefix: cross_prefix.as_deref(),
+                                clean,
+                                dry_run,
                                 confirm_installation: false,
                                 lib32_only_requested_specs: false,
                                 install_test_deps,
@@ -4311,10 +4422,10 @@ pub fn run(cli: Cli) -> Result<()> {
                                 .map(Path::to_path_buf);
                             let dep_plan = match planner::build_dependency_install_plan(
                                 &config,
-                                &cli.rootfs,
+                                &rootfs,
                                 &missing_test,
                                 planner::PlannerOptions {
-                                    assume_yes: cli.yes,
+                                    assume_yes: yes,
                                     prefer_binary: config.repo_settings.prefer_binary,
                                     local_sibling_root,
                                     include_test_deps: install_test_deps,
@@ -4349,7 +4460,7 @@ pub fn run(cli: Cli) -> Result<()> {
                                 ));
                                 print_plan_summary(&dep_plan);
                                 if !install_deps {
-                                    if cli.dry_run {
+                                    if dry_run {
                                         ui::info(
                                             "Dry run enabled, stopping before dependency installation/build.",
                                         );
@@ -4365,16 +4476,16 @@ pub fn run(cli: Cli) -> Result<()> {
                                             missing_test.join(", ")
                                         );
                                     }
-                                } else if !cli.dry_run {
+                                } else if !dry_run {
                                     execute_install_plan_with_child_commands(
                                         &dep_plan,
-                                        &cli.rootfs,
+                                        &rootfs,
                                         &config,
                                         InstallPlanExecutionOptions {
-                                            no_flags: cli.no_flags,
-                                            cross_prefix: cli.cross_prefix.as_deref(),
-                                            clean: cli.clean,
-                                            dry_run: cli.dry_run,
+                                            no_flags,
+                                            cross_prefix: cross_prefix.as_deref(),
+                                            clean,
+                                            dry_run,
                                             confirm_installation: false,
                                             lib32_only_requested_specs: false,
                                             install_test_deps,
@@ -4409,7 +4520,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             }
                         }
                     }
-                } else if cli.dry_run {
+                } else if dry_run {
                     ui::info("Dry run enabled, stopping before build.");
                     return Ok(());
                 }
@@ -4419,7 +4530,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 let _build_lock_guard =
                     locking::try_write(&mut build_lock, &build_lock_path, "build")?;
 
-                if cli.dry_run {
+                if dry_run {
                     ui::info("Dry run enabled, stopping before fetch/build.");
                     return Ok(());
                 }
@@ -4437,45 +4548,42 @@ pub fn run(cli: Cli) -> Result<()> {
                     .build_dir
                     .join("destdir")
                     .join(&pkg_spec.package.name);
-                let cross_config = cli
-                    .cross_prefix
+                let cross_config = cross_prefix
                     .as_ref()
                     .map(|p| cross::CrossConfig::from_prefix(p))
                     .transpose()?;
-                if !cli.lib32_only {
+                if !lib32_only {
                     builder::build(
                         &pkg_spec,
                         &src_dir,
                         &destdir,
                         cross_config.as_ref(),
-                        !cli.no_flags,
+                        !no_flags,
                     )?;
                     if let Some(watcher) = interrupt_watcher.as_ref() {
                         watcher.check()?;
                     }
                 }
 
-                if !cli.lib32_only {
+                if !lib32_only {
                     staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
                     install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
                     staging::process(&destdir, &pkg_spec)?;
+                    staging::stage_split_package_licenses(&src_dir, &destdir, &pkg_spec)?;
                     if let Some(watcher) = interrupt_watcher.as_ref() {
                         watcher.check()?;
                     }
                 }
 
-                let arch = cli
-                    .cross_prefix
-                    .as_deref()
-                    .unwrap_or(std::env::consts::ARCH);
+                let arch = cross_prefix.as_deref().unwrap_or(std::env::consts::ARCH);
 
                 let mut created_files = Vec::new();
-                let staged_outputs = if !cli.lib32_only {
+                let staged_outputs = if !lib32_only {
                     staged_output_specs(&pkg_spec, &destdir)?
                 } else {
                     Vec::new()
                 };
-                if !cli.lib32_only {
+                if !lib32_only {
                     for (spec_for_out, out_destdir) in &staged_outputs {
                         let packager = package::Packager::new(
                             spec_for_out.clone(),
@@ -4483,14 +4591,6 @@ pub fn run(cli: Cli) -> Result<()> {
                             config.clone(),
                         );
                         let pkg_file = packager.create_package(Path::new("."), arch)?;
-                        if let Some(sig_path) =
-                            signing::auto_sign_zst_file_detached(&cli.rootfs, &pkg_file)?
-                        {
-                            ui::success(format!(
-                                "Created detached signature: {}",
-                                sig_path.display()
-                            ));
-                        }
                         created_files.push(pkg_file);
                         if let Some(watcher) = interrupt_watcher.as_ref() {
                             watcher.check()?;
@@ -4504,8 +4604,8 @@ pub fn run(cli: Cli) -> Result<()> {
                     &src_dir,
                     &config,
                     cross_config.as_ref(),
-                    !cli.no_flags,
-                    cli.lib32_only,
+                    !no_flags,
+                    lib32_only,
                 )? {
                     let packager = package::Packager::new(
                         lib32_spec.clone(),
@@ -4513,14 +4613,6 @@ pub fn run(cli: Cli) -> Result<()> {
                         config.clone(),
                     );
                     let pkg_file = packager.create_package(Path::new("."), arch)?;
-                    if let Some(sig_path) =
-                        signing::auto_sign_zst_file_detached(&cli.rootfs, &pkg_file)?
-                    {
-                        ui::success(format!(
-                            "Created detached signature: {}",
-                            sig_path.display()
-                        ));
-                    }
                     created_files.push(pkg_file);
                     lib32_install_bundle = Some((lib32_spec, lib32_destdir));
                     if let Some(watcher) = interrupt_watcher.as_ref() {
@@ -4532,9 +4624,16 @@ pub fn run(cli: Cli) -> Result<()> {
                     ui::success(format!("Build complete. Package created: {}", f.display()));
                 }
 
+                for sig_path in signing::auto_sign_zst_files_detached(&rootfs, &created_files)? {
+                    ui::success(format!(
+                        "Created detached signature: {}",
+                        sig_path.display()
+                    ));
+                }
+
                 if install {
                     let mut install_targets = Vec::new();
-                    if !cli.lib32_only {
+                    if !lib32_only {
                         for (spec_for_out, _) in &staged_outputs {
                             let out = &spec_for_out.package;
                             install_targets
@@ -4553,15 +4652,15 @@ pub fn run(cli: Cli) -> Result<()> {
                         if let Some(watcher) = interrupt_watcher.as_ref() {
                             watcher.check()?;
                         }
-                        if should_delegate_live_rootfs_installs(&cli.rootfs) {
+                        if should_delegate_live_rootfs_installs(&rootfs) {
                             run_child_install_command(
                                 &created_files,
-                                &cli.rootfs,
+                                &rootfs,
                                 InstallPlanExecutionOptions {
-                                    no_flags: cli.no_flags,
-                                    cross_prefix: cli.cross_prefix.as_deref(),
-                                    clean: cli.clean,
-                                    dry_run: cli.dry_run,
+                                    no_flags,
+                                    cross_prefix: cross_prefix.as_deref(),
+                                    clean,
+                                    dry_run,
                                     confirm_installation: false,
                                     lib32_only_requested_specs: false,
                                     install_test_deps,
@@ -4571,22 +4670,15 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
 
                         let mut transaction_plans = Vec::new();
-                        if !cli.lib32_only {
+                        if !lib32_only {
                             let output_plans = plan_package_outputs_for_install(
-                                &pkg_spec,
-                                &destdir,
-                                &cli.rootfs,
-                                &config,
+                                &pkg_spec, &destdir, &rootfs, &config,
                             )?;
                             transaction_plans.extend(output_plans);
                         }
                         if let Some((lib32_spec, lib32_destdir)) = &lib32_install_bundle {
-                            let staged = plan_staged_install(
-                                lib32_spec,
-                                lib32_destdir,
-                                &cli.rootfs,
-                                &config,
-                            )?;
+                            let staged =
+                                plan_staged_install(lib32_spec, lib32_destdir, &rootfs, &config)?;
                             transaction_plans.push(PlannedPackageInstall {
                                 spec: lib32_spec.clone(),
                                 destdir: lib32_destdir.clone(),
@@ -4595,27 +4687,27 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
 
                         run_transaction_hooks_for_plans(
-                            &cli.rootfs,
+                            &rootfs,
                             install::hooks::HookPhase::Pre,
                             &transaction_plans,
                         )?;
                         let installed = install_planned_packages_to_rootfs(
                             &transaction_plans,
-                            &cli.rootfs,
+                            &rootfs,
                             &config,
                         )?;
                         for pkg in installed {
                             log_install_success(&pkg);
                         }
                         run_transaction_hooks_for_plans(
-                            &cli.rootfs,
+                            &rootfs,
                             install::hooks::HookPhase::Post,
                             &transaction_plans,
                         )?;
 
-                        install::scripts::run_deferred_hooks_if_possible(&cli.rootfs)?;
+                        install::scripts::run_deferred_hooks_if_possible(&rootfs)?;
                     } else {
-                        if !cli.lib32_only {
+                        if !lib32_only {
                             for (spec_for_out, _) in &staged_outputs {
                                 let out = &spec_for_out.package;
                                 ui::success(format!(
@@ -4646,13 +4738,13 @@ pub fn run(cli: Cli) -> Result<()> {
                     if cleanup_deps && !auto_installed_deps.is_empty() {
                         cleanup_auto_installed_dependencies(
                             &auto_installed_deps,
-                            &cli.rootfs,
+                            &rootfs,
                             &config,
                             !install,
                             false,
                         )?;
                     }
-                    if cli.clean {
+                    if clean {
                         clean_build_workspace(&config)?;
                     }
                 }
@@ -4663,7 +4755,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
                         if let Err(clean_err) = cleanup_auto_installed_dependencies(
                             &auto_installed_deps,
-                            &cli.rootfs,
+                            &rootfs,
                             &config,
                             !install,
                             interrupted,
@@ -4681,34 +4773,48 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Commands::Update { packages } => {
-            if cli.lib32_only {
-                anyhow::bail!("--lib32-only is not supported with 'update'");
-            }
-            let config = config::Config::for_rootfs(&cli.rootfs);
+        Commands::Update(UpdateArgs {
+            rootfs_args,
+            prompt_args,
+            build_exec_args,
+            packages,
+        }) => {
+            let rootfs = rootfs_args.rootfs;
+            let yes = prompt_args.yes;
+            let no_deps = build_exec_args.no_deps;
+            let no_flags = build_exec_args.no_flags;
+            let cross_prefix = build_exec_args.cross_prefix;
+            let clean = build_exec_args.clean;
+            let dry_run = build_exec_args.dry_run;
+            let config = config::Config::for_rootfs(&rootfs);
             run_update_command(
                 &packages,
                 &config,
                 UpdateCommandOptions {
-                    rootfs: &cli.rootfs,
-                    no_deps: cli.no_deps,
-                    no_flags: cli.no_flags,
-                    cross_prefix: cli.cross_prefix.as_deref(),
-                    clean: cli.clean,
-                    dry_run: cli.dry_run,
-                    assume_yes: cli.yes,
+                    rootfs: &rootfs,
+                    no_deps,
+                    no_flags,
+                    cross_prefix: cross_prefix.as_deref(),
+                    clean,
+                    dry_run,
+                    assume_yes: yes,
                     install_test_deps: install_test_deps_enabled(cli_test_deps, &config),
                 },
             )?;
         }
-        Commands::Check { dir } => {
+        Commands::Check(args) => {
+            let dir = args.dir;
             run_check_command(&dir)?;
         }
-        Commands::Info { package } => {
+        Commands::Info(InfoArgs {
+            rootfs_args,
+            package,
+        }) => {
+            let rootfs = rootfs_args.rootfs;
             // Try as file first, then as installed package name
             let path = PathBuf::from(&package);
             if path.exists() {
-                let config = config::Config::for_rootfs(&cli.rootfs);
+                let config = config::Config::for_rootfs(&rootfs);
                 let info_lock = locking::open_lock(&config)?;
                 let info_lock_path = locking::lock_path(&config);
                 let _info_lock_guard = locking::try_read(&info_lock, &info_lock_path, "info")?;
@@ -4716,45 +4822,53 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("{}", pkg_spec);
 
                 // Also show dependency status
-                let db_path = config.installed_db_path(&cli.rootfs);
+                let db_path = config.installed_db_path(&rootfs);
                 deps::print_dep_status(&pkg_spec, &db_path)?;
             } else {
-                let config = config::Config::for_rootfs(&cli.rootfs);
+                let config = config::Config::for_rootfs(&rootfs);
                 let info_lock = locking::open_lock(&config)?;
                 let info_lock_path = locking::lock_path(&config);
                 let _info_lock_guard = locking::try_read(&info_lock, &info_lock_path, "info")?;
-                let db_path = config.installed_db_path(&cli.rootfs);
+                let db_path = config.installed_db_path(&rootfs);
                 db::show_package_info(&db_path, &package)?;
             }
         }
-        Commands::Search { query, files } => {
-            let config = config::Config::for_rootfs(&cli.rootfs);
+        Commands::Search(SearchArgs {
+            rootfs_args,
+            query,
+            files,
+        }) => {
+            let rootfs = rootfs_args.rootfs;
+            let config = config::Config::for_rootfs(&rootfs);
             let search_lock = locking::open_lock(&config)?;
             let search_lock_path = locking::lock_path(&config);
             let _search_lock_guard = locking::try_read(&search_lock, &search_lock_path, "search")?;
-            run_search_command(&query, files, &config, &cli.rootfs)?;
+            run_search_command(&query, files, &config, &rootfs)?;
         }
-        Commands::Owns { path } => {
-            let config = config::Config::for_rootfs(&cli.rootfs);
+        Commands::Owns(OwnsArgs { rootfs_args, path }) => {
+            let rootfs = rootfs_args.rootfs;
+            let config = config::Config::for_rootfs(&rootfs);
             let owns_lock = locking::open_lock(&config)?;
             let owns_lock_path = locking::lock_path(&config);
             let _owns_lock_guard = locking::try_read(&owns_lock, &owns_lock_path, "owns")?;
-            let db_path = config.installed_db_path(&cli.rootfs);
+            let db_path = config.installed_db_path(&rootfs);
             match db::owns_path(&db_path, &path)? {
                 Some(owner) => ui::info(format!("{} is owned by {}", path.display(), owner)),
                 None => ui::warn(format!("No installed package owns {}", path.display())),
             }
         }
-        Commands::List => {
-            let config = config::Config::for_rootfs(&cli.rootfs);
+        Commands::List(ListArgs { rootfs_args }) => {
+            let rootfs = rootfs_args.rootfs;
+            let config = config::Config::for_rootfs(&rootfs);
             let list_lock = locking::open_lock(&config)?;
             let list_lock_path = locking::lock_path(&config);
             let _list_lock_guard = locking::try_read(&list_lock, &list_lock_path, "list")?;
-            let db_path = config.installed_db_path(&cli.rootfs);
+            let db_path = config.installed_db_path(&rootfs);
             db::list_packages(&db_path)?;
         }
-        Commands::Sign { files } => {
-            let sig_paths = signing::sign_zst_files_detached(&cli.rootfs, &files)?;
+        Commands::Sign(SignArgs { rootfs_args, files }) => {
+            let rootfs = rootfs_args.rootfs;
+            let sig_paths = signing::sign_zst_files_detached(&rootfs, &files)?;
             for sig_path in sig_paths {
                 ui::success(format!(
                     "Created detached signature: {}",
@@ -4762,17 +4876,17 @@ pub fn run(cli: Cli) -> Result<()> {
                 ));
             }
         }
-        Commands::Repo { command } => match command {
-            RepoCommands::Create { dir } => {
-                let cfg = config::Config::for_rootfs(&cli.rootfs);
+        Commands::Repo(RepoArgs { command }) => match command {
+            RepoCommands::Create { args, dir } => {
+                let rootfs = args.rootfs_args.rootfs;
+                let cfg = config::Config::for_rootfs(&rootfs);
                 let mut repo_lock = locking::open_lock(&cfg)?;
                 let repo_lock_path = locking::lock_path(&cfg);
                 let _repo_lock_guard =
                     locking::try_write(&mut repo_lock, &repo_lock_path, "repo create")?;
                 let repo = db::repo::RepoManager::new(dir);
                 let db_path = repo.create_repo_db()?;
-                if let Some(sig_path) = signing::auto_sign_zst_file_detached(&cli.rootfs, &db_path)?
-                {
+                if let Some(sig_path) = signing::auto_sign_zst_file_detached(&rootfs, &db_path)? {
                     ui::success(format!(
                         "Created detached signature: {}",
                         sig_path.display()
@@ -4783,8 +4897,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     db_path.display()
                 ));
             }
-            RepoCommands::Sync => {
-                let cfg = config::Config::for_rootfs(&cli.rootfs);
+            RepoCommands::Sync { args } => {
+                let rootfs = args.rootfs_args.rootfs;
+                let cfg = config::Config::for_rootfs(&rootfs);
                 let mut repo_lock = locking::open_lock(&cfg)?;
                 let repo_lock_path = locking::lock_path(&cfg);
                 let _repo_lock_guard =
@@ -4805,8 +4920,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     ));
                 }
             }
-            RepoCommands::Update { name } => {
-                let cfg = config::Config::for_rootfs(&cli.rootfs);
+            RepoCommands::Update { args, name } => {
+                let rootfs = args.rootfs_args.rootfs;
+                let cfg = config::Config::for_rootfs(&rootfs);
                 let mut repo_lock = locking::open_lock(&cfg)?;
                 let repo_lock_path = locking::lock_path(&cfg);
                 let _repo_lock_guard =
@@ -4834,8 +4950,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            RepoCommands::Index { dir, subdirs } => {
-                let cfg = config::Config::for_rootfs(&cli.rootfs);
+            RepoCommands::Index { args, dir, subdirs } => {
+                let rootfs = args.rootfs_args.rootfs;
+                let cfg = config::Config::for_rootfs(&rootfs);
                 let mut repo_lock = locking::open_lock(&cfg)?;
                 let repo_lock_path = locking::lock_path(&cfg);
                 let _repo_lock_guard =
@@ -4858,14 +4975,16 @@ pub fn run(cli: Cli) -> Result<()> {
                     stats.ignored_toml_files
                 ));
             }
-            RepoCommands::List => {
-                let config = config::Config::for_rootfs(&cli.rootfs);
+            RepoCommands::List { args } => {
+                let rootfs = args.rootfs_args.rootfs;
+                let config = config::Config::for_rootfs(&rootfs);
                 let repo_lock = locking::open_lock(&config)?;
                 let repo_lock_path = locking::lock_path(&config);
                 let _repo_lock_guard = locking::try_read(&repo_lock, &repo_lock_path, "repo list")?;
                 print_repo_list(&config);
             }
             RepoCommands::Add {
+                args,
                 name,
                 url,
                 kind,
@@ -4876,12 +4995,13 @@ pub fn run(cli: Cli) -> Result<()> {
                 repo_db,
                 allow_unsigned,
             } => {
-                let cfg = config::Config::for_rootfs(&cli.rootfs);
+                let rootfs = args.rootfs_args.rootfs;
+                let cfg = config::Config::for_rootfs(&rootfs);
                 let mut repo_lock = locking::open_lock(&cfg)?;
                 let repo_lock_path = locking::lock_path(&cfg);
                 let _repo_lock_guard =
                     locking::try_write(&mut repo_lock, &repo_lock_path, "repo add")?;
-                let mut repos = config::load_repos_config_file(&cli.rootfs)?;
+                let mut repos = config::load_repos_config_file(&rootfs)?;
                 match kind {
                     RepoKindArg::Source => {
                         if let Some(existing) = repos.source.get(&name)
@@ -4928,7 +5048,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         repos.binary.insert(name.clone(), candidate);
                     }
                 }
-                let path = config::save_repos_config_file(&cli.rootfs, &repos)?;
+                let path = config::save_repos_config_file(&rootfs, &repos)?;
                 ui::success(format!(
                     "Saved {} repo '{}' to {}",
                     repo_kind_label(kind),
@@ -4936,13 +5056,14 @@ pub fn run(cli: Cli) -> Result<()> {
                     path.display()
                 ));
             }
-            RepoCommands::Remove { name, kind } => {
-                let cfg = config::Config::for_rootfs(&cli.rootfs);
+            RepoCommands::Remove { args, name, kind } => {
+                let rootfs = args.rootfs_args.rootfs;
+                let cfg = config::Config::for_rootfs(&rootfs);
                 let mut repo_lock = locking::open_lock(&cfg)?;
                 let repo_lock_path = locking::lock_path(&cfg);
                 let _repo_lock_guard =
                     locking::try_write(&mut repo_lock, &repo_lock_path, "repo remove")?;
-                let mut repos = config::load_repos_config_file(&cli.rootfs)?;
+                let mut repos = config::load_repos_config_file(&rootfs)?;
                 let kind = resolve_repo_kind_for_name(&repos, &name, kind)?;
                 if !ui::prompt_yes_no(
                     &format!("Remove {} repo '{}'?", repo_kind_label(kind), name),
@@ -4959,7 +5080,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         repos.binary.remove(&name);
                     }
                 }
-                let path = config::save_repos_config_file(&cli.rootfs, &repos)?;
+                let path = config::save_repos_config_file(&rootfs, &repos)?;
                 ui::success(format!(
                     "Removed {} repo '{}' from {}",
                     repo_kind_label(kind),
@@ -4967,13 +5088,14 @@ pub fn run(cli: Cli) -> Result<()> {
                     path.display()
                 ));
             }
-            RepoCommands::Enable { name, kind } => {
-                let cfg = config::Config::for_rootfs(&cli.rootfs);
+            RepoCommands::Enable { args, name, kind } => {
+                let rootfs = args.rootfs_args.rootfs;
+                let cfg = config::Config::for_rootfs(&rootfs);
                 let mut repo_lock = locking::open_lock(&cfg)?;
                 let repo_lock_path = locking::lock_path(&cfg);
                 let _repo_lock_guard =
                     locking::try_write(&mut repo_lock, &repo_lock_path, "repo enable")?;
-                let mut repos = config::load_repos_config_file(&cli.rootfs)?;
+                let mut repos = config::load_repos_config_file(&rootfs)?;
                 let kind = resolve_repo_kind_for_name(&repos, &name, kind)?;
                 match kind {
                     RepoKindArg::Source => {
@@ -4985,7 +5107,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             ui::info(format!("Source repo '{}' is already enabled", name));
                         } else {
                             repo.enabled = true;
-                            let path = config::save_repos_config_file(&cli.rootfs, &repos)?;
+                            let path = config::save_repos_config_file(&rootfs, &repos)?;
                             ui::success(format!(
                                 "Enabled source repo '{}' in {}",
                                 name,
@@ -5002,7 +5124,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             ui::info(format!("Binary repo '{}' is already enabled", name));
                         } else {
                             repo.enabled = true;
-                            let path = config::save_repos_config_file(&cli.rootfs, &repos)?;
+                            let path = config::save_repos_config_file(&rootfs, &repos)?;
                             ui::success(format!(
                                 "Enabled binary repo '{}' in {}",
                                 name,
@@ -5012,13 +5134,14 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            RepoCommands::Disable { name, kind } => {
-                let cfg = config::Config::for_rootfs(&cli.rootfs);
+            RepoCommands::Disable { args, name, kind } => {
+                let rootfs = args.rootfs_args.rootfs;
+                let cfg = config::Config::for_rootfs(&rootfs);
                 let mut repo_lock = locking::open_lock(&cfg)?;
                 let repo_lock_path = locking::lock_path(&cfg);
                 let _repo_lock_guard =
                     locking::try_write(&mut repo_lock, &repo_lock_path, "repo disable")?;
-                let mut repos = config::load_repos_config_file(&cli.rootfs)?;
+                let mut repos = config::load_repos_config_file(&rootfs)?;
                 let kind = resolve_repo_kind_for_name(&repos, &name, kind)?;
                 if !ui::prompt_yes_no(
                     &format!("Disable {} repo '{}'?", repo_kind_label(kind), name),
@@ -5042,7 +5165,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         repo.enabled = false;
                     }
                 }
-                let path = config::save_repos_config_file(&cli.rootfs, &repos)?;
+                let path = config::save_repos_config_file(&rootfs, &repos)?;
                 ui::success(format!(
                     "Disabled {} repo '{}' in {}",
                     repo_kind_label(kind),
@@ -5050,8 +5173,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     path.display()
                 ));
             }
-            RepoCommands::Owns { path } => {
-                let config = config::Config::for_rootfs(&cli.rootfs);
+            RepoCommands::Owns { args, path } => {
+                let rootfs = args.rootfs_args.rootfs;
+                let config = config::Config::for_rootfs(&rootfs);
                 let repo_lock = locking::open_lock(&config)?;
                 let repo_lock_path = locking::lock_path(&config);
                 let _repo_lock_guard = locking::try_read(&repo_lock, &repo_lock_path, "repo owns")?;
@@ -5069,7 +5193,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     match db::repo::binary_repo_owns_path(
                         name,
                         repo,
-                        &cli.rootfs,
+                        &rootfs,
                         &config.package_cache_dir,
                         &path.to_string_lossy(),
                     ) {
@@ -5097,8 +5221,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     ));
                 }
             }
-            RepoCommands::Status => {
-                let config = config::Config::for_rootfs(&cli.rootfs);
+            RepoCommands::Status { args } => {
+                let rootfs = args.rootfs_args.rootfs;
+                let config = config::Config::for_rootfs(&rootfs);
                 let repo_lock = locking::open_lock(&config)?;
                 let repo_lock_path = locking::lock_path(&config);
                 let _repo_lock_guard =
@@ -5137,12 +5262,14 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
-        Commands::GenerateArtifacts { out_dir } => {
+        Commands::GenerateArtifacts(args) => {
+            let out_dir = args.out_dir;
             cli_assets::generate_cli_assets(&out_dir)?;
             ui::success(format!("Generated CLI assets in {}", out_dir.display()));
         }
-        Commands::Config => {
-            let config = config::Config::for_rootfs(&cli.rootfs);
+        Commands::Config(ConfigArgs { rootfs_args }) => {
+            let rootfs = rootfs_args.rootfs;
+            let config = config::Config::for_rootfs(&rootfs);
             let config_lock = locking::open_lock(&config)?;
             let config_lock_path = locking::lock_path(&config);
             let _config_lock_guard = locking::try_read(&config_lock, &config_lock_path, "config")?;
@@ -5169,7 +5296,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Commands::MakeSpec { output } => {
+        Commands::MakeSpec(args) => {
+            let output = args.output;
             let spec = package::create_interactive()?;
             // Produce a minimal TOML for interactive-created specs (omit defaults)
             let toml_string = package::spec_to_minimal_toml(&spec)?;
@@ -5190,7 +5318,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 output_path.display()
             ));
         }
-        Commands::Internal { command } => {
+        Commands::Internal(args) => {
+            let command = args.command;
             run_internal_command(command)?;
         }
     }
@@ -5201,10 +5330,39 @@ pub fn run(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{
+        BuildArgs, BuildExecArgs, Cli, InstallArgs, Lib32Args, PromptArgs, RootfsArgs, SearchArgs,
+        UpdateArgs,
+    };
     use crate::test_support::TestEnv;
     use std::sync::Mutex;
 
     static ASSUME_YES_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn rootfs_args(rootfs: impl Into<PathBuf>) -> RootfsArgs {
+        RootfsArgs {
+            rootfs: rootfs.into(),
+        }
+    }
+
+    fn prompt_args(yes: bool) -> PromptArgs {
+        PromptArgs { yes }
+    }
+
+    fn build_exec_args() -> BuildExecArgs {
+        BuildExecArgs {
+            no_deps: false,
+            no_flags: false,
+            cross_prefix: None,
+            clean: false,
+            dry_run: false,
+            test_deps: false,
+        }
+    }
+
+    fn lib32_args() -> Lib32Args {
+        Lib32Args { lib32_only: false }
+    }
 
     fn test_binary_repo_record(name: &str, filename: &str) -> db::repo::BinaryRepoPackageRecord {
         db::repo::BinaryRepoPackageRecord {
@@ -6515,27 +6673,43 @@ optional = []
 
     #[test]
     fn command_requires_live_root_for_install_remove_and_update() {
-        assert!(command_requires_live_root(&Commands::Install {
-            spec_or_archive: vec![PathBuf::from("foo")],
-            spec: None,
-        }));
-        assert!(command_requires_live_root(&Commands::Remove {
+        assert!(command_requires_live_root(&Commands::Install(
+            InstallArgs {
+                rootfs_args: rootfs_args("/"),
+                prompt_args: prompt_args(false),
+                build_exec_args: build_exec_args(),
+                lib32_args: lib32_args(),
+                spec_or_archive: vec![PathBuf::from("foo")],
+                spec: None,
+            }
+        )));
+        assert!(command_requires_live_root(&Commands::Remove(RemoveArgs {
+            rootfs_args: rootfs_args("/"),
+            prompt_args: prompt_args(false),
             package: "foo".to_string(),
-        }));
-        assert!(command_requires_live_root(&Commands::Update {
+        })));
+        assert!(command_requires_live_root(&Commands::Update(UpdateArgs {
+            rootfs_args: rootfs_args("/"),
+            prompt_args: prompt_args(false),
+            build_exec_args: build_exec_args(),
             packages: vec!["foo".to_string()],
-        }));
-        assert!(!command_requires_live_root(&Commands::Build {
+        })));
+        assert!(!command_requires_live_root(&Commands::Build(BuildArgs {
+            rootfs_args: rootfs_args("/"),
+            prompt_args: prompt_args(false),
+            build_exec_args: build_exec_args(),
+            lib32_args: lib32_args(),
             spec_pos: Some(PathBuf::from("foo.toml")),
             spec: None,
             install: false,
             install_deps: false,
             cleanup_deps: false,
-        }));
-        assert!(!command_requires_live_root(&Commands::Search {
+        })));
+        assert!(!command_requires_live_root(&Commands::Search(SearchArgs {
+            rootfs_args: rootfs_args("/"),
             query: "foo".to_string(),
             files: false,
-        }));
+        })));
     }
 
     #[test]
@@ -6727,22 +6901,17 @@ optional = []
         .with_context(|| format!("Failed to write {}", dep_spec.display()))?;
 
         let result = run(Cli {
-            rootfs: rootfs.clone(),
-            no_deps: false,
-            no_flags: false,
-            cross_prefix: None,
-            clean: false,
-            yes: true,
-            dry_run: false,
-            test_deps: false,
-            lib32_only: false,
-            command: Commands::Build {
+            command: Commands::Build(BuildArgs {
+                rootfs_args: rootfs_args(rootfs.clone()),
+                prompt_args: prompt_args(true),
+                build_exec_args: build_exec_args(),
+                lib32_args: lib32_args(),
                 spec_pos: Some(app_spec),
                 spec: None,
                 install: false,
                 install_deps: false,
                 cleanup_deps: false,
-            },
+            }),
         });
         ui::set_assume_yes(false);
 
@@ -6793,7 +6962,7 @@ optional = []
 
         assert_eq!(lib32.package.name, "lib32-pkg");
         assert_eq!(lib32.dependencies.build, vec!["gcc-multilib"]);
-        assert_eq!(lib32.dependencies.runtime, vec!["lib32-zlib"]);
+        assert_eq!(lib32.dependencies.runtime, vec!["lib32-zlib", "pkg"]);
         assert_eq!(lib32.dependencies.optional, vec!["lib32-gtk-doc"]);
     }
 }

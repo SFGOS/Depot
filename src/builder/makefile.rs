@@ -110,8 +110,20 @@ pub fn build(
 mod tests {
     use super::*;
     use crate::package::{Build, BuildFlags, BuildType, Dependencies, PackageInfo};
+    use crate::test_support::TestEnv;
     use std::fs;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn write_executable(path: &std::path::Path, contents: &str) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, contents)?;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
 
     fn mk_spec(name: &str, version: &str) -> PackageSpec {
         PackageSpec {
@@ -149,8 +161,24 @@ mod tests {
     fn test_makefile_build_runs_commands() -> Result<()> {
         let tmp_src = tempdir()?;
         let tmp_dest = tempdir()?;
+        let tmp_tools = tempdir()?;
         let src_path = tmp_src.path();
         let dest_path = tmp_dest.path();
+        let tools_path = tmp_tools.path();
+
+        write_executable(
+            &tools_path.join("fakeroot"),
+            r#"#!/bin/sh
+if [ "$1" = "--" ]; then
+    shift
+fi
+exec "$@"
+"#,
+        )?;
+
+        let mut env = TestEnv::new();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        env.set_var("PATH", format!("{}:{}", tools_path.display(), old_path));
 
         let mut spec = mk_spec("test-make", "1.0");
         spec.build.flags.makefile_commands = vec![
