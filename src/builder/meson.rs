@@ -132,14 +132,33 @@ pub fn build(
             }
         );
 
-        let mut install_cmd = fakeroot::wrap_install_command("meson", destdir);
+        let install_destdir =
+            crate::builder::install_destdir_path(&build_dir, destdir, flags.lib32_variant);
+        if flags.lib32_variant {
+            if install_destdir.exists() {
+                fs::remove_dir_all(&install_destdir).with_context(|| {
+                    format!(
+                        "Failed to clean temporary lib32 install dir: {}",
+                        install_destdir.display()
+                    )
+                })?;
+            }
+            fs::create_dir_all(&install_destdir).with_context(|| {
+                format!(
+                    "Failed to create temporary lib32 install dir: {}",
+                    install_destdir.display()
+                )
+            })?;
+        }
+
+        let mut install_cmd = fakeroot::wrap_install_command("meson", &install_destdir);
         install_cmd.arg("install");
         install_cmd.arg("-C").arg(&build_dir);
 
         let mut install_env = env_vars.clone();
         install_env.push((
             "DESTDIR".to_string(),
-            destdir.to_string_lossy().into_owned(),
+            install_destdir.to_string_lossy().into_owned(),
         ));
         crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
 
@@ -149,7 +168,12 @@ pub fn build(
             anyhow::bail!("meson install failed");
         }
 
-        crate::source::hooks::run_post_install_commands(spec, &actual_src, destdir)?;
+        if flags.lib32_variant {
+            crate::builder::stage_lib32_install_tree(&install_destdir, destdir)?;
+            crate::source::hooks::run_post_install_commands_in_dir(spec, &build_dir, destdir)?;
+        } else {
+            crate::source::hooks::run_post_install_commands(spec, &actual_src, destdir)?;
+        }
         state.mark_done(BuildStep::PostInstallDone)?;
     } else {
         crate::log_info!("Skipping meson install and post-install hooks (already done)");

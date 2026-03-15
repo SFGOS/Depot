@@ -188,7 +188,26 @@ pub fn build(
 
         let install_targets =
             phase_targets(&flags.make_install_target, &flags.make_install_targets);
-        let mut install_cmd = fakeroot::wrap_install_command("cmake", destdir);
+        let install_destdir =
+            crate::builder::install_destdir_path(&build_dir, destdir, flags.lib32_variant);
+        if flags.lib32_variant {
+            if install_destdir.exists() {
+                fs::remove_dir_all(&install_destdir).with_context(|| {
+                    format!(
+                        "Failed to clean temporary lib32 install dir: {}",
+                        install_destdir.display()
+                    )
+                })?;
+            }
+            fs::create_dir_all(&install_destdir).with_context(|| {
+                format!(
+                    "Failed to create temporary lib32 install dir: {}",
+                    install_destdir.display()
+                )
+            })?;
+        }
+
+        let mut install_cmd = fakeroot::wrap_install_command("cmake", &install_destdir);
         if !install_targets.is_empty() {
             install_cmd.arg("--build").arg(&build_dir);
             install_cmd.arg("--target");
@@ -202,7 +221,7 @@ pub fn build(
         let mut install_env = env_vars.clone();
         install_env.push((
             "DESTDIR".to_string(),
-            destdir.to_string_lossy().into_owned(),
+            install_destdir.to_string_lossy().into_owned(),
         ));
         crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
 
@@ -218,7 +237,12 @@ pub fn build(
             anyhow::bail!("cmake install failed");
         }
 
-        crate::source::hooks::run_post_install_commands(spec, &actual_src, destdir)?;
+        if flags.lib32_variant {
+            crate::builder::stage_lib32_install_tree(&install_destdir, destdir)?;
+            crate::source::hooks::run_post_install_commands_in_dir(spec, &build_dir, destdir)?;
+        } else {
+            crate::source::hooks::run_post_install_commands(spec, &actual_src, destdir)?;
+        }
         state.mark_done(BuildStep::PostInstallDone)?;
     } else {
         crate::log_info!("Skipping cmake install and post-install hooks (already done)");

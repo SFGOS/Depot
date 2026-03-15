@@ -3730,29 +3730,25 @@ fn execute_install_plan_with_child_commands(
                     step.package
                 ));
 
-                let mut cmd = std::process::Command::new(&exe);
-                cmd.arg("-r").arg(rootfs);
-                cmd.arg("--no-deps");
-                cmd.arg("--yes");
-                if options.no_flags {
-                    cmd.arg("--no-flags");
-                }
-                if let Some(p) = options.cross_prefix {
-                    cmd.arg("--cross-prefix").arg(p);
-                }
-                if options.clean {
-                    cmd.arg("--clean");
-                }
-                if step_requests_only_lib32(step, &options) {
-                    cmd.arg("--lib32-only");
-                }
-                cmd.arg("install").arg(path);
-
-                let status = crate::interrupts::command_status(&mut cmd)
-                    .context("Failed to spawn planned install step")?;
-                if !status.success() {
-                    anyhow::bail!("Planned install step for '{}' failed", step.package);
-                }
+                run_install_command_with_program(
+                    &exe,
+                    std::slice::from_ref(path),
+                    rootfs,
+                    ChildInstallCommandOptions {
+                        no_deps: true,
+                        assume_yes: true,
+                        no_flags: options.no_flags,
+                        cross_prefix: options.cross_prefix,
+                        clean: options.clean,
+                        lib32_only: step_requests_only_lib32(step, &options),
+                        install_test_deps: options.install_test_deps,
+                        install_context: Some(INSTALL_CONTEXT_PLANNED),
+                        dep_chain: None,
+                    },
+                )
+                .with_context(|| {
+                    format!("Failed to spawn planned install step '{}'", step.package)
+                })?;
             }
             planner::PlanOrigin::Binary { repo_name, record } => {
                 let cached = binary_archives
