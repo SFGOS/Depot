@@ -4154,7 +4154,7 @@ fn run_direct_install_request(
                         clean: options.clean,
                         lib32_only: false,
                         install_test_deps: options.install_test_deps,
-                        install_context: None,
+                        install_context: Some(INSTALL_CONTEXT_PLANNED),
                         dep_chain: Some(&new_chain),
                     },
                 )?;
@@ -4214,7 +4214,7 @@ fn run_direct_install_request(
                                 clean: options.clean,
                                 lib32_only: false,
                                 install_test_deps: options.install_test_deps,
-                                install_context: None,
+                                install_context: Some(INSTALL_CONTEXT_PLANNED),
                                 dep_chain: None,
                             },
                         )?;
