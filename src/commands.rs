@@ -151,6 +151,10 @@ fn is_explicit_depot_self_update_request(packages: &[String]) -> bool {
 }
 
 fn ensure_depot_self_update_not_required(config: &config::Config, rootfs: &Path) -> Result<()> {
+    if current_install_invocation_context() == InstallInvocationContext::Update {
+        return Ok(());
+    }
+
     let db_path = config.installed_db_path(rootfs);
     if db::get_package_version(&db_path, DEPOT_PACKAGE_NAME)
         .with_context(|| {
@@ -6338,6 +6342,47 @@ optional = []
             DEPOT_PACKAGE_NAME,
             "1.1.0",
         )?;
+
+        ensure_depot_self_update_not_required(&config, &rootfs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn depot_self_update_check_is_skipped_for_nested_update_install_context() -> Result<()> {
+        let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+        let rootfs = temp.path().join("rootfs");
+        let repo_clones = temp.path().join("repos");
+        let build_dir = temp.path().join("build");
+        let db_dir = rootfs.join("var/lib/depot");
+        fs::create_dir_all(&db_dir)?;
+        fs::create_dir_all(&repo_clones)?;
+        fs::create_dir_all(&build_dir)?;
+
+        let mut config = config::Config::for_rootfs(&rootfs);
+        config.repo_clone_dir = repo_clones.clone();
+        config.build_dir = build_dir;
+        config.db_dir = db_dir;
+        config.repo_settings.prefer_binary = false;
+        config.binary_repos.clear();
+        config.source_repos.insert(
+            "core".into(),
+            config::SourceRepo {
+                url: "https://example.test/core.git".into(),
+                enabled: true,
+                priority: 0,
+                subdirs: Vec::new(),
+            },
+        );
+
+        register_installed_test_package(&config, &rootfs, DEPOT_PACKAGE_NAME, "1.0.0")?;
+        write_test_repo_spec(
+            &repo_clones.join("core").join("depot.toml"),
+            DEPOT_PACKAGE_NAME,
+            "1.1.0",
+        )?;
+
+        let mut env = TestEnv::new();
+        env.set_var(DEPOT_INSTALL_CONTEXT_ENV, INSTALL_CONTEXT_UPDATE);
 
         ensure_depot_self_update_not_required(&config, &rootfs)?;
         Ok(())
