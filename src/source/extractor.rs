@@ -9,6 +9,7 @@ use lzma_rust2::{LzipReader, LzmaReader};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::os::unix::fs as unix_fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::{NamedTempFile, tempdir};
@@ -42,6 +43,7 @@ pub fn extract_archive(
     source: &Source,
     build_dir: &Path,
 ) -> Result<PathBuf> {
+    crate::interrupts::install()?;
     let extract_dir_name = spec.expand_vars(&source.extract_dir);
     let extract_path = build_dir.join(&extract_dir_name);
 
@@ -157,7 +159,7 @@ fn extract_zip(path: &Path, dest: &Path) -> Result<()> {
     let tmp = tempdir()?;
     let file = File::open(path)?;
     let mut archive = zip::ZipArchive::new(file)?;
-    archive.extract(tmp.path())?;
+    extract_zip_archive(&mut archive, tmp.path())?;
     finalize_extracted_tree(tmp.path(), dest)
 }
 
@@ -190,6 +192,20 @@ fn extract_tar_compress(path: &Path, dest: &Path) -> Result<()> {
     let mut child = Command::new("gzip");
     child.arg("-cd").arg(path);
     child.stdout(Stdio::piped());
+    crate::interrupts::check()?;
+    // Run gzip in its own process group so Ctrl-C can interrupt decompression too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            child.pre_exec(|| {
+                if nix::libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = child.spawn().with_context(|| {
         format!(
             "Failed to spawn gzip for .Z decompression: {}",
@@ -201,13 +217,12 @@ fn extract_tar_compress(path: &Path, dest: &Path) -> Result<()> {
         .take()
         .context("Failed to capture gzip stdout")?;
     let mut archive = tar::Archive::new(stdout);
-    archive
-        .unpack(tmp.path())
-        .with_context(|| format!("Failed to unpack .tar.Z archive {}", path.display()))?;
+    let unpack_result = crate::interrupts::unpack_tar_archive(&mut archive, tmp.path())
+        .with_context(|| format!("Failed to unpack .tar.Z archive {}", path.display()));
     drop(archive);
-    let status = child
-        .wait()
+    let status = wait_for_child_interruptibly(&mut child)
         .with_context(|| format!("Failed waiting for gzip on {}", path.display()))?;
+    unpack_result?;
     if !status.success() {
         bail!("gzip failed while decompressing {}", path.display());
     }
@@ -224,7 +239,7 @@ fn extract_cpio(path: &Path, dest: &Path) -> Result<()> {
 fn extract_tar_reader<R: Read>(reader: R, dest: &Path) -> Result<()> {
     let tmp = tempdir()?;
     let mut archive = tar::Archive::new(reader);
-    archive.unpack(tmp.path())?;
+    crate::interrupts::unpack_tar_archive(&mut archive, tmp.path())?;
     finalize_extracted_tree(tmp.path(), dest)
 }
 
@@ -281,7 +296,7 @@ fn extract_gz_file(path: &Path, dest: &Path) -> Result<()> {
 
     fs::create_dir_all(dest)?;
     let mut out = File::create(dest.join(out_name))?;
-    std::io::copy(&mut decoder, &mut out)?;
+    crate::interrupts::copy_interruptibly(&mut decoder, &mut out)?;
     Ok(())
 }
 
@@ -302,7 +317,7 @@ fn extract_xz_file(path: &Path, dest: &Path) -> Result<()> {
 
     fs::create_dir_all(dest)?;
     let mut out = File::create(dest.join(out_name))?;
-    std::io::copy(&mut decoder, &mut out)?;
+    crate::interrupts::copy_interruptibly(&mut decoder, &mut out)?;
     Ok(())
 }
 
@@ -323,7 +338,7 @@ fn extract_zst_file(path: &Path, dest: &Path) -> Result<()> {
 
     fs::create_dir_all(dest)?;
     let mut out = File::create(dest.join(out_name))?;
-    std::io::copy(&mut decoder, &mut out)?;
+    crate::interrupts::copy_interruptibly(&mut decoder, &mut out)?;
     Ok(())
 }
 
@@ -333,13 +348,14 @@ fn extract_deb(path: &Path, dest: &Path) -> Result<()> {
     let mut ar = ar::Archive::new(file);
 
     while let Some(entry_result) = ar.next_entry() {
+        crate::interrupts::check()?;
         let mut entry = entry_result?;
         let id = String::from_utf8_lossy(entry.header().identifier()).to_string();
         let lower = id.to_ascii_lowercase();
         if lower.starts_with("data.tar") {
             // write the inner member to a temporary file and reuse tar extraction logic
             let mut tmpf = NamedTempFile::new()?;
-            std::io::copy(&mut entry, &mut tmpf)?;
+            crate::interrupts::copy_interruptibly(&mut entry, &mut tmpf)?;
             let tmp_path = tmpf.path().to_path_buf();
 
             if lower.ends_with(".gz") {
@@ -364,6 +380,7 @@ fn extract_deb(path: &Path, dest: &Path) -> Result<()> {
 fn extract_cpio_newc_from_reader<R: Read>(mut r: R, dest: &Path) -> Result<()> {
     use std::str;
     loop {
+        crate::interrupts::check()?;
         // read 6-byte magic
         let mut magic = [0u8; 6];
         if let Err(e) = r.read_exact(&mut magic) {
@@ -437,6 +454,7 @@ fn extract_cpio_newc_from_reader<R: Read>(mut r: R, dest: &Path) -> Result<()> {
             let mut remaining = filesize;
             let mut buf = [0u8; 8192];
             while remaining > 0 {
+                crate::interrupts::check()?;
                 let to_read = std::cmp::min(remaining, buf.len());
                 let n = r.read(&mut buf[..to_read])?;
                 if n == 0 {
@@ -466,6 +484,7 @@ fn extract_cpio_newc_from_reader<R: Read>(mut r: R, dest: &Path) -> Result<()> {
 
 fn extract_rpm(path: &Path, dest: &Path) -> Result<()> {
     // Read entire file and search for compression/cpio magic
+    crate::interrupts::check()?;
     let data = std::fs::read(path)?;
 
     // search for known signatures
@@ -520,6 +539,7 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 fn move_dir_contents(src: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(src)? {
+        crate::interrupts::check()?;
         let entry = entry?;
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
@@ -580,6 +600,7 @@ fn copy_file_preserve_metadata(src: &Path, dst: &Path) -> Result<()> {
 
 fn copy_dir_recursive_local(src: &Path, dst: &Path) -> Result<()> {
     for entry in WalkDir::new(src) {
+        crate::interrupts::check()?;
         let entry = entry?;
         let rel = entry.path().strip_prefix(src).unwrap();
         let target = dst.join(rel);
@@ -596,6 +617,97 @@ fn copy_dir_recursive_local(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn extract_zip_archive<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    dest: &Path,
+) -> Result<()> {
+    for index in 0..archive.len() {
+        crate::interrupts::check()?;
+        let mut entry = archive.by_index(index)?;
+        let enclosed = entry
+            .enclosed_name()
+            .with_context(|| format!("Zip archive entry has unsafe path: {}", entry.name()))?;
+        let out_path = dest.join(enclosed);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&out_path)?;
+            continue;
+        }
+
+        let mode = entry.unix_mode().unwrap_or(0);
+        if (mode & 0o170000) == 0o120000 {
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut target = Vec::new();
+            crate::interrupts::copy_interruptibly(&mut entry, &mut target)?;
+            let target = String::from_utf8(target).context("Zip symlink target was not UTF-8")?;
+            let _ = fs::remove_file(&out_path);
+            unix_fs::symlink(target, &out_path)?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut out = File::create(&out_path)?;
+        crate::interrupts::copy_interruptibly(&mut entry, &mut out)?;
+        if mode != 0 {
+            fs::set_permissions(&out_path, fs::Permissions::from_mode(mode & 0o7777))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn wait_for_child_interruptibly(
+    child: &mut std::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut interrupted_at = None;
+    let mut sent_term = false;
+    let mut sent_kill = false;
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+
+        if crate::interrupts::was_interrupted() {
+            if interrupted_at.is_none() {
+                interrupted_at = Some(std::time::Instant::now());
+                signal_child_group(child, nix::libc::SIGINT);
+            } else if interrupted_at.is_some_and(|started| {
+                started.elapsed() >= std::time::Duration::from_secs(2) && !sent_term
+            }) {
+                sent_term = true;
+                signal_child_group(child, nix::libc::SIGTERM);
+            } else if interrupted_at.is_some_and(|started| {
+                started.elapsed() >= std::time::Duration::from_secs(4) && !sent_kill
+            }) {
+                sent_kill = true;
+                signal_child_group(child, nix::libc::SIGKILL);
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn signal_child_group(child: &std::process::Child, signal: i32) {
+    let rc = unsafe { nix::libc::kill(-(child.id() as i32), signal) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(nix::libc::ESRCH) {
+            crate::log_warn!(
+                "Failed to forward signal {} to extractor child process group {}: {}",
+                signal,
+                child.id(),
+                err
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -942,6 +942,19 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             ),
         );
     }
+    if !spec.build.flags.rustltoflags.is_empty() {
+        flags_tbl.insert(
+            "rustltoflags".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .rustltoflags
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if !spec.build.flags.keep.is_empty() {
         flags_tbl.insert(
             "keep".into(),

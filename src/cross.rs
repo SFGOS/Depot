@@ -119,7 +119,7 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 "#,
             self.prefix,
-            self.target_arch(),
+            target_arch_from_triple(&self.prefix),
             self.cc,
             self.cxx,
             self.ar,
@@ -169,8 +169,8 @@ endian = 'little'
             self.objcopy,
             self.objdump,
             self.readelf,
-            self.cpu_family(),
-            self.target_arch(),
+            cpu_family_for_arch(target_arch_from_triple(&self.prefix)),
+            target_arch_from_triple(&self.prefix),
         );
 
         fs::create_dir_all(build_dir)?;
@@ -179,28 +179,65 @@ endian = 'little'
 
         Ok(cross_path)
     }
+}
 
-    /// Extract target architecture from prefix
-    fn target_arch(&self) -> &str {
-        self.prefix.split('-').next().unwrap_or("unknown")
+/// Extract the leading architecture component from a target triple.
+pub fn target_arch_from_triple(triple: &str) -> &str {
+    triple.split('-').next().unwrap_or("unknown")
+}
+
+/// Return the Meson CPU family for an architecture token.
+pub fn cpu_family_for_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" | "amd64" => "x86_64",
+        "i686" | "i586" | "i486" | "i386" => "x86",
+        "aarch64" | "arm64" => "aarch64",
+        "arm" | "armv7" | "armv7l" => "arm",
+        "riscv64" => "riscv64",
+        "riscv32" => "riscv32",
+        "powerpc64" | "ppc64" => "ppc64",
+        "powerpc" | "ppc" => "ppc",
+        "mips64" => "mips64",
+        "mips" => "mips",
+        _ => arch,
     }
+}
 
-    /// Get CPU family for Meson
-    fn cpu_family(&self) -> &str {
-        let arch = self.target_arch();
-        match arch {
-            "x86_64" | "amd64" => "x86_64",
-            "i686" | "i586" | "i486" | "i386" => "x86",
-            "aarch64" | "arm64" => "aarch64",
-            "arm" | "armv7" | "armv7l" => "arm",
-            "riscv64" => "riscv64",
-            "riscv32" => "riscv32",
-            "powerpc64" | "ppc64" => "ppc64",
-            "powerpc" | "ppc" => "ppc",
-            "mips64" => "mips64",
-            "mips" => "mips",
-            _ => arch,
-        }
+/// Derive the lib32 target triple while preserving the explicit x86 variant.
+pub fn lib32_target_triple(host: &str) -> String {
+    let mut parts = host.splitn(2, '-');
+    let arch = parts.next().unwrap_or(host);
+    let rest = parts.next();
+    let lib32_arch = match arch {
+        "x86_64" | "amd64" => "i686",
+        "i686" | "i586" | "i486" | "i386" => arch,
+        _ => arch,
+    };
+
+    match rest {
+        Some(rest) if !rest.is_empty() => format!("{lib32_arch}-{rest}"),
+        _ => lib32_arch.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lib32_target_triple;
+
+    #[test]
+    fn lib32_target_triple_preserves_explicit_x86_variant() {
+        assert_eq!(
+            lib32_target_triple("x86_64-sfg-linux-gnu"),
+            "i686-sfg-linux-gnu"
+        );
+        assert_eq!(
+            lib32_target_triple("i686-sfg-linux-gnu"),
+            "i686-sfg-linux-gnu"
+        );
+        assert_eq!(
+            lib32_target_triple("i586-sfg-linux-gnu"),
+            "i586-sfg-linux-gnu"
+        );
     }
 }
 

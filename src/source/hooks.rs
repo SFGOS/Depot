@@ -68,13 +68,13 @@ fn apply_patches(
         crate::log_info!("  patch: {}", patch_path.display());
 
         // Apply with patch(1). Keep it simple: -p1 is the common case.
-        let status = Command::new("patch")
-            .current_dir(src_dir)
-            .env("PATH", crate::runtime_env::safe_script_path())
-            .arg("-p1")
-            .arg("-i")
-            .arg(&patch_path)
-            .status()
+        let mut patch_cmd = Command::new("patch");
+        patch_cmd.current_dir(src_dir);
+        patch_cmd.env("PATH", crate::runtime_env::safe_script_path());
+        patch_cmd.arg("-p1");
+        patch_cmd.arg("-i");
+        patch_cmd.arg(&patch_path);
+        let status = crate::interrupts::command_status(&mut patch_cmd)
             .with_context(|| format!("Failed to execute patch for {}", patch_path.display()))?;
 
         if !status.success() {
@@ -107,10 +107,8 @@ fn run_post_extract_commands(spec: &PackageSpec, source: &Source, src_dir: &Path
         let mut shell_cmd = Command::new("sh");
         shell_cmd.current_dir(src_dir);
         crate::builder::prepare_command(&mut shell_cmd, &env_vars);
-        let status = shell_cmd
-            .arg("-c")
-            .arg(&wrapped_cmd)
-            .status()
+        shell_cmd.arg("-c").arg(&wrapped_cmd);
+        let status = crate::interrupts::command_status(&mut shell_cmd)
             .with_context(|| format!("Failed to run post_extract command: {}", cmd_str))?;
 
         if !status.success() {
@@ -149,10 +147,8 @@ pub fn run_post_configure_commands(
         let mut shell_cmd = Command::new("sh");
         shell_cmd.current_dir(src_dir);
         crate::builder::prepare_command(&mut shell_cmd, &env_vars);
-        let status = shell_cmd
-            .arg("-c")
-            .arg(&wrapped_cmd)
-            .status()
+        shell_cmd.arg("-c").arg(&wrapped_cmd);
+        let status = crate::interrupts::command_status(&mut shell_cmd)
             .with_context(|| format!("Failed to run post_configure command: {}", cmd_str))?;
 
         if !status.success() {
@@ -187,10 +183,8 @@ pub fn run_post_compile_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
         let mut shell_cmd = Command::new("sh");
         shell_cmd.current_dir(src_dir);
         crate::builder::prepare_command(&mut shell_cmd, &env_vars);
-        let status = shell_cmd
-            .arg("-c")
-            .arg(&wrapped_cmd)
-            .status()
+        shell_cmd.arg("-c").arg(&wrapped_cmd);
+        let status = crate::interrupts::command_status(&mut shell_cmd)
             .with_context(|| format!("Failed to run post_compile command: {}", cmd_str))?;
 
         if !status.success() {
@@ -229,10 +223,8 @@ pub fn run_post_install_commands_in_dir(
         let mut shell_cmd = Command::new("sh");
         shell_cmd.current_dir(work_dir);
         crate::builder::prepare_command(&mut shell_cmd, &env_vars);
-        let status = shell_cmd
-            .arg("-c")
-            .arg(&wrapped_cmd)
-            .status()
+        shell_cmd.arg("-c").arg(&wrapped_cmd);
+        let status = crate::interrupts::command_status(&mut shell_cmd)
             .with_context(|| format!("Failed to run post_install command: {}", cmd_str))?;
 
         if !status.success() {

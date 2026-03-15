@@ -1,6 +1,6 @@
 project(
   'depot',
-  version: '0.22.1',
+  version: '0.23.0',
   meson_version: '>=0.60.0',
   default_options: ['buildtype=release'],
 )
@@ -10,6 +10,8 @@ fs = import('fs')
 cargo = find_program('cargo', required: true)
 find_prog = find_program('find', required: true)
 sh = find_program('sh', required: true)
+build_html_doc = get_option('build-html-doc')
+cli_doc = find_program('cli_doc', required: build_html_doc)
 
 src_root = meson.project_source_root()
 build_root = meson.project_build_root()
@@ -71,6 +73,23 @@ depot_bin = custom_target(
   install: true,
   install_dir: get_option('bindir'),
 )
+
+if build_html_doc
+  custom_target(
+    'depot-html-doc',
+    input: depot_bin,
+    output: 'depot.html',
+    command: [
+      cli_doc,
+      '--output-filename',
+      '@OUTPUT@',
+      join_paths(build_root, 'depot'),
+    ],
+    build_by_default: true,
+    install: true,
+    install_dir: join_paths(get_option('datadir'), 'doc', meson.project_name()),
+  )
+endif
 
 test(
   'cargo-test',

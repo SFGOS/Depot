@@ -102,8 +102,7 @@ pub fn build(
     // Set environment
     crate::builder::prepare_tool_command(&mut cargo_cmd, &env_vars);
 
-    let status = cargo_cmd
-        .status()
+    let status = crate::interrupts::command_status(&mut cargo_cmd)
         .with_context(|| format!("Failed to run cargo build for {}", spec.package.name))?;
     if !status.success() {
         anyhow::bail!("cargo build failed");

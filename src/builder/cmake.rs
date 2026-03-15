@@ -63,6 +63,9 @@ pub fn build(
         for arg in cmake_install_dir_args(flags) {
             cmake_cmd.arg(arg);
         }
+        for arg in cmake_lib32_target_args(flags, cross) {
+            cmake_cmd.arg(arg);
+        }
 
         // Add toolchain file for cross-compilation
         if let Some(ref tf) = toolchain_file {
@@ -90,7 +93,8 @@ pub fn build(
 
         crate::builder::prepare_tool_command(&mut cmake_cmd, &env_vars);
 
-        let status = cmake_cmd.status().context("Failed to run cmake")?;
+        let status =
+            crate::interrupts::command_status(&mut cmake_cmd).context("Failed to run cmake")?;
         if !status.success() {
             anyhow::bail!("cmake configure failed");
         }
@@ -117,8 +121,7 @@ pub fn build(
 
         crate::builder::prepare_tool_command(&mut build_cmd, &env_vars);
 
-        let status = build_cmd
-            .status()
+        let status = crate::interrupts::command_status(&mut build_cmd)
             .with_context(|| format!("Failed to run cmake build for {}", spec.package.name))?;
         if !status.success() {
             anyhow::bail!("cmake build failed");
@@ -139,12 +142,13 @@ pub fn build(
                 }
                 crate::builder::prepare_tool_command(&mut test_cmd, &env_vars);
 
-                let status = test_cmd.status().with_context(|| {
-                    format!(
-                        "Failed to run cmake build target(s) '{}' for {}",
-                        joined, spec.package.name
-                    )
-                })?;
+                let status =
+                    crate::interrupts::command_status(&mut test_cmd).with_context(|| {
+                        format!(
+                            "Failed to run cmake build target(s) '{}' for {}",
+                            joined, spec.package.name
+                        )
+                    })?;
                 if !status.success() {
                     anyhow::bail!("cmake test target(s) '{}' failed", joined);
                 }
@@ -157,8 +161,7 @@ pub fn build(
                 test_cmd.arg("--output-on-failure");
                 crate::builder::prepare_tool_command(&mut test_cmd, &env_vars);
 
-                let status = test_cmd
-                    .status()
+                let status = crate::interrupts::command_status(&mut test_cmd)
                     .with_context(|| format!("Failed to run ctest for {}", spec.package.name))?;
                 if !status.success() {
                     anyhow::bail!("ctest failed");
@@ -203,8 +206,7 @@ pub fn build(
         ));
         crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
 
-        let status = install_cmd
-            .status()
+        let status = crate::interrupts::command_status(&mut install_cmd)
             .with_context(|| format!("Failed to run cmake install for {}", spec.package.name))?;
         if !status.success() {
             if !install_targets.is_empty() {
@@ -376,6 +378,55 @@ fn cmake_install_dir_args(flags: &crate::package::BuildFlags) -> Vec<String> {
         .filter(|(variable, _)| cmake_cache_entry_value(&flags.configure, variable).is_none())
         .map(|(variable, value)| format!("-D{variable}={value}"))
         .collect()
+}
+
+fn cmake_lib32_target_args(
+    flags: &crate::package::BuildFlags,
+    cross: Option<&CrossConfig>,
+) -> Vec<String> {
+    if !flags.lib32_variant {
+        return Vec::new();
+    }
+
+    let target = match lib32_target_triple(flags, cross) {
+        Some(target) => target,
+        None => return Vec::new(),
+    };
+    let arch = crate::cross::target_arch_from_triple(&target);
+    let defaults = [
+        ("CMAKE_SYSTEM_PROCESSOR", arch.to_string()),
+        ("CMAKE_C_COMPILER_TARGET", target.clone()),
+        ("CMAKE_CXX_COMPILER_TARGET", target.clone()),
+        ("CMAKE_ASM_COMPILER_TARGET", target),
+    ];
+
+    defaults
+        .into_iter()
+        .filter(|(variable, _)| cmake_cache_entry_value(&flags.configure, variable).is_none())
+        .map(|(variable, value)| format!("-D{variable}={value}"))
+        .collect()
+}
+
+fn lib32_target_triple(
+    flags: &crate::package::BuildFlags,
+    cross: Option<&CrossConfig>,
+) -> Option<String> {
+    let host = if let Some(cc_cfg) = cross {
+        Some(cc_cfg.host_triple().to_string())
+    } else if !flags.chost.trim().is_empty() {
+        Some(flags.chost.trim().to_string())
+    } else {
+        let detected = CrossConfig::build_triple();
+        if let Err(err) = &detected {
+            crate::log_warn!(
+                "Failed to detect native build triple for lib32 CMake target flags: {}",
+                err
+            );
+        }
+        detected.ok()
+    };
+
+    host.map(|host| crate::cross::lib32_target_triple(&host))
 }
 
 fn cmake_install_dir_value(prefix: &str, value: &str) -> String {
@@ -607,6 +658,59 @@ mod tests {
         assert!(
             args.iter()
                 .any(|a| a == "-DCMAKE_INSTALL_INFODIR=share/info")
+        );
+    }
+
+    #[test]
+    fn test_cmake_lib32_target_args_include_compiler_target_defaults() {
+        let flags = BuildFlags {
+            lib32_variant: true,
+            chost: "x86_64-sfg-linux-gnu".into(),
+            ..BuildFlags::default()
+        };
+
+        let args = cmake_lib32_target_args(&flags, None);
+        assert!(args.iter().any(|a| a == "-DCMAKE_SYSTEM_PROCESSOR=i686"));
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_C_COMPILER_TARGET=i686-sfg-linux-gnu")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_CXX_COMPILER_TARGET=i686-sfg-linux-gnu")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_ASM_COMPILER_TARGET=i686-sfg-linux-gnu")
+        );
+    }
+
+    #[test]
+    fn test_cmake_lib32_target_args_respect_explicit_overrides() {
+        let flags = BuildFlags {
+            lib32_variant: true,
+            chost: "x86_64-sfg-linux-gnu".into(),
+            configure: vec![
+                "-DCMAKE_C_COMPILER_TARGET=i686-custom-linux-gnu".into(),
+                "-DCMAKE_SYSTEM_PROCESSOR=i686".into(),
+            ],
+            ..BuildFlags::default()
+        };
+
+        let args = cmake_lib32_target_args(&flags, None);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("-DCMAKE_C_COMPILER_TARGET="))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("-DCMAKE_SYSTEM_PROCESSOR="))
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_CXX_COMPILER_TARGET=i686-sfg-linux-gnu")
         );
     }
 

@@ -131,7 +131,7 @@ pub fn build(
         crate::builder::prepare_tool_command(&mut cmd, &env_vars);
 
         // Run the command and include the OS error on spawn failures for clearer diagnostics
-        let status = cmd.status().map_err(|e| {
+        let status = crate::interrupts::command_status(&mut cmd).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to run build script {}: {}",
                 build_script.display(),

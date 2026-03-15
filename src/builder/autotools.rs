@@ -128,8 +128,7 @@ pub fn build(
             configure_cmd.arg(expanded);
         }
 
-        let status = configure_cmd
-            .status()
+        let status = crate::interrupts::command_status(&mut configure_cmd)
             .with_context(|| format!("Failed to run configure in {}", build_dir.display()))?;
 
         if !status.success() {
@@ -164,7 +163,7 @@ pub fn build(
 
             crate::builder::prepare_tool_command(&mut make_cmd, &env_vars);
 
-            let status = make_cmd.status().with_context(|| {
+            let status = crate::interrupts::command_status(&mut make_cmd).with_context(|| {
                 format!("Failed to run {} in {}", make_exec, make_dir.display())
             })?;
 
@@ -216,14 +215,15 @@ pub fn build(
                     crate::builder::prepare_tool_command(&mut test_cmd, &env_vars);
 
                     let test_targets_display = test_targets.join(" ");
-                    let status = test_cmd.status().with_context(|| {
-                        format!(
-                            "Failed to run {} {} in {}",
-                            make_exec,
-                            test_targets_display,
-                            test_dir.display()
-                        )
-                    })?;
+                    let status =
+                        crate::interrupts::command_status(&mut test_cmd).with_context(|| {
+                            format!(
+                                "Failed to run {} {} in {}",
+                                make_exec,
+                                test_targets_display,
+                                test_dir.display()
+                            )
+                        })?;
                     if !status.success() {
                         anyhow::bail!(
                             "{} {} failed with status: {} (dir: {})",
@@ -344,15 +344,16 @@ pub fn build(
             ));
             crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
 
-            let status = install_cmd.status().with_context(|| {
-                format!(
-                    "Failed to run {} {} for {} in {}",
-                    make_exec,
-                    install_targets.join(" "),
-                    spec.package.name,
-                    install_dir.display()
-                )
-            })?;
+            let status =
+                crate::interrupts::command_status(&mut install_cmd).with_context(|| {
+                    format!(
+                        "Failed to run {} {} for {} in {}",
+                        make_exec,
+                        install_targets.join(" "),
+                        spec.package.name,
+                        install_dir.display()
+                    )
+                })?;
 
             if !status.success() {
                 anyhow::bail!(

@@ -296,6 +296,7 @@ pub fn prepare(spec: &PackageSpec, cache_dir: &Path, build_dir: &Path) -> Result
     let mut primary: Option<PathBuf> = None;
 
     for (idx, src) in spec.sources().iter().enumerate() {
+        crate::interrupts::check()?;
         let src_dir = prepare_one(spec, src, cache_dir, build_dir)
             .with_context(|| format!("Failed to prepare source #{}", idx + 1))?;
         if idx == 0 {
@@ -409,6 +410,7 @@ fn prepare_one(
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in WalkDir::new(src) {
+        crate::interrupts::check()?;
         let entry = entry?;
         let rel = entry.path().strip_prefix(src).unwrap();
         let target = dst.join(rel);

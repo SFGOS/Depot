@@ -194,12 +194,21 @@ fn compiler_flag_sets(
     (cflags, cxxflags, ldflags, ltoflags)
 }
 
+fn rust_ltoflags(flags: &crate::package::BuildFlags) -> Vec<String> {
+    sanitize_flag_list(flags.rustltoflags.clone(), "build.flags.rustltoflags")
+}
+
 pub(crate) fn effective_rustflags(flags: &crate::package::BuildFlags) -> Vec<String> {
-    replaced_flags(
+    let mut rustflags = replaced_flags(
         &flags.rustflags,
         &flags.replace_rustflags,
         "build.flags.rustflags",
-    )
+    );
+    let rust_ltoflags = rust_ltoflags(flags);
+    if flags.use_lto && !rust_ltoflags.is_empty() {
+        rustflags.extend(rust_ltoflags);
+    }
+    rustflags
 }
 
 pub fn standard_build_env(
@@ -223,6 +232,10 @@ pub fn standard_build_env(
         }
         if !ltoflags.is_empty() {
             set_env_var(&mut env_vars, "LTOFLAGS", ltoflags.join(" "));
+        }
+        let rust_ltoflags = rust_ltoflags(flags);
+        if !rust_ltoflags.is_empty() {
+            set_env_var(&mut env_vars, "RUSTLTOFLAGS", rust_ltoflags.join(" "));
         }
 
         let ldflags = if !ldflags.is_empty() || !flags.libc.is_empty() {
@@ -717,6 +730,7 @@ mod tests {
         let mut spec = mk_spec(vec!["-O2"], vec!["-Wl,--as-needed"]);
         spec.build.flags.cxxflags = vec!["-O2".into()];
         spec.build.flags.ltoflags = vec!["-flto=auto".into()];
+        spec.build.flags.rustltoflags = vec!["-Clinker-plugin-lto".into()];
         spec.build.flags.use_lto = false;
 
         let env = standard_build_env(&spec, None, true, true);
@@ -738,6 +752,12 @@ mod tests {
                 .any(|(k, v)| k == "LTOFLAGS" && v == "-flto=auto"),
             "expected LTOFLAGS variable to be exported even when use_lto is false"
         );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "RUSTLTOFLAGS" && v == "-Clinker-plugin-lto"),
+            "expected RUSTLTOFLAGS variable to be exported even when use_lto is false"
+        );
+        assert_eq!(effective_rustflags(&spec.build.flags), Vec::<String>::new());
     }
 
     #[test]
@@ -776,6 +796,24 @@ mod tests {
         flags.replace_rustflags = vec!["debuginfo=2=>opt-level=2".into()];
 
         assert_eq!(effective_rustflags(&flags), vec!["-C", "opt-level=2"]);
+    }
+
+    #[test]
+    fn test_effective_rustflags_appends_rustltoflags_when_enabled() {
+        let mut flags = BuildFlags::default();
+        flags.rustflags = vec!["-C".into(), "opt-level=3".into()];
+        flags.rustltoflags = vec!["-Clinker-plugin-lto".into(), "-Cembed-bitcode=yes".into()];
+        flags.use_lto = true;
+
+        assert_eq!(
+            effective_rustflags(&flags),
+            vec![
+                "-C",
+                "opt-level=3",
+                "-Clinker-plugin-lto",
+                "-Cembed-bitcode=yes"
+            ]
+        );
     }
 
     #[test]

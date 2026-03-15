@@ -12,6 +12,7 @@ mod deps;
 mod fakeroot;
 mod index;
 mod install;
+mod interrupts;
 mod locking;
 mod metadata_time;
 mod package;

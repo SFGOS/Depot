@@ -273,8 +273,7 @@ fn build_wheel_setup_py(
         .arg(dist_dir);
     crate::builder::prepare_tool_command(&mut cmd, &env_vars.to_vec());
 
-    let status = cmd
-        .status()
+    let status = crate::interrupts::command_status(&mut cmd)
         .with_context(|| format!("Failed to run setup.py in {}", src_dir.display()))?;
     if !status.success() {
         bail!("setup.py bdist_wheel failed with status {}", status);
@@ -315,25 +314,23 @@ fn build_wheel_pep517(
     );
     crate::builder::prepare_command(&mut cmd, &build_env);
 
-    let output = cmd.output().with_context(|| {
+    let status = crate::interrupts::command_status(&mut cmd).with_context(|| {
         format!(
             "Failed to run python3 for PEP 517 build in {}",
             src_dir.display()
         )
     })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !status.success() {
         let requires = if cfg.requires.is_empty() {
             "(none declared)".to_string()
         } else {
             cfg.requires.join(", ")
         };
         bail!(
-            "PEP 517 wheel build failed with status {}. Backend: {}. Declared build requirements: {}. stderr: {}",
-            output.status,
+            "PEP 517 wheel build failed with status {}. Backend: {}. Declared build requirements: {}",
+            status,
             cfg.backend,
-            requires,
-            stderr.trim()
+            requires
         );
     }
 

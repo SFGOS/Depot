@@ -267,7 +267,7 @@ fn resolve_perl_configure_script(spec: &PackageSpec, actual_src: &Path) -> PathB
 }
 
 fn command_status_with_sh_fallback(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {
-    match cmd.status() {
+    match crate::interrupts::command_status(cmd) {
         Ok(status) => Ok(status),
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
             let Some(script) = resolved_script_path(cmd) else {
@@ -296,7 +296,7 @@ fn command_status_with_sh_fallback(cmd: &mut Command) -> std::io::Result<std::pr
                     }
                 }
             }
-            fallback.status()
+            crate::interrupts::command_status(&mut fallback)
         }
         Err(err) => Err(err),
     }

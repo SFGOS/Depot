@@ -9,14 +9,11 @@ use crate::{
 use anyhow::{Context, Result};
 use git2::Direction;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use signal_hook::consts::SIGINT;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use url::Url;
 use walkdir::WalkDir;
 
@@ -105,6 +102,7 @@ fn should_delegate_live_rootfs_installs(rootfs: &Path) -> bool {
 const DEPOT_INSTALL_CONTEXT_ENV: &str = "DEPOT_INSTALL_CONTEXT";
 const INSTALL_CONTEXT_UPDATE: &str = "update";
 const INSTALL_CONTEXT_PLANNED: &str = "planned";
+const DEPOT_PACKAGE_NAME: &str = "depot";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstallInvocationContext {
@@ -130,6 +128,55 @@ fn suppress_nested_install_output() -> bool {
 
 fn install_test_deps_enabled(cli_test_deps: bool, config: &config::Config) -> bool {
     cli_test_deps || config.install_test_deps
+}
+
+fn current_argv0() -> String {
+    std::env::args_os()
+        .next()
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| PathBuf::from(arg).display().to_string())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|path| path.display().to_string())
+        })
+        .unwrap_or_else(|| DEPOT_PACKAGE_NAME.to_string())
+}
+
+fn is_explicit_depot_self_update_request(packages: &[String]) -> bool {
+    packages.len() == 1
+        && packages
+            .first()
+            .is_some_and(|package| package == DEPOT_PACKAGE_NAME)
+}
+
+fn ensure_depot_self_update_not_required(config: &config::Config, rootfs: &Path) -> Result<()> {
+    let db_path = config.installed_db_path(rootfs);
+    if db::get_package_version(&db_path, DEPOT_PACKAGE_NAME)
+        .with_context(|| {
+            format!(
+                "Failed to query installed package database at {}",
+                db_path.display()
+            )
+        })?
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let requested = [DEPOT_PACKAGE_NAME.to_string()];
+    let updates = collect_update_candidates(config, rootfs, &requested)
+        .context("Failed to check for pending depot self-update")?;
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "An update for '{}' is available. Run '{} update {}' before continuing.",
+        DEPOT_PACKAGE_NAME,
+        current_argv0(),
+        DEPOT_PACKAGE_NAME
+    );
 }
 
 fn maybe_reexec_with_sudo(cli: &Cli) -> Result<bool> {
@@ -235,7 +282,7 @@ fn run_install_command_with_program(
 fn command_status_with_sh_fallback(
     cmd: &mut std::process::Command,
 ) -> std::io::Result<std::process::ExitStatus> {
-    match cmd.status() {
+    match crate::interrupts::command_status(cmd) {
         Ok(status) => Ok(status),
         Err(err)
             if err.kind() == std::io::ErrorKind::PermissionDenied
@@ -264,7 +311,7 @@ fn command_status_with_sh_fallback(
                     }
                 }
             }
-            fallback.status()
+            crate::interrupts::command_status(&mut fallback)
         }
         Err(err) => Err(err),
     }
@@ -295,27 +342,21 @@ fn run_child_install_command(
 }
 
 #[derive(Clone)]
-struct InterruptWatcher {
-    interrupted: Arc<AtomicBool>,
-}
+struct InterruptWatcher;
 
 impl InterruptWatcher {
     fn install() -> Result<Self> {
-        let interrupted = Arc::new(AtomicBool::new(false));
-        signal_hook::flag::register(SIGINT, interrupted.clone())
-            .context("Failed to register Ctrl-C handler")?;
-        Ok(Self { interrupted })
+        crate::interrupts::install()?;
+        crate::interrupts::reset();
+        Ok(Self)
     }
 
     fn was_interrupted(&self) -> bool {
-        self.interrupted.load(AtomicOrdering::Relaxed)
+        crate::interrupts::was_interrupted()
     }
 
     fn check(&self) -> Result<()> {
-        if self.was_interrupted() {
-            anyhow::bail!("Interrupted by Ctrl-C");
-        }
-        Ok(())
+        crate::interrupts::check()
     }
 }
 
@@ -533,6 +574,7 @@ fn current_process_env_vars() -> Vec<(String, String)> {
         "PYTHONNOUSERSITE",
         "RANLIB",
         "RUSTFLAGS",
+        "RUSTLTOFLAGS",
         "SETUPTOOLS_USE_DISTUTILS",
         "STRIP",
     ];
@@ -767,6 +809,7 @@ fn load_package_archive_into_staging(
             archive_path.display()
         )
     })? {
+        crate::interrupts::check()?;
         let mut entry = entry.with_context(|| {
             format!(
                 "Failed to read archive entry from {}",
@@ -800,7 +843,7 @@ fn load_package_archive_into_staging(
         .with_context(|| format!("Failed to read zstd stream {}", archive_path.display()))?;
     let mut archive = tar::Archive::new(zstd_decoder);
     archive.set_preserve_permissions(true);
-    archive.unpack(&extract_dir).with_context(|| {
+    crate::interrupts::unpack_tar_archive(&mut archive, &extract_dir).with_context(|| {
         format!(
             "Failed to extract package archive {} into {}",
             archive_path.display(),
@@ -836,7 +879,7 @@ fn extract_package_archive_to_staging(
         .with_context(|| format!("Failed to read zstd stream {}", archive_path.display()))?;
     let mut archive = tar::Archive::new(zstd_decoder);
     archive.set_preserve_permissions(true);
-    archive.unpack(&extract_dir).with_context(|| {
+    crate::interrupts::unpack_tar_archive(&mut archive, &extract_dir).with_context(|| {
         format!(
             "Failed to extract package archive {} into {}",
             archive_path.display(),
@@ -2514,8 +2557,6 @@ fn run_update_command(
     config: &config::Config,
     options: UpdateCommandOptions<'_>,
 ) -> Result<()> {
-    sync_source_repositories_for_update(config)?;
-
     let updates = collect_update_candidates(config, options.rootfs, packages)?;
     if updates.is_empty() {
         ui::info("All installed packages are up to date.");
@@ -3487,8 +3528,7 @@ fn execute_install_plan_with_child_commands(
                 }
                 cmd.arg("install").arg(path);
 
-                let status = cmd
-                    .status()
+                let status = crate::interrupts::command_status(&mut cmd)
                     .context("Failed to spawn planned install step")?;
                 if !status.success() {
                     anyhow::bail!("Planned install step for '{}' failed", step.package);
@@ -4080,6 +4120,8 @@ fn run_direct_install_request(
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    crate::interrupts::install()?;
+    crate::interrupts::reset();
     ui::set_assume_yes(command_assume_yes(&cli.command));
     if maybe_reexec_with_sudo(&cli)? {
         return Ok(());
@@ -4126,6 +4168,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
             // Load configuration early so we can use configured repos/paths.
             let config = config::Config::for_rootfs(&rootfs);
+            ensure_depot_self_update_not_required(&config, &rootfs)?;
             let install_test_deps = install_test_deps_enabled(cli_test_deps, &config);
             let mut planned_targets = Vec::new();
             let mut planned_spec_paths = Vec::new();
@@ -4266,11 +4309,11 @@ pub fn run(cli: Cli) -> Result<()> {
             let dry_run = build_exec_args.dry_run;
             let cli_lib32_only = lib32_args.lib32_only;
             warn_if_running_as_root_for_build("build", &rootfs);
+            let config = config::Config::for_rootfs(&rootfs);
+            ensure_depot_self_update_not_required(&config, &rootfs)?;
             let spec_path = spec.or(spec_pos).context("No spec file provided")?;
             ui::info(format!("Building package from: {}", spec_path.display()));
             let mut pkg_spec = package::PackageSpec::from_file(&spec_path)?;
-
-            let config = config::Config::for_rootfs(&rootfs);
             let install_test_deps = install_test_deps_enabled(cli_test_deps, &config);
             let interrupt_watcher = if cleanup_deps {
                 Some(InterruptWatcher::install()?)
@@ -4783,6 +4826,10 @@ pub fn run(cli: Cli) -> Result<()> {
             let clean = build_exec_args.clean;
             let dry_run = build_exec_args.dry_run;
             let config = config::Config::for_rootfs(&rootfs);
+            sync_source_repositories_for_update(&config)?;
+            if !is_explicit_depot_self_update_request(&packages) {
+                ensure_depot_self_update_not_required(&config, &rootfs)?;
+            }
             run_update_command(
                 &packages,
                 &config,
@@ -5421,6 +5468,57 @@ mod tests {
             package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         }
+    }
+
+    fn register_installed_test_package(
+        config: &config::Config,
+        rootfs: &Path,
+        name: &str,
+        version: &str,
+    ) -> Result<()> {
+        let mut spec = test_package_spec(package::BuildType::Bin, None, &[]);
+        spec.package.name = name.to_string();
+        spec.package.version = version.to_string();
+
+        let dest = rootfs.join("dest").join(name);
+        fs::create_dir_all(dest.join("usr/bin"))?;
+        fs::write(dest.join("usr/bin").join(name), name)?;
+        db::register_package(&config.installed_db_path(rootfs), &spec, &dest)?;
+        Ok(())
+    }
+
+    fn write_test_repo_spec(path: &Path, name: &str, version: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            path,
+            format!(
+                r#"[package]
+name = "{name}"
+version = "{version}"
+revision = 1
+description = "{name}"
+homepage = "https://example.test/{name}"
+license = "MIT"
+
+[[source]]
+url = "https://example.test/{name}-{version}.tar.gz"
+sha256 = "skip"
+extract_dir = "{name}-{version}"
+
+[build]
+type = "custom"
+
+[dependencies]
+build = []
+runtime = []
+optional = []
+"#
+            ),
+        )
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(())
     }
     use anyhow::Context;
     use std::io::Write;
@@ -6151,6 +6249,97 @@ optional = []
 
         let updates = collect_update_candidates(&config, &rootfs, &[])?;
         assert!(updates.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_depot_self_update_request_requires_only_depot() {
+        assert!(is_explicit_depot_self_update_request(&[
+            DEPOT_PACKAGE_NAME.to_string()
+        ]));
+        assert!(!is_explicit_depot_self_update_request(&[]));
+        assert!(!is_explicit_depot_self_update_request(&["pkg".to_string()]));
+        assert!(!is_explicit_depot_self_update_request(&[
+            DEPOT_PACKAGE_NAME.to_string(),
+            "pkg".to_string()
+        ]));
+    }
+
+    #[test]
+    fn depot_self_update_check_blocks_when_update_is_available() -> Result<()> {
+        let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+        let rootfs = temp.path().join("rootfs");
+        let repo_clones = temp.path().join("repos");
+        let build_dir = temp.path().join("build");
+        let db_dir = rootfs.join("var/lib/depot");
+        fs::create_dir_all(&db_dir)?;
+        fs::create_dir_all(&repo_clones)?;
+        fs::create_dir_all(&build_dir)?;
+
+        let mut config = config::Config::for_rootfs(&rootfs);
+        config.repo_clone_dir = repo_clones.clone();
+        config.build_dir = build_dir;
+        config.db_dir = db_dir;
+        config.repo_settings.prefer_binary = false;
+        config.binary_repos.clear();
+        config.source_repos.insert(
+            "core".into(),
+            config::SourceRepo {
+                url: "https://example.test/core.git".into(),
+                enabled: true,
+                priority: 0,
+                subdirs: Vec::new(),
+            },
+        );
+
+        register_installed_test_package(&config, &rootfs, DEPOT_PACKAGE_NAME, "1.0.0")?;
+        write_test_repo_spec(
+            &repo_clones.join("core").join("depot.toml"),
+            DEPOT_PACKAGE_NAME,
+            "1.1.0",
+        )?;
+
+        let err = ensure_depot_self_update_not_required(&config, &rootfs)
+            .expect_err("outdated depot should block command execution");
+        assert!(err.to_string().contains("update depot"));
+        Ok(())
+    }
+
+    #[test]
+    fn depot_self_update_check_allows_when_depot_is_current() -> Result<()> {
+        let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+        let rootfs = temp.path().join("rootfs");
+        let repo_clones = temp.path().join("repos");
+        let build_dir = temp.path().join("build");
+        let db_dir = rootfs.join("var/lib/depot");
+        fs::create_dir_all(&db_dir)?;
+        fs::create_dir_all(&repo_clones)?;
+        fs::create_dir_all(&build_dir)?;
+
+        let mut config = config::Config::for_rootfs(&rootfs);
+        config.repo_clone_dir = repo_clones.clone();
+        config.build_dir = build_dir;
+        config.db_dir = db_dir;
+        config.repo_settings.prefer_binary = false;
+        config.binary_repos.clear();
+        config.source_repos.insert(
+            "core".into(),
+            config::SourceRepo {
+                url: "https://example.test/core.git".into(),
+                enabled: true,
+                priority: 0,
+                subdirs: Vec::new(),
+            },
+        );
+
+        register_installed_test_package(&config, &rootfs, DEPOT_PACKAGE_NAME, "1.1.0")?;
+        write_test_repo_spec(
+            &repo_clones.join("core").join("depot.toml"),
+            DEPOT_PACKAGE_NAME,
+            "1.1.0",
+        )?;
+
+        ensure_depot_self_update_not_required(&config, &rootfs)?;
         Ok(())
     }
 

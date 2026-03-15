@@ -1,0 +1,6 @@
+option(
+  'build-html-doc',
+  type: 'boolean',
+  value: false,
+  description: 'Generate HTML CLI documentation with cli_doc and install it',
+)

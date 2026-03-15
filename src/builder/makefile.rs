@@ -48,8 +48,7 @@ pub fn build(
             cmd.current_dir(src_dir);
             crate::builder::prepare_tool_command(&mut cmd, &env_vars);
 
-            let status = cmd
-                .status()
+            let status = crate::interrupts::command_status(&mut cmd)
                 .with_context(|| format!("Failed to run build command: {}", cmd_str))?;
             if !status.success() {
                 anyhow::bail!("Build command failed: {}", cmd_str);
@@ -89,8 +88,7 @@ pub fn build(
             ));
             crate::builder::prepare_tool_command(&mut cmd, &install_env);
 
-            let status = cmd
-                .status()
+            let status = crate::interrupts::command_status(&mut cmd)
                 .with_context(|| format!("Failed to run install command: {}", cmd_str))?;
             if !status.success() {
                 anyhow::bail!("Install command failed: {}", cmd_str);

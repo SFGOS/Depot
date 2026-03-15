@@ -17,6 +17,8 @@ ldflags = ["-Wl,-O1"]
 
 # Default LTOFLAGS and automatic injection into CFLAGS/CXXFLAGS/LDFLAGS.
 ltoflags = ["-flto=auto"]
+# Rust-specific LTO flags appended only to RUSTFLAGS when use_lto is enabled.
+#RUSTLTOFLAGS = ["-Clinker-plugin-lto"]
 use_lto = true
 
 # CARCH short name (can be overridden per-package)

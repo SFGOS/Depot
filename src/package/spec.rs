@@ -472,6 +472,17 @@ impl PackageSpec {
                         self.build.flags.ltoflags = vec![s.to_string()];
                     }
                 }
+                "rustltoflags" | "rust_ltoflags" | "rust-ltoflags" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.rustltoflags = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.rustltoflags = vec![s.to_string()];
+                    }
+                }
                 "replace_ltoflags" | "replace_lto-flags" | "replace_lto_flags" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.replace_ltoflags = arr
@@ -1064,6 +1075,18 @@ impl PackageSpec {
                             .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
                     } else if let Some(s) = v.as_str() {
                         self.build.flags.ltoflags.push(s.to_string());
+                    }
+                }
+            }
+            "rustltoflags" | "rust_ltoflags" | "rust-ltoflags" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .rustltoflags
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.rustltoflags.push(s.to_string());
                     }
                 }
             }
@@ -2316,6 +2339,7 @@ make_dirs = ["lib"]
 make_test_dirs = ["tests"]
 make_install_dirs = ["lib"]
 ltoflags = ["-flto=auto"]
+RUSTLTOFLAGS = ["-Clinker-plugin-lto"]
 replace_ltoflags = ["auto=>thin"]
 rustflags = ["-C", "debuginfo=2"]
 replace_rustflags = ["debuginfo=2=>opt-level=2"]
@@ -2517,6 +2541,12 @@ post_configure = ["echo configured"]
                 .flags
                 .ltoflags
                 .contains(&"-flto=auto".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .rustltoflags
+                .contains(&"-Clinker-plugin-lto".to_string())
         );
         assert!(
             spec.build
@@ -3868,6 +3898,18 @@ pub struct BuildFlags {
         deserialize_with = "deserialize_string_or_array"
     )]
     pub ltoflags: Vec<String>,
+    /// Rust LTO flags exported to `RUSTLTOFLAGS`.
+    ///
+    /// When `use_lto` is true (default), these flags are also appended to
+    /// `RUSTFLAGS`.
+    #[serde(
+        default,
+        alias = "rust-ltoflags",
+        alias = "rust_ltoflags",
+        alias = "RUSTLTOFLAGS",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub rustltoflags: Vec<String>,
     /// Ordered replacement rules applied to `ltoflags` before export/injection.
     #[serde(
         default,
@@ -4236,6 +4278,7 @@ impl Default for BuildFlags {
             ldflags: Vec::new(),
             replace_ldflags: Vec::new(),
             ltoflags: Vec::new(),
+            rustltoflags: Vec::new(),
             replace_ltoflags: Vec::new(),
             keep: Vec::new(),
             split_docs: false,
