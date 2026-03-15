@@ -622,7 +622,8 @@ fn source_deps_for_install(
     lib32_only: bool,
 ) -> Vec<String> {
     let mut deps_all = Vec::new();
-    let include_lib32 = lib32_only || spec.build.flags.build_32;
+    let lib32_only = lib32_only || spec.builds_only_lib32_output();
+    let include_lib32 = lib32_only || spec.builds_lib32_output();
     let local_provides = spec.local_dependency_provides_for_selection(!lib32_only, include_lib32);
     if !lib32_only && !spec.is_metapackage() {
         for dep in &spec.dependencies.build {
@@ -952,6 +953,26 @@ mod tests {
         });
 
         let deps = source_deps_for_install(&spec, true, true);
+        assert!(deps.contains(&"gcc-multilib".to_string()));
+        assert!(deps.contains(&"lib32-zlib".to_string()));
+        assert!(deps.contains(&"lib32-bats".to_string()));
+        assert!(!deps.contains(&"make".to_string()));
+        assert!(!deps.contains(&"zlib".to_string()));
+        assert!(!deps.contains(&"bats".to_string()));
+    }
+
+    #[test]
+    fn source_deps_for_install_uses_lib32_only_dependencies_from_spec_flag() {
+        let mut spec = mk_spec();
+        spec.build.flags.lib32_only = true;
+        spec.dependencies.lib32 = Some(crate::package::DependencyGroup {
+            build: vec!["gcc-multilib".into()],
+            runtime: vec!["lib32-zlib".into()],
+            test: vec!["lib32-bats".into()],
+            optional: Vec::new(),
+        });
+
+        let deps = source_deps_for_install(&spec, true, false);
         assert!(deps.contains(&"gcc-multilib".to_string()));
         assert!(deps.contains(&"lib32-zlib".to_string()));
         assert!(deps.contains(&"lib32-bats".to_string()));

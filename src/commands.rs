@@ -903,13 +903,17 @@ fn maybe_prompt_to_skip_tests_for_missing_requested_deps(
 }
 
 fn requested_outputs(pkg_spec: &package::PackageSpec, lib32_only: bool) -> deps::RequestedOutputs {
-    if lib32_only {
+    if effective_lib32_only(pkg_spec, lib32_only) {
         deps::RequestedOutputs::Lib32Only
-    } else if pkg_spec.build.flags.build_32 {
+    } else if pkg_spec.builds_lib32_output() {
         deps::RequestedOutputs::PrimaryAndLib32
     } else {
         deps::RequestedOutputs::PrimaryOnly
     }
+}
+
+fn effective_lib32_only(pkg_spec: &package::PackageSpec, cli_lib32_only: bool) -> bool {
+    cli_lib32_only || pkg_spec.builds_only_lib32_output()
 }
 
 fn should_install_test_deps(
@@ -1080,7 +1084,7 @@ fn build_lib32_companion_package(
     export_compiler_flags: bool,
     force: bool,
 ) -> Result<Option<(package::PackageSpec, PathBuf)>> {
-    if !pkg_spec.build.flags.build_32 && !force {
+    if !pkg_spec.builds_lib32_output() && !force {
         return Ok(None);
     }
     if pkg_spec.is_metapackage() {
@@ -3217,11 +3221,12 @@ fn execute_install_plan_with_child_commands(
                 let mut spec = package::PackageSpec::from_file(path)
                     .with_context(|| format!("Failed to parse spec {}", path.display()))?;
                 spec.apply_config(config);
-                let lib32_only = step_requests_only_lib32(step, &options);
+                let lib32_only =
+                    effective_lib32_only(&spec, step_requests_only_lib32(step, &options));
                 conflict_subjects.extend(install_conflict_subjects_for_spec(
                     &spec,
                     !lib32_only,
-                    spec.build.flags.build_32 || lib32_only,
+                    spec.builds_lib32_output() || lib32_only,
                 ));
             }
             planner::PlanOrigin::Binary { record, .. } => {
@@ -3750,6 +3755,7 @@ fn run_direct_install_request(
     if options.lib32_only && staging_dir.is_some() {
         anyhow::bail!("--lib32-only is only supported when installing from a package spec");
     }
+    let lib32_only = effective_lib32_only(&pkg_spec, options.lib32_only);
 
     if staging_dir.is_none() && !suppress_output {
         ui::info(format!(
@@ -3758,12 +3764,12 @@ fn run_direct_install_request(
         ));
     }
 
-    let requested_outputs = requested_outputs(&pkg_spec, options.lib32_only);
+    let requested_outputs = requested_outputs(&pkg_spec, lib32_only);
 
     let mut conflict_subjects = install_conflict_subjects_for_spec(
         &pkg_spec,
-        !options.lib32_only,
-        staging_dir.is_none() && (options.lib32_only || pkg_spec.build.flags.build_32),
+        !lib32_only,
+        staging_dir.is_none() && (lib32_only || pkg_spec.builds_lib32_output()),
     );
     if staging_dir.is_some() {
         conflict_subjects = install_conflict_subjects_for_spec(&pkg_spec, true, false);
@@ -3997,7 +4003,7 @@ fn run_direct_install_request(
             .join("destdir")
             .join(&pkg_spec.package.name);
 
-        if !options.lib32_only {
+        if !lib32_only {
             builder::build(
                 &pkg_spec,
                 &src_dir,
@@ -4016,7 +4022,7 @@ fn run_direct_install_request(
 
     let mut transaction_plans = Vec::new();
 
-    if !options.lib32_only {
+    if !lib32_only {
         if staging_dir.is_none() {
             // Source-build path: apply staging transforms (strip/compress/static cleanup).
             staging::process(&destdir, &pkg_spec)?;
@@ -4042,7 +4048,7 @@ fn run_direct_install_request(
             config,
             cross_config.as_ref(),
             !options.no_flags,
-            options.lib32_only,
+            lib32_only,
         )?
     {
         let staged = plan_staged_install(&lib32_spec, &lib32_destdir, options.rootfs, config)?;
@@ -4258,7 +4264,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let cross_prefix = build_exec_args.cross_prefix;
             let clean = build_exec_args.clean;
             let dry_run = build_exec_args.dry_run;
-            let lib32_only = lib32_args.lib32_only;
+            let cli_lib32_only = lib32_args.lib32_only;
             warn_if_running_as_root_for_build("build", &rootfs);
             let spec_path = spec.or(spec_pos).context("No spec file provided")?;
             ui::info(format!("Building package from: {}", spec_path.display()));
@@ -4275,6 +4281,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let build_result: Result<()> = (|| {
                 // Apply system overrides
                 pkg_spec.apply_config(&config);
+                let lib32_only = effective_lib32_only(&pkg_spec, cli_lib32_only);
                 let requested_outputs = requested_outputs(&pkg_spec, lib32_only);
 
                 let build_targets = vec![format!(
@@ -6953,5 +6960,16 @@ optional = []
         assert_eq!(lib32.dependencies.build, vec!["gcc-multilib"]);
         assert_eq!(lib32.dependencies.runtime, vec!["lib32-zlib", "pkg"]);
         assert_eq!(lib32.dependencies.optional, vec!["lib32-gtk-doc"]);
+    }
+
+    #[test]
+    fn requested_outputs_prefers_lib32_only_spec_flag() {
+        let mut spec = test_package_spec(package::BuildType::Custom, None, &[]);
+        spec.build.flags.lib32_only = true;
+
+        assert_eq!(
+            requested_outputs(&spec, false),
+            deps::RequestedOutputs::Lib32Only
+        );
     }
 }

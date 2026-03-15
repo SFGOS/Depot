@@ -1,6 +1,6 @@
 [package]
 name = "depot"
-version = "0.22.0"
+version = "0.22.1"
 edition = "2024"
 
 [lints.rust]
@@ -15,7 +15,7 @@ flate2 = "1.1.9"
 git2 = "0.20.4"
 indicatif = "0.18.4"
 nix = { version = "0.31.2", features = ["user"] }
-rusqlite = "0.38.0"
+rusqlite = "0.39.0"
 semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 yaml-rust2 = "0.11.0"
@@ -43,7 +43,7 @@ sys-mount = { version = "3.1.0", default-features = false }
 time = { version = "0.3.47", features = ["formatting", "parsing"] }
 b2sum-rust = "0.3.0"
 serde_ignored = "0.1.14"
-lz4_flex = "0.12.0"
+lz4_flex = "0.13.0"
 lzma-rust2 = "0.16.2"
 signal-hook = "0.4.3"
 

@@ -256,6 +256,16 @@ impl PackageSpec {
         format!("lib32-{}", self.package.name)
     }
 
+    /// Return true when this spec should emit the generated `lib32-*` package.
+    pub fn builds_lib32_output(&self) -> bool {
+        self.build.flags.build_32 || self.build.flags.lib32_only
+    }
+
+    /// Return true when only the generated `lib32-*` package should be emitted.
+    pub fn builds_only_lib32_output(&self) -> bool {
+        self.build.flags.lib32_only
+    }
+
     /// Return the effective dependency set used by the generated lib32 companion package.
     pub fn lib32_dependencies(&self) -> Dependencies {
         let mut deps = self
@@ -817,6 +827,11 @@ impl PackageSpec {
                 "build_32" | "build-32" => {
                     if let Some(b) = toml_value_as_boolish(v) {
                         self.build.flags.build_32 = b;
+                    }
+                }
+                "lib32_only" | "lib32-only" => {
+                    if let Some(b) = toml_value_as_boolish(v) {
+                        self.build.flags.lib32_only = b;
                     }
                 }
                 "configure_lib32" | "configure-lib32" => {
@@ -1560,6 +1575,11 @@ impl PackageSpec {
             "build_32" | "build-32" => {
                 if let Some(b) = values.last().and_then(toml_value_as_boolish) {
                     self.build.flags.build_32 = b;
+                }
+            }
+            "lib32_only" | "lib32-only" => {
+                if let Some(b) = values.last().and_then(toml_value_as_boolish) {
+                    self.build.flags.lib32_only = b;
                 }
             }
             "split_docs" | "split-docs" => {
@@ -3006,6 +3026,7 @@ type = "autotools"
 
 [build.flags]
 "build-32" = "true"
+"lib32-only" = "yes"
 "CFLAGS-lib32" = ["-mstackrealign"]
 "CXXFLAGS-lib32" = ["-fno-rtti"]
 "configure-lib32" = ["--disable-static"]
@@ -3018,6 +3039,9 @@ type = "autotools"
 
         let spec = PackageSpec::from_file(&path).unwrap();
         assert!(spec.build.flags.build_32);
+        assert!(spec.build.flags.lib32_only);
+        assert!(spec.builds_lib32_output());
+        assert!(spec.builds_only_lib32_output());
         assert_eq!(spec.build.flags.cflags_lib32, vec!["-mstackrealign"]);
         assert_eq!(spec.build.flags.cxxflags_lib32, vec!["-fno-rtti"]);
         assert_eq!(spec.build.flags.configure_lib32, vec!["--disable-static"]);
@@ -3911,6 +3935,14 @@ pub struct BuildFlags {
         deserialize_with = "deserialize_boolish"
     )]
     pub build_32: bool,
+    /// Build/install only the generated `lib32-*` companion package output.
+    #[serde(
+        default,
+        alias = "lib32-only",
+        alias = "lib32_only",
+        deserialize_with = "deserialize_boolish"
+    )]
+    pub lib32_only: bool,
     #[serde(default)]
     pub configure: Vec<String>,
     /// PEP 517 config settings for Python builds (each entry is `KEY=VALUE` or `KEY`).
@@ -4215,6 +4247,7 @@ impl Default for BuildFlags {
             no_compress_man: false,
             skip_tests: false,
             build_32: false,
+            lib32_only: false,
             configure: Vec::new(),
             config_settings: Vec::new(),
             configure_lib32: Vec::new(),
