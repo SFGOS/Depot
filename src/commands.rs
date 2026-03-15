@@ -190,6 +190,9 @@ fn maybe_reexec_with_sudo(cli: &Cli) -> Result<bool> {
 
     let exe = std::env::current_exe().context("Failed to locate depot executable")?;
     let mut cmd = std::process::Command::new("sudo");
+    if let Some(preserve_arg) = sudo_preserve_env_arg() {
+        cmd.arg(preserve_arg);
+    }
     cmd.arg(exe);
     cmd.args(std::env::args_os().skip(1));
 
@@ -201,6 +204,17 @@ fn maybe_reexec_with_sudo(cli: &Cli) -> Result<bool> {
     } else {
         anyhow::bail!("sudo depot command failed with status {}", status);
     }
+}
+
+fn sudo_preserve_env_arg() -> Option<String> {
+    let mut keys = Vec::new();
+    for key in [DEPOT_INSTALL_CONTEXT_ENV, "DEPOT_DEPCHAIN"] {
+        if std::env::var_os(key).is_some() {
+            keys.push(key);
+        }
+    }
+
+    (!keys.is_empty()).then(|| format!("--preserve-env={}", keys.join(",")))
 }
 
 #[derive(Clone, Copy)]
@@ -7171,6 +7185,27 @@ optional = []
         assert_eq!(
             current_install_invocation_context(),
             InstallInvocationContext::Planned
+        );
+    }
+
+    #[test]
+    fn sudo_preserve_env_arg_only_includes_present_depot_env_vars() {
+        let mut env = TestEnv::new();
+        assert_eq!(sudo_preserve_env_arg(), None);
+
+        env.set_var(DEPOT_INSTALL_CONTEXT_ENV, INSTALL_CONTEXT_PLANNED);
+        assert_eq!(
+            sudo_preserve_env_arg(),
+            Some(format!("--preserve-env={}", DEPOT_INSTALL_CONTEXT_ENV))
+        );
+
+        env.set_var("DEPOT_DEPCHAIN", "parent");
+        assert_eq!(
+            sudo_preserve_env_arg(),
+            Some(format!(
+                "--preserve-env={},DEPOT_DEPCHAIN",
+                DEPOT_INSTALL_CONTEXT_ENV
+            ))
         );
     }
 
