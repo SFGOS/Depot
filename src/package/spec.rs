@@ -3578,10 +3578,12 @@ type = "custom"
         PackageSpec {
             package: PackageInfo {
                 name: name.into(),
+                real_name: None,
                 version: version.into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -3633,17 +3635,30 @@ impl fmt::Display for PackageSpec {
 #[derive(Debug, Deserialize, serde::Serialize, Clone)]
 pub struct PackageInfo {
     pub name: String,
+    /// Stable package stream name used to associate renamed ABI-split packages.
+    #[serde(default, alias = "real-name", skip_serializing_if = "Option::is_none")]
+    pub real_name: Option<String>,
     pub version: String,
     /// Maintenance revision of the package (defaults to 1)
     #[serde(default = "default_revision")]
     pub revision: u32,
     pub description: String,
     pub homepage: String,
+    /// When true, renamed updates retain versioned shared libraries from the old package.
+    #[serde(default, alias = "abi-breaking")]
+    pub abi_breaking: bool,
     #[serde(
         deserialize_with = "deserialize_licenses",
         serialize_with = "serialize_licenses"
     )]
     pub license: Vec<String>,
+}
+
+impl PackageInfo {
+    /// Return the stable package stream name, defaulting to the package name.
+    pub fn effective_real_name(&self) -> &str {
+        self.real_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
 fn default_revision() -> u32 {

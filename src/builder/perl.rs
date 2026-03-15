@@ -348,10 +348,12 @@ mod tests {
         PackageSpec {
             package: PackageInfo {
                 name: name.into(),
+                real_name: None,
                 version: version.into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),

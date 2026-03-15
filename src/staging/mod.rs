@@ -1504,10 +1504,12 @@ mod tests {
         PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -1608,10 +1610,12 @@ mod tests {
         let mut spec = mk_spec_for_stage_processing();
         spec.packages.push(PackageInfo {
             name: "foo-dev".into(),
+            real_name: None,
             version: "1.0".into(),
             revision: 1,
             description: "dev".into(),
             homepage: "h".into(),
+            abi_breaking: false,
             license: vec!["MIT".into()],
         });
         spec.build.flags.split_docs = true;
@@ -1677,18 +1681,22 @@ mod tests {
         let mut spec = mk_spec_for_stage_processing();
         spec.packages.push(PackageInfo {
             name: "foo-dev".into(),
+            real_name: None,
             version: "1.0".into(),
             revision: 1,
             description: "dev".into(),
             homepage: "h".into(),
+            abi_breaking: false,
             license: vec!["MIT".into()],
         });
         spec.packages.push(PackageInfo {
             name: "foo-extras".into(),
+            real_name: None,
             version: "1.0".into(),
             revision: 1,
             description: "extras".into(),
             homepage: "h".into(),
+            abi_breaking: false,
             license: vec!["Apache-2.0".into()],
         });
 

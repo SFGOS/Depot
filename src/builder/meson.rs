@@ -517,6 +517,18 @@ mod tests {
     }
 
     #[test]
+    fn test_meson_setup_args_use_lib32_defaults() {
+        let flags = BuildFlags {
+            lib32_variant: true,
+            ..BuildFlags::default()
+        };
+
+        let args = meson_setup_args(&flags, None, &[]);
+        assert!(args.iter().any(|a| a == "--libdir=/usr/lib32"));
+        assert!(args.iter().any(|a| a == "--libexecdir=/usr/lib32"));
+    }
+
+    #[test]
     fn test_meson_setup_args_include_linker_override() {
         let flags = BuildFlags {
             ld: "ld.lld".to_string(),
@@ -629,10 +641,12 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "pkg".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),

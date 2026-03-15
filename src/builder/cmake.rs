@@ -319,58 +319,20 @@ fn cmake_cache_entry_value<'a>(flags: &'a [String], variable: &str) -> Option<&'
 }
 
 fn cmake_install_dir_args(flags: &crate::package::BuildFlags) -> Vec<String> {
-    let prefix = cmake_cache_entry_value(&flags.configure, "CMAKE_INSTALL_PREFIX")
-        .unwrap_or(flags.prefix.as_str());
     let dirs = crate::builder::install_dirs(flags);
     let defaults = [
-        (
-            "CMAKE_INSTALL_BINDIR",
-            cmake_install_dir_value(prefix, &dirs.bindir),
-        ),
-        (
-            "CMAKE_INSTALL_SBINDIR",
-            cmake_install_dir_value(prefix, &dirs.sbindir),
-        ),
-        (
-            "CMAKE_INSTALL_LIBDIR",
-            cmake_install_dir_value(prefix, &dirs.libdir),
-        ),
-        (
-            "CMAKE_INSTALL_LIBEXECDIR",
-            cmake_install_dir_value(prefix, &dirs.libexecdir),
-        ),
-        (
-            "CMAKE_INSTALL_SYSCONFDIR",
-            cmake_install_dir_value(prefix, &dirs.sysconfdir),
-        ),
-        (
-            "CMAKE_INSTALL_LOCALSTATEDIR",
-            cmake_install_dir_value(prefix, &dirs.localstatedir),
-        ),
-        (
-            "CMAKE_INSTALL_SHAREDSTATEDIR",
-            cmake_install_dir_value(prefix, &dirs.sharedstatedir),
-        ),
-        (
-            "CMAKE_INSTALL_INCLUDEDIR",
-            cmake_install_dir_value(prefix, &dirs.includedir),
-        ),
-        (
-            "CMAKE_INSTALL_DATAROOTDIR",
-            cmake_install_dir_value(prefix, &dirs.datarootdir),
-        ),
-        (
-            "CMAKE_INSTALL_DATADIR",
-            cmake_install_dir_value(prefix, &dirs.datadir),
-        ),
-        (
-            "CMAKE_INSTALL_MANDIR",
-            cmake_install_dir_value(prefix, &dirs.mandir),
-        ),
-        (
-            "CMAKE_INSTALL_INFODIR",
-            cmake_install_dir_value(prefix, &dirs.infodir),
-        ),
+        ("CMAKE_INSTALL_BINDIR", dirs.bindir),
+        ("CMAKE_INSTALL_SBINDIR", dirs.sbindir),
+        ("CMAKE_INSTALL_LIBDIR", dirs.libdir),
+        ("CMAKE_INSTALL_LIBEXECDIR", dirs.libexecdir),
+        ("CMAKE_INSTALL_SYSCONFDIR", dirs.sysconfdir),
+        ("CMAKE_INSTALL_LOCALSTATEDIR", dirs.localstatedir),
+        ("CMAKE_INSTALL_SHAREDSTATEDIR", dirs.sharedstatedir),
+        ("CMAKE_INSTALL_INCLUDEDIR", dirs.includedir),
+        ("CMAKE_INSTALL_DATAROOTDIR", dirs.datarootdir),
+        ("CMAKE_INSTALL_DATADIR", dirs.datadir),
+        ("CMAKE_INSTALL_MANDIR", dirs.mandir),
+        ("CMAKE_INSTALL_INFODIR", dirs.infodir),
     ];
 
     defaults
@@ -427,26 +389,6 @@ fn lib32_target_triple(
     };
 
     host.map(|host| crate::cross::lib32_target_triple(&host))
-}
-
-fn cmake_install_dir_value(prefix: &str, value: &str) -> String {
-    let trimmed_prefix = prefix.trim();
-    let trimmed_value = value.trim();
-    if trimmed_prefix.is_empty() || trimmed_value.is_empty() {
-        return trimmed_value.to_string();
-    }
-
-    let prefix_path = Path::new(trimmed_prefix);
-    let value_path = Path::new(trimmed_value);
-    if !prefix_path.is_absolute() || !value_path.is_absolute() {
-        return trimmed_value.to_string();
-    }
-
-    match value_path.strip_prefix(prefix_path) {
-        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
-        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
-        Err(_) => trimmed_value.to_string(),
-    }
 }
 
 fn num_cpus() -> usize {
@@ -632,10 +574,13 @@ mod tests {
     #[test]
     fn test_cmake_install_dir_args_include_defaults() {
         let args = cmake_install_dir_args(&BuildFlags::default());
-        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=bin"));
-        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_SBINDIR=bin"));
-        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_LIBDIR=lib"));
-        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_LIBEXECDIR=lib"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=/usr/bin"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_SBINDIR=/usr/bin"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_LIBDIR=/usr/lib"));
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_LIBEXECDIR=/usr/lib")
+        );
         assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_SYSCONFDIR=/etc"));
         assert!(
             args.iter()
@@ -647,17 +592,41 @@ mod tests {
         );
         assert!(
             args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_INCLUDEDIR=include")
+                .any(|a| a == "-DCMAKE_INSTALL_INCLUDEDIR=/usr/include")
         );
         assert!(
             args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_DATAROOTDIR=share")
+                .any(|a| a == "-DCMAKE_INSTALL_DATAROOTDIR=/usr/share")
         );
-        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_DATADIR=share"));
-        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_MANDIR=share/man"));
         assert!(
             args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_INFODIR=share/info")
+                .any(|a| a == "-DCMAKE_INSTALL_DATADIR=/usr/share")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_MANDIR=/usr/share/man")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_INFODIR=/usr/share/info")
+        );
+    }
+
+    #[test]
+    fn test_cmake_install_dir_args_use_lib32_defaults() {
+        let flags = BuildFlags {
+            lib32_variant: true,
+            ..BuildFlags::default()
+        };
+
+        let args = cmake_install_dir_args(&flags);
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_LIBDIR=/usr/lib32")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_LIBEXECDIR=/usr/lib32")
         );
     }
 
@@ -741,19 +710,7 @@ mod tests {
                 .iter()
                 .any(|a| a.starts_with("-DCMAKE_INSTALL_DATADIR="))
         );
-        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=bin"));
-    }
-
-    #[test]
-    fn test_cmake_install_dir_value_makes_prefix_children_relative() {
-        assert_eq!(cmake_install_dir_value("/usr", "/usr/include"), "include");
-        assert_eq!(cmake_install_dir_value("/", "/usr/include"), "usr/include");
-        assert_eq!(
-            cmake_install_dir_value("/opt/depot", "/opt/depot/lib64"),
-            "lib64"
-        );
-        assert_eq!(cmake_install_dir_value("/usr", "/etc"), "/etc");
-        assert_eq!(cmake_install_dir_value("/usr", "include"), "include");
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=/usr/bin"));
     }
 
     #[test]
@@ -772,10 +729,12 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "x".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "".into(),
                 homepage: "".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),

@@ -21,14 +21,57 @@ fn verbose_remove_output() -> bool {
 /// Installed package row from the local package database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPackageRecord {
+    /// Installed package name.
     pub name: String,
+    /// Stable package stream name used for renamed updates.
+    pub real_name: Option<String>,
+    /// Installed package version.
     pub version: String,
+    /// Installed package revision.
     pub revision: u32,
+    /// Whether renamed updates should retain versioned shared libraries.
+    pub abi_breaking: bool,
+    /// Package completion timestamp if known.
     pub completed_at: Option<i64>,
+}
+
+impl InstalledPackageRecord {
+    /// Return the stable package stream name, defaulting to the package name.
+    pub fn effective_real_name(&self) -> &str {
+        self.real_name.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// Rename-aware replacement metadata applied while registering a new package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageReplacement {
+    /// Installed package name being replaced.
+    pub old_name: String,
+    /// Subset of old-package files to keep installed and owned by the old package.
+    pub retained_files: Vec<String>,
+    /// Subset of old-package directories to keep owned by the old package.
+    pub retained_directories: Vec<String>,
+}
+
+impl PackageReplacement {
+    /// Return true when the replaced package remains installed after registration.
+    pub fn retains_old_package(&self) -> bool {
+        !self.retained_files.is_empty() || !self.retained_directories.is_empty()
+    }
 }
 
 /// Initialize database and register a package
 pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> Result<()> {
+    register_package_with_replacement(db_path, spec, destdir, None)
+}
+
+/// Initialize database and register a package, optionally replacing a renamed predecessor.
+pub fn register_package_with_replacement(
+    db_path: &Path,
+    spec: &PackageSpec,
+    destdir: &Path,
+    replacement: Option<&PackageReplacement>,
+) -> Result<()> {
     // Create parent directory (auto-create db dir if missing)
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)?;
@@ -43,24 +86,70 @@ pub fn register_package(db_path: &Path, spec: &PackageSpec, destdir: &Path) -> R
     // Generate manifest with files and directories
     let manifest = staging::generate_manifest_with_dirs(destdir)?;
 
+    if let Some(replacement) = replacement {
+        if replacement.old_name == spec.package.name {
+            anyhow::bail!(
+                "Replacement package '{}' cannot match new package name",
+                spec.package.name
+            );
+        }
+
+        let old_pkg_id: i64 = tx
+            .query_row(
+                "SELECT id FROM packages WHERE name = ?1",
+                params![replacement.old_name],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("Package '{}' not found", replacement.old_name))?;
+
+        if replacement.retains_old_package() {
+            tx.execute(
+                "DELETE FROM files WHERE package_id = ?1",
+                params![old_pkg_id],
+            )?;
+            tx.execute(
+                "DELETE FROM directories WHERE package_id = ?1",
+                params![old_pkg_id],
+            )?;
+            for file in &replacement.retained_files {
+                tx.execute(
+                    "INSERT INTO files (package_id, path) VALUES (?1, ?2)",
+                    params![old_pkg_id, file],
+                )?;
+            }
+            for directory in &replacement.retained_directories {
+                tx.execute(
+                    "INSERT INTO directories (package_id, path) VALUES (?1, ?2)",
+                    params![old_pkg_id, directory],
+                )?;
+            }
+        } else {
+            delete_package_rows_tx(&tx, old_pkg_id)?;
+        }
+    }
+
     // Insert/update package without changing its primary key (UPSERT keeps the existing row).
     tx.execute(
-        "INSERT INTO packages (name, version, revision, description, homepage, license, completed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO packages (name, real_name, version, revision, description, homepage, license, abi_breaking, completed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(name) DO UPDATE SET
+            real_name=excluded.real_name,
             version=excluded.version,
             revision=excluded.revision,
             description=excluded.description,
             homepage=excluded.homepage,
             license=excluded.license,
+            abi_breaking=excluded.abi_breaking,
             completed_at=excluded.completed_at",
         params![
             spec.package.name,
+            spec.package.real_name,
             spec.package.version,
             spec.package.revision,
             spec.package.description,
             spec.package.homepage,
             format_licenses(&spec.package.license),
+            spec.package.abi_breaking,
             completed_at,
         ],
     )?;
@@ -330,16 +419,7 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
     }
 
     // Remove from database
-    conn.execute("DELETE FROM files WHERE package_id = ?1", params![pkg_id])?;
-    conn.execute(
-        "DELETE FROM directories WHERE package_id = ?1",
-        params![pkg_id],
-    )?;
-    conn.execute(
-        "DELETE FROM provides WHERE package_id = ?1",
-        params![pkg_id],
-    )?;
-    conn.execute("DELETE FROM packages WHERE id = ?1", params![pkg_id])?;
+    delete_package_rows(&conn, pkg_id)?;
 
     crate::log_info!(
         "Removed {} files and {} directories",
@@ -422,11 +502,13 @@ fn init_db(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS packages (
             id INTEGER PRIMARY KEY,
             name TEXT UNIQUE NOT NULL,
+            real_name TEXT,
             version TEXT NOT NULL,
             revision INTEGER NOT NULL DEFAULT 1,
             description TEXT,
             homepage TEXT,
             license TEXT,
+            abi_breaking INTEGER NOT NULL DEFAULT 0,
             completed_at INTEGER
         );
 
@@ -460,6 +542,8 @@ fn init_db(conn: &Connection) -> Result<()> {
         ",
     )?;
     ensure_packages_completed_at_column(conn)?;
+    ensure_packages_real_name_column(conn)?;
+    ensure_packages_abi_breaking_column(conn)?;
     Ok(())
 }
 
@@ -478,6 +562,73 @@ fn ensure_packages_completed_at_column(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE packages ADD COLUMN completed_at INTEGER", [])
             .context("Failed to add completed_at column to installed package DB")?;
     }
+    Ok(())
+}
+
+fn ensure_packages_real_name_column(conn: &Connection) -> Result<()> {
+    let has_real_name: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'real_name'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        )
+        .context("Failed to inspect installed package DB schema")?;
+    if !has_real_name {
+        conn.execute("ALTER TABLE packages ADD COLUMN real_name TEXT", [])
+            .context("Failed to add real_name column to installed package DB")?;
+    }
+    Ok(())
+}
+
+fn ensure_packages_abi_breaking_column(conn: &Connection) -> Result<()> {
+    let has_abi_breaking: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'abi_breaking'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        )
+        .context("Failed to inspect installed package DB schema")?;
+    if !has_abi_breaking {
+        conn.execute(
+            "ALTER TABLE packages ADD COLUMN abi_breaking INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .context("Failed to add abi_breaking column to installed package DB")?;
+    }
+    Ok(())
+}
+
+fn delete_package_rows(conn: &Connection, pkg_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM files WHERE package_id = ?1", params![pkg_id])?;
+    conn.execute(
+        "DELETE FROM directories WHERE package_id = ?1",
+        params![pkg_id],
+    )?;
+    conn.execute(
+        "DELETE FROM provides WHERE package_id = ?1",
+        params![pkg_id],
+    )?;
+    conn.execute("DELETE FROM packages WHERE id = ?1", params![pkg_id])?;
+    Ok(())
+}
+
+fn delete_package_rows_tx(tx: &rusqlite::Transaction<'_>, pkg_id: i64) -> Result<()> {
+    tx.execute("DELETE FROM files WHERE package_id = ?1", params![pkg_id])?;
+    tx.execute(
+        "DELETE FROM directories WHERE package_id = ?1",
+        params![pkg_id],
+    )?;
+    tx.execute(
+        "DELETE FROM provides WHERE package_id = ?1",
+        params![pkg_id],
+    )?;
+    tx.execute("DELETE FROM packages WHERE id = ?1", params![pkg_id])?;
     Ok(())
 }
 
@@ -597,14 +748,19 @@ pub fn list_installed_package_records(db_path: &Path) -> Result<Vec<InstalledPac
 
     let conn = Connection::open(db_path)?;
     init_db(&conn)?;
-    let mut stmt =
-        conn.prepare("SELECT name, version, revision, completed_at FROM packages ORDER BY name")?;
+    let mut stmt = conn.prepare(
+        "SELECT name, real_name, version, revision, abi_breaking, completed_at
+         FROM packages
+         ORDER BY name",
+    )?;
     let rows = stmt.query_map([], |row| {
         Ok(InstalledPackageRecord {
             name: row.get(0)?,
-            version: row.get(1)?,
-            revision: row.get::<_, i64>(2)? as u32,
-            completed_at: row.get(3)?,
+            real_name: row.get(1)?,
+            version: row.get(2)?,
+            revision: row.get::<_, i64>(3)? as u32,
+            abi_breaking: row.get(4)?,
+            completed_at: row.get(5)?,
         })
     })?;
     Ok(rows.filter_map(|row| row.ok()).collect())
@@ -708,10 +864,12 @@ mod tests {
         PackageSpec {
             package: PackageInfo {
                 name: name.into(),
+                real_name: None,
                 version: version.into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),

@@ -73,8 +73,10 @@ impl<R: Read> Read for HashingReader<R> {
 
 struct IndexedPackage {
     name: String,
+    real_name: Option<String>,
     version: String,
     revision: u32,
+    abi_breaking: bool,
     completed_at: Option<i64>,
     description: Option<String>,
     homepage: Option<String>,
@@ -109,8 +111,10 @@ pub struct BinaryRepoSearchHit {
 pub struct BinaryRepoPackageRecord {
     pub repo_name: String,
     pub name: String,
+    pub real_name: Option<String>,
     pub version: String,
     pub revision: u32,
+    pub abi_breaking: bool,
     pub completed_at: Option<i64>,
     pub filename: String,
     pub size: u64,
@@ -123,6 +127,13 @@ pub struct BinaryRepoPackageRecord {
     pub conflicts: Vec<String>,
     pub runtime_dependencies: Vec<String>,
     pub optional_dependencies: Vec<String>,
+}
+
+impl BinaryRepoPackageRecord {
+    /// Return the stable package stream name, defaulting to the package name.
+    pub fn effective_real_name(&self) -> &str {
+        self.real_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// Local cache paths for a binary package archive and its detached signature.
@@ -283,8 +294,10 @@ impl RepoManager {
             "CREATE TABLE packages (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
+                real_name TEXT,
                 version TEXT NOT NULL,
                 revision INTEGER NOT NULL,
+                abi_breaking INTEGER NOT NULL DEFAULT 0,
                 completed_at INTEGER,
                 description TEXT,
                 homepage TEXT,
@@ -346,8 +359,10 @@ impl RepoManager {
         let mut hashing_reader = HashingReader::new(file);
 
         let mut name = String::new();
+        let mut real_name = None;
         let mut version = String::new();
         let mut revision = 1;
+        let mut abi_breaking = false;
         let mut completed_at = path_modified_unix_timestamp(pkg_path)?;
         let mut description = None;
         let mut homepage = None;
@@ -378,6 +393,10 @@ impl RepoManager {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    real_name = metadata
+                        .get("real_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                     version = metadata
                         .get("version")
                         .and_then(|v| v.as_str())
@@ -387,6 +406,10 @@ impl RepoManager {
                         .get("revision")
                         .and_then(|v| v.as_integer())
                         .unwrap_or(1) as u32;
+                    abi_breaking = metadata
+                        .get("abi_breaking")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     completed_at =
                         metadata_time::parse_completed_at_value(&metadata).or(completed_at);
                     description = metadata
@@ -469,8 +492,10 @@ impl RepoManager {
 
         Ok(IndexedPackage {
             name,
+            real_name,
             version,
             revision,
+            abi_breaking,
             completed_at,
             description,
             homepage,
@@ -490,8 +515,10 @@ impl RepoManager {
     fn insert_indexed_package(&self, conn: &mut Connection, indexed: IndexedPackage) -> Result<()> {
         let IndexedPackage {
             name,
+            real_name,
             version,
             revision,
+            abi_breaking,
             completed_at,
             description,
             homepage,
@@ -509,12 +536,14 @@ impl RepoManager {
 
         // Insert into database
         conn.execute(
-            "INSERT INTO packages (name, version, revision, completed_at, description, homepage, license, filename, size, sha256, sha512)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO packages (name, real_name, version, revision, abi_breaking, completed_at, description, homepage, license, filename, size, sha256, sha512)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 name,
+                real_name,
                 version,
                 revision as i64,
+                abi_breaking,
                 completed_at,
                 description,
                 homepage,
@@ -1620,12 +1649,24 @@ fn find_cached_binary_repo_packages(
     } else {
         "NULL"
     };
+    let real_name_expr = if repo_packages_have_real_name(&conn)? {
+        "p.real_name"
+    } else {
+        "NULL"
+    };
+    let abi_breaking_expr = if repo_packages_have_abi_breaking(&conn)? {
+        "p.abi_breaking"
+    } else {
+        "0"
+    };
     let sql = format!(
         "SELECT
             p.id,
             p.name,
+            {real_name_expr},
             p.version,
             p.revision,
+            {abi_breaking_expr},
             {completed_at_expr},
             p.filename,
             p.size,
@@ -1654,16 +1695,18 @@ fn find_cached_binary_repo_packages(
             BinaryRepoPackageRecord {
                 repo_name: repo_name.to_string(),
                 name: row.get(1)?,
-                version: row.get(2)?,
-                revision: row.get::<_, i64>(3)? as u32,
-                completed_at: row.get(4)?,
-                filename: row.get(5)?,
-                size: row.get::<_, i64>(6)? as u64,
-                sha256: row.get(7)?,
-                sha512: row.get(8)?,
-                description: row.get(9)?,
-                homepage: row.get(10)?,
-                license: row.get(11)?,
+                real_name: row.get(2)?,
+                version: row.get(3)?,
+                revision: row.get::<_, i64>(4)? as u32,
+                abi_breaking: row.get(5)?,
+                completed_at: row.get(6)?,
+                filename: row.get(7)?,
+                size: row.get::<_, i64>(8)? as u64,
+                sha256: row.get(9)?,
+                sha512: row.get(10)?,
+                description: row.get(11)?,
+                homepage: row.get(12)?,
+                license: row.get(13)?,
                 provides: Vec::new(),
                 conflicts: Vec::new(),
                 runtime_dependencies: Vec::new(),
@@ -1696,12 +1739,24 @@ fn list_cached_binary_repo_packages(
     } else {
         "NULL"
     };
+    let real_name_expr = if repo_packages_have_real_name(&conn)? {
+        "p.real_name"
+    } else {
+        "NULL"
+    };
+    let abi_breaking_expr = if repo_packages_have_abi_breaking(&conn)? {
+        "p.abi_breaking"
+    } else {
+        "0"
+    };
     let sql = format!(
         "SELECT
             p.id,
             p.name,
+            {real_name_expr},
             p.version,
             p.revision,
+            {abi_breaking_expr},
             {completed_at_expr},
             p.filename,
             p.size,
@@ -1722,16 +1777,18 @@ fn list_cached_binary_repo_packages(
             BinaryRepoPackageRecord {
                 repo_name: repo_name.to_string(),
                 name: row.get(1)?,
-                version: row.get(2)?,
-                revision: row.get::<_, i64>(3)? as u32,
-                completed_at: row.get(4)?,
-                filename: row.get(5)?,
-                size: row.get::<_, i64>(6)? as u64,
-                sha256: row.get(7)?,
-                sha512: row.get(8)?,
-                description: row.get(9)?,
-                homepage: row.get(10)?,
-                license: row.get(11)?,
+                real_name: row.get(2)?,
+                version: row.get(3)?,
+                revision: row.get::<_, i64>(4)? as u32,
+                abi_breaking: row.get(5)?,
+                completed_at: row.get(6)?,
+                filename: row.get(7)?,
+                size: row.get::<_, i64>(8)? as u64,
+                sha256: row.get(9)?,
+                sha512: row.get(10)?,
+                description: row.get(11)?,
+                homepage: row.get(12)?,
+                license: row.get(13)?,
                 provides: Vec::new(),
                 conflicts: Vec::new(),
                 runtime_dependencies: Vec::new(),
@@ -1755,6 +1812,30 @@ fn list_cached_binary_repo_packages(
 fn repo_packages_have_completed_at(conn: &Connection) -> Result<bool> {
     conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'completed_at'",
+        [],
+        |row| {
+            let count: i64 = row.get(0)?;
+            Ok(count > 0)
+        },
+    )
+    .context("Failed to inspect binary repo DB schema")
+}
+
+fn repo_packages_have_real_name(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'real_name'",
+        [],
+        |row| {
+            let count: i64 = row.get(0)?;
+            Ok(count > 0)
+        },
+    )
+    .context("Failed to inspect binary repo DB schema")
+}
+
+fn repo_packages_have_abi_breaking(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'abi_breaking'",
         [],
         |row| {
             let count: i64 = row.get(0)?;
@@ -2350,8 +2431,10 @@ mod tests {
 
         let metadata = r#"
 name = "test"
+real_name = "icu"
 version = "1.0"
 revision = 1
+abi_breaking = true
 description = "test description"
 homepage = "https://example.com"
 license = "MIT"
@@ -2385,7 +2468,9 @@ optional = []
 
         type PackageRow = (
             String,
+            Option<String>,
             String,
+            i64,
             i64,
             Option<String>,
             Option<String>,
@@ -2394,9 +2479,9 @@ optional = []
             String,
         );
 
-        let (name, version, revision, desc, home, lic, sha256, sha512): PackageRow = conn
+        let (name, real_name, version, revision, abi_breaking, desc, home, lic, sha256, sha512): PackageRow = conn
             .query_row(
-                "SELECT name, version, revision, description, homepage, license, sha256, sha512 FROM packages",
+                "SELECT name, real_name, version, revision, abi_breaking, description, homepage, license, sha256, sha512 FROM packages",
                 [],
                 |r| {
                     Ok((
@@ -2408,14 +2493,18 @@ optional = []
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
                     ))
                 },
             )
             .unwrap();
 
         assert_eq!(name, "test");
+        assert_eq!(real_name, Some("icu".to_string()));
         assert_eq!(version, "1.0");
         assert_eq!(revision, 1);
+        assert_eq!(abi_breaking, 1);
         assert_eq!(desc, Some("test description".to_string()));
         assert_eq!(home, Some("https://example.com".to_string()));
         assert_eq!(lic, Some("MIT".to_string()));
@@ -2651,8 +2740,10 @@ revision = 1
         let rec = BinaryRepoPackageRecord {
             repo_name: "repo".into(),
             name: "pkg".into(),
+            real_name: None,
             version: "1.0".into(),
             revision: 1,
+            abi_breaking: false,
             completed_at: None,
             filename: "pkg.depot.pkg.tar.zst".into(),
             size: 7,
@@ -2687,8 +2778,10 @@ revision = 1
         BinaryRepoPackageRecord {
             repo_name: "repo".into(),
             name: "pkg".into(),
+            real_name: None,
             version: "1.0".into(),
             revision: 1,
+            abi_breaking: false,
             completed_at: None,
             filename: filename.to_string(),
             size: payload.len() as u64,

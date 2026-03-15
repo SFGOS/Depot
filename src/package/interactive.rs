@@ -674,10 +674,12 @@ pub fn create_interactive() -> Result<PackageSpec> {
     Ok(PackageSpec {
         package: PackageInfo {
             name,
+            real_name: None,
             version,
             revision: 1,
             description,
             homepage,
+            abi_breaking: false,
             license,
         },
         packages: Vec::new(),
@@ -708,6 +710,9 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
     // package block
     let mut pkg = Table::new();
     pkg.insert("name".into(), Value::String(spec.package.name.clone()));
+    if let Some(real_name) = &spec.package.real_name {
+        pkg.insert("real_name".into(), Value::String(real_name.clone()));
+    }
     pkg.insert(
         "version".into(),
         Value::String(spec.package.version.clone()),
@@ -724,6 +729,9 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             Value::String(spec.package.homepage.clone()),
         );
     }
+    if spec.package.abi_breaking {
+        pkg.insert("abi_breaking".into(), Value::Boolean(true));
+    }
     if let Some(v) = licenses_to_toml_value(&spec.package.license) {
         pkg.insert("license".into(), v);
     }
@@ -735,12 +743,18 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
         for p in &spec.packages {
             let mut pt = Table::new();
             pt.insert("name".into(), Value::String(p.name.clone()));
+            if let Some(real_name) = &p.real_name {
+                pt.insert("real_name".into(), Value::String(real_name.clone()));
+            }
             pt.insert("version".into(), Value::String(p.version.clone()));
             if !p.description.is_empty() {
                 pt.insert("description".into(), Value::String(p.description.clone()));
             }
             if !p.homepage.is_empty() {
                 pt.insert("homepage".into(), Value::String(p.homepage.clone()));
+            }
+            if p.abi_breaking {
+                pt.insert("abi_breaking".into(), Value::Boolean(true));
             }
             if let Some(v) = licenses_to_toml_value(&p.license) {
                 pt.insert("license".into(), v);
@@ -1483,10 +1497,12 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "A test".into(),
                 homepage: "".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -1526,18 +1542,22 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "A test".into(),
                 homepage: "".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: vec![PackageInfo {
                 name: "foo-dev".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "dev files".into(),
                 homepage: "".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             }],
             alternatives: Alternatives::default(),
@@ -1570,10 +1590,12 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "A test".into(),
                 homepage: "".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into(), "Apache-2.0".into()],
             },
             packages: Vec::new(),
@@ -1651,10 +1673,12 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "A test".into(),
                 homepage: "".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -1728,10 +1752,12 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "A test".into(),
                 homepage: "".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -1764,10 +1790,12 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "A test".into(),
                 homepage: "".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -1821,10 +1849,12 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "A test".into(),
                 homepage: "".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -1880,10 +1910,12 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "foo-meta".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "Meta package".into(),
                 homepage: "".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -1919,10 +1951,12 @@ mod tests {
         let spec = PackageSpec {
             package: PackageInfo {
                 name: "vertex-keyring".into(),
+                real_name: None,
                 version: "1.0.0".into(),
                 revision: 1,
                 description: "keyring".into(),
                 homepage: "https://www.vertexlinux.net".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),

@@ -806,18 +806,22 @@ mod tests {
         PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: vec![PackageInfo {
                 name: "foo-libs".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             }],
             alternatives: Alternatives::default(),
@@ -878,8 +882,10 @@ mod tests {
                 record: Box::new(db::repo::BinaryRepoPackageRecord {
                     repo_name: repo_name.to_string(),
                     name: name.to_string(),
+                    real_name: None,
                     version: "1.0.0".to_string(),
                     revision: 1,
+                    abi_breaking: false,
                     completed_at: None,
                     filename: format!("{name}-1.0.0-1-x86_64.depot.pkg.tar.zst"),
                     size: 1024,

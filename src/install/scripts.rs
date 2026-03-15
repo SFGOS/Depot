@@ -1033,10 +1033,12 @@ mod tests {
         PackageSpec {
             package: PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),

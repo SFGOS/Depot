@@ -483,10 +483,12 @@ mod tests {
         PackageSpec {
             package: crate::package::PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -558,10 +560,12 @@ mod tests {
         let spec = PackageSpec {
             package: crate::package::PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -605,10 +609,12 @@ mod tests {
         let spec = PackageSpec {
             package: crate::package::PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -652,18 +658,22 @@ mod tests {
         let spec = PackageSpec {
             package: crate::package::PackageInfo {
                 name: "foo".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: vec![crate::package::PackageInfo {
                 name: "foo-libs".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             }],
             alternatives: Default::default(),

@@ -138,6 +138,12 @@ impl Packager {
             "version".to_string(),
             toml::Value::String(self.spec.package.version.clone()),
         );
+        if let Some(real_name) = &self.spec.package.real_name {
+            map.insert(
+                "real_name".to_string(),
+                toml::Value::String(real_name.clone()),
+            );
+        }
         map.insert(
             "revision".to_string(),
             toml::Value::Integer(self.spec.package.revision as i64),
@@ -149,6 +155,10 @@ impl Packager {
         map.insert(
             "homepage".to_string(),
             toml::Value::String(self.spec.package.homepage.clone()),
+        );
+        map.insert(
+            "abi_breaking".to_string(),
+            toml::Value::Boolean(self.spec.package.abi_breaking),
         );
         map.insert(
             "license".to_string(),
@@ -294,10 +304,12 @@ mod tests {
             PackageSpec {
                 package: PackageInfo {
                     name: "test".into(),
+                    real_name: None,
                     version: "1.0".into(),
                     revision: 1,
                     description: "d".into(),
                     homepage: "h".into(),
+                    abi_breaking: false,
                     license: vec!["MIT".into()],
                 },
                 packages: Vec::new(),
@@ -453,6 +465,26 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].as_str(), Some("MIT"));
         assert_eq!(arr[1].as_str(), Some("Apache-2.0"));
+    }
+
+    #[test]
+    fn test_generate_metadata_toml_includes_real_name_and_abi_breaking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+
+        let mut packager = mk_packager(dest.to_path_buf());
+        packager.spec.package.real_name = Some("icu".into());
+        packager.spec.package.abi_breaking = true;
+        packager.generate_metadata_toml().unwrap();
+
+        let meta_path = dest.join(".metadata.toml");
+        let content = fs::read_to_string(meta_path).unwrap();
+        let val: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(val.get("real_name").and_then(|v| v.as_str()), Some("icu"));
+        assert_eq!(
+            val.get("abi_breaking").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]

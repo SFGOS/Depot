@@ -634,6 +634,10 @@ fn package_spec_from_archive_metadata(metadata: &toml::Value) -> package::Packag
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            real_name: metadata
+                .get("real_name")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             version: metadata
                 .get("version")
                 .and_then(|v| v.as_str())
@@ -653,6 +657,10 @@ fn package_spec_from_archive_metadata(metadata: &toml::Value) -> package::Packag
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            abi_breaking: metadata
+                .get("abi_breaking")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             license: parse_licenses_from_toml(metadata),
         },
         packages: Vec::new(),
@@ -722,10 +730,12 @@ fn package_spec_from_repo_record(
     package::PackageSpec {
         package: package::PackageInfo {
             name: record.name.clone(),
+            real_name: record.real_name.clone(),
             version: record.version.clone(),
             revision: record.revision,
             description: record.description.clone().unwrap_or_default(),
             homepage: record.homepage.clone().unwrap_or_default(),
+            abi_breaking: record.abi_breaking,
             license: parse_license_list_from_repo(&record.license),
         },
         packages: Vec::new(),
@@ -1193,7 +1203,29 @@ fn build_lib32_companion_package(
 struct PlannedStagedInstall {
     is_update: bool,
     remove_paths: Vec<String>,
+    renamed_transition: Option<RenamedPackageTransition>,
     hook_context: install::hooks::HookExecutionContextOwned,
+}
+
+#[derive(Debug, Clone)]
+struct RenamedPackageTransition {
+    replaced: db::InstalledPackageRecord,
+    retained_files: Vec<String>,
+    retained_directories: Vec<String>,
+}
+
+impl RenamedPackageTransition {
+    fn replacement(&self) -> db::PackageReplacement {
+        db::PackageReplacement {
+            old_name: self.replaced.name.clone(),
+            retained_files: self.retained_files.clone(),
+            retained_directories: self.retained_directories.clone(),
+        }
+    }
+
+    fn retains_old_package(&self) -> bool {
+        !self.retained_files.is_empty() || !self.retained_directories.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1468,6 +1500,121 @@ fn resolve_installed_conflicts_for_subjects(
     Ok(())
 }
 
+fn is_versioned_shared_library_path(path: &str) -> bool {
+    let Some(file_name) = Path::new(path).file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(version_suffix) = file_name.split(".so.").nth(1) else {
+        return false;
+    };
+    !version_suffix.is_empty()
+        && version_suffix
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ch == '.')
+        && version_suffix.chars().any(|ch| ch.is_ascii_digit())
+}
+
+fn retained_abi_files_for_replacement(
+    old_files: &[String],
+    new_manifest: &staging::Manifest,
+) -> Vec<String> {
+    let new_files: HashSet<&str> = new_manifest.files.iter().map(String::as_str).collect();
+    let mut retained: Vec<String> = old_files
+        .iter()
+        .filter(|path| is_versioned_shared_library_path(path))
+        .filter(|path| !new_files.contains(path.as_str()))
+        .cloned()
+        .collect();
+    retained.sort();
+    retained
+}
+
+fn retained_directories_for_files(
+    old_directories: &[String],
+    retained_files: &[String],
+) -> Vec<String> {
+    let retained_files: HashSet<&str> = retained_files.iter().map(String::as_str).collect();
+    let mut directories: Vec<String> = old_directories
+        .iter()
+        .filter(|directory| {
+            let prefix = format!("{}/", directory);
+            retained_files
+                .iter()
+                .any(|file| *file == directory.as_str() || file.starts_with(&prefix))
+        })
+        .cloned()
+        .collect();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+    directories
+}
+
+fn compare_installed_records_for_stream(
+    left: &db::InstalledPackageRecord,
+    right: &db::InstalledPackageRecord,
+) -> Ordering {
+    compare_package_release(&left.version, left.revision, &right.version, right.revision)
+        .then_with(|| compare_completed_at(left.completed_at, right.completed_at))
+        .then_with(|| left.name.cmp(&right.name))
+}
+
+fn select_primary_installed_record<'a>(
+    records: impl IntoIterator<Item = &'a db::InstalledPackageRecord>,
+) -> Option<&'a db::InstalledPackageRecord> {
+    let mut best: Option<&db::InstalledPackageRecord> = None;
+    for record in records {
+        if best.as_ref().is_none_or(|current| {
+            compare_installed_records_for_stream(record, current) == Ordering::Greater
+        }) {
+            best = Some(record);
+        }
+    }
+    best
+}
+
+fn build_renamed_package_transition(
+    db_path: &Path,
+    pkg_spec: &package::PackageSpec,
+    new_manifest: &staging::Manifest,
+) -> Result<Option<RenamedPackageTransition>> {
+    let installed = db::list_installed_package_records(db_path)?;
+    if installed
+        .iter()
+        .any(|record| record.name == pkg_spec.package.name)
+    {
+        return Ok(None);
+    }
+
+    let stream_name = pkg_spec.package.effective_real_name();
+    let Some(replaced) = select_primary_installed_record(
+        installed
+            .iter()
+            .filter(|record| record.effective_real_name() == stream_name)
+            .filter(|record| record.name != pkg_spec.package.name),
+    )
+    .cloned() else {
+        return Ok(None);
+    };
+
+    let old_files = db::get_package_files(db_path, &replaced.name)?;
+    let old_directories = db::get_package_directories(db_path, &replaced.name)?;
+    let retained_files = if replaced.abi_breaking {
+        retained_abi_files_for_replacement(&old_files, new_manifest)
+    } else {
+        Vec::new()
+    };
+    let retained_directories = if retained_files.is_empty() {
+        Vec::new()
+    } else {
+        retained_directories_for_files(&old_directories, &retained_files)
+    };
+
+    Ok(Some(RenamedPackageTransition {
+        replaced,
+        retained_files,
+        retained_directories,
+    }))
+}
+
 fn plan_staged_install(
     pkg_spec: &package::PackageSpec,
     destdir: &Path,
@@ -1482,10 +1629,38 @@ fn plan_staged_install(
     })?;
     let db_path = config.installed_db_path(rootfs);
 
-    let is_update = db::get_package_version(&db_path, &pkg_spec.package.name)?.is_some();
     let new_manifest = staging::generate_manifest_with_dirs(destdir)?;
-    let remove_paths =
+    let renamed_transition = build_renamed_package_transition(&db_path, pkg_spec, &new_manifest)?;
+    let is_update = db::get_package_version(&db_path, &pkg_spec.package.name)?.is_some()
+        || renamed_transition.is_some();
+    let mut remove_paths =
         db::calculate_upgrade_paths(&db_path, &pkg_spec.package.name, &new_manifest)?;
+    if let Some(transition) = &renamed_transition {
+        let old_files = db::get_package_files(&db_path, &transition.replaced.name)?;
+        let old_directories = db::get_package_directories(&db_path, &transition.replaced.name)?;
+        let retained_files: HashSet<&str> = transition
+            .retained_files
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let retained_directories: HashSet<&str> = transition
+            .retained_directories
+            .iter()
+            .map(String::as_str)
+            .collect();
+        remove_paths.extend(
+            old_files
+                .into_iter()
+                .filter(|path| !retained_files.contains(path.as_str())),
+        );
+        remove_paths.extend(
+            old_directories
+                .into_iter()
+                .filter(|path| !retained_directories.contains(path.as_str())),
+        );
+        remove_paths.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
+        remove_paths.dedup();
+    }
     let operation = if is_update {
         install::hooks::HookOperation::Update
     } else {
@@ -1499,6 +1674,7 @@ fn plan_staged_install(
     Ok(PlannedStagedInstall {
         is_update,
         remove_paths,
+        renamed_transition,
         hook_context: install::hooks::HookExecutionContextOwned {
             operation,
             package: pkg_spec.package.name.clone(),
@@ -1582,11 +1758,26 @@ fn install_staged_to_rootfs(
     )?;
 
     let db_path = config.installed_db_path(rootfs);
-    if let Err(e) = db::register_package(&db_path, pkg_spec, destdir) {
+    let replacement = plan
+        .renamed_transition
+        .as_ref()
+        .map(RenamedPackageTransition::replacement);
+    let register_result = if let Some(replacement) = replacement.as_ref() {
+        db::register_package_with_replacement(&db_path, pkg_spec, destdir, Some(replacement))
+    } else {
+        db::register_package(&db_path, pkg_spec, destdir)
+    };
+    if let Err(e) = register_result {
         let _ = tx.rollback();
         return Err(e);
     }
     tx.commit()?;
+
+    if let Some(transition) = &plan.renamed_transition
+        && !transition.retains_old_package()
+    {
+        install::scripts::remove_installed_scripts(rootfs, &transition.replaced.name)?;
+    }
 
     install::scripts::sync_staged_scripts_to_rootfs(
         &staged_scripts_dir,
@@ -2028,7 +2219,8 @@ enum UpdateOrigin {
 
 #[derive(Debug, Clone)]
 struct UpdateCandidate {
-    package: String,
+    installed_package: String,
+    candidate_package: String,
     installed_version: String,
     installed_revision: u32,
     installed_completed_at: Option<i64>,
@@ -2243,7 +2435,7 @@ fn configured_source_scan_roots(config: &config::Config) -> Vec<(String, i32, Pa
 
 fn collect_best_source_update_candidates(
     config: &config::Config,
-    target_names: &HashSet<String>,
+    target_real_names: &HashSet<String>,
 ) -> Result<HashMap<String, SourceUpdateCandidate>> {
     let mut best: HashMap<String, SourceUpdateCandidate> = HashMap::new();
 
@@ -2255,7 +2447,8 @@ fn collect_best_source_update_candidates(
         for spec_path in scan_package_specs(&root)? {
             let mut spec = package::PackageSpec::from_file(&spec_path)?;
             spec.apply_config(config);
-            if !target_names.contains(&spec.package.name) {
+            let stream_name = spec.package.effective_real_name().to_string();
+            if !target_real_names.contains(&stream_name) {
                 continue;
             }
 
@@ -2267,7 +2460,7 @@ fn collect_best_source_update_candidates(
                 spec,
             };
 
-            let replace = match best.get(&candidate.spec.package.name) {
+            let replace = match best.get(&stream_name) {
                 Some(current) => match compare_package_release(
                     &candidate.spec.package.version,
                     candidate.spec.package.revision,
@@ -2296,7 +2489,7 @@ fn collect_best_source_update_candidates(
             };
 
             if replace {
-                best.insert(candidate.spec.package.name.clone(), candidate);
+                best.insert(stream_name, candidate);
             }
         }
     }
@@ -2307,7 +2500,7 @@ fn collect_best_source_update_candidates(
 fn collect_best_binary_update_candidates(
     config: &config::Config,
     rootfs: &Path,
-    target_names: &HashSet<String>,
+    target_real_names: &HashSet<String>,
 ) -> Result<HashMap<String, (i32, db::repo::BinaryRepoPackageRecord)>> {
     let mut best: HashMap<String, (i32, db::repo::BinaryRepoPackageRecord)> = HashMap::new();
     let host_arch = std::env::consts::ARCH;
@@ -2328,11 +2521,12 @@ fn collect_best_binary_update_candidates(
         .with_context(|| format!("Failed to list binary repo '{}'", repo_name))?;
 
         for record in records {
-            if !target_names.contains(&record.name) {
+            let stream_name = record.effective_real_name().to_string();
+            if !target_real_names.contains(&stream_name) {
                 continue;
             }
 
-            let replace = match best.get(&record.name) {
+            let replace = match best.get(&stream_name) {
                 Some((current_priority, current)) => match compare_package_release(
                     &record.version,
                     record.revision,
@@ -2361,7 +2555,7 @@ fn collect_best_binary_update_candidates(
             };
 
             if replace {
-                best.insert(record.name.clone(), (repo_cfg.priority, record));
+                best.insert(stream_name, (repo_cfg.priority, record));
             }
         }
     }
@@ -2377,8 +2571,9 @@ fn select_update_candidate(
     prefer_binary: bool,
 ) -> Option<UpdateCandidate> {
     let mut best: Option<UpdateCandidate> = None;
+    let stream_name = installed.effective_real_name();
 
-    if let Some(candidate) = source_candidates.get(&installed.name)
+    if let Some(candidate) = source_candidates.get(stream_name)
         && update_candidate_is_newer_than_installed(
             &candidate.spec.package.version,
             candidate.spec.package.revision,
@@ -2389,7 +2584,8 @@ fn select_update_candidate(
         )
     {
         best = Some(UpdateCandidate {
-            package: installed.name.clone(),
+            installed_package: installed.name.clone(),
+            candidate_package: candidate.spec.package.name.clone(),
             installed_version: installed.version.clone(),
             installed_revision: installed.revision,
             installed_completed_at,
@@ -2407,7 +2603,7 @@ fn select_update_candidate(
         });
     }
 
-    if let Some((repo_priority, record)) = binary_candidates.get(&installed.name)
+    if let Some((repo_priority, record)) = binary_candidates.get(stream_name)
         && update_candidate_is_newer_than_installed(
             &record.version,
             record.revision,
@@ -2418,7 +2614,8 @@ fn select_update_candidate(
         )
     {
         let binary_candidate = UpdateCandidate {
-            package: installed.name.clone(),
+            installed_package: installed.name.clone(),
+            candidate_package: record.name.clone(),
             installed_version: installed.version.clone(),
             installed_revision: installed.revision,
             installed_completed_at,
@@ -2456,36 +2653,53 @@ fn collect_update_candidates(
         return Ok(Vec::new());
     }
 
-    let installed_by_name: HashMap<_, _> = installed
+    let mut installed_by_real_name: HashMap<String, Vec<&db::InstalledPackageRecord>> =
+        HashMap::new();
+    for record in &installed {
+        installed_by_real_name
+            .entry(record.effective_real_name().to_string())
+            .or_default()
+            .push(record);
+    }
+
+    let active_by_real_name: HashMap<String, db::InstalledPackageRecord> = installed_by_real_name
         .iter()
-        .cloned()
-        .map(|record| (record.name.clone(), record))
+        .filter_map(|(real_name, records)| {
+            select_primary_installed_record(records.iter().copied())
+                .cloned()
+                .map(|record| (real_name.clone(), record))
+        })
         .collect();
 
-    let target_names: HashSet<String> = if requested_packages.is_empty() {
-        installed_by_name.keys().cloned().collect()
+    let target_real_names: HashSet<String> = if requested_packages.is_empty() {
+        active_by_real_name.keys().cloned().collect()
     } else {
-        requested_packages.iter().cloned().collect()
-    };
-
-    for package in requested_packages {
-        if !installed_by_name.contains_key(package) {
-            ui::warn(format!("Package '{}' is not installed; skipping", package));
+        let mut targets = HashSet::new();
+        for package in requested_packages {
+            if let Some(record) = installed.iter().find(|record| record.name == *package) {
+                targets.insert(record.effective_real_name().to_string());
+            } else if active_by_real_name.contains_key(package) {
+                targets.insert(package.clone());
+            } else {
+                ui::warn(format!("Package '{}' is not installed; skipping", package));
+            }
         }
-    }
+        targets
+    };
 
     let source_candidates = if config.repo_settings.prefer_binary {
         HashMap::new()
     } else {
-        collect_best_source_update_candidates(config, &target_names)?
+        collect_best_source_update_candidates(config, &target_real_names)?
     };
-    let binary_candidates = collect_best_binary_update_candidates(config, rootfs, &target_names)?;
+    let binary_candidates =
+        collect_best_binary_update_candidates(config, rootfs, &target_real_names)?;
 
     let mut updates = Vec::new();
-    let mut targets: Vec<_> = target_names.into_iter().collect();
+    let mut targets: Vec<_> = target_real_names.into_iter().collect();
     targets.sort();
     for target in targets {
-        let Some(installed) = installed_by_name.get(&target) else {
+        let Some(installed) = active_by_real_name.get(&target) else {
             continue;
         };
         let installed_completed_at = installed_package_completed_at(installed, &db_path, rootfs)?;
@@ -2509,7 +2723,7 @@ fn collect_missing_update_dependencies(
 ) -> Result<Vec<String>> {
     let mut planned_provides = HashSet::new();
     for candidate in candidates {
-        planned_provides.insert(candidate.package.clone());
+        planned_provides.insert(candidate.candidate_package.clone());
         for provide in &candidate.provides {
             planned_provides.insert(provide.clone());
         }
@@ -2571,10 +2785,11 @@ fn run_update_command(
         .iter()
         .map(|candidate| {
             let summary = format!(
-                "{} v{}-{} -> v{}-{}",
-                candidate.package,
+                "{} v{}-{} -> {} v{}-{}",
+                candidate.installed_package,
                 candidate.installed_version,
                 candidate.installed_revision,
+                candidate.candidate_package,
                 candidate.candidate_version,
                 candidate.candidate_revision
             );
@@ -2595,7 +2810,7 @@ fn run_update_command(
     let conflict_subjects: Vec<_> = updates
         .iter()
         .map(|candidate| InstallConflictSubject {
-            package: candidate.package.clone(),
+            package: candidate.candidate_package.clone(),
             provides: candidate.provides.clone(),
             conflicts: candidate.conflicts.clone(),
         })
@@ -2673,12 +2888,13 @@ fn run_update_command(
     let exe = std::env::current_exe().context("Failed to locate depot executable")?;
     for (idx, candidate) in updates.iter().enumerate() {
         ui::info(format!(
-            "[{}/{}] updating {} v{}-{} -> v{}-{}",
+            "[{}/{}] updating {} v{}-{} -> {} v{}-{}",
             idx + 1,
             updates.len(),
-            candidate.package,
+            candidate.installed_package,
             candidate.installed_version,
             candidate.installed_revision,
+            candidate.candidate_package,
             candidate.candidate_version,
             candidate.candidate_revision
         ));
@@ -5415,8 +5631,10 @@ mod tests {
         db::repo::BinaryRepoPackageRecord {
             repo_name: "core".into(),
             name: name.into(),
+            real_name: None,
             version: "1.0".into(),
             revision: 1,
+            abi_breaking: false,
             completed_at: None,
             filename: filename.into(),
             size: 1,
@@ -5449,10 +5667,12 @@ mod tests {
         package::PackageSpec {
             package: package::PackageInfo {
                 name: "pkg".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -5598,8 +5818,10 @@ optional = []
         let record = db::repo::BinaryRepoPackageRecord {
             repo_name: "core".into(),
             name: "pkg".into(),
+            real_name: None,
             version: "1.0".into(),
             revision: 1,
+            abi_breaking: false,
             completed_at: None,
             filename: archive_path
                 .file_name()
@@ -5897,8 +6119,10 @@ optional = []
         let record = db::repo::BinaryRepoPackageRecord {
             repo_name: "core".into(),
             name: "sudo".into(),
+            real_name: None,
             version: "1.0".into(),
             revision: 1,
+            abi_breaking: false,
             completed_at: None,
             filename: archive_path
                 .file_name()
@@ -6017,10 +6241,12 @@ optional = []
         let spec = package::PackageSpec {
             package: package::PackageInfo {
                 name: "filesystem".into(),
+                real_name: None,
                 version: "1.0.1".into(),
                 revision: 3,
                 description: "Base filesystem".into(),
                 homepage: "https://example.test".into(),
+                abi_breaking: false,
                 license: vec!["Unlicense".into()],
             },
             packages: Vec::new(),
@@ -6048,6 +6274,117 @@ optional = []
     }
 
     #[test]
+    fn renamed_abi_updates_keep_versioned_shared_libraries() -> Result<()> {
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.db_dir = rootfs.path().join("var/lib/depot");
+        cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+
+        let old_spec = package::PackageSpec {
+            package: package::PackageInfo {
+                name: "libxml214".into(),
+                real_name: Some("libxml2".into()),
+                version: "2.14.9".into(),
+                revision: 1,
+                description: "libxml2 2.14".into(),
+                homepage: "https://example.test/libxml2".into(),
+                abi_breaking: true,
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: package::Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: package::Build {
+                build_type: package::BuildType::Bin,
+                flags: package::BuildFlags::default(),
+            },
+            dependencies: package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+        let old_dest = rootfs.path().join("old-dest");
+        fs::create_dir_all(old_dest.join("usr/lib/pkgconfig"))?;
+        fs::write(old_dest.join("usr/lib/libxml2.so.14.9.0"), "old-real")?;
+        std::os::unix::fs::symlink("libxml2.so.14.9.0", old_dest.join("usr/lib/libxml2.so.14"))?;
+        std::os::unix::fs::symlink("libxml2.so.14", old_dest.join("usr/lib/libxml2.so"))?;
+        fs::write(
+            old_dest.join("usr/lib/pkgconfig/libxml-2.0.pc"),
+            "old-pkgconfig",
+        )?;
+        install_package_outputs_to_rootfs(&old_spec, &old_dest, rootfs.path(), &cfg)?;
+
+        let new_spec = package::PackageSpec {
+            package: package::PackageInfo {
+                name: "libxml215".into(),
+                real_name: Some("libxml2".into()),
+                version: "2.15.1".into(),
+                revision: 1,
+                description: "libxml2 2.15".into(),
+                homepage: "https://example.test/libxml2".into(),
+                abi_breaking: true,
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: package::Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: package::Build {
+                build_type: package::BuildType::Bin,
+                flags: package::BuildFlags::default(),
+            },
+            dependencies: package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+        let new_dest = rootfs.path().join("new-dest");
+        fs::create_dir_all(new_dest.join("usr/lib/pkgconfig"))?;
+        fs::write(new_dest.join("usr/lib/libxml2.so.15.1.0"), "new-real")?;
+        std::os::unix::fs::symlink("libxml2.so.15.1.0", new_dest.join("usr/lib/libxml2.so.15"))?;
+        std::os::unix::fs::symlink("libxml2.so.15", new_dest.join("usr/lib/libxml2.so"))?;
+        fs::write(
+            new_dest.join("usr/lib/pkgconfig/libxml-2.0.pc"),
+            "new-pkgconfig",
+        )?;
+
+        let installed =
+            install_package_outputs_to_rootfs(&new_spec, &new_dest, rootfs.path(), &cfg)?;
+        assert_eq!(installed.len(), 1);
+        assert!(installed[0].is_update);
+        assert_eq!(installed[0].package.name, "libxml215");
+
+        assert!(rootfs.path().join("usr/lib/libxml2.so.14.9.0").exists());
+        assert!(rootfs.path().join("usr/lib/libxml2.so.14").exists());
+        assert_eq!(
+            fs::read_to_string(rootfs.path().join("usr/lib/libxml2.so.15.1.0"))?,
+            "new-real"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.path().join("usr/lib/pkgconfig/libxml-2.0.pc"))?,
+            "new-pkgconfig"
+        );
+
+        let db_path = cfg.installed_db_path(rootfs.path());
+        let old_files = db::get_package_files(&db_path, "libxml214")?;
+        assert_eq!(
+            old_files,
+            vec![
+                "usr/lib/libxml2.so.14".to_string(),
+                "usr/lib/libxml2.so.14.9.0".to_string(),
+            ]
+        );
+
+        let new_files = db::get_package_files(&db_path, "libxml215")?;
+        assert!(new_files.contains(&"usr/lib/libxml2.so".to_string()));
+        assert!(new_files.contains(&"usr/lib/libxml2.so.15".to_string()));
+        assert!(new_files.contains(&"usr/lib/libxml2.so.15.1.0".to_string()));
+        assert!(new_files.contains(&"usr/lib/pkgconfig/libxml-2.0.pc".to_string()));
+        Ok(())
+    }
+
+    #[test]
     fn merge_missing_dependencies_preserves_order_and_uniqueness() {
         let merged = merge_missing_dependencies(
             vec!["make".into(), "pkgconf".into(), "glibc".into()],
@@ -6062,20 +6399,129 @@ optional = []
     }
 
     #[test]
+    fn collect_update_candidates_matches_renamed_packages_by_real_name() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let rootfs = temp.path().join("rootfs");
+        let repo_clones = temp.path().join("repos");
+        let build_dir = temp.path().join("build");
+        let db_dir = rootfs.join("var/lib/depot");
+        fs::create_dir_all(&rootfs)?;
+        fs::create_dir_all(&repo_clones)?;
+        fs::create_dir_all(&build_dir)?;
+        fs::create_dir_all(&db_dir)?;
+
+        let mut config = config::Config::for_rootfs(&rootfs);
+        config.repo_clone_dir = repo_clones.clone();
+        config.build_dir = build_dir;
+        config.db_dir = db_dir.clone();
+        config.repo_settings.prefer_binary = false;
+        config.binary_repos.clear();
+        config.source_repos.insert(
+            "private".into(),
+            config::SourceRepo {
+                url: "https://example.test/private.git".into(),
+                enabled: true,
+                priority: 0,
+                subdirs: Vec::new(),
+            },
+        );
+
+        let installed_spec = package::PackageSpec {
+            package: package::PackageInfo {
+                name: "icu78".into(),
+                real_name: Some("icu".into()),
+                version: "78.2".into(),
+                revision: 1,
+                description: "icu78".into(),
+                homepage: "https://example.test/icu".into(),
+                abi_breaking: true,
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: package::Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: package::Build {
+                build_type: package::BuildType::Bin,
+                flags: package::BuildFlags::default(),
+            },
+            dependencies: package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(dest.join("usr/lib"))?;
+        fs::write(dest.join("usr/lib/libicuuc.so.78.2"), "icu78")?;
+        db::register_package(&config.installed_db_path(&rootfs), &installed_spec, &dest)?;
+
+        let repo_root = repo_clones.join("private");
+        fs::create_dir_all(&repo_root)?;
+        fs::write(
+            repo_root.join("icu79.toml"),
+            r#"[package]
+name = "icu79"
+real_name = "icu"
+version = "79.1"
+revision = 1
+description = "icu79"
+homepage = "https://example.test/icu"
+abi_breaking = true
+license = "MIT"
+
+[build]
+type = "meta"
+
+[dependencies]
+runtime = []
+optional = []
+"#,
+        )?;
+
+        let installed_records =
+            db::list_installed_package_records(&config.installed_db_path(&rootfs))?;
+        assert_eq!(installed_records.len(), 1);
+        assert_eq!(installed_records[0].real_name.as_deref(), Some("icu"));
+
+        let source_candidates =
+            collect_best_source_update_candidates(&config, &HashSet::from([String::from("icu")]))?;
+        assert!(source_candidates.contains_key("icu"));
+        let selected = select_update_candidate(
+            &installed_records[0],
+            installed_records[0].completed_at,
+            &source_candidates,
+            &HashMap::new(),
+            false,
+        );
+        assert!(selected.is_some());
+
+        let updates = collect_update_candidates(&config, &rootfs, &["icu78".into()])?;
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].installed_package, "icu78");
+        assert_eq!(updates[0].candidate_package, "icu79");
+        assert_eq!(updates[0].candidate_version, "79.1");
+        Ok(())
+    }
+
+    #[test]
     fn update_candidate_prefers_binary_when_versions_match_and_config_does() {
         let installed = db::InstalledPackageRecord {
             name: "pkg".into(),
+            real_name: None,
             version: "1.0.0".into(),
             revision: 1,
+            abi_breaking: false,
             completed_at: None,
         };
         let source_spec = package::PackageSpec {
             package: package::PackageInfo {
                 name: "pkg".into(),
+                real_name: None,
                 version: "1.1.0".into(),
                 revision: 1,
                 description: "test".into(),
                 homepage: "https://example.test".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -6115,8 +6561,10 @@ optional = []
                 db::repo::BinaryRepoPackageRecord {
                     repo_name: "binary".into(),
                     name: "pkg".into(),
+                    real_name: None,
                     version: "1.1.0".into(),
                     revision: 1,
+                    abi_breaking: false,
                     completed_at: None,
                     filename: "pkg-1.1.0-1-x86_64.depot.pkg.tar.zst".into(),
                     size: 1,
@@ -6148,17 +6596,21 @@ optional = []
     fn select_update_candidate_uses_newer_timestamp_when_versions_match() {
         let installed = db::InstalledPackageRecord {
             name: "pkg".into(),
+            real_name: None,
             version: "1.0.0".into(),
             revision: 1,
+            abi_breaking: false,
             completed_at: Some(100),
         };
         let source_spec = package::PackageSpec {
             package: package::PackageInfo {
                 name: "pkg".into(),
+                real_name: None,
                 version: "1.0.0".into(),
                 revision: 1,
                 description: "test".into(),
                 homepage: "https://example.test".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -6227,10 +6679,12 @@ optional = []
         let installed_spec = package::PackageSpec {
             package: package::PackageInfo {
                 name: "pkg".into(),
+                real_name: None,
                 version: "1.0.0".into(),
                 revision: 1,
                 description: "pkg".into(),
                 homepage: "https://example.test".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -6397,10 +6851,12 @@ optional = []
         let libc_spec = package::PackageSpec {
             package: package::PackageInfo {
                 name: "glibc".into(),
+                real_name: None,
                 version: "1.0".into(),
                 revision: 1,
                 description: "glibc".into(),
                 homepage: "https://example.test".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -6424,7 +6880,8 @@ optional = []
         let missing = collect_missing_update_dependencies(
             &[
                 UpdateCandidate {
-                    package: "pkg".into(),
+                    installed_package: "pkg".into(),
+                    candidate_package: "pkg".into(),
                     installed_version: "1.0".into(),
                     installed_revision: 1,
                     installed_completed_at: None,
@@ -6441,7 +6898,8 @@ optional = []
                     },
                 },
                 UpdateCandidate {
-                    package: "helper".into(),
+                    installed_package: "helper".into(),
+                    candidate_package: "helper".into(),
                     installed_version: "1.0".into(),
                     installed_revision: 1,
                     installed_completed_at: None,
@@ -6458,7 +6916,8 @@ optional = []
                     },
                 },
                 UpdateCandidate {
-                    package: "tool".into(),
+                    installed_package: "tool".into(),
+                    candidate_package: "tool".into(),
                     installed_version: "1.0".into(),
                     installed_revision: 1,
                     installed_completed_at: None,

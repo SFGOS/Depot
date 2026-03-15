@@ -273,10 +273,12 @@ mod tests {
         PackageSpec {
             package: PackageInfo {
                 name: name.into(),
+                real_name: None,
                 version: version.into(),
                 revision: 1,
                 description: "d".into(),
                 homepage: "h".into(),
+                abi_breaking: false,
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -373,10 +375,12 @@ depot_install_dev_pkg() {
         let mut spec = mk_spec("demo", "1.0");
         spec.packages.push(crate::package::PackageInfo {
             name: "dev-pkg".into(),
+            real_name: None,
             version: "1.0".into(),
             revision: 1,
             description: "d".into(),
             homepage: "h".into(),
+            abi_breaking: false,
             license: vec!["MIT".into()],
         });
 
@@ -421,10 +425,12 @@ depot_install() {
         let mut spec = mk_spec("demo", "1.0");
         spec.packages.push(crate::package::PackageInfo {
             name: "dev-pkg".into(),
+            real_name: None,
             version: "1.0".into(),
             revision: 1,
             description: "d".into(),
             homepage: "h".into(),
+            abi_breaking: false,
             license: vec!["MIT".into()],
         });
 
