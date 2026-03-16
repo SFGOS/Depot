@@ -489,7 +489,7 @@ exit 0
     }
 
     #[test]
-    fn test_build_lib32_stages_usr_lib_and_keeps_non_library_paths() -> Result<()> {
+    fn test_build_lib32_stages_only_usr_lib_payload() -> Result<()> {
         let tmp_src = tempdir()?;
         let tmp_dest = tempdir()?;
         let tmp_tools = tempdir()?;
@@ -545,10 +545,7 @@ exec "$@"
             std::fs::read_to_string(tmp_dest.path().join("usr/lib32/libfoo.so.1"))?,
             "lib32"
         );
-        assert_eq!(
-            std::fs::read_to_string(tmp_dest.path().join("usr/share/man/man1/foo.1"))?,
-            "manpage"
-        );
+        assert!(!tmp_dest.path().join("usr/share/man/man1/foo.1").exists());
         assert!(!tmp_dest.path().join("usr/lib").exists());
 
         Ok(())

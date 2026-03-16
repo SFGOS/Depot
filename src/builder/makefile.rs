@@ -241,7 +241,7 @@ exec "$@"
     }
 
     #[test]
-    fn test_makefile_lib32_install_relocates_usr_lib_and_keeps_other_paths() -> Result<()> {
+    fn test_makefile_lib32_install_relocates_usr_lib_without_copying_other_paths() -> Result<()> {
         let tmp_src = tempdir()?;
         let tmp_dest = tempdir()?;
         let tmp_tools = tempdir()?;
@@ -277,7 +277,7 @@ exec "$@"
             fs::read_to_string(dest_path.join("usr/lib32/libfoo.so.1"))?,
             "lib32"
         );
-        assert_eq!(fs::read_to_string(dest_path.join("usr/bin/foo"))?, "bin");
+        assert!(!dest_path.join("usr/bin/foo").exists());
         assert!(!dest_path.join("usr/lib").exists());
 
         Ok(())
