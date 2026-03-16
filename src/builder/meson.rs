@@ -86,8 +86,14 @@ pub fn build(
             anyhow::bail!("ninja build failed");
         }
 
-        if flags.skip_tests {
-            crate::log_info!("Skipping tests: disabled by build.flags.skip_tests");
+        if spec.should_skip_automatic_tests() {
+            if flags.skip_tests {
+                crate::log_info!("Skipping tests: disabled by build.flags.skip_tests");
+            } else {
+                crate::log_info!(
+                    "Skipping tests: automatic tests are disabled for multilib builds"
+                );
+            }
         } else {
             let test_suites = meson_test_suites(flags);
             if test_suites.is_empty() {

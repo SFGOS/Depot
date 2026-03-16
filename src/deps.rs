@@ -40,6 +40,12 @@ pub(crate) enum RequestedOutputs {
     Lib32Only,
 }
 
+impl RequestedOutputs {
+    pub(crate) fn includes_lib32(self) -> bool {
+        matches!(self, Self::PrimaryAndLib32 | Self::Lib32Only)
+    }
+}
+
 /// Parse a dependency string into name, version, and operator
 fn parse_dep(dep: &str) -> ParsedDep<'_> {
     // Try operators in order of specificity (>= before >, etc.)
@@ -152,6 +158,10 @@ fn build_type_runs_automatic_tests(spec: &PackageSpec) -> bool {
         spec.build.build_type,
         BuildType::Autotools | BuildType::CMake | BuildType::Meson | BuildType::Perl
     )
+}
+
+fn automatic_tests_disabled_for_outputs(spec: &PackageSpec, outputs: RequestedOutputs) -> bool {
+    spec.should_skip_automatic_tests() || outputs.includes_lib32()
 }
 
 /// Check whether a dependency expression is satisfied by the installed package DB.
@@ -358,7 +368,8 @@ pub(crate) fn print_dep_status_for_outputs(
             "Test dependencies",
             &primary.test,
             &missing_test,
-            !spec.build.flags.skip_tests && build_type_runs_automatic_tests(spec),
+            !automatic_tests_disabled_for_outputs(spec, outputs)
+                && build_type_runs_automatic_tests(spec),
         );
         if !primary.optional.is_empty() {
             ui::info(format!(
@@ -395,7 +406,8 @@ pub(crate) fn print_dep_status_for_outputs(
                 "Lib32 test dependencies",
                 &lib32.test,
                 &missing_test,
-                !spec.build.flags.skip_tests && build_type_runs_automatic_tests(spec),
+                !automatic_tests_disabled_for_outputs(spec, outputs)
+                    && build_type_runs_automatic_tests(spec),
             );
             if !lib32.optional.is_empty() {
                 ui::info(format!(

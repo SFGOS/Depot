@@ -127,8 +127,14 @@ pub fn build(
             anyhow::bail!("cmake build failed");
         }
 
-        if flags.skip_tests {
-            crate::log_info!("Skipping tests: disabled by build.flags.skip_tests");
+        if spec.should_skip_automatic_tests() {
+            if flags.skip_tests {
+                crate::log_info!("Skipping tests: disabled by build.flags.skip_tests");
+            } else {
+                crate::log_info!(
+                    "Skipping tests: automatic tests are disabled for multilib builds"
+                );
+            }
         } else {
             let test_targets = phase_targets(&flags.make_test_target, &flags.make_test_targets);
             if !cmake_uses_default_ctest(flags) {

@@ -927,12 +927,19 @@ fn build_type_runs_automatic_tests(spec: &package::PackageSpec) -> bool {
     )
 }
 
+fn automatic_tests_disabled_for_outputs(
+    pkg_spec: &package::PackageSpec,
+    requested_outputs: deps::RequestedOutputs,
+) -> bool {
+    pkg_spec.should_skip_automatic_tests() || requested_outputs.includes_lib32()
+}
+
 fn maybe_disable_tests_for_missing_deps(
     pkg_spec: &mut package::PackageSpec,
     db_path: &Path,
     requested_outputs: deps::RequestedOutputs,
 ) -> Result<()> {
-    if pkg_spec.build.flags.skip_tests
+    if automatic_tests_disabled_for_outputs(pkg_spec, requested_outputs)
         || !build_type_runs_automatic_tests(pkg_spec)
         || deps::declared_test_deps(pkg_spec, requested_outputs).is_empty()
     {
@@ -956,7 +963,7 @@ fn maybe_prompt_to_skip_tests_for_missing_requested_deps(
     missing_test: &[String],
     reason: &str,
 ) -> Result<bool> {
-    if pkg_spec.build.flags.skip_tests
+    if pkg_spec.should_skip_automatic_tests()
         || !build_type_runs_automatic_tests(pkg_spec)
         || missing_test.is_empty()
     {
@@ -993,7 +1000,7 @@ fn should_install_test_deps(
     requested_outputs: deps::RequestedOutputs,
 ) -> bool {
     install_test_deps
-        && !pkg_spec.build.flags.skip_tests
+        && !automatic_tests_disabled_for_outputs(pkg_spec, requested_outputs)
         && !deps::declared_test_deps(pkg_spec, requested_outputs).is_empty()
 }
 
@@ -4200,7 +4207,9 @@ fn run_direct_install_request(
                     anyhow::bail!("Missing test dependencies: {}", unavailable_test.join(", "));
                 }
 
-                if !pkg_spec.build.flags.skip_tests && !dep_spec_paths.is_empty() {
+                if !automatic_tests_disabled_for_outputs(&pkg_spec, requested_outputs)
+                    && !dep_spec_paths.is_empty()
+                {
                     ui::warn(format!(
                         "Missing test dependencies: {}",
                         missing_test.join(", ")
@@ -4714,7 +4723,12 @@ pub fn run(cli: Cli) -> Result<()> {
                                 Err(err) => return Err(err),
                             };
 
-                            if cleanup_deps && !pkg_spec.build.flags.skip_tests {
+                            if cleanup_deps
+                                && !automatic_tests_disabled_for_outputs(
+                                    &pkg_spec,
+                                    requested_outputs,
+                                )
+                            {
                                 auto_installed_deps.record_plan(
                                     &dep_plan,
                                     &missing_test,
@@ -4722,7 +4736,9 @@ pub fn run(cli: Cli) -> Result<()> {
                                 );
                             }
 
-                            if !pkg_spec.build.flags.skip_tests && !dep_plan.steps.is_empty() {
+                            if !automatic_tests_disabled_for_outputs(&pkg_spec, requested_outputs)
+                                && !dep_plan.steps.is_empty()
+                            {
                                 ui::warn(format!(
                                     "Missing test dependencies: {}",
                                     missing_test.join(", ")
@@ -7383,6 +7399,43 @@ optional = []
         assert!(!prompted);
         assert!(!spec.build.flags.skip_tests);
         Ok(())
+    }
+
+    #[test]
+    fn requested_test_deps_prompt_is_ignored_for_multilib_builds() -> Result<()> {
+        let _guard = ASSUME_YES_TEST_LOCK.lock().expect("assume-yes test lock");
+        let mut spec = test_package_spec(package::BuildType::Meson, None, &[]);
+        spec.build.flags.build_32 = true;
+        spec.dependencies.test = vec!["pytest".into()];
+
+        ui::set_assume_yes(true);
+        let prompted = maybe_prompt_to_skip_tests_for_missing_requested_deps(
+            &mut spec,
+            &["pytest".into()],
+            "Requested test dependencies are missing",
+        )?;
+        ui::set_assume_yes(false);
+
+        assert!(!prompted);
+        assert!(!spec.build.flags.skip_tests);
+        Ok(())
+    }
+
+    #[test]
+    fn should_not_install_test_deps_for_cli_lib32_only_builds() {
+        let mut spec = test_package_spec(package::BuildType::Meson, None, &[]);
+        spec.dependencies.lib32 = Some(package::DependencyGroup {
+            build: Vec::new(),
+            runtime: Vec::new(),
+            test: vec!["lib32-pytest".into()],
+            optional: Vec::new(),
+        });
+
+        assert!(!should_install_test_deps(
+            &spec,
+            true,
+            deps::RequestedOutputs::Lib32Only
+        ));
     }
 
     #[test]

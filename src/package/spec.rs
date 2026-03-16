@@ -266,6 +266,14 @@ impl PackageSpec {
         self.build.flags.lib32_only
     }
 
+    /// Return true when builder-managed automatic tests should be skipped.
+    ///
+    /// Automatic test phases are disabled when `build.flags.skip_tests` is set and for
+    /// multilib builds, because the generated lib32 output is built in a separate 32-bit pass.
+    pub fn should_skip_automatic_tests(&self) -> bool {
+        self.build.flags.skip_tests || self.builds_lib32_output()
+    }
+
     /// Return the effective dependency set used by the generated lib32 companion package.
     pub fn lib32_dependencies(&self) -> Dependencies {
         let mut deps = self
@@ -3087,6 +3095,19 @@ type = "autotools"
     }
 
     #[test]
+    fn multilib_builds_skip_automatic_tests() {
+        let mut spec = mk_spec("foo", "1.0");
+        assert!(!spec.should_skip_automatic_tests());
+
+        spec.build.flags.build_32 = true;
+        assert!(spec.should_skip_automatic_tests());
+
+        spec.build.flags.build_32 = false;
+        spec.build.flags.skip_tests = true;
+        assert!(spec.should_skip_automatic_tests());
+    }
+
+    #[test]
     fn parse_post_configure_from_spec() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -3982,6 +4003,8 @@ pub struct BuildFlags {
     )]
     pub no_compress_man: bool,
     /// Skip automatic build-system test execution (e.g. Autotools `make check`/`make test`).
+    ///
+    /// Automatic tests are also skipped for multilib (`build_32` / `lib32_only`) builds.
     #[serde(default, alias = "skip-tests")]
     pub skip_tests: bool,
     /// Run an additional lib32 build pass and emit a `lib32-*` package.
