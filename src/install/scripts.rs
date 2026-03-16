@@ -692,11 +692,7 @@ fn resolve_hook_script(script_dir: &Path, hook: Hook, pkg_name: &str) -> Result<
 
     if is_lib32_package(pkg_name) {
         let label = format!("{} (lib32)", hook.canonical_name());
-        if let Some(path) =
-            resolve_hook_from_candidates(script_dir, &label, hook.lib32_candidate_names())?
-        {
-            return Ok(Some(path));
-        }
+        return resolve_hook_from_candidates(script_dir, &label, hook.lib32_candidate_names());
     }
 
     resolve_hook_from_candidates(script_dir, hook.canonical_name(), hook.candidate_names())
@@ -808,19 +804,11 @@ fn collect_legacy_root_hooks(spec_dir: &Path, pkg_name: &str) -> Result<Vec<(Hoo
     for hook in ALL_HOOKS {
         let matched_path = if is_lib32_package(pkg_name) {
             let lib32_label = format!("{} (lib32)", hook.canonical_name());
-            if let Some(path) = collect_legacy_root_hook_candidates(
+            collect_legacy_root_hook_candidates(
                 spec_dir,
                 &lib32_label,
                 hook.legacy_root_lib32_candidate_names(),
-            )? {
-                Some(path)
-            } else {
-                collect_legacy_root_hook_candidates(
-                    spec_dir,
-                    hook.canonical_name(),
-                    hook.legacy_root_candidate_names(),
-                )?
-            }
+            )?
         } else {
             collect_legacy_root_hook_candidates(
                 spec_dir,
@@ -1350,20 +1338,40 @@ mod tests {
     }
 
     #[test]
-    fn stage_scripts_from_spec_dir_lib32_falls_back_to_generic_legacy_root_hook() {
+    fn stage_scripts_from_spec_dir_lib32_ignores_generic_legacy_root_hook() {
         let tmp = tempfile::tempdir().unwrap();
         let spec_dir = tmp.path().join("spec");
         let destdir = tmp.path().join("dest");
         std::fs::create_dir_all(&spec_dir).unwrap();
         std::fs::create_dir_all(&destdir).unwrap();
 
-        // No lib32-prefixed hook; the generic one should be staged for lib32 packages.
+        // No lib32-prefixed hook; native-only scripts must NOT be staged for lib32 packages.
         std::fs::write(spec_dir.join("postinstall.sh"), "echo fallback").unwrap();
 
         let mut spec = mk_spec(&spec_dir);
         spec.package.name = "lib32-foo".into();
         let staged = stage_scripts_from_spec_dir(&spec, &destdir).unwrap();
-        assert!(staged);
-        assert!(destdir.join("scripts/post_install").exists());
+        assert!(!staged);
+        assert!(!destdir.join("scripts/post_install").exists());
+    }
+
+    #[test]
+    fn run_hook_if_present_lib32_ignores_generic_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scripts = tmp.path().join("scripts");
+        let rootfs = tmp.path().join("root");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        // Only a generic script exists; lib32 package must NOT execute it.
+        std::fs::write(
+            scripts.join("post_install"),
+            "echo generic > \"$DEPOT_ROOTFS/hook.out\"\n",
+        )
+        .unwrap();
+
+        let ran = run_hook_if_present(&scripts, Hook::PostInstall, &rootfs, "lib32-foo").unwrap();
+        assert!(!ran);
+        assert!(!rootfs.join("hook.out").exists());
     }
 }
