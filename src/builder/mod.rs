@@ -180,25 +180,9 @@ pub(crate) fn install_destdir_path(
 }
 
 pub(crate) fn stage_lib32_install_tree(staging_destdir: &Path, destdir: &Path) -> Result<()> {
-    let staged_lib32 = staging_destdir.join("usr/lib32");
-    if staged_lib32.exists() {
-        return copy_tree_preserving_links(&staged_lib32, &destdir.join("usr/lib32"));
-    }
-
-    let staged_lib = staging_destdir.join("usr/lib");
-    if staged_lib.exists() {
-        crate::log_warn!(
-            "lib32 install populated {} instead of usr/lib32; relocating staged libraries",
-            staged_lib.display()
-        );
-        return copy_tree_preserving_links(&staged_lib, &destdir.join("usr/lib32"));
-    }
-
-    anyhow::bail!(
-        "lib32 install did not populate {} or {}",
-        staged_lib32.display(),
-        staged_lib.display()
-    );
+    let lib_rel = lib32_stage_source_rel(staging_destdir)?;
+    copy_install_tree_preserving_links(staging_destdir, destdir, Some(&lib_rel))?;
+    copy_tree_preserving_links(&staging_destdir.join(&lib_rel), &destdir.join("usr/lib32"))
 }
 
 fn copy_tree_preserving_links(src: &Path, dst: &Path) -> Result<()> {
@@ -256,6 +240,105 @@ fn copy_tree_preserving_links(src: &Path, dst: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn copy_install_tree_preserving_links(
+    src: &Path,
+    dst: &Path,
+    relocated_lib_rel: Option<&Path>,
+) -> Result<()> {
+    fs::create_dir_all(dst)
+        .with_context(|| format!("Failed to create destination dir: {}", dst.display()))?;
+
+    for entry in WalkDir::new(src) {
+        let entry = entry?;
+        let rel = entry
+            .path()
+            .strip_prefix(src)
+            .with_context(|| format!("Failed to strip prefix: {}", src.display()))?;
+        if should_skip_staged_install_entry(rel, relocated_lib_rel) {
+            continue;
+        }
+
+        let target = dst.join(rel);
+
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)
+                .with_context(|| format!("Failed to create dir: {}", target.display()))?;
+            continue;
+        }
+
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create dir: {}", parent.display()))?;
+        }
+
+        if entry.file_type().is_symlink() {
+            let link_target = fs::read_link(entry.path())
+                .with_context(|| format!("Failed to read symlink: {}", entry.path().display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs as unix_fs;
+                unix_fs::symlink(&link_target, &target).with_context(|| {
+                    format!(
+                        "Failed to create symlink {} -> {}",
+                        target.display(),
+                        link_target.display()
+                    )
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!(
+                    "Symlink-preserving lib32 staging copy is only supported on unix hosts"
+                );
+            }
+        } else {
+            fs::copy(entry.path(), &target).with_context(|| {
+                format!(
+                    "Failed to copy {} to {}",
+                    entry.path().display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_skip_staged_install_entry(rel: &Path, relocated_lib_rel: Option<&Path>) -> bool {
+    if rel.as_os_str().is_empty() {
+        return false;
+    }
+
+    if rel.starts_with(Path::new(crate::shell_helpers::INTERNAL_DEPOT_DIR)) {
+        return true;
+    }
+
+    relocated_lib_rel.is_some_and(|lib_rel| rel.starts_with(lib_rel))
+}
+
+fn lib32_stage_source_rel(staging_destdir: &Path) -> Result<PathBuf> {
+    let staged_lib32 = PathBuf::from("usr/lib32");
+    if staging_destdir.join(&staged_lib32).exists() {
+        return Ok(staged_lib32);
+    }
+
+    let staged_lib = PathBuf::from("usr/lib");
+    if staging_destdir.join(&staged_lib).exists() {
+        crate::log_warn!(
+            "lib32 install populated {} instead of usr/lib32; relocating staged libraries",
+            staging_destdir.join(&staged_lib).display()
+        );
+        return Ok(staged_lib);
+    }
+
+    anyhow::bail!(
+        "lib32 install did not populate {} or {}",
+        staging_destdir.join("usr/lib32").display(),
+        staging_destdir.join("usr/lib").display()
+    );
 }
 
 fn compiler_flag_sets(
@@ -978,13 +1061,29 @@ mod tests {
         let staging = temp.path().join("staging");
         let dest = temp.path().join("dest");
         fs::create_dir_all(staging.join("usr/lib32"))?;
+        fs::create_dir_all(staging.join("usr/bin"))?;
         fs::write(staging.join("usr/lib32/libfoo.so.1"), "lib32")?;
+        fs::write(staging.join("usr/bin/foo"), "bin")?;
+        fs::create_dir_all(staging.join(crate::shell_helpers::INTERNAL_DEPOT_DIR))?;
+        fs::write(
+            staging
+                .join(crate::shell_helpers::INTERNAL_DEPOT_DIR)
+                .join("internal.txt"),
+            "skip",
+        )?;
 
         stage_lib32_install_tree(&staging, &dest)?;
 
         assert_eq!(
             fs::read_to_string(dest.join("usr/lib32/libfoo.so.1"))?,
             "lib32"
+        );
+        assert_eq!(fs::read_to_string(dest.join("usr/bin/foo"))?, "bin");
+        assert!(
+            !dest
+                .join(crate::shell_helpers::INTERNAL_DEPOT_DIR)
+                .join("internal.txt")
+                .exists()
         );
         Ok(())
     }
@@ -998,7 +1097,9 @@ mod tests {
         let staging = temp.path().join("staging");
         let dest = temp.path().join("dest");
         fs::create_dir_all(staging.join("usr/lib"))?;
+        fs::create_dir_all(staging.join("usr/share/man/man1"))?;
         fs::write(staging.join("usr/lib/libfoo.so.1"), "relocated")?;
+        fs::write(staging.join("usr/share/man/man1/foo.1"), "manpage")?;
         unix_fs::symlink("libfoo.so.1", staging.join("usr/lib/libfoo.so"))?;
 
         stage_lib32_install_tree(&staging, &dest)?;
@@ -1011,6 +1112,11 @@ mod tests {
             fs::read_link(dest.join("usr/lib32/libfoo.so"))?,
             PathBuf::from("libfoo.so.1")
         );
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/share/man/man1/foo.1"))?,
+            "manpage"
+        );
+        assert!(!dest.join("usr/lib").exists());
         Ok(())
     }
 }

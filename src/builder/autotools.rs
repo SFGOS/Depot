@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use walkdir::WalkDir;
 
 pub fn build(
     spec: &PackageSpec,
@@ -373,11 +372,7 @@ pub fn build(
         }
 
         if flags.lib32_variant {
-            let staged_lib32 = install_destdir.join("usr/lib32");
-            if !staged_lib32.exists() {
-                anyhow::bail!("lib32 install did not populate {}", staged_lib32.display());
-            }
-            copy_tree_preserving_links(&staged_lib32, &destdir.join("usr/lib32"))?;
+            crate::builder::stage_lib32_install_tree(&install_destdir, destdir)?;
             hooks::run_post_install_commands_in_dir(spec, &build_dir, destdir)?;
         } else {
             hooks::run_post_install_commands(spec, &actual_src, destdir)?;
@@ -508,63 +503,6 @@ fn install_destdir_path(build_dir: &Path, destdir: &Path, lib32_variant: bool) -
     } else {
         destdir.to_path_buf()
     }
-}
-
-fn copy_tree_preserving_links(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)
-        .with_context(|| format!("Failed to create destination dir: {}", dst.display()))?;
-
-    for entry in WalkDir::new(src) {
-        let entry = entry?;
-        let rel = entry
-            .path()
-            .strip_prefix(src)
-            .with_context(|| format!("Failed to strip prefix: {}", src.display()))?;
-        let target = dst.join(rel);
-
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)
-                .with_context(|| format!("Failed to create dir: {}", target.display()))?;
-            continue;
-        }
-
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create dir: {}", parent.display()))?;
-        }
-
-        if entry.file_type().is_symlink() {
-            let link_target = fs::read_link(entry.path())
-                .with_context(|| format!("Failed to read symlink: {}", entry.path().display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs as unix_fs;
-                unix_fs::symlink(&link_target, &target).with_context(|| {
-                    format!(
-                        "Failed to create symlink {} -> {}",
-                        target.display(),
-                        link_target.display()
-                    )
-                })?;
-            }
-            #[cfg(not(unix))]
-            {
-                anyhow::bail!(
-                    "Symlink-preserving lib32 staging copy is only supported on unix hosts"
-                );
-            }
-        } else {
-            fs::copy(entry.path(), &target).with_context(|| {
-                format!(
-                    "Failed to copy {} to {}",
-                    entry.path().display(),
-                    target.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(())
 }
 
 fn lib32_host_triple(host: &str) -> String {

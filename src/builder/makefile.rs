@@ -2,6 +2,7 @@ use crate::builder::state::{BuildStep, StateTracker};
 use crate::cross::CrossConfig;
 use crate::package::PackageSpec;
 use anyhow::{Context, Result};
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -17,6 +18,8 @@ pub fn build(
         spec.build.flags.lib32_variant.then_some("lib32"),
     )?;
     let flags = &spec.build.flags;
+    fs::create_dir_all(destdir)
+        .with_context(|| format!("Failed to create DESTDIR: {}", destdir.display()))?;
 
     let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
 
@@ -72,19 +75,38 @@ pub fn build(
             }
         );
 
+        let install_destdir =
+            crate::builder::install_destdir_path(src_dir, destdir, flags.lib32_variant);
+        if flags.lib32_variant {
+            if install_destdir.exists() {
+                fs::remove_dir_all(&install_destdir).with_context(|| {
+                    format!(
+                        "Failed to clean temporary lib32 install dir: {}",
+                        install_destdir.display()
+                    )
+                })?;
+            }
+            fs::create_dir_all(&install_destdir).with_context(|| {
+                format!(
+                    "Failed to create temporary lib32 install dir: {}",
+                    install_destdir.display()
+                )
+            })?;
+        }
+
         for cmd_str in &spec.build.flags.makefile_install_commands {
             let cmd_str = spec.expand_vars(cmd_str);
             crate::log_info!("  Executing: {}", cmd_str);
 
             // We need to run each command under fakeroot
-            let mut cmd = crate::fakeroot::wrap_install_command("sh", destdir);
+            let mut cmd = crate::fakeroot::wrap_install_command("sh", &install_destdir);
             cmd.arg("-c").arg(&cmd_str);
             cmd.current_dir(src_dir);
 
             let mut install_env = env_vars.clone();
             install_env.push((
                 "DESTDIR".to_string(),
-                destdir.to_string_lossy().into_owned(),
+                install_destdir.to_string_lossy().into_owned(),
             ));
             crate::builder::prepare_tool_command(&mut cmd, &install_env);
 
@@ -95,7 +117,12 @@ pub fn build(
             }
         }
 
-        crate::source::hooks::run_post_install_commands(spec, src_dir, destdir)?;
+        if flags.lib32_variant {
+            crate::builder::stage_lib32_install_tree(&install_destdir, destdir)?;
+            crate::source::hooks::run_post_install_commands_in_dir(spec, src_dir, destdir)?;
+        } else {
+            crate::source::hooks::run_post_install_commands(spec, src_dir, destdir)?;
+        }
         state.mark_done(BuildStep::PostInstallDone)?;
     } else {
         crate::log_info!("Skipping makefile install commands (already done)");
@@ -209,6 +236,49 @@ exec "$@"
         let state_tracker = StateTracker::new(src_path)?;
         assert!(state_tracker.is_done(BuildStep::PostCompileDone));
         assert!(state_tracker.is_done(BuildStep::PostInstallDone));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_makefile_lib32_install_relocates_usr_lib_and_keeps_other_paths() -> Result<()> {
+        let tmp_src = tempdir()?;
+        let tmp_dest = tempdir()?;
+        let tmp_tools = tempdir()?;
+        let src_path = tmp_src.path();
+        let dest_path = tmp_dest.path();
+        let tools_path = tmp_tools.path();
+
+        write_executable(
+            &tools_path.join("fakeroot"),
+            r#"#!/bin/sh
+if [ "$1" = "--" ]; then
+    shift
+fi
+exec "$@"
+"#,
+        )?;
+
+        let mut env = TestEnv::new();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        env.set_var("PATH", format!("{}:{}", tools_path.display(), old_path));
+
+        let mut spec = mk_spec("lib32-test-make", "1.0");
+        spec.build.flags.lib32_variant = true;
+        spec.build.flags.makefile_install_commands = vec![
+            "mkdir -p \"$DESTDIR/usr/lib\" \"$DESTDIR/usr/bin\"".into(),
+            "printf 'lib32' > \"$DESTDIR/usr/lib/libfoo.so.1\"".into(),
+            "printf 'bin' > \"$DESTDIR/usr/bin/foo\"".into(),
+        ];
+
+        build(&spec, src_path, dest_path, None, true)?;
+
+        assert_eq!(
+            fs::read_to_string(dest_path.join("usr/lib32/libfoo.so.1"))?,
+            "lib32"
+        );
+        assert_eq!(fs::read_to_string(dest_path.join("usr/bin/foo"))?, "bin");
+        assert!(!dest_path.join("usr/lib").exists());
 
         Ok(())
     }

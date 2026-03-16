@@ -17,12 +17,37 @@ pub fn build(
     export_compiler_flags: bool,
 ) -> Result<()> {
     let flags = &spec.build.flags;
+    let build_dir = if let Some(dir) = &flags.build_dir {
+        let bdir = src_dir.join(dir);
+        fs::create_dir_all(&bdir)?;
+        bdir
+    } else {
+        src_dir.to_path_buf()
+    };
+    let install_destdir =
+        crate::builder::install_destdir_path(&build_dir, destdir, flags.lib32_variant);
 
     // Create destdir
     fs::create_dir_all(destdir)?;
+    if flags.lib32_variant {
+        if install_destdir.exists() {
+            fs::remove_dir_all(&install_destdir).with_context(|| {
+                format!(
+                    "Failed to clean temporary lib32 install dir: {}",
+                    install_destdir.display()
+                )
+            })?;
+        }
+        fs::create_dir_all(&install_destdir).with_context(|| {
+            format!(
+                "Failed to create temporary lib32 install dir: {}",
+                install_destdir.display()
+            )
+        })?;
+    }
 
     let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
-    let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
+    let shell_helpers = crate::shell_helpers::ShellHelpers::new(&install_destdir)?;
     shell_helpers.apply_to_env_vars(&mut env_vars);
 
     // For custom builds, look for a build.sh script in the source directory
@@ -81,25 +106,17 @@ pub fn build(
             }
         );
 
-        let build_dir = if let Some(dir) = &flags.build_dir {
-            let bdir = src_dir.join(dir);
-            fs::create_dir_all(&bdir)?;
-            bdir
-        } else {
-            src_dir.to_path_buf()
-        };
-
         crate::builder::set_env_var(
             &mut env_vars,
             "DESTDIR",
-            destdir.to_string_lossy().into_owned(),
+            install_destdir.to_string_lossy().into_owned(),
         );
         crate::builder::set_env_var(
             &mut env_vars,
             "DEPOT_PRIMARY_DESTDIR",
-            destdir.to_string_lossy().into_owned(),
+            install_destdir.to_string_lossy().into_owned(),
         );
-        add_output_destdir_envs(spec, destdir, &mut env_vars);
+        add_output_destdir_envs(spec, &install_destdir, &mut env_vars);
 
         // Ensure build script path is absolute for when we are in a sub-build-dir
         let abs_build_script = if build_script.is_absolute() {
@@ -113,9 +130,9 @@ pub fn build(
             crate::log_info!(
                 "Using custom build.sh function mode (per-output install functions enabled)"
             );
-            build_function_mode_command(spec, destdir, &abs_build_script)?
+            build_function_mode_command(spec, &install_destdir, &abs_build_script)?
         } else {
-            let mut cmd = fakeroot::wrap_install_command("sh", destdir);
+            let mut cmd = fakeroot::wrap_install_command("sh", &install_destdir);
             let wrapper = crate::shell_helpers::wrap_shell_command(". \"$1\"");
             // Run custom scripts through `sh -c` so helper commands like `haul`
             // work even when the helper scripts live on a `noexec` mount.
@@ -141,6 +158,9 @@ pub fn build(
 
         if !status.success() {
             anyhow::bail!("Custom build script failed with status: {}", status);
+        }
+        if flags.lib32_variant {
+            crate::builder::stage_lib32_install_tree(&install_destdir, destdir)?;
         }
         state.mark_done(BuildStep::PostInstallDone)?;
     } else {
@@ -465,6 +485,72 @@ exit 0
         let err = build(&spec, tmp_src.path(), tmp_dest.path(), None, true)
             .expect_err("non-function custom scripts should fail when a command fails");
         assert!(err.to_string().contains("Custom build script failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_lib32_stages_usr_lib_and_keeps_non_library_paths() -> Result<()> {
+        let tmp_src = tempdir()?;
+        let tmp_dest = tempdir()?;
+        let tmp_tools = tempdir()?;
+
+        let build_sh = tmp_src.path().join("build.sh");
+        std::fs::write(
+            &build_sh,
+            r#"#!/bin/sh
+mkdir -p "$DESTDIR/usr/lib" "$DESTDIR/usr/share/man/man1"
+printf 'lib32' > "$DESTDIR/usr/lib/libfoo.so.1"
+printf 'manpage' > "$DESTDIR/usr/share/man/man1/foo.1"
+"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&build_sh)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&build_sh, perms)?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fakeroot = tmp_tools.path().join("fakeroot");
+            std::fs::write(
+                &fakeroot,
+                r#"#!/bin/sh
+if [ "$1" = "--" ]; then
+    shift
+fi
+exec "$@"
+"#,
+            )?;
+            let mut perms = std::fs::metadata(&fakeroot)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fakeroot, perms)?;
+        }
+
+        let mut env = crate::test_support::TestEnv::new();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        env.set_var(
+            "PATH",
+            format!("{}:{}", tmp_tools.path().display(), old_path),
+        );
+
+        let mut spec = mk_spec("custom-lib32", "1.0");
+        spec.build.flags.lib32_variant = true;
+
+        build(&spec, tmp_src.path(), tmp_dest.path(), None, true)?;
+
+        assert_eq!(
+            std::fs::read_to_string(tmp_dest.path().join("usr/lib32/libfoo.so.1"))?,
+            "lib32"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp_dest.path().join("usr/share/man/man1/foo.1"))?,
+            "manpage"
+        );
+        assert!(!tmp_dest.path().join("usr/lib").exists());
+
         Ok(())
     }
 }
