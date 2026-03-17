@@ -714,6 +714,13 @@ fn package_spec_from_archive_metadata(metadata: &toml::Value) -> package::Packag
             .map(String::from)
             .collect();
     }
+    if let Some(replaces) = metadata.get("replaces").and_then(|v| v.as_array()) {
+        spec.alternatives.replaces = replaces
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(String::from)
+            .collect();
+    }
 
     spec
 }
@@ -6510,6 +6517,104 @@ optional = []
         assert_eq!(
             fs::read_to_string(rootfs.path().join("etc/fstab.depotnew"))?,
             "package-fstab"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn binary_archive_install_honors_replaces_from_metadata() -> Result<()> {
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let pkg_dir = tempfile::tempdir().context("Failed to create temp package dir")?;
+        let archive_path = pkg_dir.path().join("vx-0.1.0-1-x86_64.depot.pkg.tar.zst");
+
+        let mut cfg = config::Config::for_rootfs(rootfs.path());
+        cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+        cfg.db_dir = rootfs.path().join("var/lib/depot");
+
+        let old_spec = package::PackageSpec {
+            package: package::PackageInfo {
+                name: "diffutils".into(),
+                real_name: None,
+                version: "3.12".into(),
+                revision: 1,
+                description: "diffutils".into(),
+                homepage: "https://example.test/diffutils".into(),
+                abi_breaking: false,
+                license: vec!["GPL-3.0-or-later".into()],
+            },
+            packages: Vec::new(),
+            alternatives: package::Alternatives::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: package::Build {
+                build_type: package::BuildType::Bin,
+                flags: package::BuildFlags::default(),
+            },
+            dependencies: package::Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+        let old_dest = rootfs.path().join("old-dest");
+        fs::create_dir_all(old_dest.join("usr/bin"))?;
+        fs::write(old_dest.join("usr/bin/diff"), "old-diff")?;
+        install_package_outputs_to_rootfs(&old_spec, &old_dest, rootfs.path(), &cfg)?;
+
+        let file = fs::File::create(&archive_path)
+            .with_context(|| format!("Failed to create {}", archive_path.display()))?;
+        let encoder =
+            zstd::stream::write::Encoder::new(file, 3).context("Failed to create zstd encoder")?;
+        let mut tar = tar::Builder::new(encoder);
+
+        let payload = b"vx-diff";
+        let mut payload_header = tar::Header::new_gnu();
+        payload_header.set_path("usr/bin/diff")?;
+        payload_header.set_size(payload.len() as u64);
+        payload_header.set_mode(0o755);
+        payload_header.set_cksum();
+        tar.append(&payload_header, &payload[..])?;
+
+        let metadata = br#"name = "vx"
+version = "0.1.0"
+revision = 1
+description = "vertex utils"
+homepage = "https://example.test/vx"
+license = "MIT"
+replaces = ["diffutils"]
+
+[dependencies]
+runtime = []
+optional = []
+"#;
+        let mut meta_header = tar::Header::new_gnu();
+        meta_header.set_path(".metadata.toml")?;
+        meta_header.set_size(metadata.len() as u64);
+        meta_header.set_mode(0o644);
+        meta_header.set_cksum();
+        tar.append(&meta_header, &metadata[..])?;
+
+        let encoder = tar.into_inner()?;
+        encoder.finish()?;
+
+        let (spec, staged) = load_package_archive_into_staging(&cfg, &archive_path)?;
+        assert_eq!(spec.alternatives.replaces, vec!["diffutils".to_string()]);
+
+        let installed =
+            install_package_outputs_to_rootfs(&spec, staged.path(), rootfs.path(), &cfg)?;
+
+        assert_eq!(installed.len(), 1);
+        assert!(installed[0].is_update);
+        assert_eq!(installed[0].package.name, "vx");
+        assert_eq!(
+            fs::read_to_string(rootfs.path().join("usr/bin/diff"))?,
+            "vx-diff"
+        );
+
+        let db_path = cfg.installed_db_path(rootfs.path());
+        assert_eq!(db::get_package_version(&db_path, "diffutils")?, None);
+        assert_eq!(
+            db::get_package_version(&db_path, "vx")?,
+            Some("0.1.0".into())
         );
         Ok(())
     }
