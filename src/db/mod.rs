@@ -877,6 +877,7 @@ mod tests {
                 provides: vec![format!("{}-virtual", name)],
                 conflicts: Vec::new(),
                 replaces: Vec::new(),
+                lib32: None,
             },
             manual_sources: Vec::new(),
             source: vec![Source {
@@ -979,8 +980,8 @@ mod tests {
 
         let ts = filetime::FileTime::from_unix_time(1_700_000_000, 0);
         filetime::set_file_mtime(&file, ts).unwrap();
-        filetime::set_file_mtime(&dest.join("usr"), ts).unwrap();
-        filetime::set_file_mtime(&dest.join("usr/bin"), ts).unwrap();
+        filetime::set_file_mtime(dest.join("usr"), ts).unwrap();
+        filetime::set_file_mtime(dest.join("usr/bin"), ts).unwrap();
         filetime::set_file_mtime(&dest, ts).unwrap();
 
         register_package(&db_path, &spec, &dest).unwrap();

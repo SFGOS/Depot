@@ -715,6 +715,7 @@ mod tests {
                     provides: vec!["libfoo".into()],
                     conflicts: Vec::new(),
                     replaces: Vec::new(),
+                    lib32: None,
                 },
             )]),
             package_dependencies: Default::default(),

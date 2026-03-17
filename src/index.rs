@@ -14,9 +14,11 @@ use walkdir::WalkDir;
 pub const SOURCE_REPO_INDEX_FILENAME: &str = "depot-index.tsv";
 const SOURCE_REPO_INDEX_HEADER_V1: &str = "depot-source-index-v1";
 const SOURCE_REPO_INDEX_HEADER_V2: &str = "depot-source-index-v2";
+const SOURCE_REPO_INDEX_HEADER_V3: &str = "depot-source-index-v3";
 const SOURCE_REPO_INDEX_KIND_PACKAGE: &str = "P";
 const SOURCE_REPO_INDEX_KIND_PROVIDES: &str = "V";
 const SOURCE_REPO_INDEX_KIND_CONFLICTS: &str = "C";
+const SOURCE_REPO_INDEX_KIND_REPLACES: &str = "X";
 const SOURCE_REPO_INDEX_KIND_DEP_BUILD: &str = "B";
 const SOURCE_REPO_INDEX_KIND_DEP_RUNTIME: &str = "R";
 const SOURCE_REPO_INDEX_KIND_DEP_TEST: &str = "T";
@@ -50,6 +52,8 @@ pub struct PackageIndex {
     by_name: HashMap<String, PathBuf>,
     /// Provided name -> spec paths (can be multiple)
     by_provides: HashMap<String, Vec<PathBuf>>,
+    /// Replaced package name -> replacement spec paths (can be multiple)
+    by_replaces: HashMap<String, Vec<PathBuf>>,
 }
 
 /// Source package search result from `PackageIndex`.
@@ -58,6 +62,7 @@ pub struct SourceSearchHit {
     pub name: String,
     pub path: PathBuf,
     pub provides: Vec<String>,
+    pub replaces: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +71,7 @@ struct IndexedSpecRows {
     rel: String,
     provides: Vec<String>,
     conflicts: Vec<String>,
+    replaces: Vec<String>,
     deps: Vec<(String, String)>,
 }
 
@@ -77,10 +83,11 @@ pub fn source_repo_index_path(repo_root: &Path) -> PathBuf {
 /// Create/update the source-repo package index at `repo_root`.
 ///
 /// The file format is line-based TSV with deterministic ordering:
-/// - Header: `depot-source-index-v2`
+/// - Header: `depot-source-index-v3`
 /// - Package name row: `P<TAB><name><TAB><relative-spec-path>`
 /// - Provides row: `V<TAB><feature><TAB><relative-spec-path>`
 /// - Conflicts row: `C<TAB><name><TAB><relative-spec-path>`
+/// - Replaces row: `X<TAB><name><TAB><relative-spec-path>`
 /// - Dependency rows:
 ///   - `B<TAB><dep><TAB><relative-spec-path>` for build dependencies
 ///   - `R<TAB><dep><TAB><relative-spec-path>` for runtime dependencies
@@ -140,6 +147,16 @@ pub fn create_source_repo_index(
             provides.insert(provide.clone());
         }
 
+        let mut replaces = BTreeSet::new();
+        for alternatives in spec.package_alternatives.values() {
+            for replacement in &alternatives.replaces {
+                replaces.insert(replacement.clone());
+            }
+        }
+        for replacement in &spec.alternatives.replaces {
+            replaces.insert(replacement.clone());
+        }
+
         let mut deps = BTreeSet::new();
         for dep in &spec.dependencies.build {
             deps.insert((SOURCE_REPO_INDEX_KIND_DEP_BUILD.to_string(), dep.clone()));
@@ -173,6 +190,7 @@ pub fn create_source_repo_index(
             rel,
             provides: provides.into_iter().collect(),
             conflicts: conflicts.into_iter().collect(),
+            replaces: replaces.into_iter().collect(),
             deps: deps.into_iter().collect(),
         });
     }
@@ -188,6 +206,13 @@ pub fn create_source_repo_index(
             rows.push((
                 SOURCE_REPO_INDEX_KIND_PROVIDES.to_string(),
                 provided.clone(),
+                spec_row.rel.clone(),
+            ));
+        }
+        for replacement in &spec_row.replaces {
+            rows.push((
+                SOURCE_REPO_INDEX_KIND_REPLACES.to_string(),
+                replacement.clone(),
                 spec_row.rel.clone(),
             ));
         }
@@ -209,7 +234,7 @@ pub fn create_source_repo_index(
     });
 
     let mut out = String::new();
-    out.push_str(SOURCE_REPO_INDEX_HEADER_V2);
+    out.push_str(SOURCE_REPO_INDEX_HEADER_V3);
     out.push('\n');
     for (kind, name, rel) in &rows {
         if name.contains('\n') || name.contains('\r') || name.contains('\t') {
@@ -359,7 +384,10 @@ impl PackageIndex {
             .next()
             .ok_or_else(|| anyhow::anyhow!("Missing source index header"))?;
         let header = header.trim();
-        if header != SOURCE_REPO_INDEX_HEADER_V1 && header != SOURCE_REPO_INDEX_HEADER_V2 {
+        if header != SOURCE_REPO_INDEX_HEADER_V1
+            && header != SOURCE_REPO_INDEX_HEADER_V2
+            && header != SOURCE_REPO_INDEX_HEADER_V3
+        {
             anyhow::bail!(
                 "Unsupported source index header '{}' in {}",
                 header,
@@ -392,6 +420,12 @@ impl PackageIndex {
                 }
                 SOURCE_REPO_INDEX_KIND_PROVIDES => {
                     self.by_provides
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(path);
+                }
+                SOURCE_REPO_INDEX_KIND_REPLACES => {
+                    self.by_replaces
                         .entry(name.to_string())
                         .or_default()
                         .push(path);
@@ -452,10 +486,30 @@ impl PackageIndex {
                 .or_default()
                 .push(path.clone());
         }
+        for replacement in &spec.alternatives.replaces {
+            self.by_replaces
+                .entry(replacement.clone())
+                .or_default()
+                .push(path.clone());
+        }
     }
 
     /// Find a spec by package name or provides
     pub fn find(&self, name: &str) -> Option<PathBuf> {
+        if let Some(paths) = self.by_replaces.get(name) {
+            if paths.len() > 1 {
+                crate::log_warn!(
+                    "Multiple packages replace '{}': {:?}",
+                    name,
+                    paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                );
+            }
+            return paths.first().cloned();
+        }
+
         // First try by name
         if let Some(path) = self.by_name.get(name) {
             return Some(path.clone());
@@ -479,6 +533,11 @@ impl PackageIndex {
         None
     }
 
+    /// Return all source specs that replace the requested package name.
+    pub fn find_replacements(&self, name: &str) -> Vec<PathBuf> {
+        self.by_replaces.get(name).cloned().unwrap_or_default()
+    }
+
     /// Return all source specs that provide the requested feature/package name.
     pub fn find_providers(&self, name: &str) -> Vec<PathBuf> {
         self.by_provides.get(name).cloned().unwrap_or_default()
@@ -496,17 +555,29 @@ impl PackageIndex {
                     .push(provided.clone());
             }
         }
+        let mut replaces_by_path: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        for (replacement, paths) in &self.by_replaces {
+            for path in paths {
+                replaces_by_path
+                    .entry(path.clone())
+                    .or_default()
+                    .push(replacement.clone());
+            }
+        }
 
         let mut hits = Vec::new();
         for (name, path) in &self.by_name {
             let provides = provides_by_path.remove(path).unwrap_or_default();
+            let replaces = replaces_by_path.remove(path).unwrap_or_default();
             let name_match = name.to_ascii_lowercase().contains(&q);
             let provides_match = provides.iter().any(|p| p.to_ascii_lowercase().contains(&q));
-            if name_match || provides_match {
+            let replaces_match = replaces.iter().any(|r| r.to_ascii_lowercase().contains(&q));
+            if name_match || provides_match || replaces_match {
                 hits.push(SourceSearchHit {
                     name: name.clone(),
                     path: path.clone(),
                     provides,
+                    replaces,
                 });
             }
         }
@@ -639,7 +710,7 @@ mod tests {
         assert!(stats.index_path.exists());
 
         let index_text = std::fs::read_to_string(stats.index_path).unwrap();
-        assert!(index_text.starts_with("depot-source-index-v2\n"));
+        assert!(index_text.starts_with("depot-source-index-v3\n"));
         assert!(index_text.contains("C\tbusybox\tcore/hello/hello.toml\n"));
         assert!(index_text.contains("R\tglibc\tcore/hello/hello.toml\n"));
 
@@ -711,5 +782,43 @@ mod tests {
         let providers = index.find_providers("sh");
         assert_eq!(providers.len(), 1);
         assert!(providers[0].ends_with(Path::new("core/base/base.toml")));
+    }
+
+    #[test]
+    fn replacement_index_entries_take_precedence_over_exact_package_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("depot");
+        write_meta_spec(
+            &repo_root.join("core/busybox/busybox.toml"),
+            "busybox",
+            &[],
+            &[],
+            &[],
+        );
+        write_meta_spec(
+            &repo_root.join("core/findutils/findutils.toml"),
+            "findutils",
+            &[],
+            &[],
+            &[],
+        );
+
+        let busybox_spec = repo_root.join("core/busybox/busybox.toml");
+        let text = std::fs::read_to_string(&busybox_spec).unwrap();
+        std::fs::write(
+            &busybox_spec,
+            format!(
+                "{}\n[alternatives]\nreplaces = [\"findutils\"]\n",
+                text.trim_end()
+            ),
+        )
+        .unwrap();
+
+        let index = PackageIndex::build_with_repo_dir(Some(repo_root));
+        let resolved = index.find("findutils").expect("replacement should resolve");
+        assert!(resolved.ends_with(Path::new("core/busybox/busybox.toml")));
+        let replacements = index.find_replacements("findutils");
+        assert_eq!(replacements.len(), 1);
+        assert!(replacements[0].ends_with(Path::new("core/busybox/busybox.toml")));
     }
 }

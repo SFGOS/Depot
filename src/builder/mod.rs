@@ -890,19 +890,23 @@ mod tests {
 
     #[test]
     fn test_effective_rustflags_applies_replace_rules() {
-        let mut flags = BuildFlags::default();
-        flags.rustflags = vec!["-C".into(), "debuginfo=2".into()];
-        flags.replace_rustflags = vec!["debuginfo=2=>opt-level=2".into()];
+        let flags = BuildFlags {
+            rustflags: vec!["-C".into(), "debuginfo=2".into()],
+            replace_rustflags: vec!["debuginfo=2=>opt-level=2".into()],
+            ..BuildFlags::default()
+        };
 
         assert_eq!(effective_rustflags(&flags), vec!["-C", "opt-level=2"]);
     }
 
     #[test]
     fn test_effective_rustflags_appends_rustltoflags_when_enabled() {
-        let mut flags = BuildFlags::default();
-        flags.rustflags = vec!["-C".into(), "opt-level=3".into()];
-        flags.rustltoflags = vec!["-Clinker-plugin-lto".into(), "-Cembed-bitcode=yes".into()];
-        flags.use_lto = true;
+        let flags = BuildFlags {
+            rustflags: vec!["-C".into(), "opt-level=3".into()],
+            rustltoflags: vec!["-Clinker-plugin-lto".into(), "-Cembed-bitcode=yes".into()],
+            use_lto: true,
+            ..BuildFlags::default()
+        };
 
         assert_eq!(
             effective_rustflags(&flags),

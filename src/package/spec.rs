@@ -318,6 +318,18 @@ impl PackageSpec {
     ///
     /// If no per-output override exists, returns the top-level alternatives.
     pub fn alternatives_for_output(&self, pkg_name: &str) -> Alternatives {
+        if pkg_name == self.lib32_package_name() {
+            return self
+                .package_alternatives
+                .get(pkg_name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    self.alternatives
+                        .lib32_alternatives()
+                        .unwrap_or_else(|| self.alternatives.primary_alternatives())
+                });
+        }
+
         if self.docs_parent_output_name(pkg_name).is_some() {
             return self
                 .package_alternatives
@@ -2002,6 +2014,60 @@ provides = ["binutils"]
     }
 
     #[test]
+    fn parse_lib32_alternatives_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "llvm"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/llvm.tar.gz"
+sha256 = "skip"
+extract_dir = "llvm"
+
+[build]
+type = "custom"
+
+[alternatives]
+provides = ["toolchain"]
+replaces = ["clang"]
+
+[alternatives.lib32]
+provides = ["lib32-toolchain"]
+conflicts = ["lib32-gcc"]
+replaces = ["lib32-clang"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.alternatives_for_output("llvm").replaces,
+            vec!["clang".to_string()]
+        );
+        assert_eq!(
+            spec.alternatives_for_output("lib32-llvm").provides,
+            vec!["lib32-toolchain".to_string()]
+        );
+        assert_eq!(
+            spec.alternatives_for_output("lib32-llvm").conflicts,
+            vec!["lib32-gcc".to_string()]
+        );
+        assert_eq!(
+            spec.alternatives_for_output("lib32-llvm").replaces,
+            vec!["lib32-clang".to_string()]
+        );
+    }
+
+    #[test]
     fn parse_python_build_type() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -3648,6 +3714,9 @@ impl fmt::Display for PackageSpec {
         if !self.alternatives.conflicts.is_empty() {
             writeln!(f, "Conflicts: {}", self.alternatives.conflicts.join(", "))?;
         }
+        if !self.alternatives.replaces.is_empty() {
+            writeln!(f, "Replaces: {}", self.alternatives.replaces.join(", "))?;
+        }
         Ok(())
     }
 }
@@ -3724,17 +3793,51 @@ impl PackageSpec {
     }
 }
 
-/// Package alternatives such as virtual provides and install conflicts.
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+/// Nested alternatives override group used for output-specific variants such as `lib32-*`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct AlternativeGroup {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provides: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replaces: Vec<String>,
+}
+
+/// Package alternatives such as virtual provides, install conflicts, and replacements.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Alternatives {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provides: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<String>,
-    /// Reserved for future package replacement feature
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[allow(dead_code)]
     pub replaces: Vec<String>,
+    /// Optional alternatives override used only for the generated `lib32-*` companion package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lib32: Option<AlternativeGroup>,
+}
+
+impl Alternatives {
+    /// Return the top-level alternatives set without any nested output-specific overrides.
+    pub fn primary_alternatives(&self) -> Alternatives {
+        Alternatives {
+            provides: self.provides.clone(),
+            conflicts: self.conflicts.clone(),
+            replaces: self.replaces.clone(),
+            lib32: None,
+        }
+    }
+
+    /// Return the optional lib32-specific alternatives override set.
+    pub fn lib32_alternatives(&self) -> Option<Alternatives> {
+        self.lib32.as_ref().map(|group| Alternatives {
+            provides: group.provides.clone(),
+            conflicts: group.conflicts.clone(),
+            replaces: group.replaces.clone(),
+            lib32: None,
+        })
+    }
 }
 
 /// Source tarball information

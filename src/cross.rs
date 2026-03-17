@@ -220,27 +220,6 @@ pub fn lib32_target_triple(host: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::lib32_target_triple;
-
-    #[test]
-    fn lib32_target_triple_preserves_explicit_x86_variant() {
-        assert_eq!(
-            lib32_target_triple("x86_64-sfg-linux-gnu"),
-            "i686-sfg-linux-gnu"
-        );
-        assert_eq!(
-            lib32_target_triple("i686-sfg-linux-gnu"),
-            "i686-sfg-linux-gnu"
-        );
-        assert_eq!(
-            lib32_target_triple("i586-sfg-linux-gnu"),
-            "i586-sfg-linux-gnu"
-        );
-    }
-}
-
 /// Find a cross-compilation tool in PATH and return its absolute path
 fn find_tool(prefix: &str, suffixes: &[&str], required: bool) -> Result<String> {
     for suffix in suffixes {
@@ -263,4 +242,25 @@ fn find_tool(prefix: &str, suffixes: &[&str], required: bool) -> Result<String> 
     }
 
     Err(anyhow::anyhow!("Tool not found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lib32_target_triple;
+
+    #[test]
+    fn lib32_target_triple_preserves_explicit_x86_variant() {
+        assert_eq!(
+            lib32_target_triple("x86_64-sfg-linux-gnu"),
+            "i686-sfg-linux-gnu"
+        );
+        assert_eq!(
+            lib32_target_triple("i686-sfg-linux-gnu"),
+            "i686-sfg-linux-gnu"
+        );
+        assert_eq!(
+            lib32_target_triple("i586-sfg-linux-gnu"),
+            "i586-sfg-linux-gnu"
+        );
+    }
 }

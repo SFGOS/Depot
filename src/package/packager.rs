@@ -192,6 +192,17 @@ impl Packager {
                     .collect(),
             ),
         );
+        map.insert(
+            "replaces".to_string(),
+            toml::Value::Array(
+                self.spec
+                    .alternatives
+                    .replaces
+                    .iter()
+                    .map(|s| toml::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
 
         // Add install-relevant dependency kinds for repo/runtime consumers.
         let mut deps = toml::map::Map::new();
@@ -435,6 +446,12 @@ mod tests {
         assert_eq!(val.get("revision").and_then(|v| v.as_integer()), Some(1));
         assert_eq!(val.get("license").and_then(|v| v.as_str()), Some("MIT"));
         assert!(
+            val.get("replaces")
+                .and_then(|v| v.as_array())
+                .expect("replaces should be an array")
+                .is_empty()
+        );
+        assert!(
             crate::metadata_time::parse_completed_at_value(&val).is_some(),
             "expected RFC3339 UTC completed_at"
         );
@@ -506,6 +523,27 @@ mod tests {
         assert_eq!(keep.len(), 2);
         assert_eq!(keep[0].as_str(), Some("etc/fstab"));
         assert_eq!(keep[1].as_str(), Some("etc/passwd"));
+    }
+
+    #[test]
+    fn test_generate_metadata_toml_includes_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+
+        let mut packager = mk_packager(dest.to_path_buf());
+        packager.spec.alternatives.replaces = vec!["findutils".into(), "diffutils".into()];
+        packager.generate_metadata_toml().unwrap();
+
+        let meta_path = dest.join(".metadata.toml");
+        let content = fs::read_to_string(meta_path).unwrap();
+        let val: toml::Value = toml::from_str(&content).unwrap();
+        let replaces = val
+            .get("replaces")
+            .and_then(|v| v.as_array())
+            .expect("replaces should be an array");
+        assert_eq!(replaces.len(), 2);
+        assert_eq!(replaces[0].as_str(), Some("findutils"));
+        assert_eq!(replaces[1].as_str(), Some("diffutils"));
     }
 
     #[test]

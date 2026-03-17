@@ -122,6 +122,7 @@ enum CandidateKind {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MatchKind {
+    Replaces,
     Exact,
     Provides,
 }
@@ -145,6 +146,7 @@ struct LocalSpecHit {
     spec_name: String,
     path: PathBuf,
     provides: Vec<String>,
+    replaces: Vec<String>,
 }
 
 struct Resolver<'a> {
@@ -419,6 +421,55 @@ impl<'a> Resolver<'a> {
         let mut out = Vec::new();
         let mut seen = HashSet::<String>::new();
 
+        // Local sibling fallback (e.g. ../foo/*.toml when building from a local tree).
+        // Prefer these candidates before probing configured repos so local development
+        // remains deterministic and does not block on external repository I/O.
+        let local_sibling_root = requester_spec_path
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+            .or_else(|| self.opts.local_sibling_root.clone());
+        if let Some(root) = local_sibling_root {
+            for hit in self.local_sibling_hits(&root)? {
+                let exact = hit.spec_name.eq_ignore_ascii_case(dep_name);
+                let replaces = hit
+                    .replaces
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(dep_name));
+                let provides = hit
+                    .provides
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(dep_name));
+                if !(exact || provides || replaces) {
+                    continue;
+                }
+                let key = format!("src:{}", hit.path.display());
+                if !seen.insert(key) {
+                    continue;
+                }
+                out.push(Candidate {
+                    package: hit.spec_name.clone(),
+                    kind: CandidateKind::Source {
+                        path: hit.path.clone(),
+                        local_sibling: true,
+                    },
+                    match_kind: if replaces {
+                        MatchKind::Replaces
+                    } else if exact {
+                        MatchKind::Exact
+                    } else {
+                        MatchKind::Provides
+                    },
+                    sort_repo_priority: -10,
+                    sort_label: "source:local-sibling".to_string(),
+                });
+            }
+
+            if !out.is_empty() {
+                return Ok(out);
+            }
+        }
+
         // Binary repos
         let host_arch = std::env::consts::ARCH;
         let mut binary_repos: Vec<_> = self
@@ -441,6 +492,12 @@ impl<'a> Resolver<'a> {
                     for rec in records {
                         let match_kind = if rec.name.eq_ignore_ascii_case(dep_name) {
                             MatchKind::Exact
+                        } else if rec
+                            .replaces
+                            .iter()
+                            .any(|replacement| replacement.eq_ignore_ascii_case(dep_name))
+                        {
+                            MatchKind::Replaces
                         } else {
                             MatchKind::Provides
                         };
@@ -467,7 +524,14 @@ impl<'a> Resolver<'a> {
         // Global source index
         if let Some(path) = self.pkg_index.find(dep_name) {
             let spec = self.load_spec(&path)?;
-            let match_kind = if spec.package.name.eq_ignore_ascii_case(dep_name) {
+            let match_kind = if spec
+                .alternatives
+                .replaces
+                .iter()
+                .any(|replacement| replacement.eq_ignore_ascii_case(dep_name))
+            {
+                MatchKind::Replaces
+            } else if spec.package.name.eq_ignore_ascii_case(dep_name) {
                 MatchKind::Exact
             } else {
                 MatchKind::Provides
@@ -486,6 +550,25 @@ impl<'a> Resolver<'a> {
                     sort_label: format!("source:{}", source_label_for_path(self.config, &path)),
                 });
             }
+        }
+
+        // Additional source providers from index (for provider prompt)
+        for path in self.pkg_index.find_replacements(dep_name) {
+            let spec = self.load_spec(&path)?;
+            let key = format!("src:{}", path.display());
+            if !seen.insert(key) {
+                continue;
+            }
+            out.push(Candidate {
+                package: spec.package.name.clone(),
+                kind: CandidateKind::Source {
+                    path: path.clone(),
+                    local_sibling: false,
+                },
+                match_kind: MatchKind::Replaces,
+                sort_repo_priority: 0,
+                sort_label: format!("source:{}", source_label_for_path(self.config, &path)),
+            });
         }
 
         // Additional source providers from index (for provider prompt)
@@ -509,43 +592,6 @@ impl<'a> Resolver<'a> {
                 sort_repo_priority: 0,
                 sort_label: format!("source:{}", source_label_for_path(self.config, &path)),
             });
-        }
-
-        // Local sibling fallback (e.g. ../foo/*.toml when building from a local tree)
-        let local_sibling_root = requester_spec_path
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(Path::to_path_buf)
-            .or_else(|| self.opts.local_sibling_root.clone());
-        if let Some(root) = local_sibling_root {
-            for hit in self.local_sibling_hits(&root)? {
-                let exact = hit.spec_name.eq_ignore_ascii_case(dep_name);
-                let provides = hit
-                    .provides
-                    .iter()
-                    .any(|p| p.eq_ignore_ascii_case(dep_name));
-                if !(exact || provides) {
-                    continue;
-                }
-                let key = format!("src:{}", hit.path.display());
-                if !seen.insert(key) {
-                    continue;
-                }
-                out.push(Candidate {
-                    package: hit.spec_name.clone(),
-                    kind: CandidateKind::Source {
-                        path: hit.path.clone(),
-                        local_sibling: true,
-                    },
-                    match_kind: if exact {
-                        MatchKind::Exact
-                    } else {
-                        MatchKind::Provides
-                    },
-                    sort_repo_priority: -10,
-                    sort_label: "source:local-sibling".to_string(),
-                });
-            }
         }
 
         Ok(out)
@@ -584,6 +630,7 @@ impl<'a> Resolver<'a> {
                         spec_name: spec.package.name.clone(),
                         path: path.to_path_buf(),
                         provides: spec.alternatives.provides.clone(),
+                        replaces: spec.alternatives.replaces.clone(),
                     });
                 }
             }
@@ -691,6 +738,7 @@ fn source_label_for_path(config: &Config, path: &Path) -> String {
 
 fn format_candidate_label(c: &Candidate) -> String {
     let match_label = match c.match_kind {
+        MatchKind::Replaces => "replaces",
         MatchKind::Exact => "exact",
         MatchKind::Provides => "provides",
     };
@@ -750,8 +798,9 @@ fn candidate_sort_key(c: &Candidate, prefer_binary: bool) -> (i32, i32, i32, Str
         (false, true) => 1,
     };
     let match_rank = match c.match_kind {
-        MatchKind::Exact => 0,
-        MatchKind::Provides => 1,
+        MatchKind::Replaces => 0,
+        MatchKind::Exact => 1,
+        MatchKind::Provides => 2,
     };
     (
         kind_rank,
@@ -852,6 +901,7 @@ mod tests {
                     provides: vec!["libfoo".into()],
                     conflicts: Vec::new(),
                     replaces: Vec::new(),
+                    lib32: None,
                 },
             )]),
             package_dependencies: BTreeMap::from([(
@@ -897,6 +947,7 @@ mod tests {
                     license: None,
                     provides: Vec::new(),
                     conflicts: Vec::new(),
+                    replaces: Vec::new(),
                     runtime_dependencies: Vec::new(),
                     optional_dependencies: Vec::new(),
                 }),

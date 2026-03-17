@@ -665,7 +665,11 @@ pub fn create_interactive() -> Result<PackageSpec> {
                 "Conflicting package/provide",
                 "Installed package or provided name that must be removed before install",
             )?,
-            replaces: Vec::new(),
+            replaces: prompt_repeating_list(
+                "Replaced package",
+                "Package name that should resolve to this package and be replaced during install/update",
+            )?,
+            lib32: None,
         }
     } else {
         Alternatives::default()
@@ -848,7 +852,11 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
         root.insert("source".into(), Value::Array(arr));
     }
 
-    if !spec.alternatives.provides.is_empty() || !spec.alternatives.conflicts.is_empty() {
+    if !spec.alternatives.provides.is_empty()
+        || !spec.alternatives.conflicts.is_empty()
+        || !spec.alternatives.replaces.is_empty()
+        || spec.alternatives.lib32.is_some()
+    {
         let mut alternatives_tbl = Table::new();
         if !spec.alternatives.provides.is_empty() {
             alternatives_tbl.insert(
@@ -873,6 +881,60 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
                         .collect(),
                 ),
             );
+        }
+        if !spec.alternatives.replaces.is_empty() {
+            alternatives_tbl.insert(
+                "replaces".into(),
+                Value::Array(
+                    spec.alternatives
+                        .replaces
+                        .iter()
+                        .map(|s| Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(lib32) = &spec.alternatives.lib32 {
+            let mut lib32_tbl = Table::new();
+            if !lib32.provides.is_empty() {
+                lib32_tbl.insert(
+                    "provides".into(),
+                    Value::Array(
+                        lib32
+                            .provides
+                            .iter()
+                            .map(|s| Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !lib32.conflicts.is_empty() {
+                lib32_tbl.insert(
+                    "conflicts".into(),
+                    Value::Array(
+                        lib32
+                            .conflicts
+                            .iter()
+                            .map(|s| Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !lib32.replaces.is_empty() {
+                lib32_tbl.insert(
+                    "replaces".into(),
+                    Value::Array(
+                        lib32
+                            .replaces
+                            .iter()
+                            .map(|s| Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !lib32_tbl.is_empty() {
+                alternatives_tbl.insert("lib32".into(), Value::Table(lib32_tbl));
+            }
         }
         root.insert("alternatives".into(), Value::Table(alternatives_tbl));
     }
@@ -1861,7 +1923,12 @@ mod tests {
             alternatives: Alternatives {
                 provides: vec!["editor".into(), "sh".into()],
                 conflicts: vec!["nano".into(), "busybox-sh".into()],
-                replaces: Vec::new(),
+                replaces: vec!["vi".into()],
+                lib32: Some(crate::package::AlternativeGroup {
+                    provides: Vec::new(),
+                    conflicts: Vec::new(),
+                    replaces: vec!["lib32-vi".into()],
+                }),
             },
             manual_sources: Vec::new(),
             source: vec![Source {
@@ -1896,6 +1963,18 @@ mod tests {
             .get("conflicts")
             .and_then(|v| v.as_array())
             .expect("expected alternatives.conflicts array");
+        let replaces = alternatives
+            .get("replaces")
+            .and_then(|v| v.as_array())
+            .expect("expected alternatives.replaces array");
+        let lib32 = alternatives
+            .get("lib32")
+            .and_then(|v| v.as_table())
+            .expect("expected alternatives.lib32 table");
+        let lib32_replaces = lib32
+            .get("replaces")
+            .and_then(|v| v.as_array())
+            .expect("expected alternatives.lib32.replaces array");
 
         assert_eq!(provides.len(), 2);
         assert_eq!(provides[0].as_str(), Some("editor"));
@@ -1903,6 +1982,10 @@ mod tests {
         assert_eq!(conflicts.len(), 2);
         assert_eq!(conflicts[0].as_str(), Some("nano"));
         assert_eq!(conflicts[1].as_str(), Some("busybox-sh"));
+        assert_eq!(replaces.len(), 1);
+        assert_eq!(replaces[0].as_str(), Some("vi"));
+        assert_eq!(lib32_replaces.len(), 1);
+        assert_eq!(lib32_replaces[0].as_str(), Some("lib32-vi"));
     }
 
     #[test]
