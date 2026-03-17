@@ -464,10 +464,6 @@ impl<'a> Resolver<'a> {
                     sort_label: "source:local-sibling".to_string(),
                 });
             }
-
-            if !out.is_empty() {
-                return Ok(out);
-            }
         }
 
         // Binary repos
