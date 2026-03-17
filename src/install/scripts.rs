@@ -270,7 +270,6 @@ pub fn run_hook_if_present(
                 );
             }
         }
-        HookRunOutcome::Deferred => {}
     }
 
     Ok(true)
@@ -278,7 +277,6 @@ pub fn run_hook_if_present(
 
 enum HookRunOutcome {
     Ran(std::process::ExitStatus),
-    Deferred,
 }
 
 #[derive(Default)]
@@ -432,21 +430,12 @@ fn run_script_with_rootfs_context(
             return Ok(HookRunOutcome::Ran(status));
         }
 
-        // Post hooks can be deferred until the target shell exists and chroot
-        // execution is available.
-        if matches!(
-            hook,
-            Hook::PostInstall | Hook::PostUpdate | Hook::PostRemove
-        ) {
-            enqueue_deferred_hook(rootfs, pkg_name, hook, rel)?;
-            crate::log_warn!(
-                "Deferred lifecycle hook {} for {} until {} has /bin/sh",
-                hook.canonical_name(),
-                pkg_name,
-                rootfs.display()
-            );
-            return Ok(HookRunOutcome::Deferred);
-        }
+        crate::log_warn!(
+            "Running lifecycle hook {} for {} without chroot because {} has no /bin/sh",
+            hook.canonical_name(),
+            pkg_name,
+            rootfs.display()
+        );
     }
 
     // Fallback (non-root / no rootfs shell / script outside rootfs):
@@ -593,28 +582,6 @@ fn write_deferred_hooks(path: &Path, hooks: &[DeferredHook]) -> Result<()> {
     f.flush()
         .with_context(|| format!("Failed to flush {}", path.display()))?;
     Ok(())
-}
-
-fn enqueue_deferred_hook(
-    rootfs: &Path,
-    pkg_name: &str,
-    hook: Hook,
-    script_rel: &Path,
-) -> Result<()> {
-    let path = deferred_hooks_file(rootfs);
-    let mut hooks = read_deferred_hooks(&path)?;
-    if hooks
-        .iter()
-        .any(|h| h.pkg_name == pkg_name && h.hook == hook && h.script_rel == script_rel)
-    {
-        return Ok(());
-    }
-    hooks.push(DeferredHook {
-        pkg_name: pkg_name.to_string(),
-        hook,
-        script_rel: script_rel.to_path_buf(),
-    });
-    write_deferred_hooks(&path, &hooks)
 }
 
 /// Attempt to run deferred lifecycle hooks for this rootfs once.
