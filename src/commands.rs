@@ -1876,6 +1876,7 @@ fn install_planned_packages_to_rootfs(
             is_update: plan.staged.is_update,
         });
     }
+    install::scripts::run_deferred_hooks_if_possible(rootfs)?;
     Ok(installed)
 }
 
@@ -4885,6 +4886,19 @@ pub fn run(cli: Cli) -> Result<()> {
                             "Missing dependencies: {}",
                             missing_required.join(", ")
                         ));
+                        if !install_deps {
+                            if dry_run {
+                                ui::info(
+                                    "Dry run enabled, stopping before dependency installation/build.",
+                                );
+                                return Ok(());
+                            }
+                            anyhow::bail!(
+                                "Missing dependencies: {}. Re-run with --install-deps to install them automatically, or install them manually.",
+                                missing_required.join(", ")
+                            );
+                        }
+
                         let local_sibling_root = spec_path
                             .parent()
                             .and_then(|p| p.parent())
@@ -4914,18 +4928,6 @@ pub fn run(cli: Cli) -> Result<()> {
                             );
                         }
                         print_plan_summary(&dep_plan);
-                        if !install_deps {
-                            if dry_run {
-                                ui::info(
-                                    "Dry run enabled, stopping before dependency installation/build.",
-                                );
-                                return Ok(());
-                            }
-                            anyhow::bail!(
-                                "Missing dependencies: {}. Re-run with --install-deps to install them automatically, or install them manually.",
-                                missing_required.join(", ")
-                            );
-                        }
                         if dry_run {
                             ui::info(
                                 "Dry run enabled, stopping before dependency installation/build.",

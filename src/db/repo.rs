@@ -1061,7 +1061,7 @@ fn try_trust_repo_public_key_for_repo_db(
             repo_name,
             trusted_dir.display()
         );
-        if !crate::ui::prompt_yes_no(&prompt, false)? {
+        if !crate::ui::prompt_yes_no(&prompt, true)? {
             crate::log_warn!(
                 "Skipped trusting repo key '{}' for binary repo '{}'",
                 key_name,
