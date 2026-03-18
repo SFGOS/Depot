@@ -1,5 +1,6 @@
 //! GNU Autotools build system (configure && make && make install)
 
+use crate::builder::state::{BuildStep, StateTracker};
 use crate::cross::CrossConfig;
 use crate::fakeroot;
 use crate::package::PackageSpec;
@@ -15,6 +16,7 @@ pub fn build(
     destdir: &Path,
     cross: Option<&CrossConfig>,
     export_compiler_flags: bool,
+    host_build_dir: Option<&Path>,
 ) -> Result<()> {
     let flags = &spec.build.flags;
     let make_exec = resolve_make_exec(&flags.make_exec);
@@ -26,6 +28,13 @@ pub fn build(
 
     // Build environment variables
     let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
+    if let Some(host_dir) = host_build_dir {
+        crate::builder::set_env_var(
+            &mut env_vars,
+            crate::builder::DEPOT_BUILD_HOST_DIR_ENV,
+            host_dir.to_string_lossy().into_owned(),
+        );
+    }
     let cc = if let Some(cc_cfg) = cross {
         cc_cfg.cc.clone()
     } else {
@@ -44,7 +53,6 @@ pub fn build(
         crate::builder::set_env_var(&mut env_vars, "CFLAGS", expanded);
     }
 
-    use crate::builder::state::{BuildStep, StateTracker};
     let mut state = StateTracker::new_with_namespace(
         &actual_src,
         spec.build.flags.lib32_variant.then_some("lib32"),
@@ -383,6 +391,104 @@ pub fn build(
     }
 
     Ok(())
+}
+
+pub(crate) fn ensure_host_build(
+    spec: &PackageSpec,
+    src_dir: &Path,
+    export_compiler_flags: bool,
+) -> Result<PathBuf> {
+    let host_spec = crate::builder::host_build_spec(spec);
+    let flags = &host_spec.build.flags;
+    let make_exec = resolve_make_exec(&flags.make_exec);
+    let export_compiler_flags = export_compiler_flags && !flags.no_flags;
+    let actual_src = resolve_actual_src(&host_spec, src_dir)?;
+    let build_dir = crate::builder::host_build_dir_for_source(&actual_src, flags);
+    fs::create_dir_all(&build_dir)?;
+
+    let mut env_vars =
+        crate::builder::standard_build_env(&host_spec, None, true, export_compiler_flags);
+    if export_compiler_flags
+        && let Some(cflags_str) = env_vars
+            .iter()
+            .find(|(key, _)| key == "CFLAGS")
+            .map(|(_, value)| value.clone())
+        && !cflags_str.trim().is_empty()
+    {
+        let expanded = expand_shell_commands(&cflags_str, &flags.cc)?;
+        crate::builder::set_env_var(&mut env_vars, "CFLAGS", expanded);
+    }
+
+    let mut state = StateTracker::new_with_namespace(&actual_src, Some("host"))?;
+
+    if !state.is_done(BuildStep::Configured) {
+        crate::log_info!(
+            "Running host-side configure build in {}...",
+            build_dir.display()
+        );
+        let configure_path = resolve_configure_path(&host_spec, &actual_src);
+        let mut configure_cmd = Command::new(&configure_path);
+        configure_cmd.current_dir(&build_dir);
+
+        crate::builder::prepare_tool_command(&mut configure_cmd, &env_vars);
+
+        let help_text = configure_help_text(&configure_path, &build_dir, &env_vars);
+        configure_cmd.arg(format!("--prefix={}", flags.prefix));
+        for default_dir_arg in default_configure_install_dirs(flags, help_text.as_deref()) {
+            configure_cmd.arg(default_dir_arg);
+        }
+        for arg in &flags.configure {
+            let expanded = expand_configure_arg(&host_spec, arg, &env_vars);
+            configure_cmd.arg(expanded);
+        }
+
+        let status = crate::interrupts::command_status(&mut configure_cmd)
+            .with_context(|| format!("Failed to run host configure in {}", build_dir.display()))?;
+
+        if !status.success() {
+            anyhow::bail!("host configure failed with status: {}", status);
+        }
+        state.mark_done(BuildStep::Configured)?;
+    }
+
+    if !state.is_done(BuildStep::PostCompileDone) {
+        let build_targets = phase_targets(&flags.make_target, &flags.make_targets, None);
+        let make_dirs = resolve_make_dirs(&build_dir, &flags.make_dirs, "build.flags.make_dirs")?;
+        for make_dir in make_dirs {
+            let mut make_cmd = Command::new(make_exec);
+            make_cmd.current_dir(&make_dir);
+            make_cmd.arg("-j").arg(num_cpus().to_string());
+            add_make_variable_overrides_if_supported(
+                &mut make_cmd,
+                make_exec,
+                &flags.make_vars,
+                "build",
+            )?;
+            for target in &build_targets {
+                make_cmd.arg(target);
+            }
+
+            crate::builder::prepare_tool_command(&mut make_cmd, &env_vars);
+
+            let status = crate::interrupts::command_status(&mut make_cmd).with_context(|| {
+                format!("Failed to run host {} in {}", make_exec, make_dir.display())
+            })?;
+
+            if !status.success() {
+                anyhow::bail!(
+                    "host {} failed with status: {} (dir: {})",
+                    make_exec,
+                    status,
+                    make_dir.display()
+                );
+            }
+        }
+
+        state.mark_done(BuildStep::PostCompileDone)?;
+    }
+
+    fs::canonicalize(&build_dir)
+        .with_context(|| format!("Failed to resolve host build dir: {}", build_dir.display()))
 }
 
 fn num_cpus() -> usize {
@@ -849,6 +955,45 @@ mod tests {
         let expanded =
             expand_configure_arg(&spec, "--program-prefix=$name-$version-$CARCH-", &envs);
         assert_eq!(expanded, "--program-prefix=foo-1.2.3-aarch64-");
+    }
+
+    #[test]
+    fn test_expand_configure_arg_expands_host_build_dir_env() {
+        let spec = PackageSpec {
+            package: PackageInfo {
+                name: "foo".into(),
+                real_name: None,
+                version: "1.2.3".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "h".into(),
+                abi_breaking: false,
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Default::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: Build {
+                build_type: BuildType::Autotools,
+                flags: BuildFlags::default(),
+            },
+            dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        };
+
+        let envs = vec![(
+            crate::builder::DEPOT_BUILD_HOST_DIR_ENV.to_string(),
+            "/tmp/build-host".to_string(),
+        )];
+        let expanded = expand_configure_arg(
+            &spec,
+            "--with-build-tools=$DEPOT_BUILD_HOST_DIR/tools",
+            &envs,
+        );
+        assert_eq!(expanded, "--with-build-tools=/tmp/build-host/tools");
     }
 
     #[test]

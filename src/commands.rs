@@ -1182,9 +1182,19 @@ fn build_lib32_companion_package(
     }
 
     crate::log_info!("Running separate lib32 build pass...");
+    let host_build_dir = builder::ensure_host_build(
+        pkg_spec,
+        src_dir,
+        cross_config,
+        export_compiler_flags,
+        builder::TargetBuildKind::Lib32,
+    )?;
     let mut lib32_input = pkg_spec.clone();
     lib32_input.build.flags.build_32 = true;
-    let lib32_build_spec = make_lib32_build_spec(&lib32_input);
+    let mut lib32_build_spec = make_lib32_build_spec(&lib32_input);
+    if let Some(host_dir) = host_build_dir.as_ref() {
+        lib32_build_spec.build.flags.host_build_dir = Some(host_dir.to_string_lossy().into_owned());
+    }
     let lib32_pkg_spec = make_lib32_package_spec(pkg_spec);
     let lib32_destdir = config
         .build_dir
@@ -1208,6 +1218,7 @@ fn build_lib32_companion_package(
         &lib32_destdir,
         cross_config,
         export_compiler_flags,
+        host_build_dir.as_deref(),
     )?;
 
     let lib32_src = lib32_destdir.join("usr/lib32");
@@ -4545,6 +4556,16 @@ fn run_direct_install_request(
         // 1-2. Fetch + extract sources (supports archives and git URL#rev)
         let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
         built_src_dir = Some(src_dir.clone());
+        let host_build_dir = builder::ensure_host_build(
+            &pkg_spec,
+            &src_dir,
+            cross_config.as_ref(),
+            !options.no_flags,
+            builder::TargetBuildKind::Primary,
+        )?;
+        if let Some(host_dir) = host_build_dir.as_ref() {
+            pkg_spec.build.flags.host_build_dir = Some(host_dir.to_string_lossy().into_owned());
+        }
 
         // 3. Build
         let destdir = config
@@ -4559,6 +4580,7 @@ fn run_direct_install_request(
                 &destdir,
                 cross_config.as_ref(),
                 !options.no_flags,
+                host_build_dir.as_deref(),
             )?;
 
             // 3.1 Copy license files into staged tree
@@ -5108,6 +5130,17 @@ pub fn run(cli: Cli) -> Result<()> {
                     .as_ref()
                     .map(|p| cross::CrossConfig::from_prefix(p))
                     .transpose()?;
+                let host_build_dir = builder::ensure_host_build(
+                    &pkg_spec,
+                    &src_dir,
+                    cross_config.as_ref(),
+                    !no_flags,
+                    builder::TargetBuildKind::Primary,
+                )?;
+                if let Some(host_dir) = host_build_dir.as_ref() {
+                    pkg_spec.build.flags.host_build_dir =
+                        Some(host_dir.to_string_lossy().into_owned());
+                }
                 if !lib32_only {
                     builder::build(
                         &pkg_spec,
@@ -5115,6 +5148,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         &destdir,
                         cross_config.as_ref(),
                         !no_flags,
+                        host_build_dir.as_deref(),
                     )?;
                     if let Some(watcher) = interrupt_watcher.as_ref() {
                         watcher.check()?;

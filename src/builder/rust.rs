@@ -14,6 +14,7 @@ pub fn build(
     destdir: &Path,
     cross: Option<&CrossConfig>,
     export_compiler_flags: bool,
+    _host_build_dir: Option<&Path>,
 ) -> Result<()> {
     let flags = &spec.build.flags;
 

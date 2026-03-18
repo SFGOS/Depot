@@ -1,6 +1,6 @@
 project(
   'depot',
-  version: '0.26.1',
+  version: '0.27.0',
   meson_version: '>=0.60.0',
   default_options: ['buildtype=release'],
 )

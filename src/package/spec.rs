@@ -865,6 +865,11 @@ impl PackageSpec {
                         self.build.flags.lib32_only = b;
                     }
                 }
+                "host_build" | "host-build" => {
+                    if let Some(b) = toml_value_as_boolish(v) {
+                        self.build.flags.host_build = b;
+                    }
+                }
                 "configure_lib32" | "configure-lib32" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.configure_lib32 = arr
@@ -4126,6 +4131,14 @@ pub struct BuildFlags {
         deserialize_with = "deserialize_boolish"
     )]
     pub lib32_only: bool,
+    /// Perform an additional native host-side helper build when the active target arch differs.
+    #[serde(
+        default,
+        alias = "host-build",
+        alias = "host_build",
+        deserialize_with = "deserialize_boolish"
+    )]
+    pub host_build: bool,
     #[serde(default)]
     pub configure: Vec<String>,
     /// PEP 517 config settings for Python builds (each entry is `KEY=VALUE` or `KEY`).
@@ -4403,6 +4416,9 @@ pub struct BuildFlags {
     /// Internal runtime marker used to adjust builder behavior for the lib32 variant.
     #[serde(skip)]
     pub lib32_variant: bool,
+    /// Internal runtime marker containing the absolute path to the native host helper build dir.
+    #[serde(skip)]
+    pub host_build_dir: Option<String>,
 }
 
 impl Default for BuildFlags {
@@ -4432,6 +4448,7 @@ impl Default for BuildFlags {
             skip_tests: false,
             build_32: false,
             lib32_only: false,
+            host_build: false,
             configure: Vec::new(),
             config_settings: Vec::new(),
             configure_lib32: Vec::new(),
@@ -4491,6 +4508,7 @@ impl Default for BuildFlags {
             build_dir: None,
             binary_type: String::new(),
             lib32_variant: false,
+            host_build_dir: None,
         }
     }
 }

@@ -1,11 +1,12 @@
 //! CMake build system
 
+use crate::builder::state::{BuildStep, StateTracker};
 use crate::cross::CrossConfig;
 use crate::fakeroot;
 use crate::package::PackageSpec;
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn build(
@@ -14,6 +15,7 @@ pub fn build(
     destdir: &Path,
     cross: Option<&CrossConfig>,
     export_compiler_flags: bool,
+    host_build_dir: Option<&Path>,
 ) -> Result<()> {
     let flags = &spec.build.flags;
     let make_exec_override = flags.make_exec.trim();
@@ -32,7 +34,14 @@ pub fn build(
     fs::create_dir_all(destdir)?;
 
     // Environment variables
-    let env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
+    let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
+    if let Some(host_dir) = host_build_dir {
+        crate::builder::set_env_var(
+            &mut env_vars,
+            crate::builder::DEPOT_BUILD_HOST_DIR_ENV,
+            host_dir.to_string_lossy().into_owned(),
+        );
+    }
 
     // Extract prefix from configure flags (cmake-style -DCMAKE_INSTALL_PREFIX=)
     let prefix = cmake_cache_entry_value(&flags.configure, "CMAKE_INSTALL_PREFIX")
@@ -45,7 +54,6 @@ pub fn build(
         None
     };
 
-    use crate::builder::state::{BuildStep, StateTracker};
     let mut state = StateTracker::new_with_namespace(
         &actual_src,
         spec.build.flags.lib32_variant.then_some("lib32"),
@@ -255,6 +263,96 @@ pub fn build(
     }
 
     Ok(())
+}
+
+pub(crate) fn ensure_host_build(
+    spec: &PackageSpec,
+    src_dir: &Path,
+    export_compiler_flags: bool,
+) -> Result<PathBuf> {
+    let host_spec = crate::builder::host_build_spec(spec);
+    let flags = &host_spec.build.flags;
+
+    let actual_src = resolve_actual_src(&host_spec, src_dir)?;
+    let build_dir = crate::builder::host_build_dir_for_source(&actual_src, flags);
+
+    fs::create_dir_all(&build_dir)?;
+
+    let env_vars =
+        crate::builder::standard_build_env(&host_spec, None, true, export_compiler_flags);
+    let prefix = cmake_cache_entry_value(&flags.configure, "CMAKE_INSTALL_PREFIX")
+        .unwrap_or(flags.prefix.as_str());
+
+    let mut state = StateTracker::new_with_namespace(&actual_src, Some("host"))?;
+
+    if !state.is_done(BuildStep::Configured) {
+        crate::log_info!(
+            "Running host-side cmake configure in {}...",
+            build_dir.display()
+        );
+        let mut cmake_cmd = Command::new("cmake");
+        cmake_cmd.current_dir(&build_dir);
+        cmake_cmd.arg("-S").arg(&actual_src);
+        cmake_cmd.arg("-B").arg(&build_dir);
+        cmake_cmd.arg(format!("-DCMAKE_INSTALL_PREFIX={}", prefix));
+        cmake_cmd.arg("-DCMAKE_BUILD_TYPE=Release");
+        for arg in cmake_install_dir_args(flags) {
+            cmake_cmd.arg(arg);
+        }
+
+        let make_exec_override = flags.make_exec.trim();
+        if !make_exec_override.is_empty() {
+            if !cmake_configure_flags_specify_generator(&flags.configure)
+                && let Some(generator) = cmake_generator_for_make_exec(make_exec_override)
+            {
+                cmake_cmd.arg("-G").arg(generator);
+            }
+            if !cmake_configure_flags_set_make_program(&flags.configure) {
+                cmake_cmd.arg(format!("-DCMAKE_MAKE_PROGRAM={make_exec_override}"));
+            }
+        }
+
+        for flag in &flags.configure {
+            let expanded = expand_with_envs(flag, &env_vars);
+            cmake_cmd.arg(&expanded);
+        }
+
+        crate::builder::prepare_tool_command(&mut cmake_cmd, &env_vars);
+
+        let status = crate::interrupts::command_status(&mut cmake_cmd)
+            .context("Failed to run host cmake")?;
+        if !status.success() {
+            anyhow::bail!("host cmake configure failed");
+        }
+
+        state.mark_done(BuildStep::Configured)?;
+    }
+
+    if !state.is_done(BuildStep::PostCompileDone) {
+        let build_targets = phase_targets(&flags.make_target, &flags.make_targets);
+        let mut build_cmd = Command::new("cmake");
+        build_cmd.arg("--build").arg(&build_dir);
+        build_cmd.arg("-j").arg(num_cpus().to_string());
+        if !build_targets.is_empty() {
+            build_cmd.arg("--target");
+            for target in &build_targets {
+                build_cmd.arg(target);
+            }
+        }
+
+        crate::builder::prepare_tool_command(&mut build_cmd, &env_vars);
+
+        let status = crate::interrupts::command_status(&mut build_cmd)
+            .with_context(|| format!("Failed to run host cmake build for {}", spec.package.name))?;
+        if !status.success() {
+            anyhow::bail!("host cmake build failed");
+        }
+
+        state.mark_done(BuildStep::PostCompileDone)?;
+    }
+
+    fs::canonicalize(&build_dir)
+        .with_context(|| format!("Failed to resolve host build dir: {}", build_dir.display()))
 }
 
 /// Expand environment variables in a string (e.g., $DEPOT_SYSROOT)
@@ -511,6 +609,16 @@ mod tests {
         assert!(out.contains("my-cc"));
         assert!(out.contains("my-cxx"));
         // $HOME should be expanded from process env (may be present)
+    }
+
+    #[test]
+    fn test_expand_with_envs_expands_host_build_dir() {
+        let envs = vec![(
+            crate::builder::DEPOT_BUILD_HOST_DIR_ENV.to_string(),
+            "/tmp/build-host".to_string(),
+        )];
+        let out = expand_with_envs("-DTOOLS_DIR=$DEPOT_BUILD_HOST_DIR/bin", &envs);
+        assert_eq!(out, "-DTOOLS_DIR=/tmp/build-host/bin");
     }
 
     #[test]

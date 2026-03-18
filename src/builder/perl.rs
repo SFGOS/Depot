@@ -17,6 +17,7 @@ pub fn build(
     destdir: &Path,
     cross: Option<&CrossConfig>,
     export_compiler_flags: bool,
+    _host_build_dir: Option<&Path>,
 ) -> Result<()> {
     let flags = &spec.build.flags;
     if flags.build_dir.is_some() {
@@ -459,7 +460,7 @@ exec "$@"
         spec.build.flags.make_exec = tools_path.join("make").to_string_lossy().into_owned();
         spec.build.flags.configure = vec!["CCFLAGS=-fPIC".into()];
 
-        let build_result = build(&spec, src_path, dest_path, None, true);
+        let build_result = build(&spec, src_path, dest_path, None, true, None);
 
         build_result?;
 
@@ -490,7 +491,7 @@ exec "$@"
         let mut spec = mk_spec("perl-test", "1.0");
         spec.build.flags.build_dir = Some("build".into());
 
-        let err = build(&spec, tmp_src.path(), tmp_dest.path(), None, true)
+        let err = build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None)
             .expect_err("perl build should reject build_dir");
         assert!(
             err.to_string()

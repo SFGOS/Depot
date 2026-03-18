@@ -15,6 +15,7 @@ pub fn build(
     destdir: &Path,
     cross: Option<&CrossConfig>,
     export_compiler_flags: bool,
+    _host_build_dir: Option<&Path>,
 ) -> Result<()> {
     let flags = &spec.build.flags;
     let build_dir = if let Some(dir) = &flags.build_dir {
@@ -330,7 +331,7 @@ mod tests {
 
         let spec = mk_spec("custom-no-build", "1.0");
 
-        let res = build(&spec, tmp_src.path(), tmp_dest.path(), None, true);
+        let res = build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None);
         assert!(res.is_err());
         Ok(())
     }
@@ -356,7 +357,7 @@ mod tests {
         spec.spec_dir = spec_dir.path().to_path_buf();
 
         // src_dir is empty; build() should copy build.sh from spec_dir and run it (no-op)
-        build(&spec, tmp_src.path(), tmp_dest.path(), None, true)?;
+        build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None)?;
         // If we reached here, build() succeeded and build.sh was copied into src
         assert!(tmp_src.path().join("build.sh").exists());
         Ok(())
@@ -404,7 +405,7 @@ depot_install_dev_pkg() {
             license: vec!["MIT".into()],
         });
 
-        build(&spec, tmp_src.path(), tmp_dest.path(), None, true)?;
+        build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None)?;
 
         assert!(tmp_dest.path().join("usr/share/primary.txt").exists());
         assert!(
@@ -454,7 +455,7 @@ depot_install() {
             license: vec!["MIT".into()],
         });
 
-        let err = build(&spec, tmp_src.path(), tmp_dest.path(), None, true)
+        let err = build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None)
             .expect_err("missing per-output install handler should fail");
         assert!(err.to_string().contains("Custom build script failed"));
         Ok(())
@@ -482,7 +483,7 @@ exit 0
         }
 
         let spec = mk_spec("custom-fail-fast", "1.0");
-        let err = build(&spec, tmp_src.path(), tmp_dest.path(), None, true)
+        let err = build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None)
             .expect_err("non-function custom scripts should fail when a command fails");
         assert!(err.to_string().contains("Custom build script failed"));
         Ok(())
@@ -539,7 +540,7 @@ exec "$@"
         let mut spec = mk_spec("custom-lib32", "1.0");
         spec.build.flags.lib32_variant = true;
 
-        build(&spec, tmp_src.path(), tmp_dest.path(), None, true)?;
+        build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None)?;
 
         assert_eq!(
             std::fs::read_to_string(tmp_dest.path().join("usr/lib32/libfoo.so.1"))?,

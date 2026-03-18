@@ -1,5 +1,6 @@
 //! Meson build system
 
+use crate::builder::state::{BuildStep, StateTracker};
 use crate::cross::CrossConfig;
 use crate::fakeroot;
 use crate::package::PackageSpec;
@@ -14,6 +15,7 @@ pub fn build(
     destdir: &Path,
     cross: Option<&CrossConfig>,
     export_compiler_flags: bool,
+    host_build_dir: Option<&Path>,
 ) -> Result<()> {
     let flags = &spec.build.flags;
 
@@ -27,7 +29,14 @@ pub fn build(
     fs::create_dir_all(destdir)?;
 
     // Environment variables
-    let env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
+    let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
+    if let Some(host_dir) = host_build_dir {
+        crate::builder::set_env_var(
+            &mut env_vars,
+            crate::builder::DEPOT_BUILD_HOST_DIR_ENV,
+            host_dir.to_string_lossy().into_owned(),
+        );
+    }
 
     // Generate cross file if cross-compiling, or when the lib32 variant needs
     // Meson to treat the build as x86 instead of the native x86_64 host.
@@ -39,7 +48,6 @@ pub fn build(
         None
     };
 
-    use crate::builder::state::{BuildStep, StateTracker};
     let mut state = StateTracker::new_with_namespace(
         &actual_src,
         spec.build.flags.lib32_variant.then_some("lib32"),
@@ -186,6 +194,68 @@ pub fn build(
     }
 
     Ok(())
+}
+
+pub(crate) fn ensure_host_build(
+    spec: &PackageSpec,
+    src_dir: &Path,
+    export_compiler_flags: bool,
+) -> Result<PathBuf> {
+    let host_spec = crate::builder::host_build_spec(spec);
+    let flags = &host_spec.build.flags;
+
+    let actual_src = resolve_actual_src(&host_spec, src_dir)?;
+    let build_dir = crate::builder::host_build_dir_for_source(&actual_src, flags);
+
+    fs::create_dir_all(&build_dir)?;
+
+    let env_vars =
+        crate::builder::standard_build_env(&host_spec, None, true, export_compiler_flags);
+    let mut state = StateTracker::new_with_namespace(&actual_src, Some("host"))?;
+
+    if !state.is_done(BuildStep::Configured) {
+        crate::log_info!(
+            "Running host-side meson setup in {}...",
+            build_dir.display()
+        );
+        let mut meson_cmd = Command::new("meson");
+        meson_cmd.current_dir(&actual_src);
+        meson_cmd.arg("setup");
+        meson_cmd.arg(&build_dir);
+
+        for arg in meson_setup_args(flags, None, &env_vars) {
+            meson_cmd.arg(arg);
+        }
+
+        crate::builder::prepare_tool_command(&mut meson_cmd, &env_vars);
+
+        let status = crate::interrupts::command_status(&mut meson_cmd)
+            .context("Failed to run host meson setup")?;
+        if !status.success() {
+            anyhow::bail!("host meson setup failed");
+        }
+
+        state.mark_done(BuildStep::Configured)?;
+    }
+
+    if !state.is_done(BuildStep::PostCompileDone) {
+        let mut ninja_cmd = Command::new("ninja");
+        ninja_cmd.current_dir(&build_dir);
+        ninja_cmd.arg("-j").arg(num_cpus().to_string());
+
+        crate::builder::prepare_tool_command(&mut ninja_cmd, &env_vars);
+
+        let status = crate::interrupts::command_status(&mut ninja_cmd)
+            .with_context(|| format!("Failed to run host ninja for {}", spec.package.name))?;
+        if !status.success() {
+            anyhow::bail!("host ninja build failed");
+        }
+
+        state.mark_done(BuildStep::PostCompileDone)?;
+    }
+
+    fs::canonicalize(&build_dir)
+        .with_context(|| format!("Failed to resolve host build dir: {}", build_dir.display()))
 }
 
 fn num_cpus() -> usize {
@@ -483,6 +553,22 @@ mod tests {
         assert!(args.iter().any(|a| a == "-Dmanpages=false"));
         assert!(args.iter().any(|a| a == "--prefix=/usr"));
         assert!(args.iter().any(|a| a == "--buildtype=release"));
+    }
+
+    #[test]
+    fn test_meson_setup_args_expand_host_build_dir() {
+        let mut flags = BuildFlags::default();
+        flags.configure = vec!["-Dtools_dir=$DEPOT_BUILD_HOST_DIR/bin".into()];
+
+        let args = meson_setup_args(
+            &flags,
+            None,
+            &[(
+                crate::builder::DEPOT_BUILD_HOST_DIR_ENV.to_string(),
+                "/tmp/build-host".to_string(),
+            )],
+        );
+        assert!(args.iter().any(|a| a == "-Dtools_dir=/tmp/build-host/bin"));
     }
 
     #[test]

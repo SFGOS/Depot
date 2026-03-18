@@ -21,6 +21,13 @@ use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
 pub type EnvVars = Vec<(String, String)>;
+pub(crate) const DEPOT_BUILD_HOST_DIR_ENV: &str = "DEPOT_BUILD_HOST_DIR";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetBuildKind {
+    Primary,
+    Lib32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InstallDirs {
@@ -53,6 +60,99 @@ fn default_libdir_for_variant(lib32_variant: bool) -> &'static str {
     } else {
         "/usr/lib"
     }
+}
+
+fn normalized_arch(arch: &str) -> &str {
+    match arch.trim() {
+        "amd64" => "x86_64",
+        "arm64" => "aarch64",
+        other => other,
+    }
+}
+
+fn lib32_arch_for(arch: &str) -> String {
+    match normalized_arch(arch) {
+        "x86_64" => "i686".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn host_arch() -> &'static str {
+    normalized_arch(std::env::consts::ARCH)
+}
+
+pub(crate) fn effective_target_arch(
+    flags: &crate::package::BuildFlags,
+    cross: Option<&CrossConfig>,
+    kind: TargetBuildKind,
+) -> String {
+    match kind {
+        TargetBuildKind::Lib32 => {
+            if let Some(cc_cfg) = cross {
+                return crate::cross::target_arch_from_triple(&crate::cross::lib32_target_triple(
+                    cc_cfg.host_triple(),
+                ))
+                .to_string();
+            }
+            if !flags.chost.trim().is_empty() {
+                return crate::cross::target_arch_from_triple(&crate::cross::lib32_target_triple(
+                    flags.chost.trim(),
+                ))
+                .to_string();
+            }
+            let base = if flags.carch.trim().is_empty() {
+                host_arch()
+            } else {
+                flags.carch.trim()
+            };
+            lib32_arch_for(base)
+        }
+        TargetBuildKind::Primary => {
+            if let Some(cc_cfg) = cross {
+                return crate::cross::target_arch_from_triple(cc_cfg.host_triple()).to_string();
+            }
+            if !flags.chost.trim().is_empty() {
+                return crate::cross::target_arch_from_triple(flags.chost.trim()).to_string();
+            }
+            if !flags.carch.trim().is_empty() {
+                return flags.carch.trim().to_string();
+            }
+            host_arch().to_string()
+        }
+    }
+}
+
+fn target_arch_differs_from_host(
+    flags: &crate::package::BuildFlags,
+    cross: Option<&CrossConfig>,
+    kind: TargetBuildKind,
+) -> bool {
+    normalized_arch(&effective_target_arch(flags, cross, kind)) != host_arch()
+}
+
+pub(crate) fn default_host_build_dir_name(flags: &crate::package::BuildFlags) -> String {
+    match flags.build_dir.as_deref().map(str::trim) {
+        Some(dir) if !dir.is_empty() => format!("{}-host", dir),
+        _ => "build-host".to_string(),
+    }
+}
+
+pub(crate) fn host_build_dir_for_source(
+    src_root: &Path,
+    flags: &crate::package::BuildFlags,
+) -> PathBuf {
+    src_root.join(default_host_build_dir_name(flags))
+}
+
+pub(crate) fn host_build_spec(spec: &PackageSpec) -> PackageSpec {
+    let mut host_spec = spec.clone();
+    host_spec.build.flags.lib32_variant = false;
+    host_spec.build.flags.chost.clear();
+    host_spec.build.flags.cbuild.clear();
+    host_spec.build.flags.carch = host_arch().to_string();
+    host_spec.build.flags.host_build_dir = None;
+    host_spec.build.flags.build_dir = Some(default_host_build_dir_name(&spec.build.flags));
+    host_spec
 }
 
 fn configured_install_dir(value: &str, default: &str) -> String {
@@ -357,8 +457,14 @@ pub fn standard_build_env(
     if !flags.cbuild.is_empty() {
         set_env_var(&mut env_vars, "CBUILD", flags.cbuild.clone());
     }
-    if !flags.carch.is_empty() {
-        set_env_var(&mut env_vars, "CARCH", flags.carch.clone());
+    let target_kind = if flags.lib32_variant {
+        TargetBuildKind::Lib32
+    } else {
+        TargetBuildKind::Primary
+    };
+    let effective_carch = effective_target_arch(flags, cross, target_kind);
+    if !effective_carch.is_empty() {
+        set_env_var(&mut env_vars, "CARCH", effective_carch);
     }
     if !flags.prefix.is_empty() {
         set_env_var(&mut env_vars, "PREFIX", flags.prefix.clone());
@@ -420,6 +526,34 @@ pub fn standard_build_env(
     }
 
     env_vars
+}
+
+pub fn ensure_host_build(
+    spec: &PackageSpec,
+    src_dir: &Path,
+    cross: Option<&CrossConfig>,
+    export_compiler_flags: bool,
+    kind: TargetBuildKind,
+) -> Result<Option<PathBuf>> {
+    if !spec.build.flags.host_build
+        || !target_arch_differs_from_host(&spec.build.flags, cross, kind)
+    {
+        return Ok(None);
+    }
+
+    let host_dir = match spec.build.build_type {
+        BuildType::Autotools => autotools::ensure_host_build(spec, src_dir, export_compiler_flags)?,
+        BuildType::CMake => cmake::ensure_host_build(spec, src_dir, export_compiler_flags)?,
+        BuildType::Meson => meson::ensure_host_build(spec, src_dir, export_compiler_flags)?,
+        other => {
+            anyhow::bail!(
+                "build.flags.host_build is currently supported only for autotools/cmake/meson (got {:?})",
+                other
+            );
+        }
+    };
+
+    Ok(Some(host_dir))
 }
 
 /// Prepare a Command with a hermetic environment and some essential variables preserved.
@@ -498,6 +632,7 @@ pub fn build(
     destdir: &Path,
     cross: Option<&CrossConfig>,
     export_compiler_flags: bool,
+    host_build_dir: Option<&Path>,
 ) -> Result<()> {
     if let Some(cc) = cross {
         crate::log_info!(
@@ -515,25 +650,84 @@ pub fn build(
     }
 
     match spec.build.build_type {
-        BuildType::Autotools => {
-            autotools::build(spec, src_dir, destdir, cross, export_compiler_flags)
-        }
-        BuildType::CMake => cmake::build(spec, src_dir, destdir, cross, export_compiler_flags),
-        BuildType::Meson => meson::build(spec, src_dir, destdir, cross, export_compiler_flags),
-        BuildType::Perl => perl::build(spec, src_dir, destdir, cross, export_compiler_flags),
-        BuildType::Custom => custom::build(spec, src_dir, destdir, cross, export_compiler_flags),
-        BuildType::Python => python::build(spec, src_dir, destdir, cross, export_compiler_flags),
-        BuildType::Rust => rust::build(spec, src_dir, destdir, cross, export_compiler_flags),
-        BuildType::Bin => bin::build(spec, src_dir, destdir, cross, export_compiler_flags),
+        BuildType::Autotools => autotools::build(
+            spec,
+            src_dir,
+            destdir,
+            cross,
+            export_compiler_flags,
+            host_build_dir,
+        ),
+        BuildType::CMake => cmake::build(
+            spec,
+            src_dir,
+            destdir,
+            cross,
+            export_compiler_flags,
+            host_build_dir,
+        ),
+        BuildType::Meson => meson::build(
+            spec,
+            src_dir,
+            destdir,
+            cross,
+            export_compiler_flags,
+            host_build_dir,
+        ),
+        BuildType::Perl => perl::build(
+            spec,
+            src_dir,
+            destdir,
+            cross,
+            export_compiler_flags,
+            host_build_dir,
+        ),
+        BuildType::Custom => custom::build(
+            spec,
+            src_dir,
+            destdir,
+            cross,
+            export_compiler_flags,
+            host_build_dir,
+        ),
+        BuildType::Python => python::build(
+            spec,
+            src_dir,
+            destdir,
+            cross,
+            export_compiler_flags,
+            host_build_dir,
+        ),
+        BuildType::Rust => rust::build(
+            spec,
+            src_dir,
+            destdir,
+            cross,
+            export_compiler_flags,
+            host_build_dir,
+        ),
+        BuildType::Bin => bin::build(
+            spec,
+            src_dir,
+            destdir,
+            cross,
+            export_compiler_flags,
+            host_build_dir,
+        ),
         BuildType::Meta => {
             // Metapackages are metadata-only; create an empty staging root and let
             // packaging/installation metadata carry dependencies.
             std::fs::create_dir_all(destdir)?;
             Ok(())
         }
-        BuildType::Makefile => {
-            makefile::build(spec, src_dir, destdir, cross, export_compiler_flags)
-        }
+        BuildType::Makefile => makefile::build(
+            spec,
+            src_dir,
+            destdir,
+            cross,
+            export_compiler_flags,
+            host_build_dir,
+        ),
     }
 }
 #[cfg(test)]
@@ -673,6 +867,41 @@ mod tests {
         let env = standard_build_env(&spec, None, true, true);
         assert!(env.iter().any(|(k, v)| k == "LD" && v == "ld.lld"));
         assert!(env.iter().any(|(k, v)| k == "CPP" && v == "clang-cpp"));
+    }
+
+    #[test]
+    fn test_standard_build_env_exports_effective_carch_for_cross_and_lib32() {
+        let spec = mk_spec(Vec::new(), Vec::new());
+        let cross = CrossConfig {
+            prefix: "aarch64-linux-gnu".into(),
+            cc: "aarch64-linux-gnu-gcc".into(),
+            cxx: "aarch64-linux-gnu-g++".into(),
+            ar: "aarch64-linux-gnu-ar".into(),
+            ranlib: "aarch64-linux-gnu-ranlib".into(),
+            strip: "aarch64-linux-gnu-strip".into(),
+            ld: "aarch64-linux-gnu-ld".into(),
+            nm: "aarch64-linux-gnu-nm".into(),
+            objcopy: "aarch64-linux-gnu-objcopy".into(),
+            objdump: "aarch64-linux-gnu-objdump".into(),
+            readelf: "aarch64-linux-gnu-readelf".into(),
+        };
+
+        let cross_env = standard_build_env(&spec, Some(&cross), true, true);
+        assert!(
+            cross_env
+                .iter()
+                .any(|(k, v)| k == "CARCH" && v == "aarch64"),
+            "expected cross builds to export target CARCH"
+        );
+
+        let mut lib32_spec = spec.clone();
+        lib32_spec.build.flags.lib32_variant = true;
+        lib32_spec.build.flags.carch = "x86_64".into();
+        let lib32_env = standard_build_env(&lib32_spec, None, true, true);
+        assert!(
+            lib32_env.iter().any(|(k, v)| k == "CARCH" && v == "i686"),
+            "expected lib32 builds to export i686 CARCH"
+        );
     }
 
     #[test]

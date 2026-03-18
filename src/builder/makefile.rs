@@ -12,6 +12,7 @@ pub fn build(
     destdir: &Path,
     cross: Option<&CrossConfig>,
     export_compiler_flags: bool,
+    _host_build_dir: Option<&Path>,
 ) -> Result<()> {
     let mut state = StateTracker::new_with_namespace(
         src_dir,
@@ -217,7 +218,7 @@ exec "$@"
             "cp built.txt $DESTDIR/usr/bin/installed.txt".into(),
         ];
 
-        build(&spec, src_path, dest_path, None, true)?;
+        build(&spec, src_path, dest_path, None, true, None)?;
 
         // Verify build step
         let built_file = src_path.join("built.txt");
@@ -271,7 +272,7 @@ exec "$@"
             "printf 'bin' > \"$DESTDIR/usr/bin/foo\"".into(),
         ];
 
-        build(&spec, src_path, dest_path, None, true)?;
+        build(&spec, src_path, dest_path, None, true, None)?;
 
         assert_eq!(
             fs::read_to_string(dest_path.join("usr/lib32/libfoo.so.1"))?,

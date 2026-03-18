@@ -17,6 +17,7 @@ pub fn build(
     destdir: &Path,
     _cross: Option<&CrossConfig>,
     _export_compiler_flags: bool,
+    _host_build_dir: Option<&Path>,
 ) -> Result<()> {
     crate::log_info!(
         "Binary install: copying files from {} to {} (pkg type={})",
@@ -114,7 +115,7 @@ mod tests {
         unix_fs::symlink(&target, src.join("usr/lib/libdummy.so.link"))?;
 
         let spec = mk_spec("bin-test", "1.0");
-        build(&spec, src, dest, None, true)?;
+        build(&spec, src, dest, None, true, None)?;
 
         // Check copied file
         assert!(dest.join("usr/bin/hello").exists());
