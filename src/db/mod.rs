@@ -165,6 +165,10 @@ pub fn register_package_with_replacement(
         "DELETE FROM provides WHERE package_id = ?1",
         params![pkg_id],
     )?;
+    tx.execute(
+        "DELETE FROM replaces WHERE package_id = ?1",
+        params![pkg_id],
+    )?;
     tx.execute("DELETE FROM files WHERE package_id = ?1", params![pkg_id])?;
     tx.execute(
         "DELETE FROM directories WHERE package_id = ?1",
@@ -176,6 +180,13 @@ pub fn register_package_with_replacement(
         tx.execute(
             "INSERT OR IGNORE INTO provides (package_id, provides_name) VALUES (?1, ?2)",
             params![pkg_id, provides],
+        )?;
+    }
+
+    for replaces in &spec.alternatives.replaces {
+        tx.execute(
+            "INSERT OR IGNORE INTO replaces (package_id, replaces_name) VALUES (?1, ?2)",
+            params![pkg_id, replaces],
         )?;
     }
 
@@ -375,7 +386,6 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
     }
 
     // Remove directories (only if empty and not owned by another package)
-    let mut dirs_removed = 0;
     for dir in &directories {
         let path = rootfs.join(dir);
 
@@ -401,7 +411,6 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
                 if verbose_remove_output() {
                     crate::log_info!("  Removed directory: {}", dir);
                 }
-                dirs_removed += 1;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Already gone
@@ -420,12 +429,6 @@ pub fn remove_package(db_path: &Path, name: &str, rootfs: &Path) -> Result<()> {
 
     // Remove from database
     delete_package_rows(&conn, pkg_id)?;
-
-    crate::log_info!(
-        "Removed {} files and {} directories",
-        files.len(),
-        dirs_removed
-    );
 
     if !removal_errors.is_empty() {
         crate::log_warn!("Failed to remove some paths:");
@@ -520,6 +523,14 @@ fn init_db(conn: &Connection) -> Result<()> {
             UNIQUE(package_id, provides_name)
         );
 
+        CREATE TABLE IF NOT EXISTS replaces (
+            id INTEGER PRIMARY KEY,
+            package_id INTEGER NOT NULL,
+            replaces_name TEXT NOT NULL,
+            FOREIGN KEY (package_id) REFERENCES packages(id),
+            UNIQUE(package_id, replaces_name)
+        );
+
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
             package_id INTEGER NOT NULL,
@@ -537,6 +548,7 @@ fn init_db(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_files_package ON files(package_id);
         CREATE INDEX IF NOT EXISTS idx_provides_name ON provides(provides_name);
+        CREATE INDEX IF NOT EXISTS idx_replaces_name ON replaces(replaces_name);
         CREATE INDEX IF NOT EXISTS idx_directories_package ON directories(package_id);
         CREATE INDEX IF NOT EXISTS idx_directories_path ON directories(path);
         ",
@@ -614,6 +626,10 @@ fn delete_package_rows(conn: &Connection, pkg_id: i64) -> Result<()> {
         "DELETE FROM provides WHERE package_id = ?1",
         params![pkg_id],
     )?;
+    conn.execute(
+        "DELETE FROM replaces WHERE package_id = ?1",
+        params![pkg_id],
+    )?;
     conn.execute("DELETE FROM packages WHERE id = ?1", params![pkg_id])?;
     Ok(())
 }
@@ -626,6 +642,10 @@ fn delete_package_rows_tx(tx: &rusqlite::Transaction<'_>, pkg_id: i64) -> Result
     )?;
     tx.execute(
         "DELETE FROM provides WHERE package_id = ?1",
+        params![pkg_id],
+    )?;
+    tx.execute(
+        "DELETE FROM replaces WHERE package_id = ?1",
         params![pkg_id],
     )?;
     tx.execute("DELETE FROM packages WHERE id = ?1", params![pkg_id])?;
@@ -796,6 +816,24 @@ pub fn get_all_provides(db_path: &Path) -> Result<std::collections::HashSet<Stri
     let conn = Connection::open(db_path)?;
     init_db(&conn)?;
     let mut stmt = conn.prepare("SELECT provides_name FROM provides")?;
+    let names: HashSet<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(names)
+}
+
+/// Get set of all replacement names satisfied by installed packages.
+pub fn get_all_replaces(db_path: &Path) -> Result<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+
+    if !db_path.exists() {
+        return Ok(HashSet::new());
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let mut stmt = conn.prepare("SELECT replaces_name FROM replaces")?;
     let names: HashSet<String> = stmt
         .query_map([], |row| row.get(0))?
         .filter_map(|r| r.ok())
@@ -1178,5 +1216,23 @@ mod tests {
         assert!(files.contains(&"usr/bin/foo".to_string()));
         assert!(files.contains(&"usr/bin/new_file".to_string()));
         assert!(!files.contains(&"usr/bin/shared_dir/old_file".to_string()));
+    }
+
+    #[test]
+    fn register_package_persists_replacements() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        std::fs::write(dest.join("usr/bin/vx"), "vx").unwrap();
+
+        let mut spec = mk_spec("vx", "1.0");
+        spec.alternatives.replaces = vec!["grep".into(), "patch".into()];
+
+        register_package(&db_path, &spec, &dest).unwrap();
+
+        let replaces = get_all_replaces(&db_path).unwrap();
+        assert!(replaces.contains("grep"));
+        assert!(replaces.contains("patch"));
     }
 }

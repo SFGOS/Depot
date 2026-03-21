@@ -391,8 +391,9 @@ impl<'a> Resolver<'a> {
     }
 
     fn choose_candidate(&self, dep: &str, candidates: &[Candidate]) -> Result<Candidate> {
-        let mut sorted =
-            dedupe_candidate_packages(sort_candidates(candidates, self.opts.prefer_binary));
+        let mut sorted = prune_replacement_fallback_candidates(dedupe_candidate_packages(
+            sort_candidates(candidates, self.opts.prefer_binary),
+        ));
 
         if sorted.len() == 1 {
             return Ok(sorted.remove(0));
@@ -785,6 +786,20 @@ fn dedupe_candidate_packages(candidates: Vec<Candidate>) -> Vec<Candidate> {
     out
 }
 
+fn prune_replacement_fallback_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.match_kind != MatchKind::Replaces)
+    {
+        candidates
+            .into_iter()
+            .filter(|candidate| candidate.match_kind != MatchKind::Replaces)
+            .collect()
+    } else {
+        candidates
+    }
+}
+
 fn candidate_sort_key(c: &Candidate, prefer_binary: bool) -> (i32, i32, i32, String, String) {
     let is_binary = matches!(c.kind, CandidateKind::Binary { .. });
     let kind_rank = match (prefer_binary, is_binary) {
@@ -794,9 +809,9 @@ fn candidate_sort_key(c: &Candidate, prefer_binary: bool) -> (i32, i32, i32, Str
         (false, true) => 1,
     };
     let match_rank = match c.match_kind {
-        MatchKind::Replaces => 0,
-        MatchKind::Exact => 1,
-        MatchKind::Provides => 2,
+        MatchKind::Exact => 0,
+        MatchKind::Provides => 1,
+        MatchKind::Replaces => 2,
     };
     (
         kind_rank,
@@ -838,7 +853,8 @@ pub(crate) fn build_dependency_install_plan(
 mod tests {
     use super::{
         Candidate, CandidateKind, MatchKind, PlannerOptions, build_dependency_install_plan,
-        dedupe_candidate_packages, sort_candidates, source_deps_for_install,
+        dedupe_candidate_packages, prune_replacement_fallback_candidates, sort_candidates,
+        source_deps_for_install,
     };
     use crate::config::Config;
     use crate::db;
@@ -1062,6 +1078,37 @@ mod tests {
         let deduped = dedupe_candidate_packages(sort_candidates(&candidates, false));
         assert_eq!(deduped.len(), 1);
         assert!(matches!(deduped[0].kind, CandidateKind::Source { .. }));
+    }
+
+    #[test]
+    fn replacement_candidates_are_pruned_when_direct_matches_exist() {
+        let mut replacement = mk_binary_candidate("vx", "core", 0);
+        replacement.match_kind = MatchKind::Replaces;
+
+        let mut exact = mk_binary_candidate("patch", "core", 0);
+        exact.match_kind = MatchKind::Exact;
+
+        let mut provides = mk_binary_candidate("busybox", "core", 0);
+        provides.match_kind = MatchKind::Provides;
+
+        let pruned = prune_replacement_fallback_candidates(vec![replacement, exact, provides]);
+        assert_eq!(pruned.len(), 2);
+        assert!(
+            pruned
+                .iter()
+                .all(|candidate| candidate.match_kind != MatchKind::Replaces)
+        );
+    }
+
+    #[test]
+    fn replacement_candidates_remain_when_they_are_the_only_matches() {
+        let mut replacement = mk_binary_candidate("vx", "core", 0);
+        replacement.match_kind = MatchKind::Replaces;
+
+        let pruned = prune_replacement_fallback_candidates(vec![replacement]);
+        assert_eq!(pruned.len(), 1);
+        assert!(matches!(pruned[0].match_kind, MatchKind::Replaces));
+        assert_eq!(pruned[0].package, "vx");
     }
 
     #[test]

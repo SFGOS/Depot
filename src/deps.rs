@@ -130,12 +130,16 @@ fn is_dep_satisfied(
     dep: &str,
     installed: &std::collections::HashSet<String>,
     provides: &std::collections::HashSet<String>,
+    replaces: &std::collections::HashSet<String>,
     db_path: &Path,
 ) -> Result<bool> {
     let parsed = parse_dep(dep);
 
-    // Check if package is installed or provided
-    if !installed.contains(parsed.name) && !provides.contains(parsed.name) {
+    // Check if package is installed, provided, or replaced by an installed package.
+    if !installed.contains(parsed.name)
+        && !provides.contains(parsed.name)
+        && !replaces.contains(parsed.name)
+    {
         return Ok(false);
     }
 
@@ -148,8 +152,8 @@ fn is_dep_satisfied(
     if let Some(installed_version) = db::get_package_version(db_path, parsed.name)? {
         Ok(compare_versions(&installed_version, required, parsed.op))
     } else {
-        // Package might be provided by an alternative, accept it
-        Ok(provides.contains(parsed.name))
+        // Package might be satisfied by an alternative or replacement, accept it.
+        Ok(provides.contains(parsed.name) || replaces.contains(parsed.name))
     }
 }
 
@@ -172,7 +176,8 @@ pub fn is_dep_satisfied_in_db(dep: &str, db_path: &Path) -> Result<bool> {
 
     let installed = db::get_installed_packages(db_path)?;
     let provides = db::get_all_provides(db_path)?;
-    is_dep_satisfied(dep, &installed, &provides, db_path)
+    let replaces = db::get_all_replaces(db_path)?;
+    is_dep_satisfied(dep, &installed, &provides, &replaces, db_path)
 }
 
 fn push_unique(v: &mut Vec<String>, item: String) {
@@ -252,9 +257,10 @@ pub(crate) fn check_build_deps_for_outputs(
 
     let installed = db::get_installed_packages(db_path)?;
     let provides = db::get_all_provides(db_path)?;
+    let replaces = db::get_all_replaces(db_path)?;
 
     for dep in &build_deps {
-        if !is_dep_satisfied(dep, &installed, &provides, db_path)? {
+        if !is_dep_satisfied(dep, &installed, &provides, &replaces, db_path)? {
             missing.push(dep.clone());
         }
     }
@@ -283,12 +289,13 @@ pub(crate) fn check_runtime_deps_for_outputs(
 
     let installed = db::get_installed_packages(db_path)?;
     let provides = db::get_all_provides(db_path)?;
+    let replaces = db::get_all_replaces(db_path)?;
 
     for dep in &runtime_deps {
         if local_provides.contains(dep_name(dep)) {
             continue;
         }
-        if !is_dep_satisfied(dep, &installed, &provides, db_path)? {
+        if !is_dep_satisfied(dep, &installed, &provides, &replaces, db_path)? {
             missing.push(dep.clone());
         }
     }
@@ -311,9 +318,10 @@ pub(crate) fn check_test_deps_for_outputs(
 
     let installed = db::get_installed_packages(db_path)?;
     let provides = db::get_all_provides(db_path)?;
+    let replaces = db::get_all_replaces(db_path)?;
 
     for dep in &test_deps {
-        if !is_dep_satisfied(dep, &installed, &provides, db_path)? {
+        if !is_dep_satisfied(dep, &installed, &provides, &replaces, db_path)? {
             missing.push(dep.clone());
         }
     }
@@ -748,6 +756,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(missing, vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn test_installed_replacements_satisfy_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::write(destdir.join("usr/bin/vx"), "vx").unwrap();
+
+        let mut spec = test_spec_with_build(BuildType::Custom, None, &[]);
+        spec.package.name = "vx".into();
+        spec.alternatives.replaces = vec!["patch".into(), "grep".into()];
+
+        crate::db::register_package(&db_path, &spec, &destdir).unwrap();
+
+        assert!(is_dep_satisfied_in_db("patch", &db_path).unwrap());
+        assert!(is_dep_satisfied_in_db("grep", &db_path).unwrap());
     }
 
     #[test]

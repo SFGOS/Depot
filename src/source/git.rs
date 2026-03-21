@@ -1,7 +1,9 @@
 //! Git source support via libgit2 (git2 crate)
 
 use anyhow::{Context, Result};
-use git2::{Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository};
+use git2::{
+    CheckoutNotificationType, Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository,
+};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use inquire::Password;
 use sha2::{Digest, Sha256};
@@ -23,6 +25,7 @@ pub fn checkout(
     pkgname: &str,
     cherry_pick_revs: &[String],
 ) -> Result<()> {
+    crate::interrupts::install().context("Failed to enable Ctrl-C handling for git operations")?;
     fs::create_dir_all(git_cache_dir).with_context(|| {
         format!(
             "Failed to create git cache dir: {}",
@@ -31,7 +34,7 @@ pub fn checkout(
     })?;
 
     let mirror_dir = git_cache_dir.join(mirror_key(url));
-    ensure_mirror(url, &mirror_dir, pkgname)?;
+    ensure_mirror(url, &mirror_dir, pkgname, rev)?;
 
     if checkout_dir.exists() {
         fs::remove_dir_all(checkout_dir).with_context(|| {
@@ -54,9 +57,15 @@ pub fn checkout(
 
     let mut builder = git2::build::RepoBuilder::new();
     builder.with_checkout(checkout);
-    builder
-        .clone(mirror_url, checkout_dir)
-        .with_context(|| format!("Failed to clone from mirror for {}", url))?;
+    match builder.clone(mirror_url, checkout_dir) {
+        Ok(_) => {}
+        Err(_err) if crate::interrupts::was_interrupted() => {
+            anyhow::bail!("Interrupted by Ctrl-C while cloning {}", url)
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("Failed to clone from mirror for {}", url));
+        }
+    }
     checkout_progress.finish("checkout complete");
 
     let repo = Repository::open(checkout_dir)?;
@@ -141,34 +150,83 @@ fn mirror_key(url: &str) -> String {
     format!("{:x}", digest)
 }
 
-fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str) -> Result<()> {
-    if !mirror_dir.exists() {
-        crate::log_info!("Cloning git mirror for {} ({})...", pkgname, url);
-        let mut fo = FetchOptions::new();
-        let transfer_progress = TransferProgress::new(format!("git {}", pkgname));
-        fo.remote_callbacks(authenticated_remote_callbacks(
-            Some(transfer_progress.bar()),
-            url,
-        ));
-        let mut builder = git2::build::RepoBuilder::new();
-        builder.fetch_options(fo);
-        builder.bare(true);
-        builder
-            .clone(url, mirror_dir)
-            .with_context(|| format!("Failed to clone git mirror: {}", url))?;
-        transfer_progress.finish("mirror ready");
+fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str, rev: &str) -> Result<()> {
+    let fresh = !mirror_dir.exists();
+    let repo = if fresh {
+        crate::log_info!("Initializing git mirror for {} ({})...", pkgname, url);
+        Repository::init_bare(mirror_dir)
+            .with_context(|| format!("Failed to initialize git mirror: {}", mirror_dir.display()))?
+    } else {
+        Repository::open_bare(mirror_dir)
+            .with_context(|| format!("Failed to open git mirror: {}", mirror_dir.display()))?
+    };
+
+    if should_skip_fetch_for_cached_rev(&repo, rev) {
+        crate::log_info!("Using cached git revision '{}' for {}.", rev, pkgname);
         return Ok(());
     }
 
-    // Fetch updates
-    let repo = Repository::open_bare(mirror_dir)
-        .with_context(|| format!("Failed to open git mirror: {}", mirror_dir.display()))?;
+    let mut remote = ensure_origin_remote(&repo, url)?;
+    let fetch_attempts = fetch_attempts_for_rev(rev);
+    let mut attempted = false;
 
-    let mut remote = repo
-        .find_remote("origin")
-        .or_else(|_| repo.remote_anonymous(url))
-        .with_context(|| format!("Failed to create remote for {}", url))?;
+    for attempt in &fetch_attempts {
+        let Some(message) = fetch_attempt_message(attempt, rev, fresh) else {
+            continue;
+        };
+        attempted = true;
+        let refspecs = attempt.refspecs();
+        fetch_remote_refspecs(&mut remote, url, pkgname, &refspecs)?;
+        if resolve_rev_object(&repo, rev).is_ok() {
+            crate::log_info!("{}", message);
+            return Ok(());
+        }
+    }
 
+    if !attempted {
+        anyhow::bail!("No fetch strategy available for git revision '{}'", rev);
+    }
+
+    anyhow::bail!("Failed to fetch git revision '{}'", rev)
+}
+
+#[derive(Clone)]
+enum FetchAttempt {
+    Default,
+    HeadRefs,
+    Tag(String),
+    Branch(String),
+}
+
+impl FetchAttempt {
+    fn refspecs(&self) -> Vec<&str> {
+        match self {
+            FetchAttempt::Default => Vec::new(),
+            FetchAttempt::HeadRefs => vec!["+refs/heads/*:refs/remotes/origin/*"],
+            FetchAttempt::Tag(tag) => vec![tag.as_str()],
+            FetchAttempt::Branch(branch) => vec![branch.as_str()],
+        }
+    }
+}
+
+fn ensure_origin_remote<'a>(repo: &'a Repository, url: &str) -> Result<git2::Remote<'a>> {
+    match repo.find_remote("origin") {
+        Ok(remote) => Ok(remote),
+        Err(_) => {
+            repo.remote("origin", url)
+                .with_context(|| format!("Failed to create remote for {}", url))?;
+            repo.find_remote("origin")
+                .with_context(|| format!("Failed to reopen remote for {}", url))
+        }
+    }
+}
+
+fn fetch_remote_refspecs(
+    remote: &mut git2::Remote<'_>,
+    url: &str,
+    pkgname: &str,
+    refspecs: &[&str],
+) -> Result<()> {
     let mut fo = FetchOptions::new();
     let transfer_progress = TransferProgress::new(format!("git {}", pkgname));
     fo.remote_callbacks(authenticated_remote_callbacks(
@@ -176,13 +234,76 @@ fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str) -> Result<()> {
         url,
     ));
 
-    // Fetch all remote refs (tags + heads). Empty refspec uses default.
-    remote
-        .fetch(&[] as &[&str], Some(&mut fo), None)
-        .with_context(|| format!("Failed to fetch updates for {}", url))?;
-    transfer_progress.finish("mirror updated");
-
+    match remote.fetch(refspecs, Some(&mut fo), None) {
+        Ok(_) => {}
+        Err(_err) if crate::interrupts::was_interrupted() => {
+            anyhow::bail!("Interrupted by Ctrl-C while fetching {}", url)
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("Failed to fetch updates for {}", url));
+        }
+    }
+    transfer_progress.finish("git fetch complete");
     Ok(())
+}
+
+fn fetch_attempt_message(attempt: &FetchAttempt, rev: &str, fresh: bool) -> Option<String> {
+    let state = if fresh {
+        "mirror ready"
+    } else {
+        "mirror updated"
+    };
+    match attempt {
+        FetchAttempt::Default => Some(state.to_string()),
+        FetchAttempt::HeadRefs => Some(format!("{state} (heads only)")),
+        FetchAttempt::Tag(_) => Some(format!("{state} (tag {})", rev)),
+        FetchAttempt::Branch(_) => Some(format!("{state} (branch {})", rev)),
+    }
+}
+
+fn fetch_attempts_for_rev(rev: &str) -> Vec<FetchAttempt> {
+    if rev.eq_ignore_ascii_case("HEAD") {
+        return vec![FetchAttempt::HeadRefs, FetchAttempt::Default];
+    }
+
+    if is_probably_oid(rev) {
+        return vec![FetchAttempt::Default];
+    }
+
+    vec![
+        FetchAttempt::Tag(tag_refspec(rev)),
+        FetchAttempt::Branch(branch_refspec(rev)),
+        FetchAttempt::Default,
+    ]
+}
+
+fn should_skip_fetch_for_cached_rev(repo: &Repository, rev: &str) -> bool {
+    if rev.eq_ignore_ascii_case("HEAD") {
+        return false;
+    }
+
+    if repo.find_reference(&format!("refs/tags/{rev}")).is_ok() {
+        return true;
+    }
+
+    if is_probably_oid(rev) {
+        return resolve_rev_object(repo, rev).is_ok();
+    }
+
+    false
+}
+
+fn is_probably_oid(rev: &str) -> bool {
+    let len = rev.len();
+    (7..=40).contains(&len) && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn tag_refspec(rev: &str) -> String {
+    format!("refs/tags/{rev}:refs/tags/{rev}")
+}
+
+fn branch_refspec(rev: &str) -> String {
+    format!("+refs/heads/{rev}:refs/remotes/origin/{rev}")
 }
 
 fn checkout_rev(repo: &Repository, rev: &str) -> Result<()> {
@@ -291,6 +412,10 @@ pub(crate) fn authenticated_remote_callbacks(
         credential_state.provide(url, username_from_url, allowed)
     });
     if let Some(progress_bar) = progress_bar {
+        let sideband_bar = progress_bar.clone();
+        callbacks
+            .sideband_progress(move |_message| git_operation_should_continue(Some(&sideband_bar)));
+
         callbacks.transfer_progress(move |stats| {
             let total_objects = stats.total_objects() as u64;
             if total_objects > 0 {
@@ -304,7 +429,8 @@ pub(crate) fn authenticated_remote_callbacks(
                 stats.indexed_deltas(),
                 stats.received_bytes()
             ));
-            true
+
+            git_operation_should_continue(Some(&progress_bar))
         });
     }
 
@@ -360,6 +486,22 @@ impl CheckoutProgress {
     }
 
     fn attach(&self, checkout: &mut git2::build::CheckoutBuilder<'static>) {
+        checkout.notify_on(
+            CheckoutNotificationType::CONFLICT
+                | CheckoutNotificationType::DIRTY
+                | CheckoutNotificationType::UPDATED
+                | CheckoutNotificationType::UNTRACKED
+                | CheckoutNotificationType::IGNORED,
+        );
+
+        let notify_bar = self.bar.clone();
+        checkout.notify(move |_, path, _, _, _| {
+            if let Some(path) = path {
+                notify_bar.set_message(path.display().to_string());
+            }
+            git_operation_should_continue(Some(&notify_bar))
+        });
+
         let bar = self.bar.clone();
         checkout.progress(move |path, current, total| {
             let total = total as u64;
@@ -385,6 +527,17 @@ fn progress_draw_target() -> ProgressDrawTarget {
     } else {
         ProgressDrawTarget::hidden()
     }
+}
+
+fn git_operation_should_continue(progress_bar: Option<&ProgressBar>) -> bool {
+    if !crate::interrupts::was_interrupted() {
+        return true;
+    }
+
+    if let Some(progress_bar) = progress_bar {
+        progress_bar.finish_and_clear();
+    }
+    false
 }
 
 #[derive(Default)]
@@ -634,5 +787,56 @@ mod tests {
             err.to_string()
                 .contains("Could not resolve cherry-pick rev")
         );
+    }
+
+    #[test]
+    fn fetch_attempts_for_head_prefers_heads_only_before_full_fetch() {
+        let attempts = fetch_attempts_for_rev("HEAD");
+        assert!(matches!(
+            attempts.as_slice(),
+            [FetchAttempt::HeadRefs, FetchAttempt::Default]
+        ));
+    }
+
+    #[test]
+    fn fetch_attempts_for_named_revision_try_tag_then_branch_then_fallback() {
+        let attempts = fetch_attempts_for_rev("v1.2.3");
+        assert_eq!(attempts.len(), 3);
+        assert!(
+            matches!(&attempts[0], FetchAttempt::Tag(tag) if tag == "refs/tags/v1.2.3:refs/tags/v1.2.3")
+        );
+        assert!(
+            matches!(&attempts[1], FetchAttempt::Branch(branch) if branch == "+refs/heads/v1.2.3:refs/remotes/origin/v1.2.3")
+        );
+        assert!(matches!(attempts[2], FetchAttempt::Default));
+    }
+
+    #[test]
+    fn fetch_attempts_for_oid_use_full_fetch_only() {
+        let attempts = fetch_attempts_for_rev("0123456789abcdef");
+        assert!(matches!(attempts.as_slice(), [FetchAttempt::Default]));
+    }
+
+    #[test]
+    fn should_skip_fetch_for_cached_tag_revisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("repo");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+
+        let commit_oid = commit_file(&repo, &workdir, "README", "hello");
+        let tag_target = repo.find_object(commit_oid, None).unwrap();
+        repo.tag_lightweight("v1.0.0", &tag_target, false).unwrap();
+
+        assert!(should_skip_fetch_for_cached_rev(&repo, "v1.0.0"));
+        assert!(!should_skip_fetch_for_cached_rev(&repo, "main"));
+        assert!(!should_skip_fetch_for_cached_rev(&repo, "HEAD"));
+    }
+
+    #[test]
+    fn git_operation_should_continue_allows_normal_progress() {
+        let bar = ProgressBar::hidden();
+        crate::interrupts::reset();
+        assert!(git_operation_should_continue(Some(&bar)));
     }
 }

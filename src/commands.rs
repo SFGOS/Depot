@@ -1276,6 +1276,7 @@ struct PlannedPackageInstall {
     staged: PlannedStagedInstall,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct InstalledPackageOutcome {
     package: package::PackageInfo,
@@ -1870,8 +1871,7 @@ fn install_planned_packages_to_rootfs(
     plans: &[PlannedPackageInstall],
     rootfs: &Path,
     config: &config::Config,
-) -> Result<Vec<InstalledPackageOutcome>> {
-    let mut installed = Vec::with_capacity(plans.len());
+) -> Result<()> {
     let mut removed_replacements = HashSet::new();
     for (idx, plan) in plans.iter().enumerate() {
         ui::info(format!(
@@ -1884,30 +1884,13 @@ fn install_planned_packages_to_rootfs(
         ));
         for package in &plan.staged.replacement_removals {
             if removed_replacements.insert(package.clone()) {
-                ui::info(format!("Removing package {}...", package));
                 remove_installed_package_with_hooks(package, rootfs, config)?;
             }
         }
         install_staged_to_rootfs(&plan.spec, &plan.destdir, rootfs, config, &plan.staged)?;
-        installed.push(InstalledPackageOutcome {
-            package: plan.spec.package.clone(),
-            is_update: plan.staged.is_update,
-        });
     }
     install::scripts::run_deferred_hooks_if_possible(rootfs)?;
-    Ok(installed)
-}
-
-fn log_install_success(outcome: &InstalledPackageOutcome) {
-    let action = install_success_action(outcome.is_update);
-    ui::success(format!(
-        "Successfully {} {} v{}",
-        action, outcome.package.name, outcome.package.version
-    ));
-}
-
-fn install_success_action(is_update: bool) -> &'static str {
-    if is_update { "updated" } else { "installed" }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1918,8 +1901,15 @@ fn install_package_outputs_to_rootfs(
     config: &config::Config,
 ) -> Result<Vec<InstalledPackageOutcome>> {
     let plans = plan_package_outputs_for_install(pkg_spec, destdir, rootfs, config)?;
+    let installed = plans
+        .iter()
+        .map(|plan| InstalledPackageOutcome {
+            package: plan.spec.package.clone(),
+            is_update: plan.staged.is_update,
+        })
+        .collect();
     run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Pre, &plans)?;
-    let installed = install_planned_packages_to_rootfs(&plans, rootfs, config)?;
+    install_planned_packages_to_rootfs(&plans, rootfs, config)?;
     run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Post, &plans)?;
     Ok(installed)
 }
@@ -3727,7 +3717,6 @@ fn build_live_rootfs_child_install_batches(
 fn flush_binary_install_batch(
     pending_plans: &mut Vec<PlannedPackageInstall>,
     pending_staging_dirs: &mut Vec<tempfile::TempDir>,
-    installed_outcomes: &mut Vec<InstalledPackageOutcome>,
     rootfs: &Path,
     config: &config::Config,
 ) -> Result<()> {
@@ -3735,8 +3724,7 @@ fn flush_binary_install_batch(
         return Ok(());
     }
 
-    let installed = install_planned_packages_to_rootfs(pending_plans, rootfs, config)?;
-    installed_outcomes.extend(installed);
+    install_planned_packages_to_rootfs(pending_plans, rootfs, config)?;
     pending_plans.clear();
     pending_staging_dirs.clear();
     Ok(())
@@ -4014,14 +4002,12 @@ fn execute_install_plan_with_child_commands(
     let mut binary_post_hook_plans = Vec::new();
     let mut pending_binary_install_plans = Vec::new();
     let mut pending_binary_install_staging_dirs = Vec::new();
-    let mut installed_binary_outcomes = Vec::new();
     for (idx, step) in actionable_steps.into_iter().enumerate() {
         match &step.origin {
             planner::PlanOrigin::Source { path, .. } => {
                 flush_binary_install_batch(
                     &mut pending_binary_install_plans,
                     &mut pending_binary_install_staging_dirs,
-                    &mut installed_binary_outcomes,
                     rootfs,
                     config,
                 )?;
@@ -4075,14 +4061,9 @@ fn execute_install_plan_with_child_commands(
     flush_binary_install_batch(
         &mut pending_binary_install_plans,
         &mut pending_binary_install_staging_dirs,
-        &mut installed_binary_outcomes,
         rootfs,
         config,
     )?;
-    for pkg in installed_binary_outcomes {
-        log_install_success(&pkg);
-    }
-
     run_transaction_hooks_for_plans(
         rootfs,
         install::hooks::HookPhase::Post,
@@ -4208,10 +4189,7 @@ fn run_direct_archive_install_requests(
         install::hooks::HookPhase::Pre,
         &transaction_plans,
     )?;
-    let installed = install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
-    for pkg in installed {
-        log_install_success(&pkg);
-    }
+    install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
     run_transaction_hooks_for_plans(
         options.rootfs,
         install::hooks::HookPhase::Post,
@@ -4637,10 +4615,7 @@ fn run_direct_install_request(
     )?;
     let _snapper_post_install_snapshot_todo: fn() -> ! =
         || todo!("snapper: create post-install snapshot after install commit succeeds");
-    let installed = install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
-    for pkg in installed {
-        log_install_success(&pkg);
-    }
+    install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
     run_transaction_hooks_for_plans(
         options.rootfs,
         install::hooks::HookPhase::Post,
@@ -4808,7 +4783,6 @@ pub fn run(cli: Cli) -> Result<()> {
             ..
         }) => {
             let rootfs = rootfs_args.rootfs;
-            ui::info(format!("Removing package: {}", package));
             let config = config::Config::for_rootfs(&rootfs);
             let mut remove_lock = locking::open_lock(&config)?;
             let remove_lock_path = locking::lock_path(&config);
@@ -5281,14 +5255,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             install::hooks::HookPhase::Pre,
                             &transaction_plans,
                         )?;
-                        let installed = install_planned_packages_to_rootfs(
-                            &transaction_plans,
-                            &rootfs,
-                            &config,
-                        )?;
-                        for pkg in installed {
-                            log_install_success(&pkg);
-                        }
+                        install_planned_packages_to_rootfs(&transaction_plans, &rootfs, &config)?;
                         run_transaction_hooks_for_plans(
                             &rootfs,
                             install::hooks::HookPhase::Post,
@@ -7986,12 +7953,6 @@ optional = []
                 "zlib".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn install_success_action_uses_updated_for_replacements() {
-        assert_eq!(install_success_action(false), "installed");
-        assert_eq!(install_success_action(true), "updated");
     }
 
     #[test]
