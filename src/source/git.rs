@@ -177,6 +177,7 @@ fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str, rev: &str) -> Resu
         attempted = true;
         let refspecs = attempt.refspecs();
         fetch_remote_refspecs(&mut remote, url, pkgname, &refspecs)?;
+        repair_mirror_refs(&repo)?;
         if resolve_rev_object(&repo, rev).is_ok() {
             crate::log_info!("{}", message);
             return Ok(());
@@ -202,7 +203,7 @@ impl FetchAttempt {
     fn refspecs(&self) -> Vec<&str> {
         match self {
             FetchAttempt::Default => Vec::new(),
-            FetchAttempt::HeadRefs => vec!["+refs/heads/*:refs/remotes/origin/*"],
+            FetchAttempt::HeadRefs => vec!["+refs/heads/*:refs/heads/*"],
             FetchAttempt::Tag(tag) => vec![tag.as_str()],
             FetchAttempt::Branch(branch) => vec![branch.as_str()],
         }
@@ -261,6 +262,70 @@ fn fetch_attempt_message(attempt: &FetchAttempt, rev: &str, fresh: bool) -> Opti
     }
 }
 
+fn repair_mirror_refs(repo: &Repository) -> Result<()> {
+    sync_remote_tracking_heads(repo)?;
+    ensure_valid_local_head(repo)
+}
+
+fn sync_remote_tracking_heads(repo: &Repository) -> Result<()> {
+    for reference_result in repo.references_glob("refs/remotes/origin/*")? {
+        let reference = reference_result?;
+        let Some(name) = reference.name() else {
+            continue;
+        };
+        if name == "refs/remotes/origin/HEAD" {
+            continue;
+        }
+        let Some(branch) = name.strip_prefix("refs/remotes/origin/") else {
+            continue;
+        };
+        let Some(target) = reference.target() else {
+            continue;
+        };
+        repo.reference(
+            &format!("refs/heads/{branch}"),
+            target,
+            true,
+            "sync mirror branch from origin tracking ref",
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_valid_local_head(repo: &Repository) -> Result<()> {
+    if let Ok(head) = repo.head()
+        && (head.target().is_some() || head.resolve().is_ok())
+    {
+        return Ok(());
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    for reference_result in repo.references_glob("refs/heads/*")? {
+        let reference = reference_result?;
+        let Some(name) = reference.name() else {
+            continue;
+        };
+        candidates.push(name.to_string());
+    }
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    candidates.sort();
+    let preferred = candidates
+        .iter()
+        .find(|name| name.as_str() == "refs/heads/main")
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|name| name.as_str() == "refs/heads/master")
+        })
+        .unwrap_or(&candidates[0]);
+    repo.set_head(preferred)?;
+    Ok(())
+}
+
 fn fetch_attempts_for_rev(rev: &str) -> Vec<FetchAttempt> {
     if rev.eq_ignore_ascii_case("HEAD") {
         return vec![FetchAttempt::HeadRefs, FetchAttempt::Default];
@@ -303,7 +368,7 @@ fn tag_refspec(rev: &str) -> String {
 }
 
 fn branch_refspec(rev: &str) -> String {
-    format!("+refs/heads/{rev}:refs/remotes/origin/{rev}")
+    format!("+refs/heads/{rev}:refs/heads/{rev}")
 }
 
 fn checkout_rev(repo: &Repository, rev: &str) -> Result<()> {
@@ -806,7 +871,7 @@ mod tests {
             matches!(&attempts[0], FetchAttempt::Tag(tag) if tag == "refs/tags/v1.2.3:refs/tags/v1.2.3")
         );
         assert!(
-            matches!(&attempts[1], FetchAttempt::Branch(branch) if branch == "+refs/heads/v1.2.3:refs/remotes/origin/v1.2.3")
+            matches!(&attempts[1], FetchAttempt::Branch(branch) if branch == "+refs/heads/v1.2.3:refs/heads/v1.2.3")
         );
         assert!(matches!(attempts[2], FetchAttempt::Default));
     }
@@ -838,5 +903,83 @@ mod tests {
         let bar = ProgressBar::hidden();
         crate::interrupts::reset();
         assert!(git_operation_should_continue(Some(&bar)));
+    }
+
+    #[test]
+    fn ensure_valid_local_head_prefers_main_when_head_branch_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let bare_dir = temp.path().join("bare.git");
+        let workdir = temp.path().join("work");
+        let repo = Repository::init_bare(&bare_dir).unwrap();
+        std::fs::create_dir_all(&workdir).unwrap();
+        let work_repo = Repository::init(&workdir).unwrap();
+        work_repo.set_head("refs/heads/main").unwrap();
+        commit_file(&work_repo, &workdir, "README", "hello");
+        let topic_branch = work_repo
+            .branch(
+                "topic",
+                &work_repo.head().unwrap().peel_to_commit().unwrap(),
+                false,
+            )
+            .unwrap();
+        drop(topic_branch);
+        let mut remote = work_repo
+            .remote("origin", bare_dir.to_str().unwrap())
+            .unwrap();
+        remote
+            .push(
+                &[
+                    "refs/heads/main:refs/heads/main",
+                    "refs/heads/topic:refs/heads/topic",
+                ],
+                None,
+            )
+            .unwrap();
+        repo.set_head("refs/heads/missing").unwrap();
+
+        ensure_valid_local_head(&repo).unwrap();
+
+        assert_eq!(
+            repo.head().unwrap().resolve().unwrap().name(),
+            Some("refs/heads/main")
+        );
+    }
+
+    #[test]
+    fn checkout_head_succeeds_with_bare_mirror_heads_only_fetch() {
+        let temp = tempfile::tempdir().unwrap();
+        let origin_dir = temp.path().join("origin.git");
+        let workdir = temp.path().join("work");
+        let cache_dir = temp.path().join("cache");
+        let checkout_dir = temp.path().join("checkout");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        let origin = Repository::init_bare(&origin_dir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        let commit_oid = commit_file(&repo, &workdir, "README", "hello\n");
+        let mut remote = repo.remote("origin", origin_dir.to_str().unwrap()).unwrap();
+        remote
+            .push(&["refs/heads/main:refs/heads/main"], None)
+            .unwrap();
+        origin.set_head("refs/heads/main").unwrap();
+
+        let origin_url = url::Url::from_file_path(&origin_dir).unwrap().to_string();
+        checkout(
+            &origin_url,
+            "HEAD",
+            &checkout_dir,
+            &cache_dir,
+            "test-pkg",
+            &[],
+        )
+        .unwrap();
+
+        let checkout_repo = Repository::open(&checkout_dir).unwrap();
+        assert_eq!(checkout_repo.head().unwrap().target(), Some(commit_oid));
+        assert_eq!(
+            std::fs::read_to_string(checkout_dir.join("README")).unwrap(),
+            "hello\n"
+        );
     }
 }

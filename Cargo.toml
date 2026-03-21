@@ -1,6 +1,6 @@
 [package]
 name = "depot"
-version = "0.28.0"
+version = "0.28.1"
 edition = "2024"
 
 [lints.rust]
@@ -20,14 +20,14 @@ semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 yaml-rust2 = "0.11.0"
 sha2 = "0.10.9"
-tar = "0.4.44"
+tar = "0.4.45"
 tempfile = "=3.27.0"
 thiserror = "2.0.18"
 toml = "1.0.6"
 url = "2.5.8"
 walkdir = "2.5.0"
 xz2 = "0.1.7"
-zip = "8.2.0"
+zip = "8.3.0"
 zstd = { version = "0.13.3", features = ["zstdmt"] }
 inquire = "0.9.4"
 md5 = "0.8.0"
