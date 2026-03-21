@@ -2,7 +2,8 @@
 
 use anyhow::{Context, Result};
 use git2::{
-    CheckoutNotificationType, Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository,
+    AutotagOption, CheckoutNotificationType, Cred, CredentialType, FetchOptions, Oid,
+    RemoteCallbacks, Repository,
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use inquire::Password;
@@ -199,7 +200,7 @@ fn ensure_mirror(
 
 #[derive(Clone)]
 enum FetchAttempt {
-    Default,
+    FullRefs,
     HeadRefs,
     Tag(String),
     Branch(String),
@@ -208,13 +209,16 @@ enum FetchAttempt {
 impl FetchAttempt {
     fn refspecs(&self) -> Vec<&str> {
         match self {
-            FetchAttempt::Default => Vec::new(),
+            FetchAttempt::FullRefs => vec![ALL_HEADS_REFSPEC, ALL_TAGS_REFSPEC],
             FetchAttempt::HeadRefs => vec!["+refs/heads/*:refs/heads/*"],
             FetchAttempt::Tag(tag) => vec![tag.as_str()],
             FetchAttempt::Branch(branch) => vec![branch.as_str()],
         }
     }
 }
+
+const ALL_HEADS_REFSPEC: &str = "+refs/heads/*:refs/heads/*";
+const ALL_TAGS_REFSPEC: &str = "+refs/tags/*:refs/tags/*";
 
 fn ensure_origin_remote<'a>(repo: &'a Repository, url: &str) -> Result<git2::Remote<'a>> {
     match repo.find_remote("origin") {
@@ -235,6 +239,8 @@ fn fetch_remote_refspecs(
     refspecs: &[&str],
 ) -> Result<()> {
     let mut fo = FetchOptions::new();
+    fo.download_tags(AutotagOption::All);
+    fo.update_fetchhead(true);
     let transfer_progress = TransferProgress::new(format!("git {}", pkgname));
     fo.remote_callbacks(authenticated_remote_callbacks(
         Some(transfer_progress.bar()),
@@ -261,7 +267,7 @@ fn fetch_attempt_message(attempt: &FetchAttempt, rev: &str, fresh: bool) -> Opti
         "mirror updated"
     };
     match attempt {
-        FetchAttempt::Default => Some(state.to_string()),
+        FetchAttempt::FullRefs => Some(format!("{state} (all heads/tags)")),
         FetchAttempt::HeadRefs => Some(format!("{state} (heads only)")),
         FetchAttempt::Tag(_) => Some(format!("{state} (tag {})", rev)),
         FetchAttempt::Branch(_) => Some(format!("{state} (branch {})", rev)),
@@ -334,17 +340,17 @@ fn ensure_valid_local_head(repo: &Repository) -> Result<()> {
 
 fn fetch_attempts_for_rev(rev: &str) -> Vec<FetchAttempt> {
     if rev.eq_ignore_ascii_case("HEAD") {
-        return vec![FetchAttempt::HeadRefs, FetchAttempt::Default];
+        return vec![FetchAttempt::HeadRefs, FetchAttempt::FullRefs];
     }
 
     if is_probably_oid(rev) {
-        return vec![FetchAttempt::Default];
+        return vec![FetchAttempt::FullRefs];
     }
 
     vec![
         FetchAttempt::Tag(tag_refspec(rev)),
         FetchAttempt::Branch(branch_refspec(rev)),
-        FetchAttempt::Default,
+        FetchAttempt::FullRefs,
     ]
 }
 
@@ -388,7 +394,7 @@ fn is_probably_oid(rev: &str) -> bool {
 }
 
 fn tag_refspec(rev: &str) -> String {
-    format!("refs/tags/{rev}:refs/tags/{rev}")
+    format!("+refs/tags/{rev}:refs/tags/{rev}")
 }
 
 fn branch_refspec(rev: &str) -> String {
@@ -883,7 +889,7 @@ mod tests {
         let attempts = fetch_attempts_for_rev("HEAD");
         assert!(matches!(
             attempts.as_slice(),
-            [FetchAttempt::HeadRefs, FetchAttempt::Default]
+            [FetchAttempt::HeadRefs, FetchAttempt::FullRefs]
         ));
     }
 
@@ -892,18 +898,24 @@ mod tests {
         let attempts = fetch_attempts_for_rev("v1.2.3");
         assert_eq!(attempts.len(), 3);
         assert!(
-            matches!(&attempts[0], FetchAttempt::Tag(tag) if tag == "refs/tags/v1.2.3:refs/tags/v1.2.3")
+            matches!(&attempts[0], FetchAttempt::Tag(tag) if tag == "+refs/tags/v1.2.3:refs/tags/v1.2.3")
         );
         assert!(
             matches!(&attempts[1], FetchAttempt::Branch(branch) if branch == "+refs/heads/v1.2.3:refs/heads/v1.2.3")
         );
-        assert!(matches!(attempts[2], FetchAttempt::Default));
+        assert!(matches!(attempts[2], FetchAttempt::FullRefs));
     }
 
     #[test]
     fn fetch_attempts_for_oid_use_full_fetch_only() {
         let attempts = fetch_attempts_for_rev("0123456789abcdef");
-        assert!(matches!(attempts.as_slice(), [FetchAttempt::Default]));
+        assert!(matches!(attempts.as_slice(), [FetchAttempt::FullRefs]));
+    }
+
+    #[test]
+    fn full_fetch_attempt_includes_heads_and_tags_refspecs() {
+        let refspecs = FetchAttempt::FullRefs.refspecs();
+        assert_eq!(refspecs, vec![ALL_HEADS_REFSPEC, ALL_TAGS_REFSPEC]);
     }
 
     #[test]
@@ -1080,6 +1092,56 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(checkout_dir.join("TOPIC")).unwrap(),
             "topic\n"
+        );
+    }
+
+    #[test]
+    fn checkout_resolves_annotated_tags_from_remote() {
+        let temp = tempfile::tempdir().unwrap();
+        let origin_dir = temp.path().join("origin.git");
+        let workdir = temp.path().join("work");
+        let cache_dir = temp.path().join("cache");
+        let checkout_dir = temp.path().join("checkout");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        let origin = Repository::init_bare(&origin_dir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+
+        let release_commit = commit_file(&repo, &workdir, "README", "release\n");
+        let release_target = repo.find_object(release_commit, None).unwrap();
+        let sig = git2::Signature::now("depot-test", "depot@example.test").unwrap();
+        repo.tag("v1.0.0", &release_target, &sig, "release tag", false)
+            .unwrap();
+
+        let mut remote = repo.remote("origin", origin_dir.to_str().unwrap()).unwrap();
+        remote
+            .push(
+                &[
+                    "refs/heads/main:refs/heads/main",
+                    "refs/tags/v1.0.0:refs/tags/v1.0.0",
+                ],
+                None,
+            )
+            .unwrap();
+        origin.set_head("refs/heads/main").unwrap();
+
+        let origin_url = url::Url::from_file_path(&origin_dir).unwrap().to_string();
+        checkout(
+            &origin_url,
+            "v1.0.0",
+            &checkout_dir,
+            &cache_dir,
+            "test-pkg",
+            &[],
+        )
+        .unwrap();
+
+        let checkout_repo = Repository::open(&checkout_dir).unwrap();
+        assert_eq!(checkout_repo.head().unwrap().target(), Some(release_commit));
+        assert_eq!(
+            std::fs::read_to_string(checkout_dir.join("README")).unwrap(),
+            "release\n"
         );
     }
 }
