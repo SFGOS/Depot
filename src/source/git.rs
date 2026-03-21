@@ -34,7 +34,7 @@ pub fn checkout(
     })?;
 
     let mirror_dir = git_cache_dir.join(mirror_key(url));
-    ensure_mirror(url, &mirror_dir, pkgname, rev)?;
+    ensure_mirror(url, &mirror_dir, pkgname, rev, cherry_pick_revs)?;
 
     if checkout_dir.exists() {
         fs::remove_dir_all(checkout_dir).with_context(|| {
@@ -150,7 +150,13 @@ fn mirror_key(url: &str) -> String {
     format!("{:x}", digest)
 }
 
-fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str, rev: &str) -> Result<()> {
+fn ensure_mirror(
+    url: &str,
+    mirror_dir: &Path,
+    pkgname: &str,
+    rev: &str,
+    cherry_pick_revs: &[String],
+) -> Result<()> {
     let fresh = !mirror_dir.exists();
     let repo = if fresh {
         crate::log_info!("Initializing git mirror for {} ({})...", pkgname, url);
@@ -161,7 +167,7 @@ fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str, rev: &str) -> Resu
             .with_context(|| format!("Failed to open git mirror: {}", mirror_dir.display()))?
     };
 
-    if should_skip_fetch_for_cached_rev(&repo, rev) {
+    if should_skip_fetch_for_cached_revs(&repo, rev, cherry_pick_revs) {
         crate::log_info!("Using cached git revision '{}' for {}.", rev, pkgname);
         return Ok(());
     }
@@ -178,7 +184,7 @@ fn ensure_mirror(url: &str, mirror_dir: &Path, pkgname: &str, rev: &str) -> Resu
         let refspecs = attempt.refspecs();
         fetch_remote_refspecs(&mut remote, url, pkgname, &refspecs)?;
         repair_mirror_refs(&repo)?;
-        if resolve_rev_object(&repo, rev).is_ok() {
+        if has_required_revs(&repo, rev, cherry_pick_revs) {
             crate::log_info!("{}", message);
             return Ok(());
         }
@@ -342,7 +348,15 @@ fn fetch_attempts_for_rev(rev: &str) -> Vec<FetchAttempt> {
     ]
 }
 
-fn should_skip_fetch_for_cached_rev(repo: &Repository, rev: &str) -> bool {
+fn should_skip_fetch_for_cached_revs(
+    repo: &Repository,
+    rev: &str,
+    cherry_pick_revs: &[String],
+) -> bool {
+    if !has_required_revs(repo, rev, cherry_pick_revs) {
+        return false;
+    }
+
     if rev.eq_ignore_ascii_case("HEAD") {
         return false;
     }
@@ -356,6 +370,16 @@ fn should_skip_fetch_for_cached_rev(repo: &Repository, rev: &str) -> bool {
     }
 
     false
+}
+
+fn has_required_revs(repo: &Repository, rev: &str, cherry_pick_revs: &[String]) -> bool {
+    if resolve_rev_object(repo, rev).is_err() {
+        return false;
+    }
+
+    cherry_pick_revs
+        .iter()
+        .all(|cherry_pick_rev| resolve_rev_object(repo, cherry_pick_rev.trim()).is_ok())
 }
 
 fn is_probably_oid(rev: &str) -> bool {
@@ -893,9 +917,27 @@ mod tests {
         let tag_target = repo.find_object(commit_oid, None).unwrap();
         repo.tag_lightweight("v1.0.0", &tag_target, false).unwrap();
 
-        assert!(should_skip_fetch_for_cached_rev(&repo, "v1.0.0"));
-        assert!(!should_skip_fetch_for_cached_rev(&repo, "main"));
-        assert!(!should_skip_fetch_for_cached_rev(&repo, "HEAD"));
+        assert!(should_skip_fetch_for_cached_revs(&repo, "v1.0.0", &[]));
+        assert!(!should_skip_fetch_for_cached_revs(&repo, "main", &[]));
+        assert!(!should_skip_fetch_for_cached_revs(&repo, "HEAD", &[]));
+    }
+
+    #[test]
+    fn should_not_skip_fetch_when_cherry_pick_rev_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("repo");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+
+        let commit_oid = commit_file(&repo, &workdir, "README", "hello");
+        let tag_target = repo.find_object(commit_oid, None).unwrap();
+        repo.tag_lightweight("v1.0.0", &tag_target, false).unwrap();
+
+        assert!(!should_skip_fetch_for_cached_revs(
+            &repo,
+            "v1.0.0",
+            &[String::from("deadbeef")]
+        ));
     }
 
     #[test]
@@ -980,6 +1022,64 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(checkout_dir.join("README")).unwrap(),
             "hello\n"
+        );
+    }
+
+    #[test]
+    fn checkout_fetches_cherry_pick_revs_after_tag_checkout_resolves() {
+        let temp = tempfile::tempdir().unwrap();
+        let origin_dir = temp.path().join("origin.git");
+        let workdir = temp.path().join("work");
+        let cache_dir = temp.path().join("cache");
+        let checkout_dir = temp.path().join("checkout");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        let origin = Repository::init_bare(&origin_dir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+
+        let base = commit_file(&repo, &workdir, "README", "base\n");
+        let release_target = repo.find_object(base, None).unwrap();
+        repo.tag_lightweight("v1.0.0", &release_target, false)
+            .unwrap();
+
+        let base_commit = repo.find_commit(base).unwrap();
+        repo.branch("topic", &base_commit, false).unwrap();
+        repo.set_head("refs/heads/topic").unwrap();
+        let mut branch_checkout = git2::build::CheckoutBuilder::new();
+        branch_checkout.force();
+        repo.checkout_head(Some(&mut branch_checkout)).unwrap();
+        let cherry_pick = commit_file(&repo, &workdir, "TOPIC", "topic\n");
+
+        let mut remote = repo.remote("origin", origin_dir.to_str().unwrap()).unwrap();
+        remote
+            .push(
+                &[
+                    "refs/heads/main:refs/heads/main",
+                    "refs/heads/topic:refs/heads/topic",
+                    "refs/tags/v1.0.0:refs/tags/v1.0.0",
+                ],
+                None,
+            )
+            .unwrap();
+        origin.set_head("refs/heads/main").unwrap();
+
+        let origin_url = url::Url::from_file_path(&origin_dir).unwrap().to_string();
+        checkout(
+            &origin_url,
+            "v1.0.0",
+            &checkout_dir,
+            &cache_dir,
+            "test-pkg",
+            &[cherry_pick.to_string()],
+        )
+        .unwrap();
+
+        let checkout_repo = Repository::open(&checkout_dir).unwrap();
+        assert_ne!(checkout_repo.head().unwrap().target(), Some(base));
+        assert_eq!(
+            std::fs::read_to_string(checkout_dir.join("TOPIC")).unwrap(),
+            "topic\n"
         );
     }
 }
