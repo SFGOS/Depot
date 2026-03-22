@@ -280,6 +280,7 @@ impl<'a> Resolver<'a> {
             )
         };
         if let Some(&idx) = self.by_package.get(&package_name) {
+            self.bail_if_active_cycle(&package_name)?;
             self.mark_requested_by(idx, requested_by);
             return Ok(idx);
         }
@@ -382,7 +383,7 @@ impl<'a> Resolver<'a> {
             if let Some(dep_idx) =
                 self.resolve_dep_node(dep, None, format!("{} needs {}", record.name, dep))?
             {
-                self.graph.add_edge(dep_idx, idx, ());
+                self.add_dependency_edge(dep_idx, idx, &record.name)?;
             }
         }
 
@@ -641,14 +642,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn push_stack(&mut self, pkg: &str) -> Result<()> {
-        if self.stack.iter().any(|s| s == pkg) {
-            let mut chain = self.stack.join(" -> ");
-            if !chain.is_empty() {
-                chain.push_str(" -> ");
-            }
-            chain.push_str(pkg);
-            anyhow::bail!("Dependency cycle detected: {}", chain);
-        }
+        self.bail_if_active_cycle(pkg)?;
         self.stack.push(pkg.to_string());
         Ok(())
     }
@@ -657,6 +651,48 @@ impl<'a> Resolver<'a> {
         if matches!(self.stack.last(), Some(last) if last == pkg) {
             self.stack.pop();
         }
+    }
+
+    fn add_dependency_edge(
+        &mut self,
+        dep_idx: NodeIndex,
+        dependent_idx: NodeIndex,
+        dependent_package: &str,
+    ) -> Result<()> {
+        let dep_package = self
+            .graph
+            .node_weight(dep_idx)
+            .with_context(|| format!("Missing dependency plan node {dep_idx:?}"))?
+            .step
+            .package
+            .clone();
+        if self.is_active_stack_member(&dep_package) {
+            crate::log_warn!(
+                "dependency cycle detected: {} will be installed before its {} dependency",
+                dependent_package,
+                dep_package
+            );
+            return Ok(());
+        }
+
+        self.graph.add_edge(dep_idx, dependent_idx, ());
+        Ok(())
+    }
+
+    fn bail_if_active_cycle(&self, pkg: &str) -> Result<()> {
+        if let Some(position) = self.stack.iter().position(|entry| entry == pkg) {
+            let mut chain = self.stack[position..].join(" -> ");
+            if !chain.is_empty() {
+                chain.push_str(" -> ");
+            }
+            chain.push_str(pkg);
+            anyhow::bail!("Dependency cycle detected: {}", chain);
+        }
+        Ok(())
+    }
+
+    fn is_active_stack_member(&self, pkg: &str) -> bool {
+        self.stack.iter().any(|entry| entry == pkg)
     }
 }
 
@@ -862,6 +898,7 @@ mod tests {
         Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source,
     };
     use std::collections::BTreeMap;
+    use std::fs;
     use std::path::{Path, PathBuf};
 
     fn mk_spec() -> PackageSpec {
@@ -1136,5 +1173,122 @@ mod tests {
 
         assert!(plan.steps.is_empty());
         assert!(plan.actionable_steps().next().is_none());
+    }
+
+    #[test]
+    fn build_dependency_install_plan_reports_source_cycle_chain() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let repo_root = tempfile::tempdir().unwrap();
+        let config = Config::for_rootfs(rootfs.path());
+
+        let alpha_dir = repo_root.path().join("alpha");
+        let beta_dir = repo_root.path().join("beta");
+        fs::create_dir_all(&alpha_dir).unwrap();
+        fs::create_dir_all(&beta_dir).unwrap();
+
+        fs::write(
+            alpha_dir.join("alpha.toml"),
+            r#"
+[build]
+type = "meta"
+
+[dependencies]
+runtime = ["beta"]
+
+[package]
+description = "alpha"
+homepage = "https://example.test/alpha"
+license = "MIT"
+name = "alpha"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            beta_dir.join("beta.toml"),
+            r#"
+[build]
+type = "meta"
+
+[dependencies]
+runtime = ["alpha"]
+
+[package]
+description = "beta"
+homepage = "https://example.test/beta"
+license = "MIT"
+name = "beta"
+version = "1.0.0"
+"#,
+        )
+        .unwrap();
+
+        let err = build_dependency_install_plan(
+            &config,
+            rootfs.path(),
+            &["alpha".to_string()],
+            PlannerOptions {
+                assume_yes: false,
+                prefer_binary: false,
+                local_sibling_root: Some(repo_root.path().to_path_buf()),
+                include_test_deps: false,
+                lib32_only_requested_specs: false,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Dependency cycle detected: alpha -> beta -> alpha"
+        );
+    }
+
+    #[test]
+    fn add_dependency_edge_skips_active_binary_cycle_back_edge() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let config = Config::for_rootfs(rootfs.path());
+        let mut resolver = super::Resolver::new(
+            &config,
+            rootfs.path(),
+            PlannerOptions {
+                assume_yes: false,
+                prefer_binary: true,
+                local_sibling_root: None,
+                include_test_deps: false,
+                lib32_only_requested_specs: false,
+            },
+        );
+
+        let freetype2 = resolver.graph.add_node(super::NodeData {
+            step: super::PlannedStep {
+                package: "freetype2".into(),
+                action: super::PlanAction::InstallBinary,
+                origin: super::PlanOrigin::Installed,
+                requested_by: vec!["requested".into()],
+            },
+        });
+        let harfbuzz = resolver.graph.add_node(super::NodeData {
+            step: super::PlannedStep {
+                package: "harfbuzz".into(),
+                action: super::PlanAction::InstallBinary,
+                origin: super::PlanOrigin::Installed,
+                requested_by: vec!["requested".into()],
+            },
+        });
+
+        resolver.stack = vec!["freetype2".into(), "harfbuzz".into()];
+        resolver
+            .add_dependency_edge(freetype2, harfbuzz, "harfbuzz")
+            .unwrap();
+
+        assert_eq!(resolver.graph.edge_count(), 0);
+
+        resolver.stack.clear();
+        resolver
+            .add_dependency_edge(freetype2, harfbuzz, "harfbuzz")
+            .unwrap();
+
+        assert_eq!(resolver.graph.edge_count(), 1);
     }
 }

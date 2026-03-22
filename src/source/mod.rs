@@ -23,6 +23,120 @@ fn expand_manual_source_value(spec: &PackageSpec, raw: &str) -> String {
         .replace("${CARCH}", carch)
 }
 
+fn manual_local_entries(manual: &crate::package::ManualSource) -> Vec<String> {
+    let mut local_entries = Vec::new();
+    if let Some(file) = manual.file.as_ref()
+        && !file.trim().is_empty()
+    {
+        local_entries.push(file.clone());
+    }
+    local_entries.extend(
+        manual
+            .files
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .cloned(),
+    );
+    local_entries
+}
+
+fn manual_url_entries(manual: &crate::package::ManualSource) -> Vec<String> {
+    let mut url_entries = Vec::new();
+    if let Some(url) = manual.url.as_ref()
+        && !url.trim().is_empty()
+    {
+        url_entries.push(url.clone());
+    }
+    url_entries.extend(manual.urls.iter().filter(|s| !s.trim().is_empty()).cloned());
+    url_entries
+}
+
+/// Validate manual sources early, before dependency installation and build work.
+///
+/// Local entries are checked for existence and optional checksum correctness.
+/// Remote entries are fetched into the manual-source cache so build-time source
+/// preparation can reuse the verified result later.
+pub fn preflight_manual_sources(spec: &PackageSpec, cache_dir: &Path) -> Result<()> {
+    if spec.manual_sources.is_empty() {
+        return Ok(());
+    }
+
+    let manual_entry_count: usize = spec
+        .manual_sources
+        .iter()
+        .map(|m| manual_local_entries(m).len() + manual_url_entries(m).len())
+        .sum();
+    crate::log_info!("Checking {} manual source(s)...", manual_entry_count);
+
+    for manual in &spec.manual_sources {
+        let local_entries = manual_local_entries(manual);
+        let url_entries = manual_url_entries(manual);
+
+        if !local_entries.is_empty() {
+            for raw_file in local_entries {
+                let file = expand_manual_source_value(spec, &raw_file);
+                let src_path = spec.spec_dir.join(&file);
+                if !src_path.exists() {
+                    bail!(
+                        "Manual source not found: {} (expected at {})",
+                        file,
+                        src_path.display()
+                    );
+                }
+
+                if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip")
+                    && !verify_file_hash(&src_path, expected_hash)?
+                {
+                    bail!("Checksum mismatch for {}: expected {}", file, expected_hash);
+                }
+            }
+            continue;
+        }
+
+        if !url_entries.is_empty() {
+            for raw_url in url_entries {
+                let expanded_url = expand_manual_source_value(spec, &raw_url);
+                let parsed = Url::parse(&expanded_url)
+                    .with_context(|| format!("Invalid URL: {}", expanded_url))?;
+
+                if parsed.scheme() == "file" {
+                    let src_path = parsed
+                        .to_file_path()
+                        .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", expanded_url))?;
+                    if !src_path.exists() {
+                        bail!("Manual source file URL not found: {}", src_path.display());
+                    }
+                    if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip")
+                        && !verify_file_hash(&src_path, expected_hash)?
+                    {
+                        bail!(
+                            "Checksum mismatch for {}: expected {}",
+                            expanded_url,
+                            expected_hash
+                        );
+                    }
+                    continue;
+                }
+
+                let source = crate::package::Source {
+                    url: expanded_url,
+                    sha256: manual.sha256.clone().unwrap_or_else(|| "skip".to_string()),
+                    extract_dir: "manual-source".to_string(),
+                    patches: Vec::new(),
+                    post_extract: Vec::new(),
+                    cherry_pick: Vec::new(),
+                };
+                let _ = fetcher::fetch_archive(spec, &source, &cache_dir.join("manual"))?;
+            }
+            continue;
+        }
+
+        bail!("Manual source must define one of 'file', 'files', 'url', or 'urls'");
+    }
+
+    Ok(())
+}
+
 /// Copy manual sources to the build directory before fetching remote sources.
 ///
 /// Manual sources support:
@@ -47,27 +161,8 @@ pub fn copy_manual_sources(spec: &PackageSpec, cache_dir: &Path, build_dir: &Pat
     crate::log_info!("Copying {} manual source(s)...", manual_entry_count);
 
     for manual in &spec.manual_sources {
-        let mut local_entries: Vec<String> = Vec::new();
-        if let Some(file) = manual.file.as_ref()
-            && !file.trim().is_empty()
-        {
-            local_entries.push(file.clone());
-        }
-        local_entries.extend(
-            manual
-                .files
-                .iter()
-                .filter(|s| !s.trim().is_empty())
-                .cloned(),
-        );
-
-        let mut url_entries: Vec<String> = Vec::new();
-        if let Some(url) = manual.url.as_ref()
-            && !url.trim().is_empty()
-        {
-            url_entries.push(url.clone());
-        }
-        url_entries.extend(manual.urls.iter().filter(|s| !s.trim().is_empty()).cloned());
+        let local_entries = manual_local_entries(manual);
+        let url_entries = manual_url_entries(manual);
 
         if !local_entries.is_empty() {
             for raw_file in local_entries {

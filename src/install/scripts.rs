@@ -250,8 +250,43 @@ pub fn run_hook_if_present(
     rootfs: &Path,
     pkg_name: &str,
 ) -> Result<bool> {
+    Ok(matches!(
+        dispatch_hook_if_present(script_dir, hook, rootfs, pkg_name, false)?,
+        HookDispatch::Ran
+    ))
+}
+
+/// Run a lifecycle hook if present, or queue it for later replay when the
+/// target rootfs cannot yet execute scripts inside a real chroot.
+///
+/// Returns `true` when a hook script was found and either executed or queued.
+pub fn run_hook_if_present_or_defer(
+    script_dir: &Path,
+    hook: Hook,
+    rootfs: &Path,
+    pkg_name: &str,
+) -> Result<bool> {
+    Ok(matches!(
+        dispatch_hook_if_present(script_dir, hook, rootfs, pkg_name, true)?,
+        HookDispatch::Ran | HookDispatch::Deferred
+    ))
+}
+
+enum HookDispatch {
+    Missing,
+    Ran,
+    Deferred,
+}
+
+fn dispatch_hook_if_present(
+    script_dir: &Path,
+    hook: Hook,
+    rootfs: &Path,
+    pkg_name: &str,
+    allow_defer: bool,
+) -> Result<HookDispatch> {
     let Some(script_path) = resolve_hook_script(script_dir, hook, pkg_name)? else {
-        return Ok(false);
+        return Ok(HookDispatch::Missing);
     };
 
     crate::log_info!(
@@ -260,7 +295,7 @@ pub fn run_hook_if_present(
         script_path.display()
     );
 
-    match run_script_with_rootfs_context(&script_path, rootfs, pkg_name, hook)? {
+    match run_script_with_rootfs_context(&script_path, rootfs, pkg_name, hook, allow_defer)? {
         HookRunOutcome::Ran(status) => {
             if !status.success() {
                 bail!(
@@ -269,14 +304,18 @@ pub fn run_hook_if_present(
                     script_path.display()
                 );
             }
+            Ok(HookDispatch::Ran)
+        }
+        HookRunOutcome::Deferred(script_rel) => {
+            queue_deferred_hook(rootfs, pkg_name, hook, &script_rel)?;
+            Ok(HookDispatch::Deferred)
         }
     }
-
-    Ok(true)
 }
 
 enum HookRunOutcome {
     Ran(std::process::ExitStatus),
+    Deferred(PathBuf),
 }
 
 #[derive(Default)]
@@ -418,29 +457,40 @@ fn run_script_with_rootfs_context(
     rootfs: &Path,
     pkg_name: &str,
     hook: Hook,
+    allow_defer: bool,
 ) -> Result<HookRunOutcome> {
-    // When root and rootfs provides /bin/sh, run inside a real chroot so scripts
-    // can rely on `cd /` and relative paths resolving within that rootfs.
-    if fakeroot::is_root()
-        && should_use_chroot(rootfs)
-        && let Ok(rel) = script_path.strip_prefix(rootfs)
-    {
+    if should_use_chroot(rootfs) && fakeroot::is_root() {
         if rootfs.join("bin/sh").exists() {
-            let status = run_hook_script_in_chroot(rootfs, rel, pkg_name, hook, false)?;
+            let status = if let Ok(rel) = script_path.strip_prefix(rootfs) {
+                run_hook_script_in_chroot(rootfs, rel, pkg_name, hook, false)?
+            } else {
+                run_hook_script_contents_in_chroot(rootfs, script_path, pkg_name, hook, false)?
+            };
             return Ok(HookRunOutcome::Ran(status));
         }
 
-        crate::log_warn!(
-            "Running lifecycle hook {} for {} without chroot because {} has no /bin/sh",
+        if allow_defer {
+            let rel = script_path.strip_prefix(rootfs).with_context(|| {
+                format!(
+                    "Cannot defer lifecycle hook {} for {} because {} is outside {}",
+                    hook.canonical_name(),
+                    pkg_name,
+                    script_path.display(),
+                    rootfs.display()
+                )
+            })?;
+            return Ok(HookRunOutcome::Deferred(rel.to_path_buf()));
+        }
+
+        anyhow::bail!(
+            "Lifecycle hook {} for {} requires {}/bin/sh before it can run",
             hook.canonical_name(),
             pkg_name,
             rootfs.display()
         );
     }
 
-    // Fallback (non-root / no rootfs shell / script outside rootfs):
-    // execute with host /bin/sh while setting cwd to rootfs, so relative paths
-    // inside scripts resolve against that rootfs root.
+    // Live-root installs can execute directly with the host shell.
     let script_arg = if let Ok(rel) = script_path.strip_prefix(rootfs) {
         PathBuf::from(format!("./{}", rel.to_string_lossy()))
     } else {
@@ -504,6 +554,84 @@ fn run_hook_script_in_chroot(
             rootfs.display()
         )
     })
+}
+
+fn run_hook_script_contents_in_chroot(
+    rootfs: &Path,
+    script_path: &Path,
+    pkg_name: &str,
+    hook: Hook,
+    quiet: bool,
+) -> Result<std::process::ExitStatus> {
+    let _mounts = mount_chroot_filesystems(rootfs)?;
+    let mut cmd = Command::new("chroot");
+    cmd.arg(rootfs)
+        .arg("/bin/sh")
+        .arg("-s")
+        .env("DEPOT_PACKAGE", pkg_name)
+        .env("DEPOT_ROOTFS", "/")
+        .env("DEPOT_ACTION", hook.action())
+        .env("DEPOT_PHASE", hook.phase())
+        .env("PATH", crate::runtime_env::safe_script_path())
+        .stdin(Stdio::piped());
+    if quiet {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "Failed to execute lifecycle hook {} in chroot at {}",
+            hook.canonical_name(),
+            rootfs.display()
+        )
+    })?;
+    let script_bytes = fs::read(script_path).with_context(|| {
+        format!(
+            "Failed to read lifecycle hook {} at {}",
+            hook.canonical_name(),
+            script_path.display()
+        )
+    })?;
+    let mut stdin = child.stdin.take().with_context(|| {
+        format!(
+            "Failed to open stdin for lifecycle hook {} in chroot at {}",
+            hook.canonical_name(),
+            rootfs.display()
+        )
+    })?;
+    stdin.write_all(&script_bytes).with_context(|| {
+        format!(
+            "Failed to stream lifecycle hook {} into chroot at {}",
+            hook.canonical_name(),
+            rootfs.display()
+        )
+    })?;
+    drop(stdin);
+    child.wait().with_context(|| {
+        format!(
+            "Failed to wait for lifecycle hook {} in chroot at {}",
+            hook.canonical_name(),
+            rootfs.display()
+        )
+    })
+}
+
+fn queue_deferred_hook(rootfs: &Path, pkg_name: &str, hook: Hook, script_rel: &Path) -> Result<()> {
+    let path = deferred_hooks_file(rootfs);
+    let mut hooks = read_deferred_hooks(&path)?;
+    let item = DeferredHook {
+        pkg_name: pkg_name.to_string(),
+        hook,
+        script_rel: script_rel.to_path_buf(),
+    };
+    if !hooks.iter().any(|existing| {
+        existing.pkg_name == item.pkg_name
+            && existing.hook == item.hook
+            && existing.script_rel == item.script_rel
+    }) {
+        hooks.push(item);
+        write_deferred_hooks(&path, &hooks)?;
+    }
+    Ok(())
 }
 
 fn deferred_hooks_file(rootfs: &Path) -> PathBuf {
@@ -602,7 +730,7 @@ pub fn run_deferred_hooks_if_possible(rootfs: &Path) -> Result<()> {
     for item in hooks {
         let script_path = rootfs.join(&item.script_rel);
         if !script_path.exists() {
-            crate::log_warn!(
+            crate::log_info!(
                 "Dropping deferred lifecycle hook {} for {} because script is missing: {}",
                 item.hook.canonical_name(),
                 item.pkg_name,
@@ -614,7 +742,7 @@ pub fn run_deferred_hooks_if_possible(rootfs: &Path) -> Result<()> {
         match run_hook_script_in_chroot(rootfs, &item.script_rel, &item.pkg_name, item.hook, true) {
             Ok(status) if status.success() => {}
             Ok(status) => {
-                crate::log_warn!(
+                crate::log_info!(
                     "Deferred lifecycle hook {} for {} failed with status {} (kept queued)",
                     item.hook.canonical_name(),
                     item.pkg_name,
@@ -623,7 +751,7 @@ pub fn run_deferred_hooks_if_possible(rootfs: &Path) -> Result<()> {
                 remaining.push(item);
             }
             Err(err) => {
-                crate::log_warn!(
+                crate::log_info!(
                     "Deferred lifecycle hook {} for {} failed with error (kept queued): {}",
                     item.hook.canonical_name(),
                     item.pkg_name,
@@ -636,7 +764,7 @@ pub fn run_deferred_hooks_if_possible(rootfs: &Path) -> Result<()> {
 
     write_deferred_hooks(&path, &remaining)?;
     if !remaining.is_empty() {
-        crate::log_warn!(
+        crate::log_info!(
             "{} deferred lifecycle hook(s) remain queued in {}",
             remaining.len(),
             path.display()
@@ -1207,6 +1335,34 @@ mod tests {
         assert_eq!(loaded[1].pkg_name, hooks[1].pkg_name);
         assert_eq!(loaded[1].hook, hooks[1].hook);
         assert_eq!(loaded[1].script_rel, hooks[1].script_rel);
+    }
+
+    #[test]
+    fn queue_deferred_hook_dedupes_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        queue_deferred_hook(
+            tmp.path(),
+            "foo",
+            Hook::PostInstall,
+            Path::new("usr/share/depot/foo/scripts/post_install"),
+        )
+        .unwrap();
+        queue_deferred_hook(
+            tmp.path(),
+            "foo",
+            Hook::PostInstall,
+            Path::new("usr/share/depot/foo/scripts/post_install"),
+        )
+        .unwrap();
+
+        let loaded = read_deferred_hooks(&deferred_hooks_file(tmp.path())).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].pkg_name, "foo");
+        assert_eq!(loaded[0].hook, Hook::PostInstall);
+        assert_eq!(
+            loaded[0].script_rel,
+            PathBuf::from("usr/share/depot/foo/scripts/post_install")
+        );
     }
 
     #[test]

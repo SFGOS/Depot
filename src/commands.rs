@@ -1276,6 +1276,11 @@ struct PlannedPackageInstall {
     staged: PlannedStagedInstall,
 }
 
+#[derive(Clone, Copy)]
+struct PendingLifecycleHook {
+    hook: install::scripts::Hook,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone)]
 struct InstalledPackageOutcome {
@@ -1782,7 +1787,7 @@ fn install_staged_to_rootfs(
     rootfs: &Path,
     config: &config::Config,
     plan: &PlannedStagedInstall,
-) -> Result<()> {
+) -> Result<Option<PendingLifecycleHook>> {
     let staged_scripts_dir = install::scripts::staged_scripts_dir(destdir);
     let installed_scripts_dir =
         install::scripts::installed_scripts_dir(rootfs, &pkg_spec.package.name);
@@ -1848,23 +1853,13 @@ fn install_staged_to_rootfs(
         &pkg_spec.package.name,
     )?;
 
-    if plan.is_update {
-        let _ = install::scripts::run_hook_if_present(
-            &installed_scripts_dir,
-            install::scripts::Hook::PostUpdate,
-            rootfs,
-            &pkg_spec.package.name,
-        )?;
-    } else {
-        let _ = install::scripts::run_hook_if_present(
-            &installed_scripts_dir,
-            install::scripts::Hook::PostInstall,
-            rootfs,
-            &pkg_spec.package.name,
-        )?;
-    }
-
-    Ok(())
+    Ok(Some(PendingLifecycleHook {
+        hook: if plan.is_update {
+            install::scripts::Hook::PostUpdate
+        } else {
+            install::scripts::Hook::PostInstall
+        },
+    }))
 }
 
 fn install_planned_packages_to_rootfs(
@@ -1873,6 +1868,7 @@ fn install_planned_packages_to_rootfs(
     config: &config::Config,
 ) -> Result<()> {
     let mut removed_replacements = HashSet::new();
+    let mut pending_post_hooks = Vec::new();
     for (idx, plan) in plans.iter().enumerate() {
         ui::info(format!(
             "{}/{} Installing package {}-{}-{}",
@@ -1887,7 +1883,20 @@ fn install_planned_packages_to_rootfs(
                 remove_installed_package_with_hooks(package, rootfs, config)?;
             }
         }
-        install_staged_to_rootfs(&plan.spec, &plan.destdir, rootfs, config, &plan.staged)?;
+        if let Some(hook) =
+            install_staged_to_rootfs(&plan.spec, &plan.destdir, rootfs, config, &plan.staged)?
+        {
+            pending_post_hooks.push((plan.spec.package.name.clone(), hook));
+        }
+    }
+    for (pkg_name, pending_hook) in pending_post_hooks {
+        let installed_scripts_dir = install::scripts::installed_scripts_dir(rootfs, &pkg_name);
+        let _ = install::scripts::run_hook_if_present_or_defer(
+            &installed_scripts_dir,
+            pending_hook.hook,
+            rootfs,
+            &pkg_name,
+        )?;
     }
     install::scripts::run_deferred_hooks_if_possible(rootfs)?;
     Ok(())
@@ -3306,28 +3315,31 @@ fn compare_version_fallback(left: &str, right: &str) -> Ordering {
                 ri += 1;
             }
 
-            let l_num = &left[l_start..li];
-            let r_num = &right[r_start..ri];
-            let l_trimmed = std::str::from_utf8(l_num)
-                .unwrap_or_default()
-                .trim_start_matches('0');
-            let r_trimmed = std::str::from_utf8(r_num)
-                .unwrap_or_default()
-                .trim_start_matches('0');
+            let l_raw = std::str::from_utf8(&left[l_start..li]).unwrap_or_default();
+            let r_raw = std::str::from_utf8(&right[r_start..ri]).unwrap_or_default();
+            let l_trimmed = l_raw.trim_start_matches('0');
+            let r_trimmed = r_raw.trim_start_matches('0');
 
             let l_cmp = if l_trimmed.is_empty() { "0" } else { l_trimmed };
             let r_cmp = if r_trimmed.is_empty() { "0" } else { r_trimmed };
-            match l_cmp.len().cmp(&r_cmp.len()) {
-                Ordering::Equal => match l_cmp.cmp(r_cmp) {
-                    Ordering::Equal => {}
-                    non_eq => return non_eq,
-                },
+            match l_cmp
+                .len()
+                .cmp(&r_cmp.len())
+                .then_with(|| l_cmp.cmp(r_cmp))
+                .then_with(|| l_raw.len().cmp(&r_raw.len()))
+                .then_with(|| l_raw.cmp(r_raw))
+            {
+                Ordering::Equal => {}
                 non_eq => return non_eq,
             }
             continue;
         }
 
-        match lch.to_ascii_lowercase().cmp(&rch.to_ascii_lowercase()) {
+        match lch
+            .to_ascii_lowercase()
+            .cmp(&rch.to_ascii_lowercase())
+            .then_with(|| lch.cmp(&rch))
+        {
             Ordering::Equal => {
                 li += 1;
                 ri += 1;
@@ -3339,14 +3351,20 @@ fn compare_version_fallback(left: &str, right: &str) -> Ordering {
     left.len().cmp(&right.len())
 }
 
+fn canonical_update_version(raw: &str) -> &str {
+    raw.strip_prefix('v')
+        .filter(|rest| rest.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+        .unwrap_or(raw)
+}
+
 fn compare_versions_for_updates(left: &str, right: &str) -> Ordering {
-    let left_semver = left.trim_start_matches('v');
-    let right_semver = right.trim_start_matches('v');
-    if let (Ok(left), Ok(right)) = (
-        semver::Version::parse(left_semver),
-        semver::Version::parse(right_semver),
-    ) {
-        return left.cmp(&right);
+    let left = canonical_update_version(left);
+    let right = canonical_update_version(right);
+    if let (Ok(left), Ok(right)) = (semver::Version::parse(left), semver::Version::parse(right)) {
+        match left.cmp(&right) {
+            Ordering::Equal => {}
+            non_eq => return non_eq,
+        }
     }
 
     if left.len() == 8
@@ -4341,6 +4359,10 @@ fn run_direct_install_request(
         )
     })?;
     let db_path = config.installed_db_path(options.rootfs);
+
+    if staging_dir.is_none() {
+        source::preflight_manual_sources(&pkg_spec, &config.cache_dir)?;
+    }
 
     if staging_dir.is_none() {
         if options.no_deps
@@ -7158,8 +7180,7 @@ optional = []
     }
 
     #[test]
-    fn install_planned_packages_to_rootfs_defers_replacement_removal_until_replacing_plan()
-    -> Result<()> {
+    fn install_planned_packages_to_rootfs_runs_post_hooks_after_batch_install() -> Result<()> {
         let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
         let mut cfg = config::Config::for_rootfs(rootfs.path());
         cfg.db_dir = rootfs.path().join("var/lib/depot");
@@ -7224,7 +7245,7 @@ optional = []
         fs::write(alpha_dest.join("usr/bin/alpha"), "alpha")?;
         fs::write(
             alpha_dest.join("scripts/post_install"),
-            "if [ -e \"$DEPOT_ROOTFS/usr/bin/find\" ]; then printf '%s' present > \"$DEPOT_ROOTFS/alpha-marker\"; else printf '%s' missing > \"$DEPOT_ROOTFS/alpha-marker\"; fi\n",
+            "cat \"$DEPOT_ROOTFS/usr/bin/find\" > \"$DEPOT_ROOTFS/alpha-marker\"\n",
         )?;
 
         let replacement_spec = package::PackageSpec {
@@ -7278,7 +7299,7 @@ optional = []
 
         assert_eq!(
             fs::read_to_string(rootfs.path().join("alpha-marker"))?,
-            "present"
+            "new-find"
         );
         assert_eq!(
             fs::read_to_string(rootfs.path().join("usr/bin/find"))?,
@@ -7625,6 +7646,59 @@ optional = []
             compare_versions_for_updates("1.10", "1.9"),
             Ordering::Greater
         );
+        assert_eq!(
+            compare_versions_for_updates("v1.0.0", "1.0.0"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn compare_versions_for_updates_is_transitive_for_mixed_formats() {
+        let versions = [
+            "01",
+            "1a",
+            "1.0.0",
+            "1.2.0",
+            "1.2.0rc2",
+            "v1.0.0",
+            "1.0.0+meta",
+            "20260107.1",
+            "lts_2026_01_07",
+        ];
+
+        for left in versions {
+            for middle in versions {
+                for right in versions {
+                    let left_middle = compare_versions_for_updates(left, middle);
+                    let middle_right = compare_versions_for_updates(middle, right);
+                    let left_right = compare_versions_for_updates(left, right);
+
+                    if left_middle == Ordering::Less && middle_right == Ordering::Less {
+                        assert_eq!(
+                            left_right,
+                            Ordering::Less,
+                            "expected transitive ordering for {left} < {middle} < {right}"
+                        );
+                    }
+
+                    if left_middle == Ordering::Greater && middle_right == Ordering::Greater {
+                        assert_eq!(
+                            left_right,
+                            Ordering::Greater,
+                            "expected transitive ordering for {left} > {middle} > {right}"
+                        );
+                    }
+
+                    if left_middle == Ordering::Equal && middle_right == Ordering::Equal {
+                        assert_eq!(
+                            left_right,
+                            Ordering::Equal,
+                            "expected transitive equality for {left} == {middle} == {right}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -7811,6 +7885,67 @@ optional = []
         )?;
 
         assert_eq!(fs::read_to_string(&env_path)?, INSTALL_CONTEXT_UPDATE);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_install_checks_manual_sources_before_dependency_resolution() -> Result<()> {
+        let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+        let spec_dir = tempfile::tempdir().context("Failed to create temp spec dir")?;
+        let spec_path = spec_dir.path().join("demo.toml");
+        fs::write(
+            &spec_path,
+            r#"[package]
+name = "demo"
+version = "1.0.0"
+revision = 1
+description = "demo"
+homepage = "https://example.test/demo"
+license = "MIT"
+
+[build]
+type = "custom"
+
+[dependencies]
+runtime = ["definitely-missing-dep"]
+optional = []
+
+[[manual_sources]]
+file = "missing.patch"
+"#,
+        )?;
+
+        let mut config = config::Config::for_rootfs(rootfs.path());
+        config.build_dir = rootfs.path().join("var/cache/depot/build");
+        config.cache_dir = rootfs.path().join("var/cache/depot/sources");
+        config.db_dir = rootfs.path().join("var/lib/depot");
+
+        ui::set_assume_yes(true);
+        let result = run_direct_install_request(
+            DirectInstallOptions {
+                rootfs: rootfs.path(),
+                no_deps: false,
+                no_flags: false,
+                cross_prefix: None,
+                clean: false,
+                dry_run: false,
+                lib32_only: false,
+                install_test_deps: false,
+            },
+            &config,
+            spec_path,
+        );
+        ui::set_assume_yes(false);
+
+        let err = result.expect_err("missing manual source should fail before dependency install");
+        assert!(
+            err.to_string()
+                .contains("Manual source not found: missing.patch")
+        );
+        assert!(
+            !err.to_string()
+                .contains("Could not find package spec for dependency")
+        );
         Ok(())
     }
 
