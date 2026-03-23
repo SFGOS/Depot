@@ -227,10 +227,14 @@ esac
 [ "${DEPOT_OUTPUTS_DIR:-}" != "" ] || fail "DEPOT_OUTPUTS_DIR is not set"
 
 src_root=$DESTDIR
+primary_root=${DEPOT_PRIMARY_DESTDIR:-$DESTDIR}
 out_root=$DEPOT_OUTPUTS_DIR/$out_pkg
 
 case "$src_root" in
     */) src_root=${src_root%/} ;;
+esac
+case "$primary_root" in
+    */) primary_root=${primary_root%/} ;;
 esac
 case "$out_root" in
     */) out_root=${out_root%/} ;;
@@ -319,6 +323,10 @@ collect_matches_for_pattern() {
     fi
 
     scan_root_for_pattern "$src_root" "$pattern"
+
+    if [ "$primary_root" != "$src_root" ]; then
+        scan_root_for_pattern "$primary_root" "$pattern"
+    fi
 
     for candidate_root in "$DEPOT_OUTPUTS_DIR"/*; do
         [ -d "$candidate_root" ] || continue
@@ -435,9 +443,21 @@ mod tests {
     use tempfile::tempdir;
 
     fn run_haul(helpers: &ShellHelpers, destdir: &Path, args: &[&str]) {
+        run_haul_with_env(helpers, destdir, &[], args);
+    }
+
+    fn run_haul_with_env(
+        helpers: &ShellHelpers,
+        destdir: &Path,
+        extra_envs: &[(&str, &Path)],
+        args: &[&str],
+    ) {
         let mut envs = Vec::new();
         helpers.apply_to_env_vars(&mut envs);
         envs.push(("DESTDIR".into(), destdir.to_string_lossy().into_owned()));
+        for (key, value) in extra_envs {
+            envs.push(((*key).into(), value.to_string_lossy().into_owned()));
+        }
 
         let mut cmd = Command::new("sh");
         cmd.arg(&helpers.haul_path);
@@ -587,5 +607,52 @@ mod tests {
                 )
                 .exists()
         );
+    }
+
+    #[test]
+    fn haul_scans_primary_staging_when_running_in_split_output_destdir() {
+        let temp = tempdir().unwrap();
+        let primary_destdir = temp.path().join("dest");
+        std::fs::create_dir_all(primary_destdir.join("usr/lib")).unwrap();
+        std::fs::write(
+            primary_destdir.join("usr/lib/libRusticlOpenCL.so.1.0.0"),
+            "rusticl",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "libRusticlOpenCL.so.1.0.0",
+            primary_destdir.join("usr/lib/libRusticlOpenCL.so.1"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "libRusticlOpenCL.so.1",
+            primary_destdir.join("usr/lib/libRusticlOpenCL.so"),
+        )
+        .unwrap();
+
+        let helpers = ShellHelpers::new(&primary_destdir).unwrap();
+        let split_destdir = primary_destdir.join(".depot/outputs/opencl-mesa");
+        std::fs::create_dir_all(&split_destdir).unwrap();
+
+        run_haul_with_env(
+            &helpers,
+            &split_destdir,
+            &[("DEPOT_PRIMARY_DESTDIR", &primary_destdir)],
+            &["opencl-mesa", "usr/lib/libRusticlOpenCL*"],
+        );
+
+        assert!(
+            !primary_destdir
+                .join("usr/lib/libRusticlOpenCL.so.1.0.0")
+                .exists()
+        );
+        assert!(
+            split_destdir
+                .join("usr/lib/libRusticlOpenCL.so.1.0.0")
+                .exists()
+        );
+        let link_meta =
+            std::fs::symlink_metadata(split_destdir.join("usr/lib/libRusticlOpenCL.so")).unwrap();
+        assert!(link_meta.file_type().is_symlink());
     }
 }
