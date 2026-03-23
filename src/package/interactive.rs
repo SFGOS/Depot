@@ -1544,6 +1544,107 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
         root.insert("dependencies".into(), Value::Table(dep_tbl));
     }
 
+    if !spec.package_dependencies.is_empty() {
+        let mut outputs_tbl = Table::new();
+        for (pkg_name, deps) in &spec.package_dependencies {
+            let mut dep_tbl = Table::new();
+            if !deps.build.is_empty() {
+                dep_tbl.insert(
+                    "build".into(),
+                    Value::Array(
+                        deps.build
+                            .iter()
+                            .map(|s| Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !deps.runtime.is_empty() {
+                dep_tbl.insert(
+                    "runtime".into(),
+                    Value::Array(
+                        deps.runtime
+                            .iter()
+                            .map(|s| Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !deps.test.is_empty() {
+                dep_tbl.insert(
+                    "test".into(),
+                    Value::Array(deps.test.iter().map(|s| Value::String(s.clone())).collect()),
+                );
+            }
+            if !deps.optional.is_empty() {
+                dep_tbl.insert(
+                    "optional".into(),
+                    Value::Array(
+                        deps.optional
+                            .iter()
+                            .map(|s| Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !dep_tbl.is_empty() {
+                outputs_tbl.insert(pkg_name.clone(), Value::Table(dep_tbl));
+            }
+        }
+        if !outputs_tbl.is_empty() {
+            root.insert("package_dependencies".into(), Value::Table(outputs_tbl));
+        }
+    }
+
+    if !spec.package_alternatives.is_empty() {
+        let mut outputs_tbl = Table::new();
+        for (pkg_name, alternatives) in &spec.package_alternatives {
+            let mut alt_tbl = Table::new();
+            if !alternatives.provides.is_empty() {
+                alt_tbl.insert(
+                    "provides".into(),
+                    Value::Array(
+                        alternatives
+                            .provides
+                            .iter()
+                            .map(|s| Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !alternatives.conflicts.is_empty() {
+                alt_tbl.insert(
+                    "conflicts".into(),
+                    Value::Array(
+                        alternatives
+                            .conflicts
+                            .iter()
+                            .map(|s| Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !alternatives.replaces.is_empty() {
+                alt_tbl.insert(
+                    "replaces".into(),
+                    Value::Array(
+                        alternatives
+                            .replaces
+                            .iter()
+                            .map(|s| Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !alt_tbl.is_empty() {
+                outputs_tbl.insert(pkg_name.clone(), Value::Table(alt_tbl));
+            }
+        }
+        if !outputs_tbl.is_empty() {
+            root.insert("package_alternatives".into(), Value::Table(outputs_tbl));
+        }
+    }
+
     Ok(toml::to_string_pretty(&Value::Table(root))?)
 }
 

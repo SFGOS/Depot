@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use url::Url;
 use walkdir::WalkDir;
 
@@ -418,6 +419,20 @@ fn prepare_one(
 
     // Treat `<url>#<rev>` and bare `*.git` sources as git before local file://
     // handling so `file://...repo.git#tag` resolves through the git checkout path.
+    if let Some((base, rev)) = split_hg_url(&url) {
+        let checkout_dir = build_dir.join(&extract_dir_name);
+        if checkout_dir.exists() && checkout_dir.join(".depot_state").exists() {
+            crate::log_info!(
+                "Resuming build in existing hg directory: {}",
+                checkout_dir.display()
+            );
+            return Ok(checkout_dir);
+        }
+        checkout_hg(&base, &rev, &checkout_dir)?;
+        hooks::post_extract(spec, source, &checkout_dir, cache_dir)?;
+        return Ok(checkout_dir);
+    }
+
     if let Some((base, rev)) = split_git_url(&url) {
         let checkout_dir = build_dir.join(&extract_dir_name);
         if checkout_dir.exists() && checkout_dir.join(".depot_state").exists() {
@@ -554,6 +569,45 @@ fn split_git_url(url: &str) -> Option<(String, String)> {
     }
 
     None
+}
+
+fn split_hg_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("hg+")?;
+    if let Some((base, rev)) = rest.split_once('#') {
+        let revision = if rev.trim().is_empty() {
+            "tip"
+        } else {
+            rev.trim()
+        };
+        return Some((base.to_string(), revision.to_string()));
+    }
+    Some((rest.to_string(), "tip".to_string()))
+}
+
+fn checkout_hg(url: &str, rev: &str, checkout_dir: &Path) -> Result<()> {
+    if checkout_dir.exists() {
+        fs::remove_dir_all(checkout_dir).with_context(|| {
+            format!(
+                "Failed to remove existing Mercurial checkout dir: {}",
+                checkout_dir.display()
+            )
+        })?;
+    }
+
+    crate::log_info!("Cloning Mercurial source {} @ {}...", url, rev);
+    let mut cmd = Command::new("hg");
+    cmd.arg("clone")
+        .arg("-u")
+        .arg(rev)
+        .arg(url)
+        .arg(checkout_dir);
+    cmd.env("PATH", crate::runtime_env::safe_script_path());
+    let status = crate::interrupts::command_status(&mut cmd)
+        .with_context(|| format!("Failed to run hg clone for {}", url))?;
+    if !status.success() {
+        bail!("Mercurial clone failed for {} @ {}", url, rev);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -753,6 +807,17 @@ mod tests {
             split_git_url("https://github.com/nlohmann/json.git#0123456789abcdef").unwrap();
         assert_eq!(base, "https://github.com/nlohmann/json.git");
         assert_eq!(rev, "0123456789abcdef");
+    }
+
+    #[test]
+    fn split_hg_url_accepts_revision_and_default_tip() {
+        let (base, rev) = split_hg_url("hg+https://hg.example.test/repo#v1").unwrap();
+        assert_eq!(base, "https://hg.example.test/repo");
+        assert_eq!(rev, "v1");
+
+        let (base, rev) = split_hg_url("hg+https://hg.example.test/repo").unwrap();
+        assert_eq!(base, "https://hg.example.test/repo");
+        assert_eq!(rev, "tip");
     }
 
     #[test]

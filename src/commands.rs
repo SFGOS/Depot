@@ -1,6 +1,7 @@
 use crate::cli::{
-    BuildArgs, Cli, Commands, ConfigArgs, InfoArgs, InstallArgs, InternalCommands, ListArgs,
-    OwnsArgs, RemoveArgs, RepoArgs, RepoCommands, RepoKindArg, SearchArgs, SignArgs, UpdateArgs,
+    BuildArgs, Cli, Commands, ConfigArgs, ConvertArgs, InfoArgs, InstallArgs, InternalCommands,
+    ListArgs, OwnsArgs, RemoveArgs, RepoArgs, RepoCommands, RepoKindArg, SearchArgs, SignArgs,
+    UpdateArgs,
 };
 use crate::{
     builder, cli_assets, config, cross, db, deps, index, install, locking, package, planner,
@@ -63,6 +64,7 @@ fn command_rootfs(command: &Commands) -> Option<&Path> {
         Commands::Repo(args) => Some(repo_command_rootfs(&args.command)),
         Commands::Config(args) => Some(&args.rootfs_args.rootfs),
         Commands::Check(_)
+        | Commands::Convert(_)
         | Commands::GenerateArtifacts(_)
         | Commands::MakeSpec(_)
         | Commands::Internal(_) => None,
@@ -76,6 +78,7 @@ fn command_assume_yes(command: &Commands) -> bool {
         Commands::Build(args) => args.prompt_args.yes,
         Commands::Update(args) => args.prompt_args.yes,
         Commands::Check(_)
+        | Commands::Convert(_)
         | Commands::Info(_)
         | Commands::Search(_)
         | Commands::Owns(_)
@@ -4669,6 +4672,7 @@ pub fn run(cli: Cli) -> Result<()> {
         | Commands::Repo(_)
         | Commands::Config(_)
         | Commands::GenerateArtifacts(_)
+        | Commands::Convert(_)
         | Commands::MakeSpec(_)
         | Commands::Internal(_) => false,
     };
@@ -5900,6 +5904,58 @@ pub fn run(cli: Cli) -> Result<()> {
                 "Package specification saved to {}",
                 output_path.display()
             ));
+        }
+        Commands::Convert(ConvertArgs { input, output }) => {
+            let converted = package::convert_starbuild_file(&input, output.as_deref())?;
+            let mut outputs = vec![converted.output_path.clone()];
+            if let Some(build_script_path) = &converted.build_script_path {
+                outputs.push(build_script_path.clone());
+            }
+
+            let existing: Vec<_> = outputs
+                .iter()
+                .filter(|path| path.exists())
+                .map(|path| path.display().to_string())
+                .collect();
+            if !existing.is_empty() {
+                ui::warn(format!(
+                    "Generated files already exist: {}",
+                    existing.join(", ")
+                ));
+                if !ui::prompt_yes_no("Overwrite them?", false)? {
+                    anyhow::bail!("Aborted");
+                }
+            }
+
+            fs::write(&converted.output_path, converted.toml)
+                .with_context(|| format!("Failed to write {}", converted.output_path.display()))?;
+            if let (Some(build_script), Some(build_script_path)) =
+                (converted.build_script, converted.build_script_path)
+            {
+                fs::write(&build_script_path, build_script)
+                    .with_context(|| format!("Failed to write {}", build_script_path.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = fs::metadata(&build_script_path)
+                        .with_context(|| format!("Failed to stat {}", build_script_path.display()))?
+                        .permissions();
+                    perms.set_mode(0o755);
+                    fs::set_permissions(&build_script_path, perms).with_context(|| {
+                        format!("Failed to chmod {}", build_script_path.display())
+                    })?;
+                }
+                ui::success(format!(
+                    "Converted STARBUILD into {} and {}",
+                    converted.output_path.display(),
+                    build_script_path.display()
+                ));
+            } else {
+                ui::success(format!(
+                    "Converted STARBUILD into {}",
+                    converted.output_path.display()
+                ));
+            }
         }
         Commands::Internal(args) => {
             let command = args.command;

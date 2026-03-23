@@ -117,6 +117,19 @@ pub fn build(
             "DEPOT_PRIMARY_DESTDIR",
             install_destdir.to_string_lossy().into_owned(),
         );
+        let starbuild_workdir = if spec.sources().is_empty() {
+            src_dir.to_path_buf()
+        } else {
+            src_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| src_dir.to_path_buf())
+        };
+        crate::builder::set_env_var(
+            &mut env_vars,
+            "DEPOT_STARBUILD_WORKDIR",
+            starbuild_workdir.to_string_lossy().into_owned(),
+        );
         add_output_destdir_envs(spec, &install_destdir, &mut env_vars);
 
         // Ensure build script path is absolute for when we are in a sub-build-dir

@@ -241,6 +241,17 @@ pub struct MakeSpecArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct ConvertArgs {
+    /// Path to the legacy STARBUILD file
+    #[arg(default_value = "STARBUILD")]
+    pub input: PathBuf,
+
+    /// Output TOML file path (defaults to <mainpkgname>.toml beside the STARBUILD)
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct InternalArgs {
     #[command(subcommand)]
     pub command: InternalCommands,
@@ -277,6 +288,8 @@ pub enum Commands {
     GenerateArtifacts(GenerateArtifactsArgs),
     /// Create a new package specification interactively
     MakeSpec(MakeSpecArgs),
+    /// Convert a legacy STARBUILD into a Depot package spec
+    Convert(ConvertArgs),
     #[command(hide = true)]
     Internal(InternalArgs),
 }
@@ -430,7 +443,8 @@ pub enum RepoKindArg {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildArgs, Cli, Commands, InstallArgs, RepoArgs, RepoCommands, SearchArgs, UpdateArgs,
+        BuildArgs, Cli, Commands, ConvertArgs, InstallArgs, RepoArgs, RepoCommands, SearchArgs,
+        UpdateArgs,
     };
     use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
@@ -514,6 +528,31 @@ mod tests {
         match cli.command {
             Commands::Build(BuildArgs { install_deps, .. }) => assert!(install_deps),
             _ => panic!("expected build command"),
+        }
+    }
+
+    #[test]
+    fn convert_accepts_default_input() {
+        let cli = Cli::try_parse_from(["depot", "convert"]).unwrap();
+        match cli.command {
+            Commands::Convert(ConvertArgs { input, output }) => {
+                assert_eq!(input, PathBuf::from("STARBUILD"));
+                assert!(output.is_none());
+            }
+            _ => panic!("expected convert command"),
+        }
+    }
+
+    #[test]
+    fn convert_accepts_custom_output() {
+        let cli = Cli::try_parse_from(["depot", "convert", "legacy/STARBUILD", "-o", "pkg.toml"])
+            .unwrap();
+        match cli.command {
+            Commands::Convert(ConvertArgs { input, output }) => {
+                assert_eq!(input, PathBuf::from("legacy/STARBUILD"));
+                assert_eq!(output, Some(PathBuf::from("pkg.toml")));
+            }
+            _ => panic!("expected convert command"),
         }
     }
 
