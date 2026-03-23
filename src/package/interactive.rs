@@ -1286,6 +1286,19 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             ),
         );
     }
+    if !spec.build.flags.env_vars.is_empty() {
+        flags_tbl.insert(
+            "env_vars".into(),
+            Value::Array(
+                spec.build
+                    .flags
+                    .env_vars
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if !spec.build.flags.post_compile.is_empty() {
         flags_tbl.insert(
             "post_compile".into(),
@@ -1830,6 +1843,10 @@ mod tests {
             make_test_dirs: vec!["tests".into()],
             make_install_vars: vec!["STRIPPROG=true".into()],
             make_install_dirs: vec!["lib".into(), "apps".into()],
+            env_vars: vec![
+                "SETUPTOOLS_SCM_PRETEND_VERSION=$version".into(),
+                "PYO3_CONFIG_FILE=$specdir/pyo3.toml".into(),
+            ],
             ..BuildFlags::default()
         };
 
@@ -1906,6 +1923,7 @@ mod tests {
         assert!(toml.contains("make_test_dirs = ["));
         assert!(toml.contains("make_install_vars = ["));
         assert!(toml.contains("make_install_dirs = ["));
+        assert!(toml.contains("env_vars = ["));
         assert!(toml.contains("patches = ["));
         assert!(toml.contains("post_extract = ["));
     }

@@ -822,6 +822,17 @@ impl PackageSpec {
                             s.split_whitespace().map(String::from).collect();
                     }
                 }
+                "env_vars" | "env-vars" => {
+                    if let Some(arr) = v.as_array() {
+                        self.build.flags.env_vars = arr
+                            .iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect();
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.env_vars = vec![s.to_string()];
+                    }
+                }
                 "no_flags" | "no-flags" => {
                     if let Some(b) = v.as_bool() {
                         self.build.flags.no_flags = b;
@@ -1584,6 +1595,18 @@ impl PackageSpec {
                             .flags
                             .passthrough_env
                             .extend(s.split_whitespace().map(String::from));
+                    }
+                }
+            }
+            "env_vars" | "env-vars" => {
+                for v in values {
+                    if let Some(arr) = v.as_array() {
+                        self.build
+                            .flags
+                            .env_vars
+                            .extend(arr.iter().filter_map(|x| x.as_str()).map(String::from));
+                    } else if let Some(s) = v.as_str() {
+                        self.build.flags.env_vars.push(s.to_string());
                     }
                 }
             }
@@ -2407,6 +2430,7 @@ replace_cflags = ["-O2=>-O3"]
 cxxflags = ["-O2", "-pipe"]
 replace_cxxflags = ["-pipe=>-fPIC"]
 passthrough_env = ["RUSTFLAGS"]
+env_vars = ["SETUPTOOLS_SCM_PRETEND_VERSION=$version"]
 bindir = "/opt/bin"
 sbindir = "/opt/sbin"
 libdir = "/opt/lib64"
@@ -2503,6 +2527,12 @@ post_configure = ["echo configured"]
         config.appends.insert(
             "build.flags.passthrough_env".to_string(),
             vec![toml::Value::String("CARGO_HOME".to_string())],
+        );
+        config.appends.insert(
+            "build.flags.env_vars".to_string(),
+            vec![toml::Value::String(
+                "SOURCE_DATE_EPOCH=1700000000".to_string(),
+            )],
         );
         config.appends.insert(
             "build.flags.make_test_vars".to_string(),
@@ -2667,6 +2697,18 @@ post_configure = ["echo configured"]
                 .flags
                 .passthrough_env
                 .contains(&"CARGO_HOME".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .env_vars
+                .contains(&"SETUPTOOLS_SCM_PRETEND_VERSION=$version".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .env_vars
+                .contains(&"SOURCE_DATE_EPOCH=1700000000".to_string())
         );
         assert_eq!(spec.build.flags.bindir, "/opt/bin");
         assert_eq!(spec.build.flags.sbindir, "/opt/sbin");
@@ -3384,6 +3426,45 @@ passthrough_env = ["RUSTFLAGS", "CARGO_HOME"]
         assert_eq!(
             spec.build.flags.passthrough_env,
             vec!["RUSTFLAGS".to_string(), "CARGO_HOME".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_env_vars_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "python"
+
+[build.flags]
+env_vars = ["SETUPTOOLS_SCM_PRETEND_VERSION=$version", "PYO3_CONFIG_FILE=$specdir/pyo3.toml"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(
+            spec.build.flags.env_vars,
+            vec![
+                "SETUPTOOLS_SCM_PRETEND_VERSION=$version".to_string(),
+                "PYO3_CONFIG_FILE=$specdir/pyo3.toml".to_string()
+            ]
         );
     }
 
@@ -4339,6 +4420,14 @@ pub struct BuildFlags {
         deserialize_with = "deserialize_string_or_array"
     )]
     pub passthrough_env: Vec<String>,
+    /// Explicit environment variable assignments exported to build commands.
+    /// Each entry must be `KEY=VALUE`.
+    #[serde(
+        default,
+        alias = "env-vars",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub env_vars: Vec<String>,
 
     // Rust-specific fields
     /// Rust build profile: "debug" or "release" (default: release)
@@ -4487,6 +4576,7 @@ impl Default for BuildFlags {
             make_install_targets: Vec::new(),
             make_install_dirs: Vec::new(),
             passthrough_env: Vec::new(),
+            env_vars: Vec::new(),
             profile: default_profile(),
             target: String::new(),
             rustflags: Vec::new(),

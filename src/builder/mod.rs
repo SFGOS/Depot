@@ -54,6 +54,35 @@ pub fn set_env_var(env_vars: &mut EnvVars, key: &str, value: impl Into<String>) 
     }
 }
 
+fn apply_declared_env_vars(spec: &PackageSpec, env_vars: &mut EnvVars) {
+    for raw in &spec.build.flags.env_vars {
+        let expanded = spec.expand_vars(raw);
+        let entry = expanded.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        let Some((key, value)) = entry.split_once('=') else {
+            crate::log_warn!(
+                "Skipping invalid build.flags.env_vars entry '{}'; expected KEY=VALUE",
+                raw
+            );
+            continue;
+        };
+
+        let key = key.trim();
+        if key.is_empty() || key.chars().any(char::is_whitespace) {
+            crate::log_warn!(
+                "Skipping invalid build.flags.env_vars entry '{}'; expected KEY=VALUE",
+                raw
+            );
+            continue;
+        }
+
+        set_env_var(env_vars, key, value.to_string());
+    }
+}
+
 fn default_libdir_for_variant(lib32_variant: bool) -> &'static str {
     if lib32_variant {
         "/usr/lib32"
@@ -524,6 +553,8 @@ pub fn standard_build_env(
             set_env_var(&mut env_vars, key, value);
         }
     }
+
+    apply_declared_env_vars(spec, &mut env_vars);
 
     env_vars
 }
@@ -1114,6 +1145,46 @@ mod tests {
             env.iter()
                 .any(|(k, v)| k == "RUSTFLAGS" && v == "-C target-cpu=native"),
             "expected RUSTFLAGS to be copied from parent environment"
+        );
+    }
+
+    #[test]
+    fn test_standard_build_env_exports_declared_env_vars() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.package.version = "2.4.1".to_string();
+        spec.spec_dir = PathBuf::from("/tmp/specs/demo");
+        spec.build.flags.env_vars = vec![
+            "SETUPTOOLS_SCM_PRETEND_VERSION=$version".into(),
+            "PYO3_CONFIG_FILE=$specdir/pyo3.toml".into(),
+        ];
+
+        let env = standard_build_env(&spec, None, false, true);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "SETUPTOOLS_SCM_PRETEND_VERSION" && v == "2.4.1"),
+            "expected env_vars values to expand package variables"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "PYO3_CONFIG_FILE" && v == "/tmp/specs/demo/pyo3.toml"),
+            "expected env_vars values to expand specdir variables"
+        );
+    }
+
+    #[test]
+    fn test_standard_build_env_declared_env_vars_override_defaults_and_passthrough() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.cc = "spec-cc".to_string();
+        spec.build.flags.passthrough_env = vec!["CC".into()];
+        spec.build.flags.env_vars = vec!["CC=custom-cc".into()];
+
+        let mut env = TestEnv::new();
+        env.set_var("CC", "host-cc");
+
+        let env = standard_build_env(&spec, None, true, true);
+        assert!(
+            env.iter().any(|(k, v)| k == "CC" && v == "custom-cc"),
+            "expected explicit env_vars assignments to override default and passthrough values"
         );
     }
 
