@@ -242,9 +242,69 @@ tmp_matches=$(mktemp "${TMPDIR:-/tmp}/depot-haul.XXXXXX")
 trap 'rm -f "$tmp_matches"' EXIT HUP INT TERM
 : > "$tmp_matches"
 
+safe_move() {
+    from=$1
+    to=$2
+
+    mkdir -p "$(dirname "$to")"
+
+    if mv "$from" "$to" 2>/dev/null; then
+        return 0
+    fi
+
+    if [ -d "$from" ] && [ ! -L "$from" ]; then
+        cp -a "$from" "$to" && rm -rf "$from"
+    elif [ -L "$from" ]; then
+        cp -P "$from" "$to" && rm -f "$from"
+    else
+        cp -p "$from" "$to" 2>/dev/null || cp "$from" "$to"
+        rm -f "$from"
+    fi
+}
+
+cleanup_empty_dirs() {
+    dir=$1
+    stop_at=$2
+
+    while [ "$dir" != "$stop_at" ] && [ "$dir" != "/" ] && [ "$dir" != "." ]; do
+        if [ -d "$dir" ] && [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then
+            rmdir "$dir" 2>/dev/null || break
+            dir=$(dirname "$dir")
+        else
+            break
+        fi
+    done
+}
+
+scan_root_for_pattern() {
+    root=$1
+    pattern=$2
+
+    [ -d "$root" ] || return 0
+
+    find "$root" -mindepth 1 -print | LC_ALL=C sort |
+    while IFS= read -r abs_path; do
+        rel_path=${abs_path#"$root"/}
+        [ "$rel_path" != "$abs_path" ] || continue
+
+        case "$root:$rel_path" in
+            "$src_root":.depot|"$src_root":.depot/*)
+                continue
+                ;;
+        esac
+
+        case "$rel_path" in
+            $pattern)
+                printf '%s\t%s\n' "$root" "$rel_path" >> "$tmp_matches"
+                ;;
+        esac
+    done
+}
+
 collect_matches_for_pattern() {
     pattern=$1
     before_count=$(wc -l < "$tmp_matches" | tr -d '[:space:]')
+
     case "$pattern" in
         ""|/|/*|../*|*/../*|..)
             fail "unsafe pattern: $pattern"
@@ -258,17 +318,12 @@ collect_matches_for_pattern() {
         fail "DESTDIR does not exist: $src_root"
     fi
 
-    find "$src_root" -mindepth 1 \
-        ! -path "$DEPOT_OUTPUTS_DIR" ! -path "$DEPOT_OUTPUTS_DIR/*" \
-        -print | LC_ALL=C sort |
-    while IFS= read -r abs_path; do
-        rel_path=${abs_path#"$src_root"/}
-        [ "$rel_path" != "$abs_path" ] || continue
-        case "$rel_path" in
-            $pattern)
-                printf '%s\n' "$rel_path" >> "$tmp_matches"
-                ;;
-        esac
+    scan_root_for_pattern "$src_root" "$pattern"
+
+    for candidate_root in "$DEPOT_OUTPUTS_DIR"/*; do
+        [ -d "$candidate_root" ] || continue
+        [ "$candidate_root" = "$out_root" ] && continue
+        scan_root_for_pattern "$candidate_root" "$pattern"
     done
 
     after_count=$(wc -l < "$tmp_matches" | tr -d '[:space:]')
@@ -281,9 +336,9 @@ for pattern in "$@"; do
     collect_matches_for_pattern "$pattern"
 done
 
-LC_ALL=C sort -u "$tmp_matches" | while IFS= read -r rel_path; do
+LC_ALL=C sort -u "$tmp_matches" | while IFS='	' read -r match_root rel_path; do
     [ -n "$rel_path" ] || continue
-    src_path=$src_root/$rel_path
+    src_path=$match_root/$rel_path
 
     if [ ! -e "$src_path" ] && [ ! -L "$src_path" ]; then
         # Path may already have been moved because an ancestor directory matched.
@@ -291,14 +346,29 @@ LC_ALL=C sort -u "$tmp_matches" | while IFS= read -r rel_path; do
     fi
 
     dst_path=$out_root/$rel_path
-    dst_parent=$(dirname "$dst_path")
-    mkdir -p "$dst_parent"
-
-    if [ -e "$dst_path" ] || [ -L "$dst_path" ]; then
-        fail "destination already exists: $dst_path"
+    if [ "$src_path" = "$dst_path" ]; then
+        continue
     fi
 
-    mv "$src_path" "$dst_path"
+    if [ -d "$src_path" ] && [ ! -L "$src_path" ] && [ -d "$dst_path" ]; then
+        for child in "$src_path"/* "$src_path"/.[!.]* "$src_path"/..?*; do
+            [ -e "$child" ] || [ -L "$child" ] || continue
+            child_name=$(basename "$child")
+            child_dst=$dst_path/$child_name
+            if [ -e "$child_dst" ] || [ -L "$child_dst" ]; then
+                fail "destination already exists: $child_dst"
+            fi
+            safe_move "$child" "$child_dst" || fail "failed to move: $child -> $child_dst"
+        done
+        rmdir "$src_path" 2>/dev/null || true
+    else
+        if [ -e "$dst_path" ] || [ -L "$dst_path" ]; then
+            fail "destination already exists: $dst_path"
+        fi
+        safe_move "$src_path" "$dst_path" || fail "failed to move: $src_path -> $dst_path"
+    fi
+
+    cleanup_empty_dirs "$(dirname "$src_path")" "$match_root"
 done
 
 # Clean empty directories left behind in the primary staging tree, but never
@@ -360,7 +430,27 @@ exec "$DEPOT_EXECUTABLE" internal python-install "$@"
 #[cfg(test)]
 mod tests {
     use super::{INTERNAL_DEPOT_DIR, ShellHelpers, shell_ident_suffix, wrap_shell_command};
+    use std::path::Path;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn run_haul(helpers: &ShellHelpers, destdir: &Path, args: &[&str]) {
+        let mut envs = Vec::new();
+        helpers.apply_to_env_vars(&mut envs);
+        envs.push(("DESTDIR".into(), destdir.to_string_lossy().into_owned()));
+
+        let mut cmd = Command::new("sh");
+        cmd.arg(&helpers.haul_path);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        for (key, value) in &envs {
+            cmd.env(key, value);
+        }
+
+        let status = cmd.status().unwrap();
+        assert!(status.success(), "haul failed for args: {args:?}");
+    }
 
     #[test]
     fn shell_ident_suffix_normalizes_package_names() {
@@ -415,5 +505,87 @@ mod tests {
         let wrapped = wrap_shell_command("python_build\npython_install");
         assert!(wrapped.contains("python_build()"));
         assert!(wrapped.contains("python_install()"));
+    }
+
+    #[test]
+    fn haul_can_move_paths_from_existing_output_staging() {
+        let temp = tempdir().unwrap();
+        let destdir = temp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/share/vulkan/implicit_layer.d")).unwrap();
+        std::fs::write(
+            destdir.join("usr/share/vulkan/implicit_layer.d/mesa.json"),
+            "mesa",
+        )
+        .unwrap();
+
+        let helpers = ShellHelpers::new(&destdir).unwrap();
+
+        run_haul(
+            &helpers,
+            &destdir,
+            &["vulkan-a", "usr/share/vulkan/implicit_layer.d"],
+        );
+        run_haul(
+            &helpers,
+            &destdir,
+            &["vulkan-b", "usr/share/vulkan/implicit_layer.d"],
+        );
+
+        assert!(
+            !destdir
+                .join(".depot/outputs/vulkan-a/usr/share/vulkan/implicit_layer.d")
+                .exists()
+        );
+        assert!(
+            destdir
+                .join(".depot/outputs/vulkan-b/usr/share/vulkan/implicit_layer.d/mesa.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn haul_merges_directory_into_existing_output_dir() {
+        let temp = tempdir().unwrap();
+        let destdir = temp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/share/vulkan/explicit_layer.d")).unwrap();
+        std::fs::write(
+            destdir.join("usr/share/vulkan/explicit_layer.d/new-layer.json"),
+            "new",
+        )
+        .unwrap();
+        std::fs::create_dir_all(
+            destdir.join(".depot/outputs/vulkan-layers/usr/share/vulkan/explicit_layer.d"),
+        )
+        .unwrap();
+        std::fs::write(
+            destdir.join(
+                ".depot/outputs/vulkan-layers/usr/share/vulkan/explicit_layer.d/existing.json",
+            ),
+            "existing",
+        )
+        .unwrap();
+
+        let helpers = ShellHelpers::new(&destdir).unwrap();
+        run_haul(
+            &helpers,
+            &destdir,
+            &["vulkan-layers", "usr/share/vulkan/explicit_layer.d"],
+        );
+
+        assert!(!destdir.join("usr/share/vulkan/explicit_layer.d").exists());
+        assert!(
+            destdir
+                .join(
+                    ".depot/outputs/vulkan-layers/usr/share/vulkan/explicit_layer.d/existing.json"
+                )
+                .exists()
+        );
+        assert!(
+            destdir
+                .join(
+                    ".depot/outputs/vulkan-layers/usr/share/vulkan/explicit_layer.d/new-layer.json"
+                )
+                .exists()
+        );
     }
 }
