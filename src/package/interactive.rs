@@ -217,7 +217,7 @@ fn prompt_manual_sources() -> Result<Vec<ManualSource>> {
         if single_entry {
             let checksum = prompt_optional_text(
                 "Manual source checksum (optional):",
-                "sha256:/sha512:/md5:/b2:/b2sum:, raw SHA256 hex, or 'skip' (empty omits field)",
+                "sha256:/sha512:/sha1:/md5:/b2:/b2sum:, raw SHA256 hex, or 'skip' (empty omits field)",
             )?;
             if !checksum.is_empty() {
                 manual.sha256 = Some(checksum);
@@ -411,7 +411,7 @@ pub fn create_interactive() -> Result<PackageSpec> {
 
             let source_sha256 = Text::new("Source checksum:")
                 .with_help_message(
-                    "Accepts sha256:, sha512:, md5:, b2:, b2sum:, or raw SHA256 hex (use 'skip' to bypass)",
+                    "Accepts sha256:, sha512:, sha1:, md5:, b2:, b2sum:, or raw SHA256 hex (use 'skip' to bypass)",
                 )
                 .with_default(computed_sha_default.as_str())
                 .prompt()?;

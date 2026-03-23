@@ -444,6 +444,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_ignored",
+ "sha1",
  "sha2",
  "signal-hook 0.4.3",
  "suppaftp",

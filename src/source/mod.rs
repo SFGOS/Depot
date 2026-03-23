@@ -279,8 +279,8 @@ fn copy_manual_source_file(
 
 /// Verify a file against an `expected` checksum string.
 ///
-/// Formats accepted: `sha256:HEX`, `sha512:HEX`, `md5:HEX`, `b2:HEX`,
-/// `b2sum:HEX`, or plain `HEX` (assumed sha256).
+/// Formats accepted: `sha256:HEX`, `sha512:HEX`, `sha1:HEX`, `md5:HEX`,
+/// `b2:HEX`, `b2sum:HEX`, or plain `HEX` (assumed sha256).
 fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
     use anyhow::bail;
     use std::io::Read;
@@ -324,6 +324,21 @@ fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
             use sha2::Sha512;
             let mut f = fs::File::open(path)?;
             let mut hasher = Sha512::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            let actual = format!("{:x}", hasher.finalize());
+            Ok(actual == hex)
+        }
+        "sha1" => {
+            use sha1::Sha1;
+            let mut f = fs::File::open(path)?;
+            let mut hasher = Sha1::new();
             let mut buf = [0u8; 8192];
             loop {
                 let n = f.read(&mut buf)?;
@@ -875,6 +890,7 @@ mod tests {
 
     #[test]
     fn verify_file_hash_accepts_multiple_algorithms() {
+        use sha1::Sha1;
         use sha2::{Digest, Sha256, Sha512};
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -890,6 +906,11 @@ mod tests {
             h.update(b"abc");
             format!("{:x}", h.finalize())
         };
+        let sha1_hex = {
+            let mut h = Sha1::new();
+            h.update(b"abc");
+            format!("{:x}", h.finalize())
+        };
         let md5_hex = format!("{:x}", md5::compute(b"abc"));
         let b2_hex = b2sum_rust::Blake2bSum::new(64)
             .read(tmp.path())
@@ -898,6 +919,7 @@ mod tests {
         assert!(verify_file_hash(tmp.path(), &sha256_hex).unwrap());
         assert!(verify_file_hash(tmp.path(), &format!("sha256:{}", sha256_hex)).unwrap());
         assert!(verify_file_hash(tmp.path(), &format!("sha512:{}", sha512_hex)).unwrap());
+        assert!(verify_file_hash(tmp.path(), &format!("sha1:{}", sha1_hex)).unwrap());
         assert!(verify_file_hash(tmp.path(), &format!("md5:{}", md5_hex)).unwrap());
         assert!(verify_file_hash(tmp.path(), &format!("b2:{}", b2_hex)).unwrap());
         assert!(verify_file_hash(tmp.path(), &format!("b2sum:{}", b2_hex)).unwrap());

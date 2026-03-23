@@ -289,6 +289,7 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
 /// Supported formats:
 /// - `sha256:<hex>` (or just `<hex>` — default)
 /// - `sha512:<hex>`
+/// - `sha1:<hex>`
 /// - `md5:<hex>`
 /// - `b2:<hex>` / `b2sum:<hex>`
 /// - `skip` to bypass verification
@@ -732,7 +733,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_checksum_accepts_md5_sha512_b2sum_and_default_sha256() {
+    fn verify_checksum_accepts_sha1_md5_sha512_b2sum_and_default_sha256() {
+        use sha1::Sha1;
         use sha2::Digest;
         use sha2::Sha256;
         use sha2::Sha512;
@@ -752,6 +754,11 @@ mod tests {
             h.update(b"abc");
             format!("{:x}", h.finalize())
         };
+        let sha1_hex = {
+            let mut h = Sha1::new();
+            h.update(b"abc");
+            format!("{:x}", h.finalize())
+        };
 
         let md5_hex = format!("{:x}", md5::compute(b"abc"));
         let b2_hex = b2sum_rust::Blake2bSum::new(64)
@@ -763,6 +770,7 @@ mod tests {
         // explicit prefixes
         assert!(verify_checksum(tmp.path(), &format!("sha256:{}", sha256_hex)).unwrap());
         assert!(verify_checksum(tmp.path(), &format!("sha512:{}", sha512_hex)).unwrap());
+        assert!(verify_checksum(tmp.path(), &format!("sha1:{}", sha1_hex)).unwrap());
         assert!(verify_checksum(tmp.path(), &format!("md5:{}", md5_hex)).unwrap());
         assert!(verify_checksum(tmp.path(), &format!("b2:{}", b2_hex)).unwrap());
         assert!(verify_checksum(tmp.path(), &format!("b2sum:{}", b2_hex)).unwrap());

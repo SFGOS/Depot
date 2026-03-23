@@ -25,7 +25,7 @@
 use crate::fakeroot;
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -549,7 +549,11 @@ fn run_command_with_optional_stdin(
         command.stdin(Stdio::piped());
         let mut child = command.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(payload.as_bytes())?;
+            match stdin.write_all(payload.as_bytes()) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::BrokenPipe => {}
+                Err(err) => return Err(err.into()),
+            }
         }
         Ok(child.wait()?)
     } else {
@@ -672,6 +676,38 @@ needs_paths = true
         assert_eq!(ran, 1);
         let out = std::fs::read_to_string(tmp.path().join("hook.out")).unwrap();
         assert_eq!(out, "install:pre:foo");
+    }
+
+    #[test]
+    fn run_transaction_hooks_ignores_broken_pipe_for_needs_paths_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_hook(
+            tmp.path(),
+            "noop.toml",
+            r#"
+[hook]
+name = "noop"
+
+[when]
+phase = "pre"
+operation = ["install"]
+packages = ["foo"]
+
+[exec]
+command = "true"
+needs_paths = true
+"#,
+        );
+
+        let affected = vec!["usr/bin/foo".to_string()];
+        let ctx = HookExecutionContext {
+            phase: HookPhase::Pre,
+            operation: HookOperation::Install,
+            package: "foo",
+            affected_paths: &affected,
+        };
+        let ran = run_transaction_hooks(tmp.path(), &ctx).unwrap();
+        assert_eq!(ran, 1);
     }
 
     #[test]
