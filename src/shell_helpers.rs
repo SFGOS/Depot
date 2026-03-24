@@ -14,6 +14,7 @@ const DEPOT_HAUL_HELPER_ENV: &str = "DEPOT_HAUL_HELPER";
 const DEPOT_SUBDESTDIR_HELPER_ENV: &str = "DEPOT_SUBDESTDIR_HELPER";
 const DEPOT_PYTHON_BUILD_HELPER_ENV: &str = "DEPOT_PYTHON_BUILD_HELPER";
 const DEPOT_PYTHON_INSTALL_HELPER_ENV: &str = "DEPOT_PYTHON_INSTALL_HELPER";
+const DEPOT_CLONE_HELPER_ENV: &str = "DEPOT_CLONE_HELPER";
 const DEPOT_EXECUTABLE_ENV: &str = "DEPOT_EXECUTABLE";
 
 /// Ephemeral helper command directory to prepend to PATH while running scripts.
@@ -26,6 +27,7 @@ pub struct ShellHelpers {
     subdestdir_path: PathBuf,
     python_build_path: PathBuf,
     python_install_path: PathBuf,
+    clone_path: PathBuf,
 }
 
 impl ShellHelpers {
@@ -123,6 +125,24 @@ impl ShellHelpers {
             })?;
         }
 
+        let clone_path = bin_dir.join("depot_clone");
+        fs::write(&clone_path, CLONE_SCRIPT).with_context(|| {
+            format!(
+                "Failed to write shell helper command: {}",
+                clone_path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&clone_path)
+                .with_context(|| format!("Failed to stat helper: {}", clone_path.display()))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&clone_path, perms)
+                .with_context(|| format!("Failed to chmod helper: {}", clone_path.display()))?;
+        }
+
         let path_value = crate::runtime_env::prepend_helper_to_safe_path(&bin_dir);
 
         Ok(Self {
@@ -134,6 +154,7 @@ impl ShellHelpers {
             subdestdir_path,
             python_build_path,
             python_install_path,
+            clone_path,
         })
     }
 
@@ -168,6 +189,11 @@ impl ShellHelpers {
         );
         set_env_var(
             env_vars,
+            DEPOT_CLONE_HELPER_ENV,
+            self.clone_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
             DEPOT_EXECUTABLE_ENV,
             self.depot_executable.to_string_lossy().into_owned(),
         );
@@ -178,7 +204,7 @@ impl ShellHelpers {
 /// through `/bin/sh`, avoiding direct execution from mounts that may be `noexec`.
 pub fn wrap_shell_command(command: &str) -> String {
     format!(
-        "haul() {{ /bin/sh \"${{{DEPOT_HAUL_HELPER_ENV}:?}}\" \"$@\"; }}\nsubdestdir() {{ /bin/sh \"${{{DEPOT_SUBDESTDIR_HELPER_ENV}:?}}\" \"$@\"; }}\npython_build() {{ /bin/sh \"${{{DEPOT_PYTHON_BUILD_HELPER_ENV}:?}}\" \"$@\"; }}\npython_install() {{ /bin/sh \"${{{DEPOT_PYTHON_INSTALL_HELPER_ENV}:?}}\" \"$@\"; }}\n{command}"
+        "haul() {{ /bin/sh \"${{{DEPOT_HAUL_HELPER_ENV}:?}}\" \"$@\"; }}\nsubdestdir() {{ /bin/sh \"${{{DEPOT_SUBDESTDIR_HELPER_ENV}:?}}\" \"$@\"; }}\npython_build() {{ /bin/sh \"${{{DEPOT_PYTHON_BUILD_HELPER_ENV}:?}}\" \"$@\"; }}\npython_install() {{ /bin/sh \"${{{DEPOT_PYTHON_INSTALL_HELPER_ENV}:?}}\" \"$@\"; }}\ndepot_clone() {{ /bin/sh \"${{{DEPOT_CLONE_HELPER_ENV}:?}}\" \"$@\"; }}\n{command}"
     )
 }
 
@@ -435,6 +461,19 @@ fail() {
 exec "$DEPOT_EXECUTABLE" internal python-install "$@"
 "#;
 
+const CLONE_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "depot_clone: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+
+exec "$DEPOT_EXECUTABLE" internal clone "$@"
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::{INTERNAL_DEPOT_DIR, ShellHelpers, shell_ident_suffix, wrap_shell_command};
@@ -517,14 +556,16 @@ mod tests {
             envs.iter()
                 .any(|(key, _)| key == "DEPOT_PYTHON_INSTALL_HELPER")
         );
+        assert!(envs.iter().any(|(key, _)| key == "DEPOT_CLONE_HELPER"));
         assert!(envs.iter().any(|(key, _)| key == "DEPOT_EXECUTABLE"));
     }
 
     #[test]
     fn wrap_shell_command_exposes_python_helpers() {
-        let wrapped = wrap_shell_command("python_build\npython_install");
+        let wrapped = wrap_shell_command("python_build\npython_install\ndepot_clone foo");
         assert!(wrapped.contains("python_build()"));
         assert!(wrapped.contains("python_install()"));
+        assert!(wrapped.contains("depot_clone()"));
     }
 
     #[test]

@@ -640,6 +640,36 @@ fn run_internal_command(command: InternalCommands) -> Result<()> {
                 &env_vars,
             )
         }
+        InternalCommands::Clone { repo, dest } => {
+            let (base, rev) = crate::source::split_git_url(&repo).with_context(|| {
+                format!("Unsupported repository URL for internal clone: {}", repo)
+            })?;
+            let dest = if let Some(dest) = dest {
+                dest
+            } else {
+                let cwd =
+                    std::env::current_dir().context("Failed to determine current directory")?;
+                cwd.join(crate::source::git_default_checkout_dir_name(&base))
+            };
+            if dest.exists() {
+                anyhow::bail!("Clone destination already exists: {}", dest.display());
+            }
+            let cache_root =
+                tempfile::tempdir().context("Failed to create temporary git cache for clone")?;
+            let label = dest
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("clone");
+            crate::source::git_checkout(
+                &base,
+                &rev,
+                &dest,
+                &cache_root.path().join("git"),
+                label,
+                &[],
+            )
+        }
     }
 }
 
@@ -5974,6 +6004,8 @@ mod tests {
         UpdateArgs,
     };
     use crate::test_support::TestEnv;
+    use git2::{Oid, Repository};
+    use std::path::Path;
     use std::sync::Mutex;
 
     static ASSUME_YES_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -6069,6 +6101,74 @@ mod tests {
             package_dependencies: Default::default(),
             spec_dir: PathBuf::from("."),
         }
+    }
+
+    fn commit_git_file(repo: &Repository, workdir: &Path, rel: &str, data: &str) -> Oid {
+        let full_path = workdir.join(rel);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full_path, data).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(rel)).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("depot-test", "depot@example.test").unwrap();
+        let mut parents = Vec::new();
+        if let Ok(head) = repo.head()
+            && let Some(oid) = head.target()
+        {
+            parents.push(repo.find_commit(oid).unwrap());
+        }
+        let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+
+        repo.commit(Some("HEAD"), &sig, &sig, "test", &tree, &parent_refs)
+            .unwrap()
+    }
+
+    fn make_remote_git_repo() -> (tempfile::TempDir, String, Oid) {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote_dir = tmp.path().join("origin.git");
+        let workdir = tmp.path().join("work");
+
+        Repository::init_bare(&remote_dir).unwrap();
+        let repo = Repository::init(&workdir).unwrap();
+        let tagged = commit_git_file(&repo, &workdir, "README", "tagged\n");
+        let tag_target = repo.find_object(tagged, None).unwrap();
+        repo.tag_lightweight("v1.0.0", &tag_target, false).unwrap();
+
+        let branch_ref = repo.head().unwrap().name().unwrap().to_string();
+        let mut remote = repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+        let push_specs = [
+            format!("{branch_ref}:{branch_ref}"),
+            "refs/tags/v1.0.0:refs/tags/v1.0.0".to_string(),
+        ];
+        let push_spec_refs: Vec<&String> = push_specs.iter().collect();
+        remote.push(&push_spec_refs, None).unwrap();
+
+        let remote_url = url::Url::from_file_path(&remote_dir).unwrap().to_string();
+        (tmp, remote_url, tagged)
+    }
+
+    #[test]
+    fn run_internal_clone_checks_out_git_revision() {
+        let (_tmp, remote_url, tagged) = make_remote_git_repo();
+        let clone_root = tempfile::tempdir().unwrap();
+        let dest = clone_root.path().join("cloned-src");
+
+        run_internal_command(InternalCommands::Clone {
+            repo: format!("{remote_url}#v1.0.0"),
+            dest: Some(dest.clone()),
+        })
+        .unwrap();
+
+        let repo = Repository::open(&dest).unwrap();
+        assert_eq!(repo.head().unwrap().target().unwrap(), tagged);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("README")).unwrap(),
+            "tagged\n"
+        );
     }
 
     fn register_installed_test_package(

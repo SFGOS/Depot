@@ -183,7 +183,7 @@ fn prompt_manual_sources() -> Result<Vec<ManualSource>> {
         } else {
             prompt_repeating_list(
                 "Manual source URL",
-                "Supports http(s), ftp, and file:// URLs",
+                "Supports http(s), ftp, file://, and git URLs like ...repo.git#rev",
             )?
         };
 

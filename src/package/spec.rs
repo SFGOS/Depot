@@ -3973,17 +3973,18 @@ pub struct ManualSource {
     /// Multiple filenames in the spec directory (local manual source mode).
     #[serde(default)]
     pub files: Vec<String>,
-    /// Remote URL to fetch (remote manual source mode).
+    /// Remote URL to fetch or clone (remote manual source mode).
     #[serde(default)]
     pub url: Option<String>,
-    /// Multiple remote URLs to fetch (remote manual source mode).
+    /// Multiple remote URLs to fetch or clone (remote manual source mode).
     #[serde(default)]
     pub urls: Vec<String>,
     /// Checksum (optional, use "skip" to bypass verification).
     #[serde(default)]
     pub sha256: Option<String>,
     /// Destination path relative to build work directory.
-    /// Defaults to `file` for local mode or a derived filename for URL mode.
+    /// Defaults to `file` for local mode, a derived filename for archive URLs,
+    /// or the repository directory name for git URLs.
     #[serde(default)]
     pub dest: Option<String>,
 }

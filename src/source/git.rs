@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
+use url::Url;
 
 /// Checkout a repository URL at a specific revision into `checkout_dir`.
 ///
@@ -33,6 +34,14 @@ pub fn checkout(
             git_cache_dir.display()
         )
     })?;
+    if let Some(parent) = checkout_dir.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create parent directory for checkout: {}",
+                parent.display()
+            )
+        })?;
+    }
 
     let mirror_dir = git_cache_dir.join(mirror_key(url));
     ensure_mirror(url, &mirror_dir, pkgname, rev, cherry_pick_revs)?;
@@ -74,6 +83,51 @@ pub fn checkout(
     apply_cherry_picks(&repo, cherry_pick_revs)?;
 
     Ok(())
+}
+
+/// Prime the git mirror cache for a repository/revision without creating a checkout.
+pub fn prime_cache(
+    url: &str,
+    rev: &str,
+    git_cache_dir: &Path,
+    pkgname: &str,
+    cherry_pick_revs: &[String],
+) -> Result<()> {
+    crate::interrupts::install().context("Failed to enable Ctrl-C handling for git operations")?;
+    fs::create_dir_all(git_cache_dir).with_context(|| {
+        format!(
+            "Failed to create git cache dir: {}",
+            git_cache_dir.display()
+        )
+    })?;
+    let mirror_dir = git_cache_dir.join(mirror_key(url));
+    ensure_mirror(url, &mirror_dir, pkgname, rev, cherry_pick_revs)
+}
+
+/// Derive a default checkout directory name from a git repository URL.
+pub fn default_checkout_dir_name(url: &str) -> String {
+    let without_fragment = url.split('#').next().unwrap_or(url).trim_end_matches('/');
+    let last_segment = Url::parse(without_fragment)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()?
+                .rfind(|segment| !segment.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            without_fragment
+                .rsplit(['/', ':'])
+                .find(|segment| !segment.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "repo".to_string());
+
+    last_segment
+        .strip_suffix(".git")
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&last_segment)
+        .to_string()
 }
 
 fn apply_cherry_picks(repo: &Repository, cherry_pick_revs: &[String]) -> Result<()> {

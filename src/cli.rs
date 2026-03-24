@@ -314,6 +314,8 @@ pub enum InternalCommands {
         #[arg(long, default_value = "/usr")]
         prefix: String,
     },
+    #[command(hide = true)]
+    Clone { repo: String, dest: Option<PathBuf> },
 }
 
 #[derive(Debug, Clone, Args)]

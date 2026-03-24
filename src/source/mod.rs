@@ -6,6 +6,10 @@ mod git;
 pub mod hooks;
 
 pub(crate) use git::authenticated_remote_callbacks;
+pub(crate) use git::{
+    checkout as git_checkout, default_checkout_dir_name as git_default_checkout_dir_name,
+    prime_cache as git_prime_cache,
+};
 
 use crate::package::PackageSpec;
 use anyhow::{Context, Result, bail};
@@ -56,7 +60,8 @@ fn manual_url_entries(manual: &crate::package::ManualSource) -> Vec<String> {
 ///
 /// Local entries are checked for existence and optional checksum correctness.
 /// Remote entries are fetched into the manual-source cache so build-time source
-/// preparation can reuse the verified result later.
+/// preparation can reuse the verified result later. Git manual sources prime
+/// their mirror cache and validate revision reachability.
 pub fn preflight_manual_sources(spec: &PackageSpec, cache_dir: &Path) -> Result<()> {
     if spec.manual_sources.is_empty() {
         return Ok(());
@@ -97,6 +102,24 @@ pub fn preflight_manual_sources(spec: &PackageSpec, cache_dir: &Path) -> Result<
         if !url_entries.is_empty() {
             for raw_url in url_entries {
                 let expanded_url = expand_manual_source_value(spec, &raw_url);
+                if let Some((base, rev)) = split_git_url(&expanded_url) {
+                    if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip") {
+                        bail!(
+                            "Manual git source {} cannot use checksum {}; pin the desired revision in the URL fragment instead",
+                            expanded_url,
+                            expected_hash
+                        );
+                    }
+                    git_prime_cache(
+                        &base,
+                        &rev,
+                        &cache_dir.join("manual").join("git"),
+                        &spec.package.name,
+                        &[],
+                    )?;
+                    continue;
+                }
+
                 let parsed = Url::parse(&expanded_url)
                     .with_context(|| format!("Invalid URL: {}", expanded_url))?;
 
@@ -192,6 +215,19 @@ pub fn copy_manual_sources(spec: &PackageSpec, cache_dir: &Path, build_dir: &Pat
         if !url_entries.is_empty() {
             for raw_url in url_entries {
                 let expanded_url = expand_manual_source_value(spec, &raw_url);
+                if let Some((base, rev)) = split_git_url(&expanded_url) {
+                    checkout_manual_git_source(
+                        spec,
+                        manual,
+                        build_dir,
+                        cache_dir,
+                        &expanded_url,
+                        &base,
+                        &rev,
+                    )?;
+                    continue;
+                }
+
                 let parsed = Url::parse(&expanded_url)
                     .with_context(|| format!("Invalid URL: {}", expanded_url))?;
 
@@ -255,11 +291,7 @@ fn copy_manual_source_file(
     manual: &crate::package::ManualSource,
     default_dest: &str,
 ) -> Result<()> {
-    let dest_name = if let Some(dest) = manual.dest.as_ref() {
-        expand_manual_source_value(spec, dest)
-    } else {
-        default_dest.to_string()
-    };
+    let dest_name = manual_source_dest_name(spec, manual, default_dest);
     let dest_path = build_dir.join(&dest_name);
 
     if let Some(parent) = dest_path.parent() {
@@ -275,6 +307,69 @@ fn copy_manual_source_file(
         )
     })?;
     Ok(())
+}
+
+fn manual_source_dest_name(
+    spec: &PackageSpec,
+    manual: &crate::package::ManualSource,
+    default_dest: &str,
+) -> String {
+    if let Some(dest) = manual.dest.as_ref() {
+        expand_manual_source_value(spec, dest)
+    } else {
+        default_dest.to_string()
+    }
+}
+
+fn remove_existing_path(path: &Path) -> Result<()> {
+    if !path.exists() && fs::symlink_metadata(path).is_err() {
+        return Ok(());
+    }
+    let meta =
+        fs::symlink_metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
+    if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("Failed to remove directory {}", path.display()))?;
+    } else {
+        fs::remove_file(path)
+            .with_context(|| format!("Failed to remove file {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn checkout_manual_git_source(
+    spec: &PackageSpec,
+    manual: &crate::package::ManualSource,
+    build_dir: &Path,
+    cache_dir: &Path,
+    expanded_url: &str,
+    base: &str,
+    rev: &str,
+) -> Result<()> {
+    if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip") {
+        bail!(
+            "Manual git source {} cannot use checksum {}; pin the desired revision in the URL fragment instead",
+            expanded_url,
+            expected_hash
+        );
+    }
+
+    let default_dest = git_default_checkout_dir_name(base);
+    let dest_name = manual_source_dest_name(spec, manual, &default_dest);
+    let dest_path = build_dir.join(&dest_name);
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    remove_existing_path(&dest_path)?;
+    crate::log_info!("  {} -> {}", expanded_url, dest_path.display());
+    git_checkout(
+        base,
+        rev,
+        &dest_path,
+        &cache_dir.join("manual").join("git"),
+        &spec.package.name,
+        &[],
+    )
 }
 
 /// Verify a file against an `expected` checksum string.
@@ -554,7 +649,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn split_git_url(url: &str) -> Option<(String, String)> {
+pub(crate) fn split_git_url(url: &str) -> Option<(String, String)> {
     // Check for explicit revision with #
     if let Some((base, rev)) = url.split_once('#') {
         // Ignore fragment for obvious archives.
@@ -994,6 +1089,49 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(build_dir.join("assets/manual.txt")).unwrap(),
             "remote-data"
+        );
+    }
+
+    #[test]
+    fn preflight_manual_sources_accepts_git_url() {
+        let (_tmp, remote_url, _tagged, hashed) = make_remote_git_repo();
+        let spec = mk_spec_with_manuals(
+            PathBuf::from("."),
+            vec![ManualSource {
+                file: None,
+                files: Vec::new(),
+                url: Some(format!("{remote_url}#{hashed}")),
+                urls: Vec::new(),
+                sha256: None,
+                dest: None,
+            }],
+        );
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        preflight_manual_sources(&spec, cache_dir.path()).unwrap();
+    }
+
+    #[test]
+    fn copy_manual_sources_git_url_mode_checks_out_repository() {
+        let (_tmp, remote_url, _tagged, hashed) = make_remote_git_repo();
+        let spec = mk_spec_with_manuals(
+            PathBuf::from("."),
+            vec![ManualSource {
+                file: None,
+                files: Vec::new(),
+                url: Some(format!("{remote_url}#{hashed}")),
+                urls: Vec::new(),
+                sha256: None,
+                dest: None,
+            }],
+        );
+        let cache_dir = tempfile::tempdir().unwrap();
+        let build_dir = tempfile::tempdir().unwrap();
+
+        copy_manual_sources(&spec, cache_dir.path(), build_dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(build_dir.path().join("origin/README")).unwrap(),
+            "hashed\n"
         );
     }
 
