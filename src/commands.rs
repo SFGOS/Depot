@@ -727,6 +727,7 @@ fn package_spec_from_archive_metadata(metadata: &toml::Value) -> package::Packag
             runtime: parse_dependency_list(metadata, "runtime"),
             test: Vec::new(),
             optional: parse_dependency_list(metadata, "optional"),
+            groups: parse_dependency_list(metadata, "groups"),
             lib32: None,
         },
         package_alternatives: Default::default(),
@@ -811,6 +812,7 @@ fn package_spec_from_repo_record(
             runtime: record.runtime_dependencies.clone(),
             test: Vec::new(),
             optional: record.optional_dependencies.clone(),
+            groups: Vec::new(),
             lib32: None,
         },
         package_alternatives: Default::default(),
@@ -2273,6 +2275,172 @@ fn scan_package_specs(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     specs.sort();
     Ok(specs)
+}
+
+fn spec_group_package_names(spec: &package::PackageSpec, group: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for output in spec.outputs() {
+        if spec
+            .dependencies_for_output(&output.name)
+            .groups
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(group))
+        {
+            names.push(output.name);
+        }
+    }
+    if spec.builds_lib32_output() {
+        let lib32_name = spec.lib32_package_name();
+        if spec
+            .dependencies_for_output(&lib32_name)
+            .groups
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(group))
+        {
+            names.push(lib32_name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn collect_source_group_package_names(config: &config::Config, group: &str) -> Result<Vec<String>> {
+    if !config.repo_clone_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut packages = BTreeSet::new();
+    for spec_path in scan_package_specs(&config.repo_clone_dir)? {
+        let spec = package::PackageSpec::from_file(&spec_path)
+            .with_context(|| format!("Failed to parse spec {}", spec_path.display()))?;
+        for package_name in spec_group_package_names(&spec, group) {
+            packages.insert(package_name);
+        }
+    }
+    Ok(packages.into_iter().collect())
+}
+
+fn collect_binary_group_package_names(
+    config: &config::Config,
+    rootfs: &Path,
+    group: &str,
+) -> Result<Vec<String>> {
+    let host_arch = std::env::consts::ARCH;
+    let mut binary_repos: Vec<_> = config
+        .binary_repos
+        .iter()
+        .filter(|(_, repo)| repo.enabled && repo.supports_arch(host_arch))
+        .collect();
+    binary_repos.sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
+
+    let mut packages = BTreeSet::new();
+    for (repo_name, repo_cfg) in binary_repos {
+        let matches = db::repo::find_binary_repo_packages_by_group(
+            repo_name,
+            repo_cfg,
+            rootfs,
+            &config.package_cache_dir,
+            group,
+        )?;
+        for record in matches {
+            packages.insert(record.name);
+        }
+    }
+    Ok(packages.into_iter().collect())
+}
+
+fn collect_install_group_package_names(
+    config: &config::Config,
+    rootfs: &Path,
+    group: &str,
+) -> Result<Vec<String>> {
+    let mut packages = BTreeSet::new();
+    for package_name in collect_source_group_package_names(config, group)? {
+        packages.insert(package_name);
+    }
+    for package_name in collect_binary_group_package_names(config, rootfs, group)? {
+        packages.insert(package_name);
+    }
+    Ok(packages.into_iter().collect())
+}
+
+fn expand_install_requests_for_groups(
+    config: &config::Config,
+    rootfs: &Path,
+    requests: &[PathBuf],
+) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let mut expanded = Vec::new();
+    let mut explicit_groups = Vec::new();
+    let mut seen = HashSet::new();
+
+    for request in requests {
+        if request.exists() {
+            let key = request.to_string_lossy().to_string();
+            if seen.insert(key) {
+                expanded.push(request.clone());
+            }
+            continue;
+        }
+
+        let request_name = request.to_string_lossy().to_string();
+        let group_packages = collect_install_group_package_names(config, rootfs, &request_name)?;
+        if group_packages.is_empty() {
+            if seen.insert(request_name.clone()) {
+                expanded.push(request.clone());
+            }
+            continue;
+        }
+
+        ui::info(format!(
+            "Expanding group '{}' ({} packages)...",
+            request_name,
+            group_packages.len()
+        ));
+        explicit_groups.push(request_name);
+        for package_name in group_packages {
+            if seen.insert(package_name.clone()) {
+                expanded.push(PathBuf::from(package_name));
+            }
+        }
+    }
+
+    Ok((expanded, explicit_groups))
+}
+
+fn expand_installed_group_targets(
+    db_path: &Path,
+    requests: &[String],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut expanded = Vec::new();
+    let mut explicit_groups = Vec::new();
+    let mut seen = HashSet::new();
+
+    for request in requests {
+        if db::is_installed_group(db_path, request)? {
+            let group_packages = db::get_packages_in_installed_group(db_path, request)?;
+            if !group_packages.is_empty() {
+                ui::info(format!(
+                    "Expanding group '{}' ({} packages)...",
+                    request,
+                    group_packages.len()
+                ));
+                explicit_groups.push(request.clone());
+                for package_name in group_packages {
+                    if seen.insert(package_name.clone()) {
+                        expanded.push(package_name);
+                    }
+                }
+                continue;
+            }
+        }
+
+        if seen.insert(request.clone()) {
+            expanded.push(request.clone());
+        }
+    }
+
+    Ok((expanded, explicit_groups))
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -5094,6 +5262,8 @@ pub fn run(cli: Cli) -> Result<()> {
             // Load configuration early so we can use configured repos/paths.
             let config = config::Config::for_rootfs(&rootfs);
             ensure_depot_self_update_not_required(&config, &rootfs)?;
+            let (install_requests, explicit_groups) =
+                expand_install_requests_for_groups(&config, &rootfs, &install_requests)?;
             let install_test_deps = install_test_deps_enabled(cli_test_deps, &config);
             let mut planned_targets = Vec::new();
             let mut planned_spec_paths = Vec::new();
@@ -5192,6 +5362,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 install::scripts::run_deferred_hooks_if_possible(&rootfs)?;
             }
 
+            if !dry_run && !explicit_groups.is_empty() {
+                db::record_installed_groups(&config.installed_db_path(&rootfs), &explicit_groups)?;
+            }
+
             if clean && (ran_plan_mode || ran_direct_install) {
                 clean_build_workspace(&config)?;
             }
@@ -5207,11 +5381,18 @@ pub fn run(cli: Cli) -> Result<()> {
             let remove_lock_path = locking::lock_path(&config);
             let _remove_lock_guard =
                 locking::try_write(&mut remove_lock, &remove_lock_path, "remove")?;
-            let removal_targets = vec![package.clone()];
+            let db_path = config.installed_db_path(&rootfs);
+            let (removal_targets, explicit_groups) =
+                expand_installed_group_targets(&db_path, std::slice::from_ref(&package))?;
             if !ui::prompt_package_action("removal", &removal_targets, true)? {
                 anyhow::bail!("Aborted");
             }
-            remove_installed_package_with_hooks(&package, &rootfs, &config)?;
+            for target in &removal_targets {
+                remove_installed_package_with_hooks(target, &rootfs, &config)?;
+            }
+            for group in explicit_groups {
+                db::remove_installed_group(&db_path, &group)?;
+            }
         }
         Commands::Build(BuildArgs {
             rootfs_args,
@@ -5764,11 +5945,16 @@ pub fn run(cli: Cli) -> Result<()> {
             let dry_run = build_exec_args.dry_run;
             let config = config::Config::for_rootfs(&rootfs);
             sync_source_repositories_for_update(&config)?;
-            if !is_explicit_depot_self_update_request(&packages) {
+            let expanded_packages = if packages.is_empty() {
+                Vec::new()
+            } else {
+                expand_installed_group_targets(&config.installed_db_path(&rootfs), &packages)?.0
+            };
+            if !is_explicit_depot_self_update_request(&expanded_packages) {
                 ensure_depot_self_update_not_required(&config, &rootfs)?;
             }
             run_update_command(
-                &packages,
+                &expanded_packages,
                 &config,
                 UpdateCommandOptions {
                     rootfs: &rootfs,
@@ -6419,6 +6605,7 @@ mod tests {
             replaces: Vec::new(),
             runtime_dependencies: Vec::new(),
             optional_dependencies: Vec::new(),
+            groups: Vec::new(),
         }
     }
 
@@ -6679,6 +6866,7 @@ optional = []
             replaces: Vec::new(),
             runtime_dependencies: vec!["glibc".into()],
             optional_dependencies: vec!["manpages".into()],
+            groups: vec!["base".into()],
         };
         let spec = package_spec_from_repo_record(&record);
         let installed =
@@ -6981,6 +7169,7 @@ optional = []
             replaces: Vec::new(),
             runtime_dependencies: Vec::new(),
             optional_dependencies: Vec::new(),
+            groups: Vec::new(),
         };
         let spec = package_spec_from_repo_record(&record);
         let installed =
@@ -7520,6 +7709,7 @@ optional = []
                     replaces: Vec::new(),
                     runtime_dependencies: Vec::new(),
                     optional_dependencies: Vec::new(),
+                    groups: Vec::new(),
                 },
             ),
         )]);
@@ -8818,6 +9008,7 @@ file = "missing.patch"
             runtime: Vec::new(),
             test: vec!["lib32-pytest".into()],
             optional: Vec::new(),
+            groups: Vec::new(),
         });
 
         assert!(!should_install_test_deps(
@@ -9118,6 +9309,7 @@ optional = []
             runtime: vec!["lib32-zlib".into()],
             test: Vec::new(),
             optional: vec!["lib32-gtk-doc".into()],
+            groups: Vec::new(),
         });
 
         let lib32 = make_lib32_package_spec(&base);
@@ -9137,5 +9329,104 @@ optional = []
             requested_outputs(&spec, false),
             deps::RequestedOutputs::Lib32Only
         );
+    }
+
+    #[test]
+    fn expand_install_requests_for_groups_uses_source_specs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let rootfs = temp.path().join("rootfs");
+        let repo_root = temp.path().join("repos");
+        let core = repo_root.join("core").join("foo");
+        let desktop = repo_root.join("desktop").join("bar");
+        fs::create_dir_all(&rootfs)?;
+        fs::create_dir_all(&core)?;
+        fs::create_dir_all(&desktop)?;
+
+        let foo_spec = core.join("foo.toml");
+        fs::write(
+            &foo_spec,
+            r#"[package]
+name = "foo"
+version = "1.0.0"
+revision = 1
+description = "foo"
+homepage = "https://example.test/foo"
+license = "MIT"
+
+[[source]]
+url = "https://example.test/foo-1.0.0.tar.gz"
+sha256 = "skip"
+extract_dir = "foo-1.0.0"
+
+[build]
+type = "custom"
+
+[dependencies]
+groups = ["base"]
+runtime = []
+optional = []
+"#,
+        )?;
+
+        let bar_spec = desktop.join("bar.toml");
+        fs::write(
+            &bar_spec,
+            r#"[package]
+name = "bar"
+version = "1.0.0"
+revision = 1
+description = "bar"
+homepage = "https://example.test/bar"
+license = "MIT"
+
+[[source]]
+url = "https://example.test/bar-1.0.0.tar.gz"
+sha256 = "skip"
+extract_dir = "bar-1.0.0"
+
+[build]
+type = "custom"
+
+[dependencies]
+groups = ["base", "desktop"]
+runtime = []
+optional = []
+"#,
+        )?;
+
+        let mut config = config::Config::for_rootfs(&rootfs);
+        config.repo_clone_dir = repo_root;
+        config.binary_repos.clear();
+
+        let (expanded, groups) =
+            expand_install_requests_for_groups(&config, &rootfs, &[PathBuf::from("base")])?;
+
+        assert_eq!(groups, vec!["base".to_string()]);
+        assert_eq!(expanded, vec![PathBuf::from("bar"), PathBuf::from("foo")]);
+        Ok(())
+    }
+
+    #[test]
+    fn expand_installed_group_targets_uses_installed_group_membership() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let rootfs = temp.path().join("rootfs");
+        fs::create_dir_all(&rootfs)?;
+        let config = config::Config::for_rootfs(&rootfs);
+        let db_path = config.installed_db_path(&rootfs);
+
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(dest.join("usr/bin"))?;
+        fs::write(dest.join("usr/bin/foo"), "foo")?;
+
+        let mut spec = test_package_spec(package::BuildType::Custom, None, &[]);
+        spec.package.name = "foo".into();
+        spec.dependencies.groups = vec!["base".into()];
+        db::register_package(&db_path, &spec, &dest)?;
+        db::record_installed_groups(&db_path, &[String::from("base")])?;
+
+        let (expanded, groups) = expand_installed_group_targets(&db_path, &[String::from("base")])?;
+        assert_eq!(groups, vec!["base".to_string()]);
+        assert_eq!(expanded, vec!["foo".to_string()]);
+        Ok(())
     }
 }

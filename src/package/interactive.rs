@@ -655,6 +655,14 @@ pub fn create_interactive() -> Result<PackageSpec> {
         "Optional dependency",
         "Package that enables optional runtime functionality",
     )?;
+    let groups = if show_advanced {
+        prompt_repeating_list(
+            "Package group",
+            "Group name(s) this package belongs to, e.g. base, desktop, development",
+        )?
+    } else {
+        Vec::new()
+    };
     let alternatives = if show_advanced {
         Alternatives {
             provides: prompt_repeating_list(
@@ -696,6 +704,7 @@ pub fn create_interactive() -> Result<PackageSpec> {
             runtime: runtime_deps,
             test: test_deps,
             optional: optional_deps,
+            groups,
             lib32: None,
         },
         package_alternatives: Default::default(),
@@ -1504,6 +1513,7 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
         || !spec.dependencies.runtime.is_empty()
         || !spec.dependencies.test.is_empty()
         || !spec.dependencies.optional.is_empty()
+        || !spec.dependencies.groups.is_empty()
     {
         let mut dep_tbl = Table::new();
         if !spec.dependencies.build.is_empty() {
@@ -1554,6 +1564,18 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
                 ),
             );
         }
+        if !spec.dependencies.groups.is_empty() {
+            dep_tbl.insert(
+                "groups".into(),
+                Value::Array(
+                    spec.dependencies
+                        .groups
+                        .iter()
+                        .map(|s| Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
         root.insert("dependencies".into(), Value::Table(dep_tbl));
     }
 
@@ -1594,6 +1616,17 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
                     "optional".into(),
                     Value::Array(
                         deps.optional
+                            .iter()
+                            .map(|s| Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !deps.groups.is_empty() {
+                dep_tbl.insert(
+                    "groups".into(),
+                    Value::Array(
+                        deps.groups
                             .iter()
                             .map(|s| Value::String(s.clone()))
                             .collect(),
@@ -1999,6 +2032,7 @@ mod tests {
                 runtime: vec![],
                 test: vec!["python".into(), "bats".into()],
                 optional: vec!["gtk-doc".into()],
+                groups: vec!["base".into(), "devtools".into()],
                 lib32: None,
             },
             package_alternatives: Default::default(),
@@ -2023,6 +2057,14 @@ mod tests {
             .expect("expected dependencies.optional array");
         assert_eq!(optional_deps.len(), 1);
         assert_eq!(optional_deps[0].as_str(), Some("gtk-doc"));
+        let groups = val
+            .get("dependencies")
+            .and_then(|d| d.get("groups"))
+            .and_then(|t| t.as_array())
+            .expect("expected dependencies.groups array");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].as_str(), Some("base"));
+        assert_eq!(groups[1].as_str(), Some("devtools"));
     }
 
     #[test]
@@ -2133,6 +2175,7 @@ mod tests {
                 runtime: vec!["foo".into(), "bar".into()],
                 test: Vec::new(),
                 optional: Vec::new(),
+                groups: vec!["base".into()],
                 lib32: None,
             },
             package_alternatives: Default::default(),

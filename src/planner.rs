@@ -942,6 +942,7 @@ mod tests {
                 runtime: vec!["foo-libs".into(), "zlib".into()],
                 test: vec!["bats".into()],
                 optional: vec!["docs-viewer".into()],
+                groups: Vec::new(),
                 lib32: None,
             },
             package_alternatives: BTreeMap::from([(
@@ -960,6 +961,7 @@ mod tests {
                     runtime: vec!["foo-libs".into(), "libfoo".into(), "openssl".into()],
                     test: Vec::new(),
                     optional: Vec::new(),
+                    groups: Vec::new(),
                     lib32: None,
                 },
             )]),
@@ -999,6 +1001,7 @@ mod tests {
                     replaces: Vec::new(),
                     runtime_dependencies: Vec::new(),
                     optional_dependencies: Vec::new(),
+                    groups: Vec::new(),
                 }),
             },
             match_kind: MatchKind::Exact,
@@ -1057,6 +1060,7 @@ mod tests {
             runtime: vec!["lib32-zlib".into()],
             test: vec!["lib32-bats".into()],
             optional: Vec::new(),
+            groups: Vec::new(),
         });
 
         let deps = source_deps_for_install(&spec, true, true);
@@ -1077,6 +1081,7 @@ mod tests {
             runtime: vec!["lib32-zlib".into()],
             test: vec!["lib32-bats".into()],
             optional: Vec::new(),
+            groups: Vec::new(),
         });
 
         let deps = source_deps_for_install(&spec, true, false);

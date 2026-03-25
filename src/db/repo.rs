@@ -90,6 +90,7 @@ struct IndexedPackage {
     replaces: Vec<String>,
     runtime_dependencies: Vec<String>,
     optional_dependencies: Vec<String>,
+    groups: Vec<String>,
     archive_files: Vec<String>,
 }
 
@@ -129,6 +130,7 @@ pub struct BinaryRepoPackageRecord {
     pub replaces: Vec<String>,
     pub runtime_dependencies: Vec<String>,
     pub optional_dependencies: Vec<String>,
+    pub groups: Vec<String>,
 }
 
 impl BinaryRepoPackageRecord {
@@ -330,6 +332,11 @@ impl RepoManager {
                 name TEXT NOT NULL,
                 FOREIGN KEY(package_id) REFERENCES packages(id)
             );
+            CREATE TABLE groups (
+                package_id INTEGER,
+                name TEXT NOT NULL,
+                FOREIGN KEY(package_id) REFERENCES packages(id)
+            );
             CREATE TABLE files (
                 package_id INTEGER,
                 path TEXT NOT NULL,
@@ -348,6 +355,7 @@ impl RepoManager {
              CREATE INDEX idx_replaces_name ON replaces(name);
              CREATE INDEX idx_dependencies_name ON dependencies(name);
              CREATE INDEX idx_dependencies_kind ON dependencies(kind);
+             CREATE INDEX idx_groups_name ON groups(name);
              CREATE INDEX idx_repo_files_path ON files(path);",
         )
         .context("Failed to create repo DB indexes")?;
@@ -380,6 +388,7 @@ impl RepoManager {
         let mut replaces = Vec::new();
         let mut runtime_dependencies = Vec::new();
         let mut optional_dependencies = Vec::new();
+        let mut groups = Vec::new();
         let mut archive_files = Vec::new();
 
         {
@@ -478,6 +487,17 @@ impl RepoManager {
                             .map(String::from)
                             .collect();
                     }
+                    if let Some(groups_arr) = metadata
+                        .get("dependencies")
+                        .and_then(|v| v.get("groups"))
+                        .and_then(|v| v.as_array())
+                    {
+                        groups = groups_arr
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(String::from)
+                            .collect();
+                    }
                     continue;
                 }
 
@@ -526,6 +546,7 @@ impl RepoManager {
             replaces,
             runtime_dependencies,
             optional_dependencies,
+            groups,
             archive_files,
         })
     }
@@ -550,6 +571,7 @@ impl RepoManager {
             replaces,
             runtime_dependencies,
             optional_dependencies,
+            groups,
             archive_files,
         } = indexed;
 
@@ -606,6 +628,12 @@ impl RepoManager {
             conn.execute(
                 "INSERT INTO dependencies (package_id, kind, name) VALUES (?1, 'optional', ?2)",
                 params![package_id, dep],
+            )?;
+        }
+        for group in groups {
+            conn.execute(
+                "INSERT INTO groups (package_id, name) VALUES (?1, ?2)",
+                params![package_id, group],
             )?;
         }
 
@@ -1681,6 +1709,26 @@ fn query_package_optional_deps(conn: &Connection, package_id: i64) -> Result<Vec
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+fn query_package_groups(conn: &Connection, package_id: i64) -> Result<Vec<String>> {
+    let has_groups_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='groups'",
+            [],
+            |r| {
+                let n: i64 = r.get(0)?;
+                Ok(n > 0)
+            },
+        )
+        .unwrap_or(false);
+    if !has_groups_table {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare("SELECT name FROM groups WHERE package_id = ?1 ORDER BY name")?;
+    let rows = stmt.query_map(params![package_id], |row| row.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 fn find_cached_binary_repo_packages(
     repo_name: &str,
     db_path: &Path,
@@ -1770,6 +1818,7 @@ fn find_cached_binary_repo_packages(
                 replaces: Vec::new(),
                 runtime_dependencies: Vec::new(),
                 optional_dependencies: Vec::new(),
+                groups: Vec::new(),
             },
         ))
     })?;
@@ -1782,6 +1831,113 @@ fn find_cached_binary_repo_packages(
         rec.replaces = query_package_replaces(&conn, package_id)?;
         rec.runtime_dependencies = query_package_runtime_deps(&conn, package_id)?;
         rec.optional_dependencies = query_package_optional_deps(&conn, package_id)?;
+        rec.groups = query_package_groups(&conn, package_id)?;
+        out.push(rec);
+    }
+    Ok(out)
+}
+
+fn find_cached_binary_repo_packages_by_group(
+    repo_name: &str,
+    db_path: &Path,
+    group: &str,
+) -> Result<Vec<BinaryRepoPackageRecord>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("Failed to open binary repo DB {}", db_path.display()))?;
+
+    let has_groups_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='groups'",
+            [],
+            |r| {
+                let n: i64 = r.get(0)?;
+                Ok(n > 0)
+            },
+        )
+        .unwrap_or(false);
+    if !has_groups_table {
+        return Ok(Vec::new());
+    }
+
+    let completed_at_expr = if repo_packages_have_completed_at(&conn)? {
+        "p.completed_at"
+    } else {
+        "NULL"
+    };
+    let real_name_expr = if repo_packages_have_real_name(&conn)? {
+        "p.real_name"
+    } else {
+        "NULL"
+    };
+    let abi_breaking_expr = if repo_packages_have_abi_breaking(&conn)? {
+        "p.abi_breaking"
+    } else {
+        "0"
+    };
+    let sql = format!(
+        "SELECT
+            p.id,
+            p.name,
+            {real_name_expr},
+            p.version,
+            p.revision,
+            {abi_breaking_expr},
+            {completed_at_expr},
+            p.filename,
+            p.size,
+            p.sha256,
+            p.sha512,
+            p.description,
+            p.homepage,
+            p.license
+         FROM packages p
+         WHERE EXISTS (
+            SELECT 1 FROM groups g
+            WHERE g.package_id = p.id
+              AND lower(g.name) = lower(?1)
+         )
+         ORDER BY p.name ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+
+    let rows = stmt.query_map(params![group], |row| {
+        let package_id = row.get::<_, i64>(0)?;
+        Ok((
+            package_id,
+            BinaryRepoPackageRecord {
+                repo_name: repo_name.to_string(),
+                name: row.get(1)?,
+                real_name: row.get(2)?,
+                version: row.get(3)?,
+                revision: row.get::<_, i64>(4)? as u32,
+                abi_breaking: row.get(5)?,
+                completed_at: row.get(6)?,
+                filename: row.get(7)?,
+                size: row.get::<_, i64>(8)? as u64,
+                sha256: row.get(9)?,
+                sha512: row.get(10)?,
+                description: row.get(11)?,
+                homepage: row.get(12)?,
+                license: row.get(13)?,
+                provides: Vec::new(),
+                conflicts: Vec::new(),
+                replaces: Vec::new(),
+                runtime_dependencies: Vec::new(),
+                optional_dependencies: Vec::new(),
+                groups: Vec::new(),
+            },
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (package_id, mut rec) = row?;
+        rec.provides = query_package_provides(&conn, package_id)?;
+        rec.conflicts = query_package_conflicts(&conn, package_id)?;
+        rec.replaces = query_package_replaces(&conn, package_id)?;
+        rec.runtime_dependencies = query_package_runtime_deps(&conn, package_id)?;
+        rec.optional_dependencies = query_package_optional_deps(&conn, package_id)?;
+        rec.groups = query_package_groups(&conn, package_id)?;
         out.push(rec);
     }
     Ok(out)
@@ -1854,6 +2010,7 @@ fn list_cached_binary_repo_packages(
                 replaces: Vec::new(),
                 runtime_dependencies: Vec::new(),
                 optional_dependencies: Vec::new(),
+                groups: Vec::new(),
             },
         ))
     })?;
@@ -1866,6 +2023,7 @@ fn list_cached_binary_repo_packages(
         rec.replaces = query_package_replaces(&conn, package_id)?;
         rec.runtime_dependencies = query_package_runtime_deps(&conn, package_id)?;
         rec.optional_dependencies = query_package_optional_deps(&conn, package_id)?;
+        rec.groups = query_package_groups(&conn, package_id)?;
         out.push(rec);
     }
     Ok(out)
@@ -1947,6 +2105,18 @@ pub fn find_binary_repo_packages(
 ) -> Result<Vec<BinaryRepoPackageRecord>> {
     let db_path = fetch_binary_repo_db(repo_name, repo, rootfs, package_cache_dir)?;
     find_cached_binary_repo_packages(repo_name, &db_path, query)
+}
+
+/// Resolve package records that belong to the named group from a binary repo.
+pub fn find_binary_repo_packages_by_group(
+    repo_name: &str,
+    repo: &crate::config::BinaryRepo,
+    rootfs: &Path,
+    package_cache_dir: &Path,
+    group: &str,
+) -> Result<Vec<BinaryRepoPackageRecord>> {
+    let db_path = fetch_binary_repo_db(repo_name, repo, rootfs, package_cache_dir)?;
+    find_cached_binary_repo_packages_by_group(repo_name, &db_path, group)
 }
 
 /// List all binary packages from a cached, verified repository database.
@@ -2717,6 +2887,33 @@ revision = 1
     }
 
     #[test]
+    fn test_find_cached_binary_repo_packages_by_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("repo.db");
+        let mut conn = Connection::open(&db_path).unwrap();
+        let manager = RepoManager::new(tmp.path().to_path_buf());
+        manager.init_repo_schema(&mut conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO packages (id, name, version, revision, description, homepage, license, filename, size, sha256, sha512)
+             VALUES (1, 'foo', '1.2.3', 1, 'Foo package', 'https://example.test', 'MIT', 'foo-1.2.3-1-x86_64.depot.pkg.tar.zst', 1234, 'a', 'b')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO groups (package_id, name) VALUES (1, 'base')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let hits = find_cached_binary_repo_packages_by_group("testrepo", &db_path, "base").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "foo");
+        assert_eq!(hits[0].groups, vec!["base".to_string()]);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn test_repo_owns_query_candidates_follow_rootfs_symlink_targets() {
         let rootfs = tempfile::tempdir().unwrap();
@@ -2819,6 +3016,7 @@ revision = 1
             replaces: Vec::new(),
             runtime_dependencies: Vec::new(),
             optional_dependencies: Vec::new(),
+            groups: Vec::new(),
         };
 
         verify_binary_package_record_checksums(&pkg, &rec).unwrap();
@@ -2858,6 +3056,7 @@ revision = 1
             replaces: Vec::new(),
             runtime_dependencies: Vec::new(),
             optional_dependencies: Vec::new(),
+            groups: Vec::new(),
         }
     }
 

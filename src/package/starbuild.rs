@@ -514,6 +514,7 @@ impl ParsedStarbuild {
             runtime: dedupe_preserve_order(self.dependencies.clone()),
             test: Vec::new(),
             optional: dedupe_preserve_order(self.optional_dependencies.clone()),
+            groups: Vec::new(),
             lib32: None,
         };
         let mut alternatives = Alternatives {
@@ -544,6 +545,7 @@ impl ParsedStarbuild {
                                 .cloned()
                                 .unwrap_or_default(),
                         ),
+                        groups: Vec::new(),
                         lib32: None,
                     },
                 );

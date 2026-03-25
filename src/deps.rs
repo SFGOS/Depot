@@ -608,6 +608,7 @@ mod tests {
                 runtime: Vec::new(),
                 test: vec!["bats".into(), "python".into()],
                 optional: Vec::new(),
+                groups: Vec::new(),
                 lib32: None,
             },
             package_alternatives: Default::default(),
@@ -657,6 +658,7 @@ mod tests {
                 runtime: vec!["python".into()],
                 test: Vec::new(),
                 optional: Vec::new(),
+                groups: Vec::new(),
                 lib32: None,
             },
             package_alternatives: Default::default(),
@@ -715,6 +717,7 @@ mod tests {
                 runtime: vec!["foo-libs".into(), "libfoo".into(), "python".into()],
                 test: Vec::new(),
                 optional: Vec::new(),
+                groups: Vec::new(),
                 lib32: None,
             },
             package_alternatives: std::collections::BTreeMap::from([(
@@ -747,6 +750,7 @@ mod tests {
             runtime: vec!["foo".into()],
             test: Vec::new(),
             optional: Vec::new(),
+            groups: Vec::new(),
         });
 
         let missing = check_runtime_deps_for_outputs(

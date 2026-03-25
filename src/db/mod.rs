@@ -5,7 +5,7 @@ pub mod repo;
 use crate::package::PackageSpec;
 use crate::staging;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -174,6 +174,10 @@ pub fn register_package_with_replacement(
         "DELETE FROM directories WHERE package_id = ?1",
         params![pkg_id],
     )?;
+    tx.execute(
+        "DELETE FROM package_groups WHERE package_id = ?1",
+        params![pkg_id],
+    )?;
 
     // Insert provides
     for provides in &spec.alternatives.provides {
@@ -187,6 +191,12 @@ pub fn register_package_with_replacement(
         tx.execute(
             "INSERT OR IGNORE INTO replaces (package_id, replaces_name) VALUES (?1, ?2)",
             params![pkg_id, replaces],
+        )?;
+    }
+    for group in &spec.dependencies.groups {
+        tx.execute(
+            "INSERT OR IGNORE INTO package_groups (package_id, group_name) VALUES (?1, ?2)",
+            params![pkg_id, group],
         )?;
     }
 
@@ -461,6 +471,11 @@ pub fn show_package_info(db_path: &Path, name: &str) -> Result<()> {
     crate::log_info!("Homepage: {}", homepage);
     crate::log_info!("License: {}", license);
 
+    let groups = get_package_groups(db_path, name)?;
+    if !groups.is_empty() {
+        crate::log_info!("Groups: {}", groups.join(", "));
+    }
+
     // Count files
     let file_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM files f JOIN packages p ON f.package_id = p.id WHERE p.name = ?1",
@@ -483,17 +498,46 @@ pub fn list_packages(db_path: &Path) -> Result<()> {
     let conn = Connection::open(db_path)?;
     init_db(&conn)?;
 
-    let mut stmt = conn.prepare("SELECT name, version FROM packages ORDER BY name")?;
+    let mut stmt = conn.prepare(
+        "SELECT
+            p.name,
+            p.version,
+            GROUP_CONCAT(pg.group_name, ',')
+         FROM packages p
+         LEFT JOIN package_groups pg ON pg.package_id = p.id
+         GROUP BY p.id
+         ORDER BY p.name",
+    )?;
     let packages = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
     })?;
 
     crate::log_info!("{:<30} VERSION", "PACKAGE");
     crate::log_info!("{}", "-".repeat(50));
 
     for pkg in packages {
-        let (name, version) = pkg?;
-        crate::log_info!("{:<30} {}", name, version);
+        let (name, version, groups_csv) = pkg?;
+        let groups = groups_csv
+            .map(|csv| {
+                let mut values: Vec<String> = csv
+                    .split(',')
+                    .filter(|value| !value.is_empty())
+                    .map(String::from)
+                    .collect();
+                values.sort();
+                values.dedup();
+                values
+            })
+            .unwrap_or_default();
+        if groups.is_empty() {
+            crate::log_info!("{:<30} {}", name, version);
+        } else {
+            crate::log_info!("{:<30} {} [groups: {}]", name, version, groups.join(", "));
+        }
     }
 
     Ok(())
@@ -531,6 +575,18 @@ fn init_db(conn: &Connection) -> Result<()> {
             UNIQUE(package_id, replaces_name)
         );
 
+        CREATE TABLE IF NOT EXISTS package_groups (
+            id INTEGER PRIMARY KEY,
+            package_id INTEGER NOT NULL,
+            group_name TEXT NOT NULL,
+            FOREIGN KEY (package_id) REFERENCES packages(id),
+            UNIQUE(package_id, group_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS installed_groups (
+            group_name TEXT PRIMARY KEY NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
             package_id INTEGER NOT NULL,
@@ -549,6 +605,7 @@ fn init_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_files_package ON files(package_id);
         CREATE INDEX IF NOT EXISTS idx_provides_name ON provides(provides_name);
         CREATE INDEX IF NOT EXISTS idx_replaces_name ON replaces(replaces_name);
+        CREATE INDEX IF NOT EXISTS idx_package_groups_name ON package_groups(group_name);
         CREATE INDEX IF NOT EXISTS idx_directories_package ON directories(package_id);
         CREATE INDEX IF NOT EXISTS idx_directories_path ON directories(path);
         ",
@@ -630,6 +687,10 @@ fn delete_package_rows(conn: &Connection, pkg_id: i64) -> Result<()> {
         "DELETE FROM replaces WHERE package_id = ?1",
         params![pkg_id],
     )?;
+    conn.execute(
+        "DELETE FROM package_groups WHERE package_id = ?1",
+        params![pkg_id],
+    )?;
     conn.execute("DELETE FROM packages WHERE id = ?1", params![pkg_id])?;
     Ok(())
 }
@@ -646,6 +707,10 @@ fn delete_package_rows_tx(tx: &rusqlite::Transaction<'_>, pkg_id: i64) -> Result
     )?;
     tx.execute(
         "DELETE FROM replaces WHERE package_id = ?1",
+        params![pkg_id],
+    )?;
+    tx.execute(
+        "DELETE FROM package_groups WHERE package_id = ?1",
         params![pkg_id],
     )?;
     tx.execute("DELETE FROM packages WHERE id = ?1", params![pkg_id])?;
@@ -803,6 +868,101 @@ pub fn get_package_provides(db_path: &Path, name: &str) -> Result<Vec<String>> {
     )?;
     let rows = stmt.query_map(params![name], |row| row.get(0))?;
     Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+/// Return the group memberships recorded for an installed package.
+pub fn get_package_groups(db_path: &Path, name: &str) -> Result<Vec<String>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT pg.group_name
+         FROM package_groups pg
+         JOIN packages p ON p.id = pg.package_id
+         WHERE p.name = ?1
+         ORDER BY pg.group_name",
+    )?;
+    let rows = stmt.query_map(params![name], |row| row.get(0))?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+/// Return the installed package names that belong to an explicitly recorded group.
+pub fn get_packages_in_installed_group(db_path: &Path, group: &str) -> Result<Vec<String>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT p.name
+         FROM package_groups pg
+         JOIN packages p ON p.id = pg.package_id
+         WHERE lower(pg.group_name) = lower(?1)
+         ORDER BY p.name",
+    )?;
+    let rows = stmt.query_map(params![group], |row| row.get(0))?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+/// Return true when the named group was explicitly installed by the user.
+pub fn is_installed_group(db_path: &Path, group: &str) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM installed_groups WHERE lower(group_name) = lower(?1) LIMIT 1",
+            params![group],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    Ok(found)
+}
+
+/// Record one or more explicit group installs.
+pub fn record_installed_groups(db_path: &Path, groups: &[String]) -> Result<()> {
+    if groups.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let tx = conn.transaction()?;
+    for group in groups {
+        tx.execute(
+            "INSERT OR IGNORE INTO installed_groups (group_name) VALUES (?1)",
+            params![group],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Remove an explicit installed-group marker.
+pub fn remove_installed_group(db_path: &Path, group: &str) -> Result<()> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    conn.execute(
+        "DELETE FROM installed_groups WHERE lower(group_name) = lower(?1)",
+        params![group],
+    )?;
+    Ok(())
 }
 
 /// Get set of all provided package names (alternatives)
@@ -1234,5 +1394,47 @@ mod tests {
         let replaces = get_all_replaces(&db_path).unwrap();
         assert!(replaces.contains("grep"));
         assert!(replaces.contains("patch"));
+    }
+
+    #[test]
+    fn register_package_persists_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        std::fs::write(dest.join("usr/bin/foo"), "foo").unwrap();
+
+        let mut spec = mk_spec("foo", "1.0");
+        spec.dependencies.groups = vec!["base".into(), "desktop".into()];
+
+        register_package(&db_path, &spec, &dest).unwrap();
+
+        assert_eq!(
+            get_package_groups(&db_path, "foo").unwrap(),
+            vec!["base".to_string(), "desktop".to_string()]
+        );
+    }
+
+    #[test]
+    fn installed_group_helpers_round_trip_membership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        std::fs::write(dest.join("usr/bin/foo"), "foo").unwrap();
+
+        let mut spec = mk_spec("foo", "1.0");
+        spec.dependencies.groups = vec!["base".into()];
+        register_package(&db_path, &spec, &dest).unwrap();
+
+        record_installed_groups(&db_path, &[String::from("base")]).unwrap();
+        assert!(is_installed_group(&db_path, "base").unwrap());
+        assert_eq!(
+            get_packages_in_installed_group(&db_path, "base").unwrap(),
+            vec!["foo".to_string()]
+        );
+
+        remove_installed_group(&db_path, "base").unwrap();
+        assert!(!is_installed_group(&db_path, "base").unwrap());
     }
 }

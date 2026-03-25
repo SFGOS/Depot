@@ -228,6 +228,17 @@ impl Packager {
                     .collect(),
             ),
         );
+        deps.insert(
+            "groups".to_string(),
+            toml::Value::Array(
+                self.spec
+                    .dependencies
+                    .groups
+                    .iter()
+                    .map(|s| toml::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
         map.insert("dependencies".to_string(), toml::Value::Table(deps));
         if !self.spec.build.flags.keep.is_empty() {
             map.insert(

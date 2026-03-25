@@ -1899,9 +1899,11 @@ type = "custom"
 
 [dependencies]
 runtime = ["base"]
+groups = ["toolchain"]
 
 [package_dependencies.clang]
 runtime = ["llvm-libs", "llvm-libgcc"]
+groups = ["compiler"]
 
 [package_dependencies.llvm-libs]
 runtime = ["llvm-libgcc", "zstd"]
@@ -1915,12 +1917,24 @@ runtime = ["llvm-libgcc", "zstd"]
             vec!["base".to_string()]
         );
         assert_eq!(
+            spec.dependencies_for_output("llvm").groups,
+            vec!["toolchain".to_string()]
+        );
+        assert_eq!(
             spec.dependencies_for_output("clang").runtime,
             vec!["llvm-libs".to_string(), "llvm-libgcc".to_string()]
         );
         assert_eq!(
+            spec.dependencies_for_output("clang").groups,
+            vec!["compiler".to_string()]
+        );
+        assert_eq!(
             spec.dependencies_for_output("llvm-libs").runtime,
             vec!["llvm-libgcc".to_string(), "zstd".to_string()]
+        );
+        assert_eq!(
+            spec.dependencies_for_output("llvm-libs").groups,
+            Vec::<String>::new()
         );
     }
 
@@ -1949,11 +1963,13 @@ type = "custom"
 
 [dependencies]
 runtime = ["base"]
+groups = ["toolchain"]
 
 [dependencies.lib32]
 build = ["gcc-multilib"]
 runtime = ["lib32-zlib"]
 test = ["bats"]
+groups = ["lib32-toolchain"]
 "#,
         )
         .unwrap();
@@ -1962,6 +1978,10 @@ test = ["bats"]
         assert_eq!(
             spec.dependencies_for_output("llvm").runtime,
             vec!["base".to_string()]
+        );
+        assert_eq!(
+            spec.dependencies_for_output("llvm").groups,
+            vec!["toolchain".to_string()]
         );
         assert_eq!(
             spec.dependencies_for_output("lib32-llvm").build,
@@ -1974,6 +1994,10 @@ test = ["bats"]
         assert_eq!(
             spec.dependencies_for_output("lib32-llvm").test,
             vec!["bats".to_string()]
+        );
+        assert_eq!(
+            spec.dependencies_for_output("lib32-llvm").groups,
+            vec!["lib32-toolchain".to_string()]
         );
     }
 
@@ -2274,6 +2298,7 @@ type = "meta"
 
 [dependencies]
 runtime = ["foo", "bar"]
+groups = ["base"]
 "#,
         )
         .unwrap();
@@ -2283,6 +2308,7 @@ runtime = ["foo", "bar"]
         assert!(spec.manual_sources.is_empty());
         assert!(spec.is_metapackage());
         assert_eq!(spec.dependencies.runtime, vec!["foo", "bar"]);
+        assert_eq!(spec.dependencies.groups, vec!["base"]);
     }
 
     #[test]
@@ -3803,6 +3829,9 @@ impl fmt::Display for PackageSpec {
         if !self.alternatives.replaces.is_empty() {
             writeln!(f, "Replaces: {}", self.alternatives.replaces.join(", "))?;
         }
+        if !self.dependencies.groups.is_empty() {
+            writeln!(f, "Groups: {}", self.dependencies.groups.join(", "))?;
+        }
         Ok(())
     }
 }
@@ -4786,6 +4815,9 @@ pub struct DependencyGroup {
     /// Optional runtime integrations that enhance functionality when installed.
     #[serde(default)]
     pub optional: Vec<String>,
+    /// Package groups associated with this package output.
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 impl DependencyGroup {
@@ -4795,6 +4827,7 @@ impl DependencyGroup {
             runtime: self.runtime.clone(),
             test: self.test.clone(),
             optional: self.optional.clone(),
+            groups: self.groups.clone(),
             lib32: None,
         }
     }
@@ -4815,6 +4848,9 @@ pub struct Dependencies {
     /// Optional runtime integrations that enhance functionality when installed.
     #[serde(default)]
     pub optional: Vec<String>,
+    /// Package groups associated with this package.
+    #[serde(default)]
+    pub groups: Vec<String>,
     /// Optional dependency overrides used only for the generated `lib32-*` companion package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lib32: Option<DependencyGroup>,
@@ -4828,6 +4864,7 @@ impl Dependencies {
             runtime: self.runtime.clone(),
             test: self.test.clone(),
             optional: self.optional.clone(),
+            groups: self.groups.clone(),
             lib32: None,
         }
     }
