@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use url::Url;
 use walkdir::WalkDir;
 
@@ -2256,6 +2257,7 @@ fn scan_package_specs(dir: &Path) -> Result<Vec<PathBuf>> {
         .into_iter()
         .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"))
     {
+        crate::interrupts::check()?;
         let entry = entry.with_context(|| format!("Failed to walk {}", root.display()))?;
         if !entry.file_type().is_file() {
             continue;
@@ -3256,6 +3258,12 @@ enum CheckStatus {
     Unknown { reason: String },
 }
 
+#[derive(Debug, Clone)]
+struct ArchiveListingProbe {
+    listing_url: String,
+    patterns: Vec<VersionPattern>,
+}
+
 fn strip_known_archive_suffixes(input: &str) -> &str {
     for suffix in [
         ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz", ".txz", ".tbz2", ".zip", ".tar",
@@ -3266,6 +3274,22 @@ fn strip_known_archive_suffixes(input: &str) -> &str {
         }
     }
     input
+}
+
+fn version_pattern_from_template(
+    template: &str,
+    strip_archive_suffix: bool,
+) -> Option<VersionPattern> {
+    let (prefix, suffix) = template.split_once("$version")?;
+    let suffix = if strip_archive_suffix {
+        strip_known_archive_suffixes(suffix)
+    } else {
+        suffix
+    };
+    Some(VersionPattern {
+        prefix: prefix.to_string(),
+        suffix: suffix.to_string(),
+    })
 }
 
 fn extract_version_patterns(raw: &str) -> Vec<VersionPattern> {
@@ -3282,12 +3306,9 @@ fn extract_version_patterns(raw: &str) -> Vec<VersionPattern> {
             .find(['/', '#', '?', '&', '='])
             .map(|pos| idx + "$version".len() + pos)
             .unwrap_or(raw.len());
-        let prefix = raw[prefix_start..idx].to_string();
-        let suffix = strip_known_archive_suffixes(&raw[idx + "$version".len()..suffix_end]);
-        patterns.insert(VersionPattern {
-            prefix,
-            suffix: suffix.to_string(),
-        });
+        if let Some(pattern) = version_pattern_from_template(&raw[prefix_start..suffix_end], true) {
+            patterns.insert(pattern);
+        }
         start = idx + "$version".len();
     }
 
@@ -3390,10 +3411,122 @@ fn canonical_update_version(raw: &str) -> &str {
         .unwrap_or(raw)
 }
 
+fn collapse_date_like_components(value: &str) -> String {
+    let parts: Vec<_> = value.split('.').collect();
+    if parts.len() < 3 {
+        return value.to_string();
+    }
+    if !parts[0].chars().all(|ch| ch.is_ascii_digit())
+        || !parts[1].chars().all(|ch| ch.is_ascii_digit())
+        || !parts[2].chars().all(|ch| ch.is_ascii_digit())
+        || parts[0].len() != 4
+        || parts[1].len() != 2
+        || parts[2].len() != 2
+    {
+        return value.to_string();
+    }
+
+    let mut collapsed = vec![format!("{}{}{}", parts[0], parts[1], parts[2])];
+    collapsed.extend(parts.into_iter().skip(3).map(str::to_string));
+    collapsed.join(".")
+}
+
+fn normalize_comparable_version(raw: &str) -> String {
+    let mut value = canonical_update_version(raw).trim().to_ascii_lowercase();
+    if let Some(first_digit) = value.find(|ch: char| ch.is_ascii_digit())
+        && first_digit > 0
+        && value[..first_digit].chars().all(|ch| !ch.is_ascii_digit())
+    {
+        value = value[first_digit..].to_string();
+    }
+
+    let mut normalized = String::with_capacity(value.len());
+    let mut last_was_dot = false;
+    for ch in value.chars() {
+        let mapped = match ch {
+            '_' | '-' | '+' => '.',
+            ch if ch.is_ascii_alphanumeric() || ch == '.' => ch,
+            _ => continue,
+        };
+        if mapped == '.' {
+            if normalized.is_empty() || last_was_dot {
+                continue;
+            }
+            last_was_dot = true;
+        } else {
+            last_was_dot = false;
+        }
+        normalized.push(mapped);
+    }
+    while normalized.ends_with('.') {
+        normalized.pop();
+    }
+
+    collapse_date_like_components(&normalized)
+}
+
+fn numeric_component_count(value: &str) -> usize {
+    let mut count = 0usize;
+    let mut in_digits = false;
+    for ch in value.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                count += 1;
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+        }
+    }
+    count
+}
+
+fn first_numeric_component_len(value: &str) -> Option<usize> {
+    let start = value.find(|ch: char| ch.is_ascii_digit())?;
+    Some(
+        value[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .count(),
+    )
+}
+
+fn is_prerelease_version(value: &str) -> bool {
+    let normalized = normalize_comparable_version(value);
+    [
+        "alpha", "beta", "rc", "pre", "preview", "snapshot", "nightly", "dev",
+    ]
+    .into_iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn normalize_candidate_version(current: &str, candidate: &str) -> Option<String> {
+    let normalized = normalize_comparable_version(candidate);
+    if !looks_like_version(&normalized) {
+        return None;
+    }
+    if !is_prerelease_version(current) && is_prerelease_version(candidate) {
+        return None;
+    }
+
+    let current_normalized = normalize_comparable_version(current);
+    if numeric_component_count(&current_normalized) >= 2
+        && numeric_component_count(&normalized) == 1
+        && first_numeric_component_len(&current_normalized).is_some_and(|len| len <= 4)
+    {
+        return None;
+    }
+
+    Some(normalized)
+}
+
 fn compare_versions_for_updates(left: &str, right: &str) -> Ordering {
-    let left = canonical_update_version(left);
-    let right = canonical_update_version(right);
-    if let (Ok(left), Ok(right)) = (semver::Version::parse(left), semver::Version::parse(right)) {
+    let left = normalize_comparable_version(left);
+    let right = normalize_comparable_version(right);
+    if let (Ok(left), Ok(right)) = (
+        semver::Version::parse(&left),
+        semver::Version::parse(&right),
+    ) {
         match left.cmp(&right) {
             Ordering::Equal => {}
             non_eq => return non_eq,
@@ -3405,29 +3538,32 @@ fn compare_versions_for_updates(left: &str, right: &str) -> Ordering {
         && left.chars().all(|ch| ch.is_ascii_digit())
         && right.chars().all(|ch| ch.is_ascii_digit())
     {
-        return left.cmp(right);
+        return left.cmp(&right);
     }
 
-    compare_version_fallback(left, right)
+    compare_version_fallback(&left, &right)
 }
 
 fn best_newer_version<'a>(
     current: &str,
     candidates: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
-    let mut best: Option<&str> = None;
+    let mut best: Option<String> = None;
     for candidate in candidates {
-        if compare_versions_for_updates(candidate, current) != Ordering::Greater {
+        let Some(candidate) = normalize_candidate_version(current, candidate) else {
+            continue;
+        };
+        if compare_versions_for_updates(&candidate, current) != Ordering::Greater {
             continue;
         }
-        if let Some(existing) = best
-            && compare_versions_for_updates(candidate, existing) != Ordering::Greater
+        if let Some(existing) = best.as_deref()
+            && compare_versions_for_updates(&candidate, existing) != Ordering::Greater
         {
             continue;
         }
         best = Some(candidate);
     }
-    best.map(str::to_string)
+    best
 }
 
 fn remote_git_repository_from_source_url(expanded_url: &str) -> Option<String> {
@@ -3441,14 +3577,36 @@ fn remote_git_repository_from_source_url(expanded_url: &str) -> Option<String> {
     if segments.len() < 3 {
         return None;
     }
-    let owner = segments[0];
-    let repo = segments[1].strip_suffix(".git").unwrap_or(segments[1]);
-    match segments[2] {
-        "releases" | "archive" => {
-            Some(format!("{}://{}/{owner}/{repo}.git", parsed.scheme(), host))
-        }
-        _ => None,
+
+    let keyword_idx = segments
+        .iter()
+        .position(|segment| matches!(*segment, "releases" | "archive"))?;
+    let repo_segments = if keyword_idx > 0 && segments.get(keyword_idx - 1) == Some(&"-") {
+        &segments[..keyword_idx - 1]
+    } else {
+        &segments[..keyword_idx]
+    };
+    if repo_segments.len() < 2 {
+        return None;
     }
+
+    Some(format!(
+        "{}://{}/{}.git",
+        parsed.scheme(),
+        host,
+        repo_segments
+            .iter()
+            .enumerate()
+            .map(|(idx, segment)| {
+                if idx + 1 == repo_segments.len() {
+                    segment.strip_suffix(".git").unwrap_or(segment)
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    ))
 }
 
 fn source_git_url_parts(url: &str) -> Option<(String, String)> {
@@ -3475,18 +3633,35 @@ fn source_git_url_parts(url: &str) -> Option<(String, String)> {
 }
 
 fn list_remote_refs(url: &str) -> Result<Vec<String>> {
+    crate::interrupts::check()?;
     let mut remote = git2::Remote::create_detached(url)
         .with_context(|| format!("Failed to create detached git remote for {}", url))?;
-    remote
-        .connect(Direction::Fetch)
-        .with_context(|| format!("Failed to connect to git remote {}", url))?;
-    let refs = remote
-        .list()
-        .with_context(|| format!("Failed to list refs for git remote {}", url))?
-        .iter()
-        .map(|head| head.name().trim_end_matches("^{}").to_string())
-        .collect();
-    remote.disconnect()?;
+    let mut callbacks = git2::RemoteCallbacks::new();
+    callbacks.sideband_progress(|_| !crate::interrupts::was_interrupted());
+    callbacks.transfer_progress(|_| !crate::interrupts::was_interrupted());
+
+    let refs = {
+        let connection = match remote.connect_auth(Direction::Fetch, Some(callbacks), None) {
+            Ok(connection) => connection,
+            Err(_err) if crate::interrupts::was_interrupted() => {
+                anyhow::bail!("Interrupted by Ctrl-C while checking {}", url);
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to connect to git remote {}", url));
+            }
+        };
+        crate::interrupts::check()?;
+        let refs = connection
+            .list()
+            .with_context(|| format!("Failed to list refs for git remote {}", url))?
+            .iter()
+            .map(|head| head.name().trim_end_matches("^{}").to_string())
+            .collect();
+        drop(connection);
+        refs
+    };
+    remote.disconnect().ok();
     Ok(refs)
 }
 
@@ -3494,10 +3669,9 @@ fn candidate_versions_from_refs(refs: &[String], patterns: &[VersionPattern]) ->
     let mut versions = HashSet::new();
 
     for name in refs {
-        let short = name
-            .strip_prefix("refs/tags/")
-            .or_else(|| name.strip_prefix("refs/heads/"))
-            .unwrap_or(name.as_str());
+        let Some(short) = name.strip_prefix("refs/tags/") else {
+            continue;
+        };
 
         for pattern in patterns {
             if let Some(candidate) = match_version_pattern(short, pattern) {
@@ -3511,6 +3685,109 @@ fn candidate_versions_from_refs(refs: &[String], patterns: &[VersionPattern]) ->
     out
 }
 
+fn archive_listing_probe(raw_url: &str, expanded_url: &str) -> Option<ArchiveListingProbe> {
+    let raw = Url::parse(raw_url).ok()?;
+    let expanded = Url::parse(expanded_url).ok()?;
+    if !matches!(expanded.scheme(), "http" | "https") {
+        return None;
+    }
+
+    let raw_segments: Vec<_> = raw.path_segments()?.collect();
+    let expanded_segments: Vec<_> = expanded.path_segments()?.collect();
+    if raw_segments.len() != expanded_segments.len() {
+        return None;
+    }
+
+    let first_version_idx = raw_segments
+        .iter()
+        .position(|segment| segment.contains("$version"))?;
+    let pattern = version_pattern_from_template(raw_segments[first_version_idx], false)?;
+
+    let mut listing_url = expanded.clone();
+    let listing_path = if first_version_idx == 0 {
+        "/".to_string()
+    } else {
+        format!("/{}/", expanded_segments[..first_version_idx].join("/"))
+    };
+    listing_url.set_path(&listing_path);
+    listing_url.set_query(None);
+    listing_url.set_fragment(None);
+
+    Some(ArchiveListingProbe {
+        listing_url: listing_url.to_string(),
+        patterns: vec![pattern],
+    })
+}
+
+fn archive_listing_tokens(body: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    for token in body.split(|ch: char| {
+        ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']')
+    }) {
+        let token = token
+            .split_once('?')
+            .map(|(value, _)| value)
+            .unwrap_or(token)
+            .split_once('#')
+            .map(|(value, _)| value)
+            .unwrap_or(token)
+            .trim_matches(|ch: char| matches!(ch, ',' | ';' | '='))
+            .trim_end_matches('/');
+        if token.is_empty() {
+            continue;
+        }
+        let basename = token.rsplit('/').next().unwrap_or(token);
+        if !basename.is_empty() {
+            tokens.insert(basename.to_string());
+        }
+    }
+    tokens
+}
+
+fn candidate_versions_from_listing(body: &str, patterns: &[VersionPattern]) -> Vec<String> {
+    let mut versions = HashSet::new();
+    for token in archive_listing_tokens(body) {
+        for pattern in patterns {
+            if let Some(candidate) = match_version_pattern(&token, pattern) {
+                versions.insert(candidate.to_string());
+            }
+        }
+    }
+
+    let mut out: Vec<_> = versions.into_iter().collect();
+    out.sort_by(|a, b| compare_versions_for_updates(a, b));
+    out
+}
+
+fn list_archive_versions(probe: &ArchiveListingProbe) -> Result<Vec<String>> {
+    crate::interrupts::check()?;
+    let client = source::build_blocking_client(
+        &format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+        Some(Duration::from_secs(20)),
+    )?;
+    let response = client
+        .get(&probe.listing_url)
+        .send()
+        .with_context(|| format!("Failed to fetch archive index {}", probe.listing_url))?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "archive index {} returned {}",
+            probe.listing_url,
+            response.status()
+        );
+    }
+    let body = response
+        .text()
+        .with_context(|| format!("Failed to read archive index {}", probe.listing_url))?;
+    crate::interrupts::check()?;
+
+    let candidates = candidate_versions_from_listing(&body, &probe.patterns);
+    if candidates.is_empty() {
+        anyhow::bail!("no matching archive entries found in {}", probe.listing_url);
+    }
+    Ok(candidates)
+}
+
 fn source_check_status(
     spec: &package::PackageSpec,
     source: &package::Source,
@@ -3521,16 +3798,52 @@ fn source_check_status(
     }
 
     let expanded_url = spec.expand_vars(&source.url);
-    let repo_url = remote_git_repository_from_source_url(&expanded_url)
-        .ok_or_else(|| anyhow::anyhow!("could not derive a git remote from {}", expanded_url))?;
-    let refs = list_remote_refs(&repo_url)?;
-    let candidates = candidate_versions_from_refs(&refs, &patterns);
+    let mut reasons = Vec::new();
 
-    if candidates.is_empty() {
-        anyhow::bail!("no matching remote refs found in {}", repo_url);
-    }
+    let (candidates, source_label) = if let Some(repo_url) =
+        remote_git_repository_from_source_url(&expanded_url)
+    {
+        match list_remote_refs(&repo_url).map(|refs| candidate_versions_from_refs(&refs, &patterns))
+        {
+            Ok(candidates) if !candidates.is_empty() => {
+                (candidates, format!("git tags {}", repo_url))
+            }
+            Ok(_) => {
+                reasons.push(format!("no matching git tags found in {}", repo_url));
+                if let Some(probe) = archive_listing_probe(&source.url, &expanded_url) {
+                    let candidates = list_archive_versions(&probe)?;
+                    (candidates, format!("archive index {}", probe.listing_url))
+                } else {
+                    anyhow::bail!("{}", reasons.remove(0));
+                }
+            }
+            Err(err) => {
+                reasons.push(err.to_string());
+                if let Some(probe) = archive_listing_probe(&source.url, &expanded_url) {
+                    match list_archive_versions(&probe) {
+                        Ok(candidates) => {
+                            (candidates, format!("archive index {}", probe.listing_url))
+                        }
+                        Err(archive_err) => {
+                            reasons.push(archive_err.to_string());
+                            anyhow::bail!("{}", reasons.join("; "));
+                        }
+                    }
+                } else {
+                    anyhow::bail!("{}", reasons.remove(0));
+                }
+            }
+        }
+    } else if let Some(probe) = archive_listing_probe(&source.url, &expanded_url) {
+        let candidates = list_archive_versions(&probe)?;
+        (candidates, format!("archive index {}", probe.listing_url))
+    } else {
+        anyhow::bail!(
+            "could not derive a git remote or archive index from {}",
+            expanded_url
+        );
+    };
 
-    let source_label = format!("git refs {}", repo_url);
     if let Some(latest) =
         best_newer_version(&spec.package.version, candidates.iter().map(String::as_str))
     {
@@ -3560,6 +3873,11 @@ fn check_package_spec(spec_path: &Path) -> CheckStatus {
     let mut reasons = Vec::new();
 
     for source in spec.sources() {
+        if let Err(err) = crate::interrupts::check() {
+            return CheckStatus::Unknown {
+                reason: err.to_string(),
+            };
+        }
         match source_check_status(&spec, source) {
             Ok(CheckStatus::UpdateAvailable { latest, source }) => {
                 let replace = match &best_update {
@@ -3610,33 +3928,78 @@ fn run_check_command(dir: &Path) -> Result<()> {
         return Ok(());
     }
 
+    let verbose = std::env::var_os("DEPOT_CHECK_VERBOSE").is_some();
+    let mut updates = 0usize;
+    let mut up_to_date = 0usize;
+    let mut skipped = Vec::new();
+
     for spec_path in specs {
-        let spec = package::PackageSpec::from_file(&spec_path)?;
+        crate::interrupts::check()?;
+        let spec = match package::PackageSpec::from_file(&spec_path) {
+            Ok(spec) => spec,
+            Err(err) => {
+                skipped.push(format!(
+                    "{} could not be loaded: {}",
+                    spec_path.display(),
+                    err,
+                ));
+                continue;
+            }
+        };
         match check_package_spec(&spec_path) {
-            CheckStatus::UpdateAvailable { latest, source } => ui::warn(format!(
-                "{} {} -> {} [{}] ({})",
-                spec.package.name,
-                spec.package.version,
-                latest,
-                source,
-                spec_path.display()
-            )),
-            CheckStatus::UpToDate { source } => ui::info(format!(
-                "{} {} is up to date [{}] ({})",
-                spec.package.name,
-                spec.package.version,
-                source,
-                spec_path.display()
-            )),
-            CheckStatus::Unknown { reason } => ui::warn(format!(
-                "{} {} could not be checked: {} ({})",
-                spec.package.name,
-                spec.package.version,
-                reason,
-                spec_path.display()
-            )),
+            CheckStatus::UpdateAvailable { latest, source } => {
+                updates += 1;
+                ui::warn(format!(
+                    "{} {} -> {} [{}] ({})",
+                    spec.package.name,
+                    spec.package.version,
+                    latest,
+                    source,
+                    spec_path.display()
+                ));
+            }
+            CheckStatus::UpToDate { source } => {
+                up_to_date += 1;
+                if verbose {
+                    ui::info(format!(
+                        "{} {} is up to date [{}] ({})",
+                        spec.package.name,
+                        spec.package.version,
+                        source,
+                        spec_path.display()
+                    ));
+                }
+            }
+            CheckStatus::Unknown { reason } => {
+                skipped.push(format!(
+                    "{} {} could not be checked: {} ({})",
+                    spec.package.name,
+                    spec.package.version,
+                    reason,
+                    spec_path.display()
+                ));
+            }
         }
     }
+
+    if verbose {
+        for entry in &skipped {
+            ui::warn(entry);
+        }
+    } else if !skipped.is_empty() {
+        ui::warn(format!(
+            "Skipped {} package(s) that could not be checked; set DEPOT_CHECK_VERBOSE=1 for per-package reasons.",
+            skipped.len()
+        ));
+    }
+
+    ui::info(format!(
+        "Check summary: {} package(s), {} update(s), {} up to date, {} skipped",
+        updates + up_to_date + skipped.len(),
+        updates,
+        up_to_date,
+        skipped.len()
+    ));
 
     Ok(())
 }
@@ -7806,6 +8169,10 @@ optional = []
             compare_versions_for_updates("v1.0.0", "1.0.0"),
             Ordering::Equal
         );
+        assert_eq!(
+            compare_versions_for_updates("lts_2027_01_01", "20260107.1"),
+            Ordering::Greater
+        );
     }
 
     #[test]
@@ -7893,6 +8260,24 @@ optional = []
     }
 
     #[test]
+    fn best_newer_version_skips_branches_and_prereleases() {
+        let candidates = ["2", "1.10.0rc1", "1.10.0", "release-0.13"];
+        assert_eq!(
+            best_newer_version("1.9.5", candidates.into_iter()),
+            Some("1.10.0".to_string())
+        );
+    }
+
+    #[test]
+    fn best_newer_version_normalizes_date_style_tags() {
+        let candidates = ["lts_2026_01_07", "lts_2027_02_03"];
+        assert_eq!(
+            best_newer_version("20260107.1", candidates.into_iter()),
+            Some("20270203".to_string())
+        );
+    }
+
+    #[test]
     fn remote_git_repository_from_github_release_url_maps_to_repo_git_url() {
         let repo_url = remote_git_repository_from_source_url(
             "https://github.com/Mic92/iana-etc/releases/download/20260202/iana-etc-20260202.tar.gz",
@@ -7901,6 +8286,103 @@ optional = []
             repo_url,
             Some("https://github.com/Mic92/iana-etc.git".to_string())
         );
+    }
+
+    #[test]
+    fn remote_git_repository_from_gitlab_archive_url_maps_to_repo_git_url() {
+        let repo_url = remote_git_repository_from_source_url(
+            "https://gitlab.com/graphviz/graphviz/-/archive/14.1.4/graphviz-14.1.4.tar.gz",
+        );
+        assert_eq!(
+            repo_url,
+            Some("https://gitlab.com/graphviz/graphviz.git".to_string())
+        );
+    }
+
+    #[test]
+    fn archive_listing_probe_uses_parent_of_first_version_segment() {
+        let probe = archive_listing_probe(
+            "https://downloads.example.test/dav1d/$version/dav1d-$version.tar.xz",
+            "https://downloads.example.test/dav1d/1.5.3/dav1d-1.5.3.tar.xz",
+        )
+        .expect("archive probe");
+        assert_eq!(probe.listing_url, "https://downloads.example.test/dav1d/");
+        assert_eq!(
+            probe.patterns,
+            vec![VersionPattern {
+                prefix: String::new(),
+                suffix: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn candidate_versions_from_listing_matches_archive_entries() {
+        let patterns = vec![VersionPattern {
+            prefix: "alsa-lib-".into(),
+            suffix: ".tar.bz2".into(),
+        }];
+        let html = r#"
+            <a href="alsa-lib-1.2.15.3.tar.bz2">alsa-lib-1.2.15.3.tar.bz2</a>
+            <a href="alsa-lib-1.2.16.tar.bz2">alsa-lib-1.2.16.tar.bz2</a>
+        "#;
+        assert_eq!(
+            candidate_versions_from_listing(html, &patterns),
+            vec!["1.2.15.3".to_string(), "1.2.16".to_string()]
+        );
+    }
+
+    #[test]
+    fn list_archive_versions_reads_simple_http_index() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").context("bind test listener")?;
+        let addr = listener.local_addr().context("listener addr")?;
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept().context("accept request")?;
+            let mut reader = BufReader::new(stream.try_clone().context("clone stream")?);
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .context("read request line")?;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).context("read header line")?;
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            assert!(request_line.starts_with("GET /pub/lib/ HTTP/1.1"));
+            let body = r#"
+                <html>
+                    <a href="alsa-lib-1.2.15.3.tar.bz2">alsa-lib-1.2.15.3.tar.bz2</a>
+                    <a href="alsa-lib-1.2.16.tar.bz2">alsa-lib-1.2.16.tar.bz2</a>
+                </html>
+            "#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .context("write response")?;
+            stream.flush().context("flush response")?;
+            Ok(())
+        });
+
+        let probe = ArchiveListingProbe {
+            listing_url: format!("http://{addr}/pub/lib/"),
+            patterns: vec![VersionPattern {
+                prefix: "alsa-lib-".into(),
+                suffix: ".tar.bz2".into(),
+            }],
+        };
+        let versions = list_archive_versions(&probe)?;
+        server.join().expect("join server")?;
+        assert_eq!(versions, vec!["1.2.15.3".to_string(), "1.2.16".to_string()]);
+        Ok(())
     }
 
     #[test]
