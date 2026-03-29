@@ -132,10 +132,10 @@ pub fn build(
 
         for arg in &flags.configure {
             let expanded = expand_configure_arg(spec, arg, &env_vars);
-            configure_cmd.arg(expanded);
+            add_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &expanded);
         }
         for arg in crate::builder::static_build_args_for(crate::package::BuildType::Autotools)? {
-            configure_cmd.arg(arg);
+            add_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &arg);
         }
 
         let status = crate::interrupts::command_status(&mut configure_cmd)
@@ -442,10 +442,10 @@ pub(crate) fn ensure_host_build(
         }
         for arg in &flags.configure {
             let expanded = expand_configure_arg(&host_spec, arg, &env_vars);
-            configure_cmd.arg(expanded);
+            add_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &expanded);
         }
         for arg in crate::builder::static_build_args_for(crate::package::BuildType::Autotools)? {
-            configure_cmd.arg(arg);
+            add_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &arg);
         }
 
         let status = crate::interrupts::command_status(&mut configure_cmd)
@@ -560,9 +560,34 @@ fn configure_help_text(
 }
 
 fn configure_help_supports_option(help_text: &str, option: &str) -> bool {
+    configure_help_option_aliases(option)
+        .iter()
+        .any(|candidate| configure_help_mentions_option(help_text, candidate))
+}
+
+fn configure_help_mentions_option(help_text: &str, option: &str) -> bool {
     let with_eq = format!("{}=", option);
     let with_space = format!("{} ", option);
     help_text.contains(&with_eq) || help_text.contains(&with_space) || help_text.contains(option)
+}
+
+fn configure_help_option_aliases(option: &str) -> Vec<String> {
+    let mut aliases = vec![option.to_string()];
+
+    if let Some(feature) = option.strip_prefix("--enable-") {
+        aliases.push(format!("--disable-{feature}"));
+    }
+    if let Some(feature) = option.strip_prefix("--disable-") {
+        aliases.push(format!("--enable-{feature}"));
+    }
+    if let Some(feature) = option.strip_prefix("--with-") {
+        aliases.push(format!("--without-{feature}"));
+    }
+    if let Some(feature) = option.strip_prefix("--without-") {
+        aliases.push(format!("--with-{feature}"));
+    }
+
+    aliases
 }
 
 fn configure_supports_option(help_text: Option<&str>, option: &str, configure_file: &str) -> bool {
@@ -577,6 +602,39 @@ fn has_configure_option_prefix(args: &[String], option: &str) -> bool {
         let trimmed = arg.trim();
         trimmed == option || trimmed.starts_with(&with_eq)
     })
+}
+
+fn configure_long_option(arg: &str) -> Option<&str> {
+    let trimmed = arg.trim();
+    if !trimmed.starts_with("--") || trimmed == "--" {
+        return None;
+    }
+
+    let end = trimmed
+        .find(|ch: char| ch == '=' || ch.is_whitespace())
+        .unwrap_or(trimmed.len());
+    Some(&trimmed[..end])
+}
+
+fn add_configure_arg_if_supported(configure_cmd: &mut Command, help_text: Option<&str>, arg: &str) {
+    if let Some(help_text) = help_text
+        && let Some(option) = configure_long_option(arg)
+        && !configure_help_supports_option(help_text, option)
+    {
+        let trimmed = arg.trim();
+        if trimmed == option {
+            crate::log_info!("  configure does not support {}; skipping", option);
+        } else {
+            crate::log_info!(
+                "  configure does not support {}; skipping {}",
+                option,
+                trimmed
+            );
+        }
+        return;
+    }
+
+    configure_cmd.arg(arg);
 }
 
 fn default_configure_install_dirs(
@@ -1017,6 +1075,13 @@ mod tests {
     }
 
     #[test]
+    fn test_configure_help_supports_enable_disable_aliases() {
+        let help = "  --enable-static  build static libraries\n  --with-zlib=DIR";
+        assert!(configure_help_supports_option(help, "--disable-static"));
+        assert!(configure_help_supports_option(help, "--without-zlib"));
+    }
+
+    #[test]
     fn test_configure_supports_option_defaults_by_configure_file_usage() {
         assert!(configure_supports_option(None, "--host", ""));
         assert!(!configure_supports_option(
@@ -1092,6 +1157,45 @@ mod tests {
         let flags = BuildFlags::default();
         let args = default_configure_install_dirs(&flags, Some("--prefix=PREFIX"));
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_configure_long_option_extracts_long_option_name() {
+        assert_eq!(
+            configure_long_option(" --disable-static "),
+            Some("--disable-static")
+        );
+        assert_eq!(
+            configure_long_option("--with-zlib=/usr"),
+            Some("--with-zlib")
+        );
+        assert_eq!(configure_long_option("prefix=/usr"), None);
+        assert_eq!(configure_long_option("-C"), None);
+    }
+
+    #[test]
+    fn test_add_configure_arg_if_supported_skips_unsupported_long_option() {
+        let mut cmd = Command::new("configure");
+        add_configure_arg_if_supported(&mut cmd, Some("--enable-static"), "--disable-nls");
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_add_configure_arg_if_supported_keeps_supported_alias_and_non_option_args() {
+        let mut cmd = Command::new("configure");
+        add_configure_arg_if_supported(&mut cmd, Some("--enable-static"), "--disable-static");
+        add_configure_arg_if_supported(&mut cmd, Some("--enable-static"), "srcdir");
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["--disable-static", "srcdir"]);
     }
 
     #[test]
