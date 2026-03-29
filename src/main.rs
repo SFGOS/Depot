@@ -1,6 +1,7 @@
 //! Depot - Not Your Average Package Manager
 //! A source-based package manager for Linux
 
+mod build_options;
 mod builder;
 mod cli;
 mod cli_assets;
@@ -10,6 +11,7 @@ mod cross;
 mod db;
 mod deps;
 mod fakeroot;
+mod hex;
 mod index;
 mod install;
 mod interrupts;

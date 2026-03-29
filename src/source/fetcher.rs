@@ -12,6 +12,10 @@ use url::Url;
 
 const MAX_MIRROR_RETRIES: usize = 8;
 
+fn scheme_uses_http_transport(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https")
+}
+
 /// Fetch an archive source tarball, returning path to downloaded file.
 pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> Result<PathBuf> {
     let url = spec.expand_vars(&source.url);
@@ -32,8 +36,17 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
 
     // Parse URL early so we can handle non-HTTP schemes (FTP support)
     let parsed_url = Url::parse(&url).with_context(|| format!("Invalid URL: {}", url))?;
+    let pb = ProgressBar::new(0);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
-    // If this is an FTP URL, fetch via suppaftp into the cache and continue
+    // If this is an FTP URL, fetch via suppaftp and skip the HTTP client path.
     if parsed_url.scheme() == "ftp" {
         // Connect and login (anonymous fallback)
         let host = parsed_url.host_str().context("FTP URL missing host")?;
@@ -86,65 +99,66 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
         if !retrieved {
             bail!("FTP error fetching {}", url);
         }
-    }
-
-    // Download with progress bar
-    // Use a sensible default User-Agent so servers that reject empty/unknown agents (e.g. IANA)
-    // will accept requests. Include package name/version at compile time.
-    let ua = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    let client =
-        super::build_blocking_client(&ua, None).with_context(|| "Failed to build HTTP client")?;
-
-    let mut response = client
-        .get(&url)
-        .send()
-        .with_context(|| format!("Failed to fetch: {}", url))?;
-    // If the server returned a non-success status, read a short body preview and fail early.
-    // This prevents saving HTML error pages (which then fail checksum) and gives a clearer
-    // diagnostic to the user.
-    let status = response.status();
-    if !status.is_success() {
-        let mut preview_bytes = Vec::new();
-        // read up to 1 KiB for a preview (ignore errors while reading preview)
-        let _ = response.take(1024).read_to_end(&mut preview_bytes);
-        let preview = String::from_utf8_lossy(&preview_bytes);
-        bail!(
-            "HTTP error fetching {}: {}{}",
-            url,
-            status,
-            if preview.trim().is_empty() {
-                "".to_string()
-            } else {
-                format!(" — preview: {}", preview.trim())
-            }
-        );
-    }
-    let total_size = response.content_length().unwrap_or(0);
-    let pb = ProgressBar::new(total_size);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    let mut file = File::create(&dest_path)
-        .with_context(|| format!("Failed to create: {}", dest_path.display()))?;
-
-    let mut buffer = [0u8; 8192];
-    let mut downloaded = 0u64;
-
-    loop {
-        let bytes_read = response.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
+    } else {
+        if !scheme_uses_http_transport(parsed_url.scheme()) {
+            bail!(
+                "Unsupported URL scheme for source fetch: {}",
+                parsed_url.scheme()
+            );
         }
-        file.write_all(&buffer[..bytes_read])?;
-        downloaded += bytes_read as u64;
-        pb.set_position(downloaded);
-    }
 
-    pb.finish_with_message("Download complete");
+        // Download with progress bar
+        // Use a sensible default User-Agent so servers that reject empty/unknown agents (e.g. IANA)
+        // will accept requests. Include package name/version at compile time.
+        let ua = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        let client = super::build_blocking_client(&ua, None)
+            .with_context(|| "Failed to build HTTP client")?;
+
+        let mut response = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("Failed to fetch: {}", url))?;
+        // If the server returned a non-success status, read a short body preview and fail early.
+        // This prevents saving HTML error pages (which then fail checksum) and gives a clearer
+        // diagnostic to the user.
+        let status = response.status();
+        if !status.is_success() {
+            let mut preview_bytes = Vec::new();
+            // read up to 1 KiB for a preview (ignore errors while reading preview)
+            let _ = response.take(1024).read_to_end(&mut preview_bytes);
+            let preview = String::from_utf8_lossy(&preview_bytes);
+            bail!(
+                "HTTP error fetching {}: {}{}",
+                url,
+                status,
+                if preview.trim().is_empty() {
+                    "".to_string()
+                } else {
+                    format!(" — preview: {}", preview.trim())
+                }
+            );
+        }
+        let total_size = response.content_length().unwrap_or(0);
+        pb.set_length(total_size);
+
+        let mut file = File::create(&dest_path)
+            .with_context(|| format!("Failed to create: {}", dest_path.display()))?;
+
+        let mut buffer = [0u8; 8192];
+        let mut downloaded = 0u64;
+
+        loop {
+            let bytes_read = response.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..bytes_read])?;
+            downloaded += bytes_read as u64;
+            pb.set_position(downloaded);
+        }
+
+        pb.finish_with_message("Download complete");
+    }
 
     // Quick validation: ensure the downloaded file looks like the expected
     // archive (detect obvious HTML error pages or wrong formats by magic).
@@ -320,7 +334,7 @@ pub(crate) fn derive_filename_from_url(url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
     let h = hasher.finalize();
-    let hex = format!("{:x}", h);
+    let hex = crate::hex::encode_lower(h);
     format!("source-{}.download", &hex[..12])
 }
 
@@ -590,6 +604,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scheme_uses_http_transport_only_for_http_and_https() {
+        assert!(scheme_uses_http_transport("http"));
+        assert!(scheme_uses_http_transport("https"));
+        assert!(!scheme_uses_http_transport("ftp"));
+        assert!(!scheme_uses_http_transport("file"));
+    }
+
+    #[test]
     fn filename_from_simple_url() {
         assert_eq!(
             derive_filename_from_url("https://example.com/foo-1.2.3.tar.gz"),
@@ -746,18 +768,18 @@ mod tests {
         let sha256_hex = {
             let mut h = Sha256::new();
             h.update(b"abc");
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
 
         let sha512_hex = {
             let mut h = Sha512::new();
             h.update(b"abc");
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
         let sha1_hex = {
             let mut h = Sha1::new();
             h.update(b"abc");
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
 
         let md5_hex = format!("{:x}", md5::compute(b"abc"));

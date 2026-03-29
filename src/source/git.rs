@@ -202,7 +202,7 @@ fn mirror_key(url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
     let digest = hasher.finalize();
-    format!("{:x}", digest)
+    crate::hex::encode_lower(digest)
 }
 
 fn ensure_mirror(

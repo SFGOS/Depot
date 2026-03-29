@@ -65,6 +65,9 @@ pub fn build(
         for arg in meson_setup_args(flags, cross_file.as_deref(), &env_vars) {
             meson_cmd.arg(arg);
         }
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Meson)? {
+            meson_cmd.arg(arg);
+        }
 
         crate::builder::prepare_tool_command(&mut meson_cmd, &env_vars);
 
@@ -227,6 +230,9 @@ pub(crate) fn ensure_host_build(
         meson_cmd.arg(&build_dir);
 
         for arg in meson_setup_args(flags, None, &env_vars) {
+            meson_cmd.arg(arg);
+        }
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Meson)? {
             meson_cmd.arg(arg);
         }
 

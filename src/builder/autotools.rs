@@ -134,6 +134,9 @@ pub fn build(
             let expanded = expand_configure_arg(spec, arg, &env_vars);
             configure_cmd.arg(expanded);
         }
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Autotools)? {
+            configure_cmd.arg(arg);
+        }
 
         let status = crate::interrupts::command_status(&mut configure_cmd)
             .with_context(|| format!("Failed to run configure in {}", build_dir.display()))?;
@@ -440,6 +443,9 @@ pub(crate) fn ensure_host_build(
         for arg in &flags.configure {
             let expanded = expand_configure_arg(&host_spec, arg, &env_vars);
             configure_cmd.arg(expanded);
+        }
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Autotools)? {
+            configure_cmd.arg(arg);
         }
 
         let status = crate::interrupts::command_status(&mut configure_cmd)

@@ -412,7 +412,7 @@ fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
                 }
                 hasher.update(&buf[..n]);
             }
-            let actual = format!("{:x}", hasher.finalize());
+            let actual = crate::hex::encode_lower(hasher.finalize());
             Ok(actual == hex)
         }
         "sha512" => {
@@ -427,7 +427,7 @@ fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
                 }
                 hasher.update(&buf[..n]);
             }
-            let actual = format!("{:x}", hasher.finalize());
+            let actual = crate::hex::encode_lower(hasher.finalize());
             Ok(actual == hex)
         }
         "sha1" => {
@@ -442,7 +442,7 @@ fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
                 }
                 hasher.update(&buf[..n]);
             }
-            let actual = format!("{:x}", hasher.finalize());
+            let actual = crate::hex::encode_lower(hasher.finalize());
             Ok(actual == hex)
         }
         "md5" => {
@@ -457,7 +457,7 @@ fn verify_file_hash(path: &Path, expected: &str) -> Result<bool> {
                 ctx.consume(&buf[..n]);
             }
             let digest = ctx.finalize();
-            let actual = format!("{:x}", digest);
+            let actual = crate::hex::encode_lower(*digest);
             Ok(actual == hex)
         }
         "b2" | "b2sum" => {
@@ -994,17 +994,17 @@ mod tests {
         let sha256_hex = {
             let mut h = Sha256::new();
             h.update(b"abc");
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
         let sha512_hex = {
             let mut h = Sha512::new();
             h.update(b"abc");
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
         let sha1_hex = {
             let mut h = Sha1::new();
             h.update(b"abc");
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
         let md5_hex = format!("{:x}", md5::compute(b"abc"));
         let b2_hex = b2sum_rust::Blake2bSum::new(64)

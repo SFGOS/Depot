@@ -1,6 +1,6 @@
 project(
   'depot',
-  version: '0.33.1',
+  version: '0.34.0',
   meson_version: '>=0.60.0',
   default_options: ['buildtype=release'],
 )
@@ -12,6 +12,15 @@ find_prog = find_program('find', required: true)
 sh = find_program('sh', required: true)
 build_html_doc = get_option('build-html-doc')
 cli_doc = find_program('cli_doc', required: build_html_doc)
+build_depot_static = get_option('BUILD_DEPOT_STATIC')
+depot_autotools_package = get_option('DEPOT_AUTOTOOLS_PACKAGE')
+depot_cmake_package = get_option('DEPOT_CMAKE_PACKAGE')
+depot_meson_package = get_option('DEPOT_MESON_PACKAGE')
+depot_perl_package = get_option('DEPOT_PERL_PACKAGE')
+depot_custom_package = get_option('DEPOT_CUSTOM_PACKAGE')
+depot_python_package = get_option('DEPOT_PYTHON_PACKAGE')
+depot_rust_package = get_option('DEPOT_RUST_PACKAGE')
+depot_makefile_package = get_option('DEPOT_MAKEFILE_PACKAGE')
 
 src_root = meson.project_source_root()
 build_root = meson.project_build_root()
@@ -66,6 +75,15 @@ depot_bin = custom_target(
     build_root,
     cargo_profile,
     cargo_release ? '1' : '0',
+    build_depot_static ? 'true' : 'false',
+    depot_autotools_package,
+    depot_cmake_package,
+    depot_meson_package,
+    depot_perl_package,
+    depot_custom_package,
+    depot_python_package,
+    depot_rust_package,
+    depot_makefile_package,
     '@OUTPUT@',
   ],
   console: true,
@@ -101,6 +119,15 @@ test(
     build_root,
     cargo_profile,
     cargo_release ? '1' : '0',
+    build_depot_static ? 'true' : 'false',
+    depot_autotools_package,
+    depot_cmake_package,
+    depot_meson_package,
+    depot_perl_package,
+    depot_custom_package,
+    depot_python_package,
+    depot_rust_package,
+    depot_makefile_package,
   ],
   suite: ['cargo'],
   timeout: 0,

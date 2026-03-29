@@ -100,6 +100,7 @@ impl PackageSpec {
         appends: &std::collections::HashMap<String, Vec<toml::Value>>,
     ) -> Result<()> {
         for (key, values) in appends {
+            let key = normalize_append_key(key);
             if let Some(subkey) = key.strip_prefix("build.flags.") {
                 self.apply_append(subkey, values);
                 continue;
@@ -109,7 +110,7 @@ impl PackageSpec {
                 continue;
             }
             if !key.contains('.') {
-                self.apply_append(key, values);
+                self.apply_append(&key, values);
                 continue;
             }
             anyhow::bail!("Unsupported '+=' key in package spec: {}", key);
@@ -323,11 +324,8 @@ impl PackageSpec {
                 .package_alternatives
                 .get(pkg_name)
                 .cloned()
-                .unwrap_or_else(|| {
-                    self.alternatives
-                        .lib32_alternatives()
-                        .unwrap_or_else(|| self.alternatives.primary_alternatives())
-                });
+                .or_else(|| self.alternatives.lib32_alternatives())
+                .unwrap_or_default();
         }
 
         if self.docs_parent_output_name(pkg_name).is_some() {
@@ -351,7 +349,10 @@ impl PackageSpec {
 
         // Apply appends from /etc/depot.d/build.toml (e.g. build.flags.cflags += ["-O3"])
         for (key, values) in &config.appends {
+            let key = normalize_append_key(key);
             if let Some(subkey) = key.strip_prefix("build.flags.") {
+                self.apply_append(subkey, values);
+            } else if let Some(subkey) = key.strip_prefix("build.") {
                 self.apply_append(subkey, values);
             }
         }
@@ -981,7 +982,8 @@ impl PackageSpec {
     }
 
     fn apply_append(&mut self, key: &str, values: &[toml::Value]) {
-        match key {
+        let key = normalize_append_key(key);
+        match key.as_str() {
             "cflags" => {
                 for v in values {
                     if let Some(arr) = v.as_array() {
@@ -1675,14 +1677,14 @@ fn preprocess_spec_toml_appends(
         let trimmed = line.trim();
 
         if trimmed.starts_with("[[") && trimmed.ends_with("]]") && trimmed.len() >= 4 {
-            current_table = Some(trimmed[2..trimmed.len() - 2].trim().to_string());
+            current_table = Some(normalize_append_key(trimmed[2..trimmed.len() - 2].trim()));
             in_array_table = true;
             base_text.push_str(line);
             base_text.push('\n');
             continue;
         }
         if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
-            current_table = Some(trimmed[1..trimmed.len() - 1].trim().to_string());
+            current_table = Some(normalize_append_key(trimmed[1..trimmed.len() - 1].trim()));
             in_array_table = false;
             base_text.push_str(line);
             base_text.push('\n');
@@ -1702,7 +1704,7 @@ fn preprocess_spec_toml_appends(
                     current_table.as_deref().unwrap_or("")
                 );
             }
-            let key = trimmed[..plus_idx].trim();
+            let key = normalize_append_key(trimmed[..plus_idx].trim());
             let val_str = trimmed[plus_idx + 2..].trim();
             let val: toml::Value = toml::from_str::<toml::Value>(&format!("v = {}", val_str))
                 .context("Failed to parse append value")?
@@ -1711,11 +1713,11 @@ fn preprocess_spec_toml_appends(
                 .unwrap();
 
             let full_key = if key.contains('.') {
-                key.to_string()
+                key
             } else if let Some(table) = current_table.as_deref() {
                 format!("{}.{}", table, key)
             } else {
-                key.to_string()
+                key
             };
 
             appends.entry(full_key).or_insert_with(Vec::new).push(val);
@@ -1729,6 +1731,24 @@ fn preprocess_spec_toml_appends(
     }
 
     Ok((base_text, appends))
+}
+
+fn normalize_append_key(raw: &str) -> String {
+    raw.split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let stripped = if (part.starts_with('"') && part.ends_with('"'))
+                || (part.starts_with('\'') && part.ends_with('\''))
+            {
+                &part[1..part.len() - 1]
+            } else {
+                part
+            };
+            stripped.trim().to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 #[cfg(test)]
@@ -2117,6 +2137,48 @@ replaces = ["lib32-clang"]
             spec.alternatives_for_output("lib32-llvm").replaces,
             vec!["lib32-clang".to_string()]
         );
+    }
+
+    #[test]
+    fn lib32_output_does_not_fallback_to_primary_alternatives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "llvm"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+build_32 = true
+
+[alternatives]
+provides = ["toolchain"]
+conflicts = ["gcc"]
+replaces = ["clang"]
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        let lib32 = spec.alternatives_for_output("lib32-llvm");
+
+        assert!(lib32.provides.is_empty());
+        assert!(lib32.conflicts.is_empty());
+        assert!(lib32.replaces.is_empty());
     }
 
     #[test]
@@ -3420,6 +3482,102 @@ replace_rustflags += "opt-level=3=>opt-level=z"
     }
 
     #[test]
+    fn parse_build_flags_appends_accepts_quoted_and_uppercase_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+"cflags" += ["-fPIC"]
+CXXFLAGS += ["-stdlib=libc++"]
+"LDFLAGS" += "-Wl,--as-needed"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.build.flags.cflags, vec!["-fPIC".to_string()]);
+        assert_eq!(
+            spec.build.flags.cxxflags,
+            vec!["-stdlib=libc++".to_string()]
+        );
+        assert_eq!(
+            spec.build.flags.ldflags,
+            vec!["-Wl,--as-needed".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_config_reads_build_flag_appends_from_rootfs_build_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("etc/depot.d/build.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"
+[flags]
+cflags += ["-g"]
+CXXFLAGS += ["-stdlib=libc++"]
+LDFLAGS += "-Wl,--as-needed"
+"#,
+        )
+        .unwrap();
+
+        let config = crate::config::Config::for_rootfs(tmp.path());
+        assert_eq!(
+            config.appends.get("build.flags.cflags").unwrap()[0]
+                .as_array()
+                .unwrap()[0]
+                .as_str(),
+            Some("-g")
+        );
+        assert_eq!(
+            config.appends.get("build.flags.cxxflags").unwrap()[0]
+                .as_array()
+                .unwrap()[0]
+                .as_str(),
+            Some("-stdlib=libc++")
+        );
+        assert_eq!(
+            config.appends.get("build.flags.ldflags").unwrap()[0].as_str(),
+            Some("-Wl,--as-needed")
+        );
+        let mut spec = mk_spec("foo", "1.0");
+        spec.apply_config(&config);
+
+        assert!(spec.build.flags.cflags.contains(&"-g".to_string()));
+        assert!(
+            spec.build
+                .flags
+                .cxxflags
+                .contains(&"-stdlib=libc++".to_string())
+        );
+        assert!(
+            spec.build
+                .flags
+                .ldflags
+                .contains(&"-Wl,--as-needed".to_string())
+        );
+    }
+
+    #[test]
     fn parse_passthrough_env_from_spec() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -3934,16 +4092,6 @@ pub struct Alternatives {
 }
 
 impl Alternatives {
-    /// Return the top-level alternatives set without any nested output-specific overrides.
-    pub fn primary_alternatives(&self) -> Alternatives {
-        Alternatives {
-            provides: self.provides.clone(),
-            conflicts: self.conflicts.clone(),
-            replaces: self.replaces.clone(),
-            lib32: None,
-        }
-    }
-
     /// Return the optional lib32-specific alternatives override set.
     pub fn lib32_alternatives(&self) -> Option<Alternatives> {
         self.lib32.as_ref().map(|group| Alternatives {

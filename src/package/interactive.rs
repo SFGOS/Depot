@@ -44,7 +44,7 @@ fn compute_sha256_for_url(u: &str) -> anyhow::Result<String> {
             }
             hasher.update(&buf[..n]);
         }
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(crate::hex::encode_lower(hasher.finalize()))
     }
 
     // Try to parse as URL first; if parsing fails, treat as local path.
@@ -2261,7 +2261,7 @@ mod tests {
         let expected = {
             let mut h = TestSha256::new();
             h.update(b"abc");
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
 
         // plain path

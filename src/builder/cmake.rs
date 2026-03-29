@@ -44,8 +44,7 @@ pub fn build(
     }
 
     // Extract prefix from configure flags (cmake-style -DCMAKE_INSTALL_PREFIX=)
-    let prefix = cmake_cache_entry_value(&flags.configure, "CMAKE_INSTALL_PREFIX")
-        .unwrap_or(flags.prefix.as_str());
+    let prefix = effective_cmake_install_prefix(flags);
 
     // Generate toolchain file if cross-compiling
     let toolchain_file = if let Some(cc_cfg) = cross {
@@ -68,7 +67,7 @@ pub fn build(
         cmake_cmd.arg("-B").arg(&build_dir);
         cmake_cmd.arg(format!("-DCMAKE_INSTALL_PREFIX={}", prefix));
         cmake_cmd.arg("-DCMAKE_BUILD_TYPE=Release");
-        for arg in cmake_install_dir_args(flags) {
+        for arg in cmake_install_dir_args(flags, prefix) {
             cmake_cmd.arg(arg);
         }
         for arg in cmake_lib32_target_args(flags, cross) {
@@ -97,6 +96,9 @@ pub fn build(
         for flag in &flags.configure {
             let expanded = expand_with_envs(flag, &env_vars);
             cmake_cmd.arg(&expanded);
+        }
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::CMake)? {
+            cmake_cmd.arg(arg);
         }
 
         crate::builder::prepare_tool_command(&mut cmake_cmd, &env_vars);
@@ -280,8 +282,7 @@ pub(crate) fn ensure_host_build(
 
     let env_vars =
         crate::builder::standard_build_env(&host_spec, None, true, export_compiler_flags);
-    let prefix = cmake_cache_entry_value(&flags.configure, "CMAKE_INSTALL_PREFIX")
-        .unwrap_or(flags.prefix.as_str());
+    let prefix = effective_cmake_install_prefix(flags);
 
     let mut state = StateTracker::new_with_namespace(&actual_src, Some("host"))?;
 
@@ -296,7 +297,7 @@ pub(crate) fn ensure_host_build(
         cmake_cmd.arg("-B").arg(&build_dir);
         cmake_cmd.arg(format!("-DCMAKE_INSTALL_PREFIX={}", prefix));
         cmake_cmd.arg("-DCMAKE_BUILD_TYPE=Release");
-        for arg in cmake_install_dir_args(flags) {
+        for arg in cmake_install_dir_args(flags, prefix) {
             cmake_cmd.arg(arg);
         }
 
@@ -315,6 +316,9 @@ pub(crate) fn ensure_host_build(
         for flag in &flags.configure {
             let expanded = expand_with_envs(flag, &env_vars);
             cmake_cmd.arg(&expanded);
+        }
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::CMake)? {
+            cmake_cmd.arg(arg);
         }
 
         crate::builder::prepare_tool_command(&mut cmake_cmd, &env_vars);
@@ -446,21 +450,72 @@ fn cmake_cache_entry_value<'a>(flags: &'a [String], variable: &str) -> Option<&'
     })
 }
 
-fn cmake_install_dir_args(flags: &crate::package::BuildFlags) -> Vec<String> {
+fn effective_cmake_install_prefix(flags: &crate::package::BuildFlags) -> &str {
+    cmake_cache_entry_value(&flags.configure, "CMAKE_INSTALL_PREFIX")
+        .unwrap_or(flags.prefix.as_str())
+}
+
+fn cmake_dir_value_for_prefix(prefix: &str, value: String) -> String {
+    let prefix_path = Path::new(prefix);
+    let value_path = Path::new(&value);
+
+    if prefix_path.is_absolute()
+        && value_path.is_absolute()
+        && let Ok(relative) = value_path.strip_prefix(prefix_path)
+    {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        return if relative.is_empty() {
+            ".".to_string()
+        } else {
+            relative
+        };
+    }
+
+    value
+}
+
+fn cmake_install_dir_args(flags: &crate::package::BuildFlags, prefix: &str) -> Vec<String> {
     let dirs = crate::builder::install_dirs(flags);
     let defaults = [
-        ("CMAKE_INSTALL_BINDIR", dirs.bindir),
-        ("CMAKE_INSTALL_SBINDIR", dirs.sbindir),
-        ("CMAKE_INSTALL_LIBDIR", dirs.libdir),
-        ("CMAKE_INSTALL_LIBEXECDIR", dirs.libexecdir),
+        (
+            "CMAKE_INSTALL_BINDIR",
+            cmake_dir_value_for_prefix(prefix, dirs.bindir),
+        ),
+        (
+            "CMAKE_INSTALL_SBINDIR",
+            cmake_dir_value_for_prefix(prefix, dirs.sbindir),
+        ),
+        (
+            "CMAKE_INSTALL_LIBDIR",
+            cmake_dir_value_for_prefix(prefix, dirs.libdir),
+        ),
+        (
+            "CMAKE_INSTALL_LIBEXECDIR",
+            cmake_dir_value_for_prefix(prefix, dirs.libexecdir),
+        ),
         ("CMAKE_INSTALL_SYSCONFDIR", dirs.sysconfdir),
         ("CMAKE_INSTALL_LOCALSTATEDIR", dirs.localstatedir),
         ("CMAKE_INSTALL_SHAREDSTATEDIR", dirs.sharedstatedir),
-        ("CMAKE_INSTALL_INCLUDEDIR", dirs.includedir),
-        ("CMAKE_INSTALL_DATAROOTDIR", dirs.datarootdir),
-        ("CMAKE_INSTALL_DATADIR", dirs.datadir),
-        ("CMAKE_INSTALL_MANDIR", dirs.mandir),
-        ("CMAKE_INSTALL_INFODIR", dirs.infodir),
+        (
+            "CMAKE_INSTALL_INCLUDEDIR",
+            cmake_dir_value_for_prefix(prefix, dirs.includedir),
+        ),
+        (
+            "CMAKE_INSTALL_DATAROOTDIR",
+            cmake_dir_value_for_prefix(prefix, dirs.datarootdir),
+        ),
+        (
+            "CMAKE_INSTALL_DATADIR",
+            cmake_dir_value_for_prefix(prefix, dirs.datadir),
+        ),
+        (
+            "CMAKE_INSTALL_MANDIR",
+            cmake_dir_value_for_prefix(prefix, dirs.mandir),
+        ),
+        (
+            "CMAKE_INSTALL_INFODIR",
+            cmake_dir_value_for_prefix(prefix, dirs.infodir),
+        ),
     ];
 
     defaults
@@ -710,15 +765,41 @@ mod tests {
     }
 
     #[test]
-    fn test_cmake_install_dir_args_include_defaults() {
-        let args = cmake_install_dir_args(&BuildFlags::default());
-        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=/usr/bin"));
-        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_SBINDIR=/usr/bin"));
-        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_LIBDIR=/usr/lib"));
-        assert!(
-            args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_LIBEXECDIR=/usr/lib")
+    fn test_effective_cmake_install_prefix_prefers_explicit_configure_flag() {
+        let flags = BuildFlags {
+            prefix: "/usr".into(),
+            configure: vec!["-DCMAKE_INSTALL_PREFIX=/opt/soundtouch".into()],
+            ..BuildFlags::default()
+        };
+
+        assert_eq!(effective_cmake_install_prefix(&flags), "/opt/soundtouch");
+    }
+
+    #[test]
+    fn test_cmake_dir_value_for_prefix_converts_prefix_owned_absolute_paths() {
+        assert_eq!(cmake_dir_value_for_prefix("/usr", "/usr/lib".into()), "lib");
+        assert_eq!(
+            cmake_dir_value_for_prefix("/usr", "/usr/share/man".into()),
+            "share/man"
         );
+    }
+
+    #[test]
+    fn test_cmake_dir_value_for_prefix_keeps_non_prefix_absolute_paths() {
+        assert_eq!(cmake_dir_value_for_prefix("/usr", "/etc".into()), "/etc");
+        assert_eq!(
+            cmake_dir_value_for_prefix("/opt/pkg", "/usr/bin".into()),
+            "/usr/bin"
+        );
+    }
+
+    #[test]
+    fn test_cmake_install_dir_args_include_prefix_relative_defaults() {
+        let args = cmake_install_dir_args(&BuildFlags::default(), "/usr");
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=bin"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_SBINDIR=bin"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_LIBDIR=lib"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_LIBEXECDIR=lib"));
         assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_SYSCONFDIR=/etc"));
         assert!(
             args.iter()
@@ -730,23 +811,17 @@ mod tests {
         );
         assert!(
             args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_INCLUDEDIR=/usr/include")
+                .any(|a| a == "-DCMAKE_INSTALL_INCLUDEDIR=include")
         );
         assert!(
             args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_DATAROOTDIR=/usr/share")
+                .any(|a| a == "-DCMAKE_INSTALL_DATAROOTDIR=share")
         );
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_DATADIR=share"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_MANDIR=share/man"));
         assert!(
             args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_DATADIR=/usr/share")
-        );
-        assert!(
-            args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_MANDIR=/usr/share/man")
-        );
-        assert!(
-            args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_INFODIR=/usr/share/info")
+                .any(|a| a == "-DCMAKE_INSTALL_INFODIR=share/info")
         );
     }
 
@@ -757,15 +832,9 @@ mod tests {
             ..BuildFlags::default()
         };
 
-        let args = cmake_install_dir_args(&flags);
-        assert!(
-            args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_LIBDIR=/usr/lib32")
-        );
-        assert!(
-            args.iter()
-                .any(|a| a == "-DCMAKE_INSTALL_LIBEXECDIR=/usr/lib32")
-        );
+        let args = cmake_install_dir_args(&flags, "/usr");
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_LIBDIR=lib32"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_LIBEXECDIR=lib32"));
     }
 
     #[test]
@@ -832,7 +901,7 @@ mod tests {
             ..BuildFlags::default()
         };
 
-        let args = cmake_install_dir_args(&flags);
+        let args = cmake_install_dir_args(&flags, "/usr");
         assert!(
             !args
                 .iter()
@@ -848,7 +917,44 @@ mod tests {
                 .iter()
                 .any(|a| a.starts_with("-DCMAKE_INSTALL_DATADIR="))
         );
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=bin"));
+    }
+
+    #[test]
+    fn test_cmake_install_dir_args_convert_custom_prefix_owned_dirs() {
+        let flags = BuildFlags {
+            prefix: "/opt/soundtouch".into(),
+            bindir: "/opt/soundtouch/bin".into(),
+            libdir: "/opt/soundtouch/lib64".into(),
+            includedir: "/opt/soundtouch/include/soundtouch".into(),
+            datadir: "/opt/soundtouch/share".into(),
+            mandir: "/opt/soundtouch/share/man".into(),
+            ..BuildFlags::default()
+        };
+
+        let args = cmake_install_dir_args(&flags, effective_cmake_install_prefix(&flags));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=bin"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_LIBDIR=lib64"));
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_INSTALL_INCLUDEDIR=include/soundtouch")
+        );
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_DATADIR=share"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_MANDIR=share/man"));
+    }
+
+    #[test]
+    fn test_cmake_install_dir_args_keep_absolute_dirs_outside_prefix() {
+        let flags = BuildFlags {
+            prefix: "/opt/soundtouch".into(),
+            bindir: "/usr/bin".into(),
+            sysconfdir: "/etc".into(),
+            ..BuildFlags::default()
+        };
+
+        let args = cmake_install_dir_args(&flags, effective_cmake_install_prefix(&flags));
         assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_BINDIR=/usr/bin"));
+        assert!(args.iter().any(|a| a == "-DCMAKE_INSTALL_SYSCONFDIR=/etc"));
     }
 
     #[test]

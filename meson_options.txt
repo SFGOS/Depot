@@ -4,3 +4,57 @@ option(
   value: false,
   description: 'Generate HTML CLI documentation with cli_doc and install it',
 )
+option(
+  'BUILD_DEPOT_STATIC',
+  type: 'boolean',
+  value: false,
+  description: 'Compile Depot with a default static-build preference for supported package builders',
+)
+option(
+  'DEPOT_AUTOTOOLS_PACKAGE',
+  type: 'string',
+  value: '',
+  description: 'Compile in the helper package to auto-install before autotools builds',
+)
+option(
+  'DEPOT_CMAKE_PACKAGE',
+  type: 'string',
+  value: '',
+  description: 'Compile in the helper package to auto-install before CMake builds',
+)
+option(
+  'DEPOT_MESON_PACKAGE',
+  type: 'string',
+  value: '',
+  description: 'Compile in the helper package to auto-install before Meson builds',
+)
+option(
+  'DEPOT_PERL_PACKAGE',
+  type: 'string',
+  value: '',
+  description: 'Compile in the helper package to auto-install before Perl builds',
+)
+option(
+  'DEPOT_CUSTOM_PACKAGE',
+  type: 'string',
+  value: '',
+  description: 'Compile in the helper package to auto-install before custom builds',
+)
+option(
+  'DEPOT_PYTHON_PACKAGE',
+  type: 'string',
+  value: '',
+  description: 'Compile in the helper package to auto-install before Python builds',
+)
+option(
+  'DEPOT_RUST_PACKAGE',
+  type: 'string',
+  value: '',
+  description: 'Compile in the helper package to auto-install before Rust builds',
+)
+option(
+  'DEPOT_MAKEFILE_PACKAGE',
+  type: 'string',
+  value: '',
+  description: 'Compile in the helper package to auto-install before makefile builds',
+)

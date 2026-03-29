@@ -24,6 +24,7 @@
 
 use crate::fakeroot;
 use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -225,7 +226,8 @@ pub fn run_transaction_hooks(rootfs: &Path, ctx: &HookExecutionContext<'_>) -> R
 /// Load and execute hooks for a batch of transaction contexts in stable order.
 ///
 /// Hooks are discovered and parsed once, then matched against each context in
-/// input order. Matching hooks run in hook-file order for each context.
+/// input order. Each matching hook runs once per hook file and operation, with
+/// affected paths aggregated across all matching contexts for that batch.
 ///
 /// Returns the number of hook commands executed.
 pub fn run_transaction_hooks_batch(
@@ -251,34 +253,80 @@ pub fn run_transaction_hooks_batch(
     #[derive(Clone, Copy)]
     struct ScheduledHookRun {
         hook_idx: usize,
-        ctx_idx: usize,
+        operation: HookOperation,
+        first_ctx_idx: usize,
+    }
+
+    fn push_unique_normalized_paths(
+        out: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+        paths: &[String],
+    ) {
+        for path in normalize_affected_paths(paths) {
+            if seen.insert(path.clone()) {
+                out.push(path);
+            }
+        }
     }
 
     let mut scheduled = Vec::new();
-    for (ctx_idx, ctx_owned) in contexts.iter().enumerate() {
-        let normalized_paths = normalize_affected_paths(&ctx_owned.affected_paths);
-        let ctx = HookExecutionContext {
-            phase,
-            operation: ctx_owned.operation,
-            package: &ctx_owned.package,
-            affected_paths: &ctx_owned.affected_paths,
-        };
-        for (hook_idx, hook) in hooks.iter().enumerate() {
-            if hook.matches(&ctx, &normalized_paths) {
-                scheduled.push(ScheduledHookRun { hook_idx, ctx_idx });
+    for (hook_idx, hook) in hooks.iter().enumerate() {
+        let mut matched_operations = Vec::new();
+        for (ctx_idx, ctx_owned) in contexts.iter().enumerate() {
+            let normalized_paths = normalize_affected_paths(&ctx_owned.affected_paths);
+            let ctx = HookExecutionContext {
+                phase,
+                operation: ctx_owned.operation,
+                package: &ctx_owned.package,
+                affected_paths: &ctx_owned.affected_paths,
+            };
+            if hook.matches(&ctx, &normalized_paths)
+                && !matched_operations.contains(&ctx_owned.operation)
+            {
+                matched_operations.push(ctx_owned.operation);
+                scheduled.push(ScheduledHookRun {
+                    hook_idx,
+                    operation: ctx_owned.operation,
+                    first_ctx_idx: ctx_idx,
+                });
             }
         }
     }
 
     let total = scheduled.len();
     for (run_idx, run) in scheduled.into_iter().enumerate() {
-        let ctx_owned = &contexts[run.ctx_idx];
-        let normalized_paths = normalize_affected_paths(&ctx_owned.affected_paths);
+        let primary_ctx = &contexts[run.first_ctx_idx];
+        let mut normalized_paths = Vec::new();
+        let mut seen_paths = HashSet::new();
+        push_unique_normalized_paths(
+            &mut normalized_paths,
+            &mut seen_paths,
+            &primary_ctx.affected_paths,
+        );
+        for ctx_owned in contexts.iter().skip(run.first_ctx_idx + 1) {
+            if ctx_owned.operation != run.operation {
+                continue;
+            }
+            let ctx = HookExecutionContext {
+                phase,
+                operation: ctx_owned.operation,
+                package: &ctx_owned.package,
+                affected_paths: &ctx_owned.affected_paths,
+            };
+            let ctx_paths = normalize_affected_paths(&ctx_owned.affected_paths);
+            if hooks[run.hook_idx].matches(&ctx, &ctx_paths) {
+                push_unique_normalized_paths(
+                    &mut normalized_paths,
+                    &mut seen_paths,
+                    &ctx_owned.affected_paths,
+                );
+            }
+        }
         let ctx = HookExecutionContext {
             phase,
-            operation: ctx_owned.operation,
-            package: &ctx_owned.package,
-            affected_paths: &ctx_owned.affected_paths,
+            operation: primary_ctx.operation,
+            package: &primary_ctx.package,
+            affected_paths: &primary_ctx.affected_paths,
         };
         run_hook_command(
             rootfs,
@@ -758,7 +806,8 @@ phase = "post"
 operation = ["install"]
 
 [exec]
-command = "printf '%s\n' \"$DEPOT_PACKAGE\" >> \"$DEPOT_ROOTFS/batch.out\""
+command = "cat >> \"$DEPOT_ROOTFS/batch.out\""
+needs_paths = true
 "#,
         );
 
@@ -766,18 +815,61 @@ command = "printf '%s\n' \"$DEPOT_PACKAGE\" >> \"$DEPOT_ROOTFS/batch.out\""
             HookExecutionContextOwned {
                 operation: HookOperation::Install,
                 package: "foo".to_string(),
-                affected_paths: Vec::new(),
+                affected_paths: vec!["usr/bin/foo".to_string()],
             },
             HookExecutionContextOwned {
                 operation: HookOperation::Install,
                 package: "bar".to_string(),
-                affected_paths: Vec::new(),
+                affected_paths: vec!["usr/share/doc/bar".to_string()],
+            },
+        ];
+
+        let ran = run_transaction_hooks_batch(tmp.path(), HookPhase::Post, &contexts).unwrap();
+        assert_eq!(ran, 1);
+        let out = std::fs::read_to_string(tmp.path().join("batch.out")).unwrap();
+        assert_eq!(out, "usr/bin/foo\nusr/share/doc/bar\n");
+    }
+
+    #[test]
+    fn run_transaction_hooks_batch_runs_once_per_operation() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_hook(
+            tmp.path(),
+            "batch.toml",
+            r#"
+[hook]
+name = "batch"
+
+[when]
+phase = "post"
+operation = ["install", "update"]
+
+[exec]
+command = "printf '%s:%s\n' \"$DEPOT_ACTION\" \"$DEPOT_PACKAGE\" >> \"$DEPOT_ROOTFS/batch.out\""
+"#,
+        );
+
+        let contexts = vec![
+            HookExecutionContextOwned {
+                operation: HookOperation::Install,
+                package: "foo".to_string(),
+                affected_paths: vec!["usr/bin/foo".to_string()],
+            },
+            HookExecutionContextOwned {
+                operation: HookOperation::Install,
+                package: "bar".to_string(),
+                affected_paths: vec!["usr/share/doc/bar".to_string()],
+            },
+            HookExecutionContextOwned {
+                operation: HookOperation::Update,
+                package: "baz".to_string(),
+                affected_paths: vec!["usr/bin/baz".to_string()],
             },
         ];
 
         let ran = run_transaction_hooks_batch(tmp.path(), HookPhase::Post, &contexts).unwrap();
         assert_eq!(ran, 2);
         let out = std::fs::read_to_string(tmp.path().join("batch.out")).unwrap();
-        assert_eq!(out, "foo\nbar\n");
+        assert_eq!(out, "install:foo\nupdate:baz\n");
     }
 }

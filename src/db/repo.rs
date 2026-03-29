@@ -54,8 +54,8 @@ impl<R> HashingReader<R> {
 
     fn finalize_hex(self) -> (String, String) {
         (
-            format!("{:x}", self.sha256.finalize()),
-            format!("{:x}", self.sha512.finalize()),
+            crate::hex::encode_lower(self.sha256.finalize()),
+            crate::hex::encode_lower(self.sha512.finalize()),
         )
     }
 }
@@ -2151,7 +2151,7 @@ fn verify_hex_digest(path: &Path, algorithm: &str, expected_hex: &str) -> Result
                 }
                 h.update(&buf[..n]);
             }
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         }
         "sha512" => {
             use sha2::{Digest, Sha512};
@@ -2163,7 +2163,7 @@ fn verify_hex_digest(path: &Path, algorithm: &str, expected_hex: &str) -> Result
                 }
                 h.update(&buf[..n]);
             }
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         }
         _ => anyhow::bail!("Unsupported checksum algorithm: {}", algorithm),
     };
@@ -2988,12 +2988,12 @@ revision = 1
         let sha256 = {
             let mut h = Sha256::new();
             h.update(b"payload");
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
         let sha512 = {
             let mut h = Sha512::new();
             h.update(b"payload");
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
 
         let rec = BinaryRepoPackageRecord {
@@ -3028,12 +3028,12 @@ revision = 1
         let sha256 = {
             let mut h = Sha256::new();
             h.update(payload);
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
         let sha512 = {
             let mut h = Sha512::new();
             h.update(payload);
-            format!("{:x}", h.finalize())
+            crate::hex::encode_lower(h.finalize())
         };
 
         BinaryRepoPackageRecord {

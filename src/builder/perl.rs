@@ -59,6 +59,9 @@ pub fn build(
         for arg in &flags.configure {
             configure_cmd.arg(spec.expand_vars(arg));
         }
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Perl)? {
+            configure_cmd.arg(arg);
+        }
         crate::builder::prepare_tool_command(&mut configure_cmd, &env_vars);
 
         let status = command_status_with_sh_fallback(&mut configure_cmd).with_context(|| {

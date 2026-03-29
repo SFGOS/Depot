@@ -184,6 +184,47 @@ pub(crate) fn host_build_spec(spec: &PackageSpec) -> PackageSpec {
     host_spec
 }
 
+pub(crate) fn requested_static_build() -> Result<Option<bool>> {
+    crate::build_options::requested_static_build()
+}
+
+pub(crate) fn static_build_args_for(build_type: BuildType) -> Result<Vec<String>> {
+    let Some(enabled) = requested_static_build()? else {
+        return Ok(Vec::new());
+    };
+
+    let args = match build_type {
+        BuildType::Autotools => vec![if enabled {
+            "--enable-static".to_string()
+        } else {
+            "--disable-static".to_string()
+        }],
+        BuildType::CMake => vec![format!(
+            "-DBUILD_SHARED_LIBS={}",
+            if enabled { "OFF" } else { "ON" }
+        )],
+        BuildType::Meson => vec![format!(
+            "-Ddefault_library={}",
+            if enabled { "static" } else { "shared" }
+        )],
+        BuildType::Perl => vec![format!(
+            "LINKTYPE={}",
+            if enabled { "static" } else { "dynamic" }
+        )],
+        _ => Vec::new(),
+    };
+
+    Ok(args)
+}
+
+pub(crate) fn build_tool_package_option(build_type: BuildType) -> Option<&'static str> {
+    crate::build_options::build_tool_package_option(build_type)
+}
+
+pub(crate) fn requested_build_tool_package(build_type: BuildType) -> Option<String> {
+    crate::build_options::requested_build_tool_package(build_type)
+}
+
 fn configured_install_dir(value: &str, default: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -887,6 +928,19 @@ mod tests {
                 std::ffi::OsString::from("/var/cache/rustup-home").as_os_str()
             ))
         );
+    }
+
+    #[test]
+    fn test_build_tool_package_option_maps_supported_builders() {
+        assert_eq!(
+            build_tool_package_option(BuildType::Meson),
+            Some("DEPOT_MESON_PACKAGE")
+        );
+        assert_eq!(
+            build_tool_package_option(BuildType::CMake),
+            Some("DEPOT_CMAKE_PACKAGE")
+        );
+        assert_eq!(build_tool_package_option(BuildType::Bin), None);
     }
 
     #[test]

@@ -159,6 +159,34 @@ fn repo_settings_is_default(settings: &RepoSettings) -> bool {
     !settings.prefer_binary
 }
 
+fn normalize_append_key(raw: &str) -> String {
+    raw.split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let stripped = if (part.starts_with('"') && part.ends_with('"'))
+                || (part.starts_with('\'') && part.ends_with('\''))
+            {
+                &part[1..part.len() - 1]
+            } else {
+                part
+            };
+            stripped.trim().to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn scope_append_key(scope: &str, key: &str) -> String {
+    let key = normalize_append_key(key);
+    let scope = normalize_append_key(scope);
+    if key == scope || key.starts_with(&format!("{scope}.")) {
+        key
+    } else {
+        format!("{scope}.{key}")
+    }
+}
+
 /// Return the canonical `repos.toml` path for the given rootfs.
 pub fn repos_toml_path(rootfs: &Path) -> PathBuf {
     resolve_rootfs_base(rootfs).join("etc/depot.d/repos.toml")
@@ -345,7 +373,7 @@ impl Config {
             let (val, appends) = self.preprocess_toml(&content)?;
             merge_toml_values(&mut self.build_overrides, &val);
             for (k, v) in appends {
-                self.appends.insert(format!("build.{}", k), v);
+                self.appends.insert(scope_append_key("build", &k), v);
             }
         }
 
@@ -359,7 +387,7 @@ impl Config {
             let (val, appends) = self.preprocess_toml(&content)?;
             merge_toml_values(&mut self.build_overrides, &val);
             for (k, v) in appends {
-                self.appends.insert(format!("build.{}", k), v);
+                self.appends.insert(scope_append_key("build", &k), v);
             }
         }
 
@@ -376,7 +404,7 @@ impl Config {
             let (val, appends) = self.preprocess_toml(&content)?;
             merge_toml_values(&mut self.package_overrides, &val);
             for (k, v) in appends {
-                self.appends.insert(format!("package.{}", k), v);
+                self.appends.insert(scope_append_key("package", &k), v);
             }
         }
 
@@ -390,7 +418,7 @@ impl Config {
             let (val, appends) = self.preprocess_toml(&content)?;
             merge_toml_values(&mut self.package_overrides, &val);
             for (k, v) in appends {
-                self.appends.insert(format!("package.{}", k), v);
+                self.appends.insert(scope_append_key("package", &k), v);
             }
         }
 
@@ -482,9 +510,25 @@ impl Config {
     ) -> Result<(toml::Value, HashMap<String, Vec<toml::Value>>)> {
         let mut base_text = String::new();
         let mut appends = HashMap::new();
+        let mut current_table: Option<String> = None;
+        let mut in_array_table = false;
 
         for line in input.lines() {
             let trimmed = line.trim();
+            if trimmed.starts_with("[[") && trimmed.ends_with("]]") && trimmed.len() >= 4 {
+                current_table = Some(normalize_append_key(&trimmed[2..trimmed.len() - 2]));
+                in_array_table = true;
+                base_text.push_str(line);
+                base_text.push('\n');
+                continue;
+            }
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+                current_table = Some(normalize_append_key(&trimmed[1..trimmed.len() - 1]));
+                in_array_table = false;
+                base_text.push_str(line);
+                base_text.push('\n');
+                continue;
+            }
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 base_text.push_str(line);
                 base_text.push('\n');
@@ -492,7 +536,13 @@ impl Config {
             }
 
             if let Some(plus_idx) = trimmed.find("+=") {
-                let key = trimmed[..plus_idx].trim().to_string();
+                if in_array_table {
+                    anyhow::bail!(
+                        "'+=' is not supported inside array-of-table sections ({})",
+                        current_table.as_deref().unwrap_or("")
+                    );
+                }
+                let key = normalize_append_key(trimmed[..plus_idx].trim());
                 let val_str = trimmed[plus_idx + 2..].trim();
                 let val: toml::Value = toml::from_str::<toml::Value>(&format!("v = {}", val_str))
                     .context("Failed to parse append value")?
@@ -500,7 +550,16 @@ impl Config {
                     .cloned()
                     .unwrap();
 
-                appends.entry(key).or_insert_with(Vec::new).push(val);
+                let full_key = if key.contains('.') {
+                    key
+                } else if let Some(table) = current_table.as_deref() {
+                    format!("{table}.{key}")
+                } else {
+                    key
+                };
+
+                appends.entry(full_key).or_insert_with(Vec::new).push(val);
+                base_text.push('\n');
             } else {
                 base_text.push_str(line);
                 base_text.push('\n');
@@ -574,16 +633,16 @@ ldflags += "-L/usr/local/lib"
         );
 
         // Appends should be captured
-        assert!(appends.contains_key("cflags"));
-        assert_eq!(appends.get("cflags").unwrap().len(), 1);
+        assert!(appends.contains_key("flags.cflags"));
+        assert_eq!(appends.get("flags.cflags").unwrap().len(), 1);
         assert_eq!(
-            appends.get("cflags").unwrap()[0].as_array().unwrap()[0].as_str(),
+            appends.get("flags.cflags").unwrap()[0].as_array().unwrap()[0].as_str(),
             Some("-DDEBUG")
         );
 
-        assert!(appends.contains_key("ldflags"));
+        assert!(appends.contains_key("flags.ldflags"));
         assert_eq!(
-            appends.get("ldflags").unwrap()[0].as_str(),
+            appends.get("flags.ldflags").unwrap()[0].as_str(),
             Some("-L/usr/local/lib")
         );
     }
@@ -615,9 +674,9 @@ cflags += ["-g"]
                 .map(|a| a.len()),
             Some(1)
         );
-        assert!(config.appends.contains_key("build.cflags"));
+        assert!(config.appends.contains_key("build.flags.cflags"));
         assert_eq!(
-            config.appends.get("build.cflags").unwrap()[0]
+            config.appends.get("build.flags.cflags").unwrap()[0]
                 .as_array()
                 .unwrap()[0]
                 .as_str(),
