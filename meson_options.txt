@@ -19,19 +19,19 @@ option(
 option(
   'DEPOT_CMAKE_PACKAGE',
   type: 'string',
-  value: '',
+  value: 'cmake',
   description: 'Compile in the helper package to auto-install before CMake builds',
 )
 option(
   'DEPOT_MESON_PACKAGE',
   type: 'string',
-  value: '',
+  value: 'meson',
   description: 'Compile in the helper package to auto-install before Meson builds',
 )
 option(
   'DEPOT_PERL_PACKAGE',
   type: 'string',
-  value: '',
+  value: 'perl',
   description: 'Compile in the helper package to auto-install before Perl builds',
 )
 option(
@@ -43,13 +43,13 @@ option(
 option(
   'DEPOT_PYTHON_PACKAGE',
   type: 'string',
-  value: '',
+  value: 'python',
   description: 'Compile in the helper package to auto-install before Python builds',
 )
 option(
   'DEPOT_RUST_PACKAGE',
   type: 'string',
-  value: '',
+  value: 'rust',
   description: 'Compile in the helper package to auto-install before Rust builds',
 )
 option(

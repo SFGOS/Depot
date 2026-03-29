@@ -550,13 +550,26 @@ fn configure_help_text(
     help_cmd.arg("--help");
     crate::builder::prepare_command(&mut help_cmd, env_vars);
     let output = help_cmd.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
     let mut text = String::new();
     text.push_str(&String::from_utf8_lossy(&output.stdout));
     text.push_str(&String::from_utf8_lossy(&output.stderr));
-    Some(text)
+    if output.status.success() || looks_like_configure_help_text(&text) {
+        return Some(text);
+    }
+    None
+}
+
+fn looks_like_configure_help_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("usage:")
+        || lower.contains("options:")
+        || lower.contains("--help")
+        || lower.contains("--prefix")
 }
 
 fn configure_help_supports_option(help_text: &str, option: &str) -> bool {
@@ -1079,6 +1092,24 @@ mod tests {
         let help = "  --enable-static  build static libraries\n  --with-zlib=DIR";
         assert!(configure_help_supports_option(help, "--disable-static"));
         assert!(configure_help_supports_option(help, "--without-zlib"));
+    }
+
+    #[test]
+    fn test_looks_like_configure_help_text_accepts_bootstrap_style_output() {
+        let help = "\
+Usage: ./bootstrap [<options>...]
+Options:
+  --help
+  --prefix=PREFIX";
+        assert!(looks_like_configure_help_text(help));
+    }
+
+    #[test]
+    fn test_looks_like_configure_help_text_rejects_non_help_output() {
+        assert!(!looks_like_configure_help_text(""));
+        assert!(!looks_like_configure_help_text(
+            "Unknown option: --disable-static"
+        ));
     }
 
     #[test]
