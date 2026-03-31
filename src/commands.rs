@@ -1414,6 +1414,21 @@ fn print_plan_summary(plan: &planner::ExecutionPlan) {
     }
 }
 
+fn actionable_plan_packages(plan: &planner::ExecutionPlan) -> Vec<String> {
+    plan.actionable_steps()
+        .map(|step| step.package.clone())
+        .collect()
+}
+
+fn warn_source_build_installs(count: usize) {
+    if count > 0 {
+        ui::warn(format!(
+            "{} package(s) will be built from source before installation.",
+            count
+        ));
+    }
+}
+
 #[derive(Clone, Copy)]
 struct InstallPlanExecutionOptions<'a> {
     no_flags: bool,
@@ -1524,16 +1539,8 @@ fn execute_install_plan_with_child_commands(
         return Ok(());
     }
 
-    if summary.source_build_installs > 0 {
-        ui::warn(format!(
-            "{} package(s) will be built from source before installation.",
-            summary.source_build_installs
-        ));
-    }
-    let planned_packages: Vec<String> = actionable_steps
-        .iter()
-        .map(|step| step.package.clone())
-        .collect();
+    warn_source_build_installs(summary.source_build_installs);
+    let planned_packages = actionable_plan_packages(plan);
     if options.confirm_installation
         && !ui::prompt_package_action("installation", &planned_packages, true)?
     {
@@ -2169,7 +2176,27 @@ fn run_direct_install_request(
                 "Missing dependencies: {}",
                 missing_required.join(", ")
             ));
-            if ui::prompt_package_action("dependency installation", &missing_required, true)? {
+            let local_sibling_root = spec_path.parent().and_then(|path| path.parent());
+            let dep_plan = planner::build_dependency_install_plan(
+                config,
+                options.rootfs,
+                &missing_required,
+                planner::PlannerOptions {
+                    assume_yes: ui::assume_yes_enabled(),
+                    prefer_binary: config.repo_settings.prefer_binary,
+                    local_sibling_root: local_sibling_root.map(Path::to_path_buf),
+                    include_test_deps: options.install_test_deps,
+                    lib32_only_requested_specs: false,
+                },
+            )?;
+            let dep_plan_packages = actionable_plan_packages(&dep_plan);
+            warn_source_build_installs(dep_plan.summary().source_build_installs);
+            let dep_prompt_packages = if dep_plan_packages.is_empty() {
+                missing_required.clone()
+            } else {
+                dep_plan_packages
+            };
+            if ui::prompt_package_action("dependency installation", &dep_prompt_packages, true)? {
                 // Build package index for fast lookups
                 let pkg_index =
                     index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
@@ -2203,7 +2230,7 @@ fn run_direct_install_request(
                     options.rootfs,
                     ChildInstallCommandOptions {
                         no_deps: options.no_deps,
-                        assume_yes: false,
+                        assume_yes: true,
                         no_flags: options.no_flags,
                         cross_prefix: options.cross_prefix,
                         clean: options.clean,
@@ -2252,7 +2279,31 @@ fn run_direct_install_request(
                         "Missing test dependencies: {}",
                         missing_test.join(", ")
                     ));
-                    if ui::prompt_package_action("dependency installation", &missing_test, true)? {
+                    let local_sibling_root = spec_path.parent().and_then(|path| path.parent());
+                    let dep_plan = planner::build_dependency_install_plan(
+                        config,
+                        options.rootfs,
+                        &missing_test,
+                        planner::PlannerOptions {
+                            assume_yes: ui::assume_yes_enabled(),
+                            prefer_binary: config.repo_settings.prefer_binary,
+                            local_sibling_root: local_sibling_root.map(Path::to_path_buf),
+                            include_test_deps: options.install_test_deps,
+                            lib32_only_requested_specs: false,
+                        },
+                    )?;
+                    let dep_plan_packages = actionable_plan_packages(&dep_plan);
+                    warn_source_build_installs(dep_plan.summary().source_build_installs);
+                    let dep_prompt_packages = if dep_plan_packages.is_empty() {
+                        missing_test.clone()
+                    } else {
+                        dep_plan_packages
+                    };
+                    if ui::prompt_package_action(
+                        "dependency installation",
+                        &dep_prompt_packages,
+                        true,
+                    )? {
                         ui::info(format!(
                             "Installing test dependencies: {}",
                             install_request_display(&dep_spec_paths)
@@ -2265,7 +2316,7 @@ fn run_direct_install_request(
                             options.rootfs,
                             ChildInstallCommandOptions {
                                 no_deps: options.no_deps,
-                                assume_yes: false,
+                                assume_yes: true,
                                 no_flags: options.no_flags,
                                 cross_prefix: options.cross_prefix,
                                 clean: options.clean,

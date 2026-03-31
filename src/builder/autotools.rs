@@ -132,10 +132,10 @@ pub fn build(
 
         for arg in &flags.configure {
             let expanded = expand_configure_arg(spec, arg, &env_vars);
-            add_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &expanded);
+            configure_cmd.arg(expanded);
         }
         for arg in crate::builder::static_build_args_for(crate::package::BuildType::Autotools)? {
-            add_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &arg);
+            add_auto_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &arg);
         }
 
         let status = crate::interrupts::command_status(&mut configure_cmd)
@@ -442,10 +442,10 @@ pub(crate) fn ensure_host_build(
         }
         for arg in &flags.configure {
             let expanded = expand_configure_arg(&host_spec, arg, &env_vars);
-            add_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &expanded);
+            configure_cmd.arg(expanded);
         }
         for arg in crate::builder::static_build_args_for(crate::package::BuildType::Autotools)? {
-            add_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &arg);
+            add_auto_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &arg);
         }
 
         let status = crate::interrupts::command_status(&mut configure_cmd)
@@ -579,9 +579,15 @@ fn configure_help_supports_option(help_text: &str, option: &str) -> bool {
 }
 
 fn configure_help_mentions_option(help_text: &str, option: &str) -> bool {
-    let with_eq = format!("{}=", option);
-    let with_space = format!("{} ", option);
-    help_text.contains(&with_eq) || help_text.contains(&with_space) || help_text.contains(option)
+    help_text.match_indices(option).any(|(idx, _)| {
+        let before = help_text[..idx].chars().next_back();
+        let after = help_text[idx + option.len()..].chars().next();
+        is_configure_option_boundary(before) && is_configure_option_boundary(after)
+    })
+}
+
+fn is_configure_option_boundary(ch: Option<char>) -> bool {
+    ch.is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
 }
 
 fn configure_help_option_aliases(option: &str) -> Vec<String> {
@@ -629,7 +635,11 @@ fn configure_long_option(arg: &str) -> Option<&str> {
     Some(&trimmed[..end])
 }
 
-fn add_configure_arg_if_supported(configure_cmd: &mut Command, help_text: Option<&str>, arg: &str) {
+fn add_auto_configure_arg_if_supported(
+    configure_cmd: &mut Command,
+    help_text: Option<&str>,
+    arg: &str,
+) {
     if let Some(help_text) = help_text
         && let Some(option) = configure_long_option(arg)
         && !configure_help_supports_option(help_text, option)
@@ -1095,6 +1105,15 @@ mod tests {
     }
 
     #[test]
+    fn test_configure_help_supports_option_requires_exact_match() {
+        let help = "\
+  --host-cc=HOSTCC         use host C compiler
+  --build-suffix=SUFFIX    library name suffix []";
+        assert!(!configure_help_supports_option(help, "--host"));
+        assert!(!configure_help_supports_option(help, "--build"));
+    }
+
+    #[test]
     fn test_looks_like_configure_help_text_accepts_bootstrap_style_output() {
         let help = "\
 Usage: ./bootstrap [<options>...]
@@ -1205,9 +1224,9 @@ Options:
     }
 
     #[test]
-    fn test_add_configure_arg_if_supported_skips_unsupported_long_option() {
+    fn test_add_auto_configure_arg_if_supported_skips_unsupported_long_option() {
         let mut cmd = Command::new("configure");
-        add_configure_arg_if_supported(&mut cmd, Some("--enable-static"), "--disable-nls");
+        add_auto_configure_arg_if_supported(&mut cmd, Some("--enable-static"), "--disable-nls");
 
         let args: Vec<String> = cmd
             .get_args()
@@ -1217,10 +1236,10 @@ Options:
     }
 
     #[test]
-    fn test_add_configure_arg_if_supported_keeps_supported_alias_and_non_option_args() {
+    fn test_add_auto_configure_arg_if_supported_keeps_supported_alias_and_non_option_args() {
         let mut cmd = Command::new("configure");
-        add_configure_arg_if_supported(&mut cmd, Some("--enable-static"), "--disable-static");
-        add_configure_arg_if_supported(&mut cmd, Some("--enable-static"), "srcdir");
+        add_auto_configure_arg_if_supported(&mut cmd, Some("--enable-static"), "--disable-static");
+        add_auto_configure_arg_if_supported(&mut cmd, Some("--enable-static"), "srcdir");
 
         let args: Vec<String> = cmd
             .get_args()
