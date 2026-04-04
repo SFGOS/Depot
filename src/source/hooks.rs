@@ -13,9 +13,12 @@ use crate::builder::state::{BuildStep, StateTracker};
 fn hook_env_vars(
     spec: &PackageSpec,
     shell_helpers: &crate::shell_helpers::ShellHelpers,
+    source_dir: &Path,
 ) -> Result<crate::builder::EnvVars> {
     let mut env_vars = crate::builder::standard_build_env(spec, None, true, true);
     shell_helpers.apply_to_env_vars(&mut env_vars);
+    crate::builder::apply_build_helper_context_env(&mut env_vars, spec)?;
+    crate::builder::apply_build_helper_dirs_env(&mut env_vars, Some(source_dir), None);
     Ok(env_vars)
 }
 
@@ -96,7 +99,7 @@ fn run_post_extract_commands(spec: &PackageSpec, source: &Source, src_dir: &Path
     );
     let helper_root = tempfile::tempdir().context("Failed to create post-extract helper root")?;
     let shell_helpers = crate::shell_helpers::ShellHelpers::new(helper_root.path())?;
-    let env_vars = hook_env_vars(spec, &shell_helpers)?;
+    let env_vars = hook_env_vars(spec, &shell_helpers, src_dir)?;
 
     for cmd in &source.post_extract {
         let cmd_str = spec.expand_vars(cmd);
@@ -132,7 +135,7 @@ pub fn run_post_configure_commands(
 
     crate::log_info!("Running {} post-configure command(s)...", commands.len());
     let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
-    let mut env_vars = hook_env_vars(spec, &shell_helpers)?;
+    let mut env_vars = hook_env_vars(spec, &shell_helpers, src_dir)?;
     crate::builder::set_env_var(
         &mut env_vars,
         "DESTDIR",
@@ -168,7 +171,7 @@ pub fn run_post_compile_commands(spec: &PackageSpec, src_dir: &Path, destdir: &P
 
     crate::log_info!("Running {} post-compile command(s)...", commands.len());
     let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
-    let mut env_vars = hook_env_vars(spec, &shell_helpers)?;
+    let mut env_vars = hook_env_vars(spec, &shell_helpers, src_dir)?;
     crate::builder::set_env_var(
         &mut env_vars,
         "DESTDIR",
@@ -208,7 +211,7 @@ pub fn run_post_install_commands_in_dir(
 
     crate::log_info!("Running {} post-install command(s)...", commands.len());
     let shell_helpers = crate::shell_helpers::ShellHelpers::new(destdir)?;
-    let mut env_vars = hook_env_vars(spec, &shell_helpers)?;
+    let mut env_vars = hook_env_vars(spec, &shell_helpers, work_dir)?;
     crate::builder::set_env_var(
         &mut env_vars,
         "DESTDIR",

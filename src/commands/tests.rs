@@ -6,9 +6,15 @@ use crate::cli::{
 use crate::test_support::TestEnv;
 use git2::{Oid, Repository};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 static ASSUME_YES_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn assume_yes_test_lock() -> MutexGuard<'static, ()> {
+    ASSUME_YES_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
 
 fn rootfs_args(rootfs: impl Into<PathBuf>) -> RootfsArgs {
     RootfsArgs {
@@ -186,6 +192,16 @@ fn register_installed_test_package(
     fs::create_dir_all(dest.join("usr/bin"))?;
     fs::write(dest.join("usr/bin").join(name), name)?;
     db::register_package(&config.installed_db_path(rootfs), &spec, &dest)?;
+    Ok(())
+}
+
+fn register_required_development_package_if_configured(
+    config: &config::Config,
+    rootfs: &Path,
+) -> Result<()> {
+    if let Some(package_name) = builder::requested_development_package() {
+        register_installed_test_package(config, rootfs, &package_name, "1.0.0")?;
+    }
     Ok(())
 }
 
@@ -2216,7 +2232,7 @@ file = "missing.patch"
 
 #[test]
 fn build_command_checks_manual_sources_before_dependency_resolution() -> Result<()> {
-    let _guard = ASSUME_YES_TEST_LOCK.lock().expect("assume-yes test lock");
+    let _guard = assume_yes_test_lock();
     let temp = tempfile::tempdir().context("Failed to create temp dir")?;
     let rootfs = temp.path().join("rootfs");
     let spec_dir = temp.path().join("packages").join("demo");
@@ -2534,7 +2550,7 @@ fn build_type_runs_automatic_tests_matches_builder_behavior() {
 
 #[test]
 fn requested_test_deps_prompt_can_disable_tests() -> Result<()> {
-    let _guard = ASSUME_YES_TEST_LOCK.lock().expect("assume-yes test lock");
+    let _guard = assume_yes_test_lock();
     let mut spec = test_package_spec(package::BuildType::Meson, None, &[]);
     spec.dependencies.test = vec!["pytest".into()];
 
@@ -2553,7 +2569,7 @@ fn requested_test_deps_prompt_can_disable_tests() -> Result<()> {
 
 #[test]
 fn requested_test_deps_prompt_is_ignored_for_non_automatic_test_builders() -> Result<()> {
-    let _guard = ASSUME_YES_TEST_LOCK.lock().expect("assume-yes test lock");
+    let _guard = assume_yes_test_lock();
     let mut spec = test_package_spec(package::BuildType::Custom, None, &[]);
     spec.dependencies.test = vec!["pytest".into()];
 
@@ -2572,7 +2588,7 @@ fn requested_test_deps_prompt_is_ignored_for_non_automatic_test_builders() -> Re
 
 #[test]
 fn requested_test_deps_prompt_is_ignored_for_multilib_builds() -> Result<()> {
-    let _guard = ASSUME_YES_TEST_LOCK.lock().expect("assume-yes test lock");
+    let _guard = assume_yes_test_lock();
     let mut spec = test_package_spec(package::BuildType::Meson, None, &[]);
     spec.build.flags.build_32 = true;
     spec.dependencies.test = vec!["pytest".into()];
@@ -2777,7 +2793,7 @@ fn live_rootfs_child_install_batches_group_consecutive_binary_steps() -> Result<
 
 #[test]
 fn build_command_requires_install_deps_flag_for_missing_dependencies() -> Result<()> {
-    let _guard = ASSUME_YES_TEST_LOCK.lock().expect("assume-yes test lock");
+    let _guard = assume_yes_test_lock();
     let temp = tempfile::tempdir().context("Failed to create temp dir")?;
     let rootfs = temp.path().join("rootfs");
     let repo_root = temp.path().join("packages");
@@ -2840,6 +2856,9 @@ optional = []
 "#,
     )
     .with_context(|| format!("Failed to write {}", dep_spec.display()))?;
+
+    let config = config::Config::for_rootfs(&rootfs);
+    register_required_development_package_if_configured(&config, &rootfs)?;
 
     let result = run(Cli {
         command: Commands::Build(BuildArgs {

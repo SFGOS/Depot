@@ -51,6 +51,8 @@ pub fn build(
     let mut env_vars = crate::builder::standard_build_env(spec, cross, true, export_compiler_flags);
     let shell_helpers = crate::shell_helpers::ShellHelpers::new(&install_destdir)?;
     shell_helpers.apply_to_env_vars(&mut env_vars);
+    crate::builder::apply_build_helper_context_env(&mut env_vars, spec)?;
+    crate::builder::apply_build_helper_dirs_env(&mut env_vars, Some(src_dir), Some(&build_dir));
 
     // For custom builds, look for a build.sh script in the source directory
     let build_script = src_dir.join("build.sh");
@@ -280,19 +282,27 @@ fn build_function_mode_install_command(
             "DEPOT_OUTPUT_NAME='{q_name}'; DEPOT_OUTPUT_DESTDIR='{q_dest}'; DESTDIR=\"$DEPOT_OUTPUT_DESTDIR\"; export DEPOT_OUTPUT_NAME DEPOT_OUTPUT_DESTDIR DESTDIR\n"
         ));
         wrapper.push_str("depot_output_installed=0\n");
-        wrapper.push_str(&format!(
-            "if depot_has_function depot_install_{fn_suffix}; then depot_install_{fn_suffix}; depot_output_installed=1;\n"
-        ));
-        wrapper.push_str(&format!(
-            "elif depot_has_function install_{fn_suffix}; then install_{fn_suffix}; depot_output_installed=1;\n"
-        ));
         if out.name == *primary {
-            wrapper
-                .push_str("elif depot_has_function depot_install; then depot_install; depot_output_installed=1;\n");
+            wrapper.push_str(
+                "if depot_has_function depot_install; then depot_install; depot_output_installed=1;\n",
+            );
             wrapper.push_str(
                 "elif depot_has_function install; then install; depot_output_installed=1;\n",
             );
+            wrapper.push_str(&format!(
+                "elif depot_has_function depot_install_{fn_suffix}; then depot_install_{fn_suffix}; depot_output_installed=1;\n"
+            ));
+            wrapper.push_str(&format!(
+                "elif depot_has_function install_{fn_suffix}; then install_{fn_suffix}; depot_output_installed=1;\n"
+            ));
             wrapper.push_str("elif [ \"$depot_build_ran\" = 1 ]; then depot_output_installed=1;\n");
+        } else {
+            wrapper.push_str(&format!(
+                "if depot_has_function depot_install_{fn_suffix}; then depot_install_{fn_suffix}; depot_output_installed=1;\n"
+            ));
+            wrapper.push_str(&format!(
+                "elif depot_has_function install_{fn_suffix}; then install_{fn_suffix}; depot_output_installed=1;\n"
+            ));
         }
         wrapper.push_str("fi\n");
         wrapper.push_str("if [ \"$depot_output_installed\" != 1 ]; then\n");

@@ -1,5 +1,6 @@
 //! Perl MakeMaker build system (`perl Makefile.PL && make && make test && make install`)
 
+use crate::builder::BuildHelperContext;
 use crate::builder::autotools;
 use crate::builder::state::{BuildStep, StateTracker};
 use crate::cross::CrossConfig;
@@ -261,8 +262,142 @@ pub fn build(
     Ok(())
 }
 
+pub(crate) fn run_helper_configure(
+    context: &BuildHelperContext,
+    source_dir: Option<&Path>,
+    env_vars: &[(String, String)],
+    extra_args: &[String],
+) -> Result<()> {
+    let flags = context.build_flags();
+    let source_dir = source_dir
+        .map(Path::to_path_buf)
+        .unwrap_or(std::env::current_dir().context("Failed to determine current directory")?);
+    let configure_script = helper_configure_script(context, &source_dir);
+    let mut helper_env = env_vars.to_vec();
+    crate::builder::set_env_var(&mut helper_env, "PERL_MM_USE_DEFAULT", "1");
+    if !flags.rootfs.is_empty() && flags.rootfs != "/" {
+        crate::builder::set_env_var(
+            &mut helper_env,
+            "PKG_CONFIG_SYSROOT_DIR",
+            flags.rootfs.clone(),
+        );
+    }
+
+    let mut configure_cmd =
+        Command::new(resolved_command_path("perl").unwrap_or_else(|| PathBuf::from("perl")));
+    configure_cmd.current_dir(&source_dir);
+    configure_cmd.arg(&configure_script);
+    if !has_assignment_prefix(&flags.configure, "INSTALLDIRS") {
+        configure_cmd.arg("INSTALLDIRS=vendor");
+    }
+    for arg in &flags.configure {
+        configure_cmd.arg(context.expand_vars(arg));
+    }
+    for arg in crate::builder::static_build_args_for(crate::package::BuildType::Perl, &flags)? {
+        configure_cmd.arg(arg);
+    }
+    for arg in extra_args {
+        configure_cmd.arg(context.expand_vars(arg));
+    }
+    crate::builder::prepare_tool_command(&mut configure_cmd, &helper_env);
+
+    let status = command_status_with_sh_fallback(&mut configure_cmd)
+        .context("Failed to run helper perl configure")?;
+    if !status.success() {
+        anyhow::bail!("perl Makefile.PL failed with status: {}", status);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn run_helper_install(
+    context: &BuildHelperContext,
+    build_dir: Option<&Path>,
+    env_vars: &[(String, String)],
+    extra_args: &[String],
+) -> Result<()> {
+    let flags = context.build_flags();
+    let build_dir = build_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(helper_source_dir);
+    let destdir = std::env::var("DESTDIR").context("DESTDIR must be set for perl_install")?;
+    let make_exec = autotools::resolve_make_exec(&flags.make_exec);
+    let install_dirs = autotools::resolve_make_dirs(
+        &build_dir,
+        &flags.make_install_dirs,
+        "build.flags.make_install_dirs",
+    )?;
+    let install_targets = autotools::phase_targets(
+        &flags.make_install_target,
+        &flags.make_install_targets,
+        Some("install"),
+    );
+
+    for install_dir in install_dirs {
+        let mut install_cmd = fakeroot::wrap_install_command(make_exec, Path::new(&destdir));
+        install_cmd.current_dir(&install_dir);
+        if autotools::make_exec_supports_make_assignments(make_exec)
+            && !autotools::has_make_variable_override(&flags.make_install_vars, "DESTDIR")
+        {
+            install_cmd.arg(format!("DESTDIR={destdir}"));
+        }
+        autotools::add_make_variable_overrides_if_supported(
+            &mut install_cmd,
+            make_exec,
+            &flags.make_install_vars,
+            "install",
+        )?;
+        for target in &install_targets {
+            install_cmd.arg(target);
+        }
+        for arg in extra_args {
+            install_cmd.arg(context.expand_vars(arg));
+        }
+
+        let mut install_env = env_vars.to_vec();
+        crate::builder::set_env_var(&mut install_env, "DESTDIR", destdir.clone());
+        crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
+
+        let status = command_status_with_sh_fallback(&mut install_cmd).with_context(|| {
+            format!(
+                "Failed to run helper {} {} in {}",
+                make_exec,
+                install_targets.join(" "),
+                install_dir.display()
+            )
+        })?;
+        if !status.success() {
+            anyhow::bail!(
+                "{} {} failed with status: {} (dir: {})",
+                make_exec,
+                install_targets.join(" "),
+                status,
+                install_dir.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn resolve_perl_configure_script(spec: &PackageSpec, actual_src: &Path) -> PathBuf {
     let configured = spec.expand_vars(&spec.build.flags.configure_file);
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        return actual_src.join("Makefile.PL");
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        actual_src.join(path)
+    }
+}
+
+fn helper_configure_script(context: &BuildHelperContext, actual_src: &Path) -> PathBuf {
+    let flags = context.build_flags();
+    let configured = context.expand_vars(&flags.configure_file);
     let trimmed = configured.trim();
     if trimmed.is_empty() {
         return actual_src.join("Makefile.PL");
@@ -344,6 +479,12 @@ fn has_assignment_prefix(args: &[String], name: &str) -> bool {
         let trimmed = arg.trim();
         trimmed == name || trimmed.starts_with(&format!("{name}="))
     })
+}
+
+fn helper_source_dir() -> PathBuf {
+    std::env::var(crate::builder::DEPOT_BUILD_HELPER_SOURCE_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 #[cfg(test)]

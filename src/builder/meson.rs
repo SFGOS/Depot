@@ -1,5 +1,6 @@
 //! Meson build system
 
+use crate::builder::BuildHelperContext;
 use crate::builder::state::{BuildStep, StateTracker};
 use crate::cross::CrossConfig;
 use crate::fakeroot;
@@ -267,10 +268,104 @@ pub(crate) fn ensure_host_build(
         .with_context(|| format!("Failed to resolve host build dir: {}", build_dir.display()))
 }
 
+pub(crate) fn run_helper_configure(
+    context: &BuildHelperContext,
+    source_dir: Option<&Path>,
+    build_dir: Option<&Path>,
+    cross: Option<&CrossConfig>,
+    env_vars: &[(String, String)],
+    extra_args: &[String],
+) -> Result<()> {
+    let flags = context.build_flags();
+    let source_dir = source_dir
+        .map(Path::to_path_buf)
+        .unwrap_or(std::env::current_dir().context("Failed to determine current directory")?);
+    let build_dir = build_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| resolve_build_dir(&source_dir, &flags));
+
+    fs::create_dir_all(&build_dir)
+        .with_context(|| format!("Failed to create build directory: {}", build_dir.display()))?;
+
+    let mut helper_env = env_vars.to_vec();
+    configure_pkg_config_env(&mut helper_env, &flags, cross);
+
+    let cross_file = if let Some(cc_cfg) = cross {
+        Some(cc_cfg.generate_meson_cross_file(&build_dir)?)
+    } else if flags.lib32_variant {
+        Some(generate_lib32_meson_cross_file(&flags, &build_dir)?)
+    } else {
+        None
+    };
+
+    let mut meson_cmd = Command::new("meson");
+    meson_cmd.current_dir(&source_dir);
+    meson_cmd.arg("setup");
+    meson_cmd.arg(&build_dir);
+
+    for arg in meson_setup_args(&flags, cross_file.as_deref(), &helper_env) {
+        meson_cmd.arg(arg);
+    }
+    for arg in crate::builder::static_build_args_for(crate::package::BuildType::Meson, &flags)? {
+        meson_cmd.arg(arg);
+    }
+    for arg in extra_args {
+        meson_cmd.arg(context.expand_vars(arg));
+    }
+
+    crate::builder::prepare_tool_command(&mut meson_cmd, &helper_env);
+
+    let status = crate::interrupts::command_status(&mut meson_cmd)
+        .context("Failed to run helper meson setup")?;
+    if !status.success() {
+        bail!("meson setup failed");
+    }
+
+    Ok(())
+}
+
+pub(crate) fn run_helper_install(
+    context: &BuildHelperContext,
+    build_dir: Option<&Path>,
+    env_vars: &[(String, String)],
+    extra_args: &[String],
+) -> Result<()> {
+    let flags = context.build_flags();
+    let build_dir = build_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| resolve_build_dir(&helper_source_dir(), &flags));
+    let destdir = std::env::var("DESTDIR").context("DESTDIR must be set for meson_install")?;
+
+    let mut install_cmd = fakeroot::wrap_install_command("meson", Path::new(&destdir));
+    install_cmd.arg("install");
+    install_cmd.arg("-C").arg(&build_dir);
+    for arg in extra_args {
+        install_cmd.arg(context.expand_vars(arg));
+    }
+
+    let mut install_env = env_vars.to_vec();
+    crate::builder::set_env_var(&mut install_env, "DESTDIR", destdir);
+    crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
+
+    let status = crate::interrupts::command_status(&mut install_cmd)
+        .context("Failed to run helper meson install")?;
+    if !status.success() {
+        bail!("meson install failed");
+    }
+
+    Ok(())
+}
+
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+fn helper_source_dir() -> PathBuf {
+    std::env::var(crate::builder::DEPOT_BUILD_HELPER_SOURCE_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 fn resolve_build_dir(actual_src: &Path, flags: &crate::package::BuildFlags) -> PathBuf {

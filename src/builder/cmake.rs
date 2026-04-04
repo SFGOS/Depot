@@ -1,5 +1,6 @@
 //! CMake build system
 
+use crate::builder::BuildHelperContext;
 use crate::builder::state::{BuildStep, StateTracker};
 use crate::cross::CrossConfig;
 use crate::fakeroot;
@@ -359,6 +360,139 @@ pub(crate) fn ensure_host_build(
         .with_context(|| format!("Failed to resolve host build dir: {}", build_dir.display()))
 }
 
+pub(crate) fn run_helper_configure(
+    context: &BuildHelperContext,
+    source_dir: Option<&Path>,
+    build_dir: Option<&Path>,
+    cross: Option<&CrossConfig>,
+    env_vars: &[(String, String)],
+    extra_args: &[String],
+) -> Result<()> {
+    let flags = context.build_flags();
+    let source_dir = source_dir
+        .map(Path::to_path_buf)
+        .unwrap_or(std::env::current_dir().context("Failed to determine current directory")?);
+    let build_dir = build_dir.map(Path::to_path_buf).unwrap_or_else(|| {
+        flags
+            .build_dir
+            .as_ref()
+            .map(|dir| source_dir.join(dir))
+            .unwrap_or_else(|| source_dir.join("build"))
+    });
+    let prefix = effective_cmake_install_prefix(&flags);
+
+    fs::create_dir_all(&build_dir)
+        .with_context(|| format!("Failed to create build directory: {}", build_dir.display()))?;
+
+    let toolchain_file = if let Some(cc_cfg) = cross {
+        Some(cc_cfg.generate_cmake_toolchain(&build_dir)?)
+    } else {
+        None
+    };
+
+    let mut cmake_cmd = Command::new("cmake");
+    cmake_cmd.current_dir(&build_dir);
+    cmake_cmd.arg("-S").arg(&source_dir);
+    cmake_cmd.arg("-B").arg(&build_dir);
+    cmake_cmd.arg(format!("-DCMAKE_INSTALL_PREFIX={prefix}"));
+    cmake_cmd.arg("-DCMAKE_BUILD_TYPE=Release");
+    for arg in cmake_install_dir_args(&flags, prefix) {
+        cmake_cmd.arg(arg);
+    }
+    for arg in cmake_lib32_target_args(&flags, cross) {
+        cmake_cmd.arg(arg);
+    }
+    if let Some(toolchain_file) = &toolchain_file {
+        cmake_cmd.arg(format!(
+            "-DCMAKE_TOOLCHAIN_FILE={}",
+            toolchain_file.display()
+        ));
+    }
+
+    let make_exec_override = flags.make_exec.trim();
+    if !make_exec_override.is_empty() {
+        if !cmake_configure_flags_specify_generator(&flags.configure)
+            && let Some(generator) = cmake_generator_for_make_exec(make_exec_override)
+        {
+            cmake_cmd.arg("-G").arg(generator);
+        }
+        if !cmake_configure_flags_set_make_program(&flags.configure) {
+            cmake_cmd.arg(format!("-DCMAKE_MAKE_PROGRAM={make_exec_override}"));
+        }
+    }
+
+    for flag in &flags.configure {
+        cmake_cmd.arg(expand_with_envs(&context.expand_vars(flag), env_vars));
+    }
+    for arg in crate::builder::static_build_args_for(crate::package::BuildType::CMake, &flags)? {
+        cmake_cmd.arg(arg);
+    }
+    for arg in extra_args {
+        cmake_cmd.arg(expand_with_envs(&context.expand_vars(arg), env_vars));
+    }
+
+    crate::builder::prepare_tool_command(&mut cmake_cmd, &env_vars.to_vec());
+
+    let status = crate::interrupts::command_status(&mut cmake_cmd)
+        .context("Failed to run helper cmake configure")?;
+    if !status.success() {
+        anyhow::bail!("cmake configure failed");
+    }
+
+    Ok(())
+}
+
+pub(crate) fn run_helper_install(
+    context: &BuildHelperContext,
+    build_dir: Option<&Path>,
+    env_vars: &[(String, String)],
+    extra_args: &[String],
+) -> Result<()> {
+    let flags = context.build_flags();
+    let source_dir = helper_source_dir();
+    let build_dir = build_dir.map(Path::to_path_buf).unwrap_or_else(|| {
+        flags
+            .build_dir
+            .as_ref()
+            .map(|dir| source_dir.join(dir))
+            .unwrap_or_else(|| source_dir.join("build"))
+    });
+    let destdir = std::env::var("DESTDIR").context("DESTDIR must be set for cmake_install")?;
+    let install_targets = phase_targets(&flags.make_install_target, &flags.make_install_targets);
+
+    let mut install_cmd = fakeroot::wrap_install_command("cmake", Path::new(&destdir));
+    if install_targets.is_empty() {
+        install_cmd.arg("--install").arg(&build_dir);
+    } else {
+        install_cmd.arg("--build").arg(&build_dir);
+        install_cmd.arg("--target");
+        for target in &install_targets {
+            install_cmd.arg(target);
+        }
+    }
+    for arg in extra_args {
+        install_cmd.arg(context.expand_vars(arg));
+    }
+
+    let mut install_env = env_vars.to_vec();
+    crate::builder::set_env_var(&mut install_env, "DESTDIR", destdir);
+    crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
+
+    let status = crate::interrupts::command_status(&mut install_cmd)
+        .context("Failed to run helper cmake install")?;
+    if !status.success() {
+        if install_targets.is_empty() {
+            anyhow::bail!("cmake install failed");
+        }
+        anyhow::bail!(
+            "cmake install target(s) '{}' failed",
+            install_targets.join(" ")
+        );
+    }
+
+    Ok(())
+}
+
 /// Expand environment variables in a string (e.g., $DEPOT_SYSROOT)
 fn expand_env_vars(input: &str) -> String {
     let mut result = input.to_string();
@@ -578,6 +712,12 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+fn helper_source_dir() -> PathBuf {
+    std::env::var(crate::builder::DEPOT_BUILD_HELPER_SOURCE_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// Resolve `source_subdir` with multiple fallbacks:

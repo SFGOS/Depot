@@ -15,6 +15,14 @@ const DEPOT_SUBDESTDIR_HELPER_ENV: &str = "DEPOT_SUBDESTDIR_HELPER";
 const DEPOT_PYTHON_BUILD_HELPER_ENV: &str = "DEPOT_PYTHON_BUILD_HELPER";
 const DEPOT_PYTHON_INSTALL_HELPER_ENV: &str = "DEPOT_PYTHON_INSTALL_HELPER";
 const DEPOT_CLONE_HELPER_ENV: &str = "DEPOT_CLONE_HELPER";
+const DEPOT_AUTOTOOLS_CONFIGURE_HELPER_ENV: &str = "DEPOT_AUTOTOOLS_CONFIGURE_HELPER";
+const DEPOT_AUTOTOOLS_INSTALL_HELPER_ENV: &str = "DEPOT_AUTOTOOLS_INSTALL_HELPER";
+const DEPOT_CMAKE_CONFIGURE_HELPER_ENV: &str = "DEPOT_CMAKE_CONFIGURE_HELPER";
+const DEPOT_CMAKE_INSTALL_HELPER_ENV: &str = "DEPOT_CMAKE_INSTALL_HELPER";
+const DEPOT_MESON_CONFIGURE_HELPER_ENV: &str = "DEPOT_MESON_CONFIGURE_HELPER";
+const DEPOT_MESON_INSTALL_HELPER_ENV: &str = "DEPOT_MESON_INSTALL_HELPER";
+const DEPOT_PERL_CONFIGURE_HELPER_ENV: &str = "DEPOT_PERL_CONFIGURE_HELPER";
+const DEPOT_PERL_INSTALL_HELPER_ENV: &str = "DEPOT_PERL_INSTALL_HELPER";
 const DEPOT_EXECUTABLE_ENV: &str = "DEPOT_EXECUTABLE";
 
 /// Ephemeral helper command directory to prepend to PATH while running scripts.
@@ -28,6 +36,14 @@ pub struct ShellHelpers {
     python_build_path: PathBuf,
     python_install_path: PathBuf,
     clone_path: PathBuf,
+    autotools_configure_path: PathBuf,
+    autotools_install_path: PathBuf,
+    cmake_configure_path: PathBuf,
+    cmake_install_path: PathBuf,
+    meson_configure_path: PathBuf,
+    meson_install_path: PathBuf,
+    perl_configure_path: PathBuf,
+    perl_install_path: PathBuf,
 }
 
 impl ShellHelpers {
@@ -49,99 +65,43 @@ impl ShellHelpers {
             .context("Failed to locate depot executable for shell helpers")?;
 
         let haul_path = bin_dir.join("haul");
-        fs::write(&haul_path, HAUL_SCRIPT).with_context(|| {
-            format!(
-                "Failed to write shell helper command: {}",
-                haul_path.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&haul_path)
-                .with_context(|| format!("Failed to stat helper: {}", haul_path.display()))?
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&haul_path, perms)
-                .with_context(|| format!("Failed to chmod helper: {}", haul_path.display()))?;
-        }
+        write_helper_script(&haul_path, HAUL_SCRIPT)?;
 
         let subdestdir_path = bin_dir.join("subdestdir");
-        fs::write(&subdestdir_path, SUBDESTDIR_SCRIPT).with_context(|| {
-            format!(
-                "Failed to write shell helper command: {}",
-                subdestdir_path.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&subdestdir_path)
-                .with_context(|| format!("Failed to stat helper: {}", subdestdir_path.display()))?
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&subdestdir_path, perms).with_context(|| {
-                format!("Failed to chmod helper: {}", subdestdir_path.display())
-            })?;
-        }
+        write_helper_script(&subdestdir_path, SUBDESTDIR_SCRIPT)?;
 
         let python_build_path = bin_dir.join("python_build");
-        fs::write(&python_build_path, PYTHON_BUILD_SCRIPT).with_context(|| {
-            format!(
-                "Failed to write shell helper command: {}",
-                python_build_path.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python_build_path)
-                .with_context(|| format!("Failed to stat helper: {}", python_build_path.display()))?
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python_build_path, perms).with_context(|| {
-                format!("Failed to chmod helper: {}", python_build_path.display())
-            })?;
-        }
+        write_helper_script(&python_build_path, PYTHON_BUILD_SCRIPT)?;
 
         let python_install_path = bin_dir.join("python_install");
-        fs::write(&python_install_path, PYTHON_INSTALL_SCRIPT).with_context(|| {
-            format!(
-                "Failed to write shell helper command: {}",
-                python_install_path.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python_install_path)
-                .with_context(|| {
-                    format!("Failed to stat helper: {}", python_install_path.display())
-                })?
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python_install_path, perms).with_context(|| {
-                format!("Failed to chmod helper: {}", python_install_path.display())
-            })?;
-        }
+        write_helper_script(&python_install_path, PYTHON_INSTALL_SCRIPT)?;
 
         let clone_path = bin_dir.join("depot_clone");
-        fs::write(&clone_path, CLONE_SCRIPT).with_context(|| {
-            format!(
-                "Failed to write shell helper command: {}",
-                clone_path.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&clone_path)
-                .with_context(|| format!("Failed to stat helper: {}", clone_path.display()))?
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&clone_path, perms)
-                .with_context(|| format!("Failed to chmod helper: {}", clone_path.display()))?;
-        }
+        write_helper_script(&clone_path, CLONE_SCRIPT)?;
+
+        let autotools_configure_path = bin_dir.join("autotools_configure");
+        write_helper_script(&autotools_configure_path, AUTOTOOLS_CONFIGURE_SCRIPT)?;
+
+        let autotools_install_path = bin_dir.join("autotools_install");
+        write_helper_script(&autotools_install_path, AUTOTOOLS_INSTALL_SCRIPT)?;
+
+        let cmake_configure_path = bin_dir.join("cmake_configure");
+        write_helper_script(&cmake_configure_path, CMAKE_CONFIGURE_SCRIPT)?;
+
+        let cmake_install_path = bin_dir.join("cmake_install");
+        write_helper_script(&cmake_install_path, CMAKE_INSTALL_SCRIPT)?;
+
+        let meson_configure_path = bin_dir.join("meson_configure");
+        write_helper_script(&meson_configure_path, MESON_CONFIGURE_SCRIPT)?;
+
+        let meson_install_path = bin_dir.join("meson_install");
+        write_helper_script(&meson_install_path, MESON_INSTALL_SCRIPT)?;
+
+        let perl_configure_path = bin_dir.join("perl_configure");
+        write_helper_script(&perl_configure_path, PERL_CONFIGURE_SCRIPT)?;
+
+        let perl_install_path = bin_dir.join("perl_install");
+        write_helper_script(&perl_install_path, PERL_INSTALL_SCRIPT)?;
 
         let path_value = crate::runtime_env::prepend_helper_to_safe_path(&bin_dir);
 
@@ -155,6 +115,14 @@ impl ShellHelpers {
             python_build_path,
             python_install_path,
             clone_path,
+            autotools_configure_path,
+            autotools_install_path,
+            cmake_configure_path,
+            cmake_install_path,
+            meson_configure_path,
+            meson_install_path,
+            perl_configure_path,
+            perl_install_path,
         })
     }
 
@@ -194,6 +162,46 @@ impl ShellHelpers {
         );
         set_env_var(
             env_vars,
+            DEPOT_AUTOTOOLS_CONFIGURE_HELPER_ENV,
+            self.autotools_configure_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
+            DEPOT_AUTOTOOLS_INSTALL_HELPER_ENV,
+            self.autotools_install_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
+            DEPOT_CMAKE_CONFIGURE_HELPER_ENV,
+            self.cmake_configure_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
+            DEPOT_CMAKE_INSTALL_HELPER_ENV,
+            self.cmake_install_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
+            DEPOT_MESON_CONFIGURE_HELPER_ENV,
+            self.meson_configure_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
+            DEPOT_MESON_INSTALL_HELPER_ENV,
+            self.meson_install_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
+            DEPOT_PERL_CONFIGURE_HELPER_ENV,
+            self.perl_configure_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
+            DEPOT_PERL_INSTALL_HELPER_ENV,
+            self.perl_install_path.to_string_lossy().into_owned(),
+        );
+        set_env_var(
+            env_vars,
             DEPOT_EXECUTABLE_ENV,
             self.depot_executable.to_string_lossy().into_owned(),
         );
@@ -204,8 +212,24 @@ impl ShellHelpers {
 /// through `/bin/sh`, avoiding direct execution from mounts that may be `noexec`.
 pub fn wrap_shell_command(command: &str) -> String {
     format!(
-        "haul() {{ /bin/sh \"${{{DEPOT_HAUL_HELPER_ENV}:?}}\" \"$@\"; }}\nsubdestdir() {{ /bin/sh \"${{{DEPOT_SUBDESTDIR_HELPER_ENV}:?}}\" \"$@\"; }}\npython_build() {{ /bin/sh \"${{{DEPOT_PYTHON_BUILD_HELPER_ENV}:?}}\" \"$@\"; }}\npython_install() {{ /bin/sh \"${{{DEPOT_PYTHON_INSTALL_HELPER_ENV}:?}}\" \"$@\"; }}\ndepot_clone() {{ /bin/sh \"${{{DEPOT_CLONE_HELPER_ENV}:?}}\" \"$@\"; }}\n{command}"
+        "haul() {{ /bin/sh \"${{{DEPOT_HAUL_HELPER_ENV}:?}}\" \"$@\"; }}\nsubdestdir() {{ /bin/sh \"${{{DEPOT_SUBDESTDIR_HELPER_ENV}:?}}\" \"$@\"; }}\npython_build() {{ /bin/sh \"${{{DEPOT_PYTHON_BUILD_HELPER_ENV}:?}}\" \"$@\"; }}\npython_install() {{ /bin/sh \"${{{DEPOT_PYTHON_INSTALL_HELPER_ENV}:?}}\" \"$@\"; }}\ndepot_clone() {{ /bin/sh \"${{{DEPOT_CLONE_HELPER_ENV}:?}}\" \"$@\"; }}\nautotools_configure() {{ /bin/sh \"${{{DEPOT_AUTOTOOLS_CONFIGURE_HELPER_ENV}:?}}\" \"$@\"; }}\nautotools_install() {{ /bin/sh \"${{{DEPOT_AUTOTOOLS_INSTALL_HELPER_ENV}:?}}\" \"$@\"; }}\ncmake_configure() {{ /bin/sh \"${{{DEPOT_CMAKE_CONFIGURE_HELPER_ENV}:?}}\" \"$@\"; }}\ncmake_install() {{ /bin/sh \"${{{DEPOT_CMAKE_INSTALL_HELPER_ENV}:?}}\" \"$@\"; }}\nmeson_configure() {{ /bin/sh \"${{{DEPOT_MESON_CONFIGURE_HELPER_ENV}:?}}\" \"$@\"; }}\nmeson_install() {{ /bin/sh \"${{{DEPOT_MESON_INSTALL_HELPER_ENV}:?}}\" \"$@\"; }}\nperl_configure() {{ /bin/sh \"${{{DEPOT_PERL_CONFIGURE_HELPER_ENV}:?}}\" \"$@\"; }}\nperl_install() {{ /bin/sh \"${{{DEPOT_PERL_INSTALL_HELPER_ENV}:?}}\" \"$@\"; }}\n{command}"
     )
+}
+
+fn write_helper_script(path: &Path, content: &str) -> Result<()> {
+    fs::write(path, content)
+        .with_context(|| format!("Failed to write shell helper command: {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)
+            .with_context(|| format!("Failed to stat helper: {}", path.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)
+            .with_context(|| format!("Failed to chmod helper: {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Convert a package name into a safe shell identifier suffix.
@@ -474,6 +498,114 @@ fail() {
 exec "$DEPOT_EXECUTABLE" internal clone "$@"
 "#;
 
+const AUTOTOOLS_CONFIGURE_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "autotools_configure: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+
+exec "$DEPOT_EXECUTABLE" internal autotools-configure "$@"
+"#;
+
+const AUTOTOOLS_INSTALL_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "autotools_install: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+[ "${DESTDIR:-}" != "" ] || fail "DESTDIR is not set"
+
+exec "$DEPOT_EXECUTABLE" internal autotools-install "$@"
+"#;
+
+const CMAKE_CONFIGURE_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "cmake_configure: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+
+exec "$DEPOT_EXECUTABLE" internal cmake-configure "$@"
+"#;
+
+const CMAKE_INSTALL_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "cmake_install: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+[ "${DESTDIR:-}" != "" ] || fail "DESTDIR is not set"
+
+exec "$DEPOT_EXECUTABLE" internal cmake-install "$@"
+"#;
+
+const MESON_CONFIGURE_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "meson_configure: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+
+exec "$DEPOT_EXECUTABLE" internal meson-configure "$@"
+"#;
+
+const MESON_INSTALL_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "meson_install: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+[ "${DESTDIR:-}" != "" ] || fail "DESTDIR is not set"
+
+exec "$DEPOT_EXECUTABLE" internal meson-install "$@"
+"#;
+
+const PERL_CONFIGURE_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "perl_configure: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+
+exec "$DEPOT_EXECUTABLE" internal perl-configure "$@"
+"#;
+
+const PERL_INSTALL_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+
+fail() {
+    echo "perl_install: $*" >&2
+    exit 1
+}
+
+[ "${DEPOT_EXECUTABLE:-}" != "" ] || fail "DEPOT_EXECUTABLE is not set"
+[ "${DESTDIR:-}" != "" ] || fail "DESTDIR is not set"
+
+exec "$DEPOT_EXECUTABLE" internal perl-install "$@"
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::{INTERNAL_DEPOT_DIR, ShellHelpers, shell_ident_suffix, wrap_shell_command};
@@ -557,15 +689,57 @@ mod tests {
                 .any(|(key, _)| key == "DEPOT_PYTHON_INSTALL_HELPER")
         );
         assert!(envs.iter().any(|(key, _)| key == "DEPOT_CLONE_HELPER"));
+        assert!(
+            envs.iter()
+                .any(|(key, _)| key == "DEPOT_AUTOTOOLS_CONFIGURE_HELPER")
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, _)| key == "DEPOT_AUTOTOOLS_INSTALL_HELPER")
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, _)| key == "DEPOT_CMAKE_CONFIGURE_HELPER")
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, _)| key == "DEPOT_CMAKE_INSTALL_HELPER")
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, _)| key == "DEPOT_MESON_CONFIGURE_HELPER")
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, _)| key == "DEPOT_MESON_INSTALL_HELPER")
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, _)| key == "DEPOT_PERL_CONFIGURE_HELPER")
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, _)| key == "DEPOT_PERL_INSTALL_HELPER")
+        );
         assert!(envs.iter().any(|(key, _)| key == "DEPOT_EXECUTABLE"));
     }
 
     #[test]
     fn wrap_shell_command_exposes_python_helpers() {
-        let wrapped = wrap_shell_command("python_build\npython_install\ndepot_clone foo");
+        let wrapped = wrap_shell_command(
+            "python_build\npython_install\ndepot_clone foo\nmeson_configure\ncmake_install",
+        );
         assert!(wrapped.contains("python_build()"));
         assert!(wrapped.contains("python_install()"));
         assert!(wrapped.contains("depot_clone()"));
+        assert!(wrapped.contains("autotools_configure()"));
+        assert!(wrapped.contains("autotools_install()"));
+        assert!(wrapped.contains("cmake_configure()"));
+        assert!(wrapped.contains("cmake_install()"));
+        assert!(wrapped.contains("meson_configure()"));
+        assert!(wrapped.contains("meson_install()"));
+        assert!(wrapped.contains("perl_configure()"));
+        assert!(wrapped.contains("perl_install()"));
     }
 
     #[test]

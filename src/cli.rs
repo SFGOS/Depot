@@ -316,6 +316,46 @@ pub enum InternalCommands {
     },
     #[command(hide = true)]
     Clone { repo: String, dest: Option<PathBuf> },
+    #[command(hide = true)]
+    AutotoolsConfigure {
+        #[arg(value_name = "ARG", num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
+    AutotoolsInstall {
+        #[arg(value_name = "ARG", num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
+    CmakeConfigure {
+        #[arg(value_name = "ARG", num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
+    CmakeInstall {
+        #[arg(value_name = "ARG", num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
+    MesonConfigure {
+        #[arg(value_name = "ARG", num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
+    MesonInstall {
+        #[arg(value_name = "ARG", num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
+    PerlConfigure {
+        #[arg(value_name = "ARG", num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
+    PerlInstall {
+        #[arg(value_name = "ARG", num_args = 0.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Args)]

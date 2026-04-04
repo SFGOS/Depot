@@ -22,6 +22,9 @@ use walkdir::WalkDir;
 
 pub type EnvVars = Vec<(String, String)>;
 pub(crate) const DEPOT_BUILD_HOST_DIR_ENV: &str = "DEPOT_BUILD_HOST_DIR";
+pub(crate) const DEPOT_BUILD_HELPER_CONTEXT_ENV: &str = "DEPOT_BUILD_HELPER_CONTEXT";
+pub(crate) const DEPOT_BUILD_HELPER_SOURCE_DIR_ENV: &str = "DEPOT_BUILD_HELPER_SOURCE_DIR";
+pub(crate) const DEPOT_BUILD_HELPER_BUILD_DIR_ENV: &str = "DEPOT_BUILD_HELPER_BUILD_DIR";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetBuildKind {
@@ -43,6 +46,154 @@ pub(crate) struct InstallDirs {
     pub datadir: String,
     pub mandir: String,
     pub infodir: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub(crate) struct BuildHelperContext {
+    pub package_name: String,
+    pub package_version: String,
+    pub spec_dir: PathBuf,
+    pub flags: BuildFlags,
+    pub lib32_variant: bool,
+    pub host_build_dir: Option<String>,
+}
+
+impl BuildHelperContext {
+    pub(crate) fn from_spec(spec: &PackageSpec) -> Self {
+        Self {
+            package_name: spec.package.name.clone(),
+            package_version: spec.package.version.clone(),
+            spec_dir: spec.spec_dir.clone(),
+            flags: spec.build.flags.clone(),
+            lib32_variant: spec.build.flags.lib32_variant,
+            host_build_dir: spec.build.flags.host_build_dir.clone(),
+        }
+    }
+
+    pub(crate) fn expand_vars(&self, input: &str) -> String {
+        let specdir = self.spec_dir.to_string_lossy();
+        input
+            .replace("$name", &self.package_name)
+            .replace("$version", &self.package_version)
+            .replace("$specdir", &specdir)
+            .replace("$DEPOT_SPECDIR", &specdir)
+    }
+
+    pub(crate) fn build_flags(&self) -> BuildFlags {
+        let mut flags = self.flags.clone();
+        flags.lib32_variant = self.lib32_variant;
+        flags.host_build_dir = self.host_build_dir.clone();
+        flags
+    }
+}
+
+pub(crate) fn apply_build_helper_context_env(
+    env_vars: &mut EnvVars,
+    spec: &PackageSpec,
+) -> Result<()> {
+    let encoded = toml::to_string(&BuildHelperContext::from_spec(spec))
+        .context("Failed to serialize build helper context")?;
+    set_env_var(env_vars, DEPOT_BUILD_HELPER_CONTEXT_ENV, encoded);
+    Ok(())
+}
+
+pub(crate) fn apply_build_helper_dirs_env(
+    env_vars: &mut EnvVars,
+    source_dir: Option<&Path>,
+    build_dir: Option<&Path>,
+) {
+    if let Some(source_dir) = source_dir {
+        set_env_var(
+            env_vars,
+            DEPOT_BUILD_HELPER_SOURCE_DIR_ENV,
+            source_dir.to_string_lossy().into_owned(),
+        );
+    }
+    if let Some(build_dir) = build_dir {
+        set_env_var(
+            env_vars,
+            DEPOT_BUILD_HELPER_BUILD_DIR_ENV,
+            build_dir.to_string_lossy().into_owned(),
+        );
+    }
+}
+
+pub(crate) fn run_autotools_helper_configure(
+    context: &BuildHelperContext,
+    source_dir: Option<&Path>,
+    build_dir: Option<&Path>,
+    cross: Option<&CrossConfig>,
+    env_vars: &EnvVars,
+    extra_args: &[String],
+) -> Result<()> {
+    autotools::run_helper_configure(context, source_dir, build_dir, cross, env_vars, extra_args)
+}
+
+pub(crate) fn run_autotools_helper_install(
+    context: &BuildHelperContext,
+    build_dir: Option<&Path>,
+    env_vars: &EnvVars,
+    extra_args: &[String],
+) -> Result<()> {
+    autotools::run_helper_install(context, build_dir, env_vars, extra_args)
+}
+
+pub(crate) fn run_cmake_helper_configure(
+    context: &BuildHelperContext,
+    source_dir: Option<&Path>,
+    build_dir: Option<&Path>,
+    cross: Option<&CrossConfig>,
+    env_vars: &EnvVars,
+    extra_args: &[String],
+) -> Result<()> {
+    cmake::run_helper_configure(context, source_dir, build_dir, cross, env_vars, extra_args)
+}
+
+pub(crate) fn run_cmake_helper_install(
+    context: &BuildHelperContext,
+    build_dir: Option<&Path>,
+    env_vars: &EnvVars,
+    extra_args: &[String],
+) -> Result<()> {
+    cmake::run_helper_install(context, build_dir, env_vars, extra_args)
+}
+
+pub(crate) fn run_meson_helper_configure(
+    context: &BuildHelperContext,
+    source_dir: Option<&Path>,
+    build_dir: Option<&Path>,
+    cross: Option<&CrossConfig>,
+    env_vars: &EnvVars,
+    extra_args: &[String],
+) -> Result<()> {
+    meson::run_helper_configure(context, source_dir, build_dir, cross, env_vars, extra_args)
+}
+
+pub(crate) fn run_meson_helper_install(
+    context: &BuildHelperContext,
+    build_dir: Option<&Path>,
+    env_vars: &EnvVars,
+    extra_args: &[String],
+) -> Result<()> {
+    meson::run_helper_install(context, build_dir, env_vars, extra_args)
+}
+
+pub(crate) fn run_perl_helper_configure(
+    context: &BuildHelperContext,
+    source_dir: Option<&Path>,
+    env_vars: &EnvVars,
+    extra_args: &[String],
+) -> Result<()> {
+    perl::run_helper_configure(context, source_dir, env_vars, extra_args)
+}
+
+pub(crate) fn run_perl_helper_install(
+    context: &BuildHelperContext,
+    build_dir: Option<&Path>,
+    env_vars: &EnvVars,
+    extra_args: &[String],
+) -> Result<()> {
+    perl::run_helper_install(context, build_dir, env_vars, extra_args)
 }
 
 pub fn set_env_var(env_vars: &mut EnvVars, key: &str, value: impl Into<String>) {
@@ -1351,6 +1502,17 @@ mod tests {
         });
         assert_eq!(lib32_dirs.libdir, "/usr/lib32");
         assert_eq!(lib32_dirs.libexecdir, "/usr/lib32");
+    }
+
+    #[test]
+    fn test_build_helper_context_restores_runtime_build_flags() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.lib32_variant = true;
+        spec.build.flags.host_build_dir = Some("/tmp/build-host".into());
+
+        let restored = BuildHelperContext::from_spec(&spec).build_flags();
+        assert!(restored.lib32_variant);
+        assert_eq!(restored.host_build_dir.as_deref(), Some("/tmp/build-host"));
     }
 
     #[test]
