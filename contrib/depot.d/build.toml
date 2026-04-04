@@ -1,28 +1,45 @@
 [flags]
-# Default build flags applied to all packages via /etc/depot.d/build.toml
-# Compiler selection
-cc = "gcc"
+# Example /etc/depot.d/build.toml
+#
+# Drop-in build defaults. This file is a good place for policy that should
+# apply everywhere without crowding the main /etc/depot.toml.
 
-# Default CFLAGS
+# Toolchain selection.
+cc = "clang"
+# cxx = "clang++"
+# ar = "ar"
+# ld = "ld.lld"
+
+# Compiler defaults. These are merged with package-level flags unless a package
+# explicitly replaces them.
 cflags = ["-O2"]
 cflags += ["-pipe"]
+# cxxflags = ["-O2", "-pipe"]
 
-# Optional install directory overrides for supported builders
-#bindir = "/usr/bin"
-#libdir = "/usr/lib"
-#sysconfdir = "/etc"
-
-# Default LDFLAGS
+# Linker defaults.
 ldflags = ["-Wl,-O1"]
 
-# Default LTOFLAGS and automatic injection into CFLAGS/CXXFLAGS/LDFLAGS.
+# Link-time optimization policy.
 ltoflags = ["-flto=auto"]
+
 # Rust-specific LTO flags appended only to RUSTFLAGS when use_lto is enabled.
-#RUSTLTOFLAGS = ["-Clinker-plugin-lto"]
+# rustltoflags = ["-Clinker-plugin-lto"]
 use_lto = true
 
-# CARCH short name (can be overridden per-package)
+# Architecture defaults. Packages may still override this when needed.
 carch = "x86_64"
+# chost = "x86_64-sfg-linux-gnu"
+# cbuild = "x86_64-sfg-linux-gnu"
 
-# Example of appending per-package cflags: (will be exposed as build.cflags appends)
+# Optional install directory overrides for supported builders.
+# bindir = "/usr/bin"
+# libdir = "/usr/lib"
+# sysconfdir = "/etc"
+
+# Example of additive layering in depot.d:
+# cflags += ["-fstack-clash-protection"]
+# ldflags += ["-Wl,-z,relro", "-Wl,-z,now"]
+
+# Avoid host-specific tuning such as -march=native in shared system configs
+# unless every package built on this machine is intended only for this machine.
 # cflags += ["-march=native"]

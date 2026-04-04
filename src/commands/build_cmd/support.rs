@@ -247,6 +247,30 @@ pub(crate) fn ensure_requested_build_tool_package_installed(
     )
 }
 
+fn ensure_requested_development_package_installed_for(
+    package_name: Option<&str>,
+    db_path: &Path,
+) -> Result<()> {
+    let Some(package_name) = package_name.filter(|name| !name.trim().is_empty()) else {
+        return Ok(());
+    };
+
+    if deps::is_dep_satisfied_in_db(package_name, db_path)? {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "Missing required development package for source builds ({}): {}. Install it first before building packages from source.",
+        builder::development_package_option(),
+        package_name
+    );
+}
+
+pub(crate) fn ensure_requested_development_package_installed(db_path: &Path) -> Result<()> {
+    let package_name = builder::requested_development_package();
+    ensure_requested_development_package_installed_for(package_name.as_deref(), db_path)
+}
+
 pub(crate) fn build_lib32_companion_package(
     pkg_spec: &package::PackageSpec,
     src_dir: &Path,
@@ -322,4 +346,78 @@ pub(crate) fn build_lib32_companion_package(
     )?;
 
     Ok(Some((lib32_pkg_spec, lib32_destdir)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_requested_development_package_installed_for;
+    use crate::config;
+    use crate::db;
+    use crate::package::{
+        Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source,
+    };
+    use anyhow::Result;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn test_spec(name: &str) -> PackageSpec {
+        PackageSpec {
+            package: PackageInfo {
+                name: name.into(),
+                real_name: None,
+                version: "1.0.0".into(),
+                revision: 1,
+                description: "d".into(),
+                homepage: "https://example.test".into(),
+                abi_breaking: false,
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Default::default(),
+            manual_sources: Vec::new(),
+            source: vec![Source {
+                url: "https://example.test/src.tar.gz".into(),
+                sha256: "skip".into(),
+                extract_dir: "src".into(),
+                patches: Vec::new(),
+                post_extract: Vec::new(),
+                cherry_pick: Vec::new(),
+            }],
+            build: Build {
+                build_type: BuildType::Custom,
+                flags: BuildFlags::default(),
+            },
+            dependencies: Dependencies::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir: PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn requested_development_package_requirement_fails_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("installed.sqlite");
+        let err =
+            ensure_requested_development_package_installed_for(Some("development-base"), &db_path)
+                .expect_err("missing development package should fail");
+        assert!(err.to_string().contains("development-base"));
+    }
+
+    #[test]
+    fn requested_development_package_requirement_passes_when_installed() -> Result<()> {
+        let rootfs = tempfile::tempdir()?;
+        let config = config::Config::for_rootfs(rootfs.path());
+        fs::create_dir_all(&config.db_dir)?;
+        let db_path = config.installed_db_path(rootfs.path());
+
+        let spec = test_spec("development-base");
+        let dest = rootfs.path().join("dest").join("development-base");
+        fs::create_dir_all(dest.join("usr/bin"))?;
+        fs::write(dest.join("usr/bin/dev-base"), "bin")?;
+        db::register_package(&db_path, &spec, &dest)?;
+
+        ensure_requested_development_package_installed_for(Some("development-base"), &db_path)?;
+        Ok(())
+    }
 }

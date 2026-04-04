@@ -5,9 +5,10 @@ pub(crate) mod support;
 use self::support::{
     RequestedBuildToolPackageInstall, automatic_tests_disabled_for_outputs,
     build_lib32_companion_package, clean_build_workspace, effective_lib32_only,
-    ensure_requested_build_tool_package_installed, maybe_disable_tests_for_missing_deps,
-    maybe_prompt_to_skip_tests_for_missing_requested_deps, merge_missing_dependencies,
-    requested_outputs, should_install_test_deps, warn_if_running_as_root_for_build,
+    ensure_requested_build_tool_package_installed, ensure_requested_development_package_installed,
+    maybe_disable_tests_for_missing_deps, maybe_prompt_to_skip_tests_for_missing_requested_deps,
+    merge_missing_dependencies, requested_outputs, should_install_test_deps,
+    warn_if_running_as_root_for_build,
 };
 
 pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
@@ -47,6 +48,12 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
         pkg_spec.apply_config(&config);
         let lib32_only = effective_lib32_only(&pkg_spec, cli_lib32_only);
         let requested_outputs = requested_outputs(&pkg_spec, lib32_only);
+        let db_path = config.installed_db_path(&rootfs);
+
+        source::preflight_local_manual_sources(&pkg_spec)?;
+        if !pkg_spec.is_metapackage() {
+            ensure_requested_development_package_installed(&db_path)?;
+        }
 
         let build_targets = vec![format!(
             "{} v{}-{}",
@@ -62,7 +69,6 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
                 config.db_dir.display()
             )
         })?;
-        let db_path = config.installed_db_path(&rootfs);
 
         if no_deps && should_install_test_deps(&pkg_spec, install_test_deps, requested_outputs) {
             let missing_test =
@@ -297,6 +303,7 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
             watcher.check()?;
         }
 
+        source::preflight_manual_sources(&pkg_spec, &config.cache_dir)?;
         let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
         if let Some(watcher) = interrupt_watcher.as_ref() {
             watcher.check()?;

@@ -1,6 +1,6 @@
 project(
   'depot',
-  version: '0.35.0',
+  version: '0.35.1',
   meson_version: '>=0.60.0',
   default_options: ['buildtype=release'],
 )
@@ -21,6 +21,7 @@ depot_custom_package = get_option('DEPOT_CUSTOM_PACKAGE')
 depot_python_package = get_option('DEPOT_PYTHON_PACKAGE')
 depot_rust_package = get_option('DEPOT_RUST_PACKAGE')
 depot_makefile_package = get_option('DEPOT_MAKEFILE_PACKAGE')
+depot_development_package = get_option('DEPOT_DEVELOPMENT_PACKAGE')
 
 src_root = meson.project_source_root()
 build_root = meson.project_build_root()
@@ -84,6 +85,7 @@ depot_bin = custom_target(
     depot_python_package,
     depot_rust_package,
     depot_makefile_package,
+    depot_development_package,
     '@OUTPUT@',
   ],
   console: true,
@@ -128,6 +130,7 @@ test(
     depot_python_package,
     depot_rust_package,
     depot_makefile_package,
+    depot_development_package,
   ],
   suite: ['cargo'],
   timeout: 0,

@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 15 ]; then
-    echo "usage: $0 <cargo> <src_root> <build_root> <profile> <release_flag> <build_static> <autotools_pkg> <cmake_pkg> <meson_pkg> <perl_pkg> <custom_pkg> <python_pkg> <rust_pkg> <makefile_pkg> <output>" >&2
+if [ "$#" -ne 16 ]; then
+    echo "usage: $0 <cargo> <src_root> <build_root> <profile> <release_flag> <build_static> <autotools_pkg> <cmake_pkg> <meson_pkg> <perl_pkg> <custom_pkg> <python_pkg> <rust_pkg> <makefile_pkg> <development_pkg> <output>" >&2
     exit 2
 fi
 
@@ -20,7 +20,8 @@ custom_pkg="${11}"
 python_pkg="${12}"
 rust_pkg="${13}"
 makefile_pkg="${14}"
-output="${15}"
+development_pkg="${15}"
+output="${16}"
 
 cargo_home="$build_root/cargo-home"
 cargo_target_dir="$build_root/cargo-target"
@@ -38,6 +39,7 @@ export DEPOT_CUSTOM_PACKAGE="$custom_pkg"
 export DEPOT_PYTHON_PACKAGE="$python_pkg"
 export DEPOT_RUST_PACKAGE="$rust_pkg"
 export DEPOT_MAKEFILE_PACKAGE="$makefile_pkg"
+export DEPOT_DEVELOPMENT_PACKAGE="$development_pkg"
 
 if [ "$release_flag" = "1" ]; then
     "$cargo_bin" build --locked --manifest-path "$src_root/Cargo.toml" --release

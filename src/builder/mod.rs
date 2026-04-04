@@ -12,7 +12,7 @@ mod rust;
 pub mod state;
 
 use crate::cross::CrossConfig;
-use crate::package::{BuildType, PackageSpec};
+use crate::package::{BuildFlags, BuildType, PackageSpec};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::fs;
@@ -188,12 +188,20 @@ pub(crate) fn requested_static_build() -> Result<Option<bool>> {
     crate::build_options::requested_static_build()
 }
 
-pub(crate) fn static_build_args_for(build_type: BuildType) -> Result<Vec<String>> {
-    let Some(enabled) = requested_static_build()? else {
-        return Ok(Vec::new());
+fn static_build_args_for_request(
+    build_type: BuildType,
+    requested_static: Option<bool>,
+    no_delete_static: bool,
+) -> Vec<String> {
+    let Some(enabled) = requested_static else {
+        return Vec::new();
     };
 
-    let args = match build_type {
+    if !enabled && no_delete_static {
+        return Vec::new();
+    }
+
+    match build_type {
         BuildType::Autotools => vec![if enabled {
             "--enable-static".to_string()
         } else {
@@ -212,9 +220,18 @@ pub(crate) fn static_build_args_for(build_type: BuildType) -> Result<Vec<String>
             if enabled { "static" } else { "dynamic" }
         )],
         _ => Vec::new(),
-    };
+    }
+}
 
-    Ok(args)
+pub(crate) fn static_build_args_for(
+    build_type: BuildType,
+    flags: &BuildFlags,
+) -> Result<Vec<String>> {
+    Ok(static_build_args_for_request(
+        build_type,
+        requested_static_build()?,
+        flags.no_delete_static,
+    ))
 }
 
 pub(crate) fn build_tool_package_option(build_type: BuildType) -> Option<&'static str> {
@@ -223,6 +240,14 @@ pub(crate) fn build_tool_package_option(build_type: BuildType) -> Option<&'stati
 
 pub(crate) fn requested_build_tool_package(build_type: BuildType) -> Option<String> {
     crate::build_options::requested_build_tool_package(build_type)
+}
+
+pub(crate) fn development_package_option() -> &'static str {
+    crate::build_options::development_package_option()
+}
+
+pub(crate) fn requested_development_package() -> Option<String> {
+    crate::build_options::requested_development_package()
 }
 
 fn configured_install_dir(value: &str, default: &str) -> String {
@@ -941,6 +966,27 @@ mod tests {
             Some("DEPOT_CMAKE_PACKAGE")
         );
         assert_eq!(build_tool_package_option(BuildType::Bin), None);
+    }
+
+    #[test]
+    fn test_static_build_args_skip_disable_static_when_no_delete_static_enabled() {
+        let args = static_build_args_for_request(BuildType::Autotools, Some(false), true);
+        assert!(args.is_empty());
+
+        let args = static_build_args_for_request(BuildType::CMake, Some(false), true);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_static_build_args_keep_other_requested_modes() {
+        assert_eq!(
+            static_build_args_for_request(BuildType::Autotools, Some(false), false),
+            vec!["--disable-static".to_string()]
+        );
+        assert_eq!(
+            static_build_args_for_request(BuildType::Meson, Some(true), true),
+            vec!["-Ddefault_library=static".to_string()]
+        );
     }
 
     #[test]

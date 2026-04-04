@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use tempfile::NamedTempFile;
 
 pub fn build(
     spec: &PackageSpec,
@@ -98,15 +99,6 @@ pub fn build(
     }
 
     if !state.is_done(BuildStep::PostInstallDone) {
-        crate::log_info!(
-            "Running custom build script{}...",
-            if fakeroot::is_root() {
-                ""
-            } else {
-                " (with fakeroot)"
-            }
-        );
-
         crate::builder::set_env_var(
             &mut env_vars,
             "DESTDIR",
@@ -139,13 +131,31 @@ pub fn build(
             std::env::current_dir()?.join(&build_script)
         };
 
-        // Use POSIX `sh` (more likely to be available in minimal/chroot environments)
-        let mut cmd = if custom_function_mode_enabled(&abs_build_script)? {
+        let function_mode = custom_function_mode_enabled(&abs_build_script)?;
+        if function_mode {
+            crate::log_info!(
+                "Running custom build script (function mode; fakeroot only during install)..."
+            );
             crate::log_info!(
                 "Using custom build.sh function mode (per-output install functions enabled)"
             );
-            build_function_mode_command(spec, &install_destdir, &abs_build_script)?
+            run_function_mode_build_script(
+                spec,
+                &build_dir,
+                &install_destdir,
+                &abs_build_script,
+                &env_vars,
+            )?;
         } else {
+            crate::log_info!(
+                "Running custom build script{}...",
+                if fakeroot::is_root() {
+                    ""
+                } else {
+                    " (with fakeroot)"
+                }
+            );
+            // Use POSIX `sh` (doing something wrong if your system doesn't have it...)
             let mut cmd = fakeroot::wrap_install_command("sh", &install_destdir);
             let wrapper = crate::shell_helpers::wrap_shell_command(". \"$1\"");
             // Run custom scripts through `sh -c` so helper commands like `haul`
@@ -155,23 +165,22 @@ pub fn build(
                 .arg(wrapper)
                 .arg("sh")
                 .arg(&abs_build_script);
-            cmd
-        };
-        cmd.current_dir(&build_dir);
+            cmd.current_dir(&build_dir);
 
-        crate::builder::prepare_tool_command(&mut cmd, &env_vars);
+            crate::builder::prepare_tool_command(&mut cmd, &env_vars);
 
-        // Run the command and include the OS error on spawn failures for clearer diagnostics
-        let status = crate::interrupts::command_status(&mut cmd).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to run build script {}: {}",
-                build_script.display(),
-                e
-            )
-        })?;
+            // Run the command and include the OS error on spawn failures for clearer diagnostics
+            let status = crate::interrupts::command_status(&mut cmd).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to run build script {}: {}",
+                    build_script.display(),
+                    e
+                )
+            })?;
 
-        if !status.success() {
-            anyhow::bail!("Custom build script failed with status: {}", status);
+            if !status.success() {
+                anyhow::bail!("Custom build script failed with status: {}", status);
+            }
         }
         if flags.lib32_variant {
             crate::builder::stage_lib32_install_tree(&install_destdir, destdir)?;
@@ -213,11 +222,7 @@ fn custom_function_mode_enabled(build_script: &Path) -> Result<bool> {
         || contents.contains("install_"))
 }
 
-fn build_function_mode_command(
-    spec: &PackageSpec,
-    destdir: &Path,
-    build_script: &Path,
-) -> Result<Command> {
+fn function_mode_shell_prelude() -> String {
     let mut wrapper = crate::shell_helpers::wrap_shell_command("");
     wrapper.push_str("\nset -eu\n");
     wrapper.push_str("depot_has_function() {\n");
@@ -226,11 +231,39 @@ fn build_function_mode_command(
     wrapper.push_str("        *) return 1 ;;\n");
     wrapper.push_str("    esac\n");
     wrapper.push_str("}\n");
+    wrapper
+}
+
+fn build_function_mode_build_command(build_script: &Path, state_file: &Path) -> Command {
+    let mut wrapper = function_mode_shell_prelude();
     wrapper.push_str("depot_build_ran=0\n");
     wrapper.push_str(". \"$1\"\n");
     wrapper.push_str("if depot_has_function depot_build; then depot_build; depot_build_ran=1;\n");
     wrapper.push_str("elif depot_has_function build; then build; depot_build_ran=1;\n");
     wrapper.push_str("fi\n");
+    wrapper.push_str("printf '%s\\n' \"$depot_build_ran\" > \"$2\"\n");
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(wrapper)
+        .arg("sh")
+        .arg(build_script)
+        .arg(state_file);
+    cmd
+}
+
+fn build_function_mode_install_command(
+    spec: &PackageSpec,
+    destdir: &Path,
+    build_script: &Path,
+    build_ran: bool,
+) -> Command {
+    let mut wrapper = function_mode_shell_prelude();
+    wrapper.push_str(&format!(
+        "depot_build_ran={}\n",
+        if build_ran { 1 } else { 0 }
+    ));
+    wrapper.push_str(". \"$1\"\n");
 
     let primary = &spec.package.name;
     for out in spec.outputs() {
@@ -272,7 +305,65 @@ fn build_function_mode_command(
 
     let mut cmd = fakeroot::wrap_install_command("sh", destdir);
     cmd.arg("-c").arg(wrapper).arg("sh").arg(build_script);
-    Ok(cmd)
+    cmd
+}
+
+fn run_function_mode_build_script(
+    spec: &PackageSpec,
+    build_dir: &Path,
+    install_destdir: &Path,
+    build_script: &Path,
+    env_vars: &crate::builder::EnvVars,
+) -> Result<()> {
+    let state_file = NamedTempFile::new_in(build_dir).with_context(|| {
+        format!(
+            "Failed to create function mode state file in {}",
+            build_dir.display()
+        )
+    })?;
+    let state_path = state_file.path().to_path_buf();
+
+    let mut build_cmd = build_function_mode_build_command(build_script, &state_path);
+    build_cmd.current_dir(build_dir);
+    let mut build_env = env_vars.clone();
+    crate::builder::set_env_var(
+        &mut build_env,
+        "DESTDIR",
+        install_destdir.to_string_lossy().into_owned(),
+    );
+    crate::builder::prepare_tool_command(&mut build_cmd, &build_env);
+    let build_status = crate::interrupts::command_status(&mut build_cmd).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to run build script {}: {}",
+            build_script.display(),
+            e
+        )
+    })?;
+    if !build_status.success() {
+        anyhow::bail!("Custom build script failed with status: {}", build_status);
+    }
+
+    let build_ran = fs::read_to_string(&state_path)
+        .ok()
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false);
+
+    let mut install_cmd =
+        build_function_mode_install_command(spec, install_destdir, build_script, build_ran);
+    install_cmd.current_dir(build_dir);
+    crate::builder::prepare_tool_command(&mut install_cmd, env_vars);
+    let install_status = crate::interrupts::command_status(&mut install_cmd).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to run build script {}: {}",
+            build_script.display(),
+            e
+        )
+    })?;
+    if !install_status.success() {
+        anyhow::bail!("Custom build script failed with status: {}", install_status);
+    }
+
+    Ok(())
 }
 
 fn shell_fn_suffix(pkg_name: &str) -> String {
@@ -428,6 +519,70 @@ depot_install_dev_pkg() {
                 .exists()
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_build_function_mode_only_uses_fakeroot_for_install() -> Result<()> {
+        let tmp_src = tempdir()?;
+        let tmp_dest = tempdir()?;
+
+        let build_sh = tmp_src.path().join("build.sh");
+        std::fs::write(
+            &build_sh,
+            r#"#!/bin/sh
+depot_build() {
+  if [ "${FAKEROOT_ACTIVE:-0}" = 1 ]; then
+    echo yes > build-fakeroot.txt
+  else
+    echo no > build-fakeroot.txt
+  fi
+}
+depot_install() {
+  mkdir -p "$DESTDIR/usr/share"
+  echo installed > "$DESTDIR/usr/share/install-fakeroot.txt"
+}
+"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&build_sh)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&build_sh, perms)?;
+        }
+
+        let spec = mk_spec("custom-function-fakeroot-split", "1.0");
+        build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None)?;
+
+        assert_eq!(
+            std::fs::read_to_string(tmp_src.path().join("build-fakeroot.txt"))?,
+            "no\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp_dest.path().join("usr/share/install-fakeroot.txt"))?,
+            "installed\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_function_mode_commands_split_fakeroot_boundary() {
+        let build_script = Path::new("/tmp/build.sh");
+        let state_file = Path::new("/tmp/build-state");
+        let install_destdir = Path::new("/tmp/destdir");
+
+        let build_cmd = build_function_mode_build_command(build_script, state_file);
+        assert_eq!(build_cmd.get_program(), std::ffi::OsStr::new("sh"));
+
+        let spec = mk_spec("custom-function-fakeroot-split", "1.0");
+        let install_cmd =
+            build_function_mode_install_command(&spec, install_destdir, build_script, true);
+        let expected = if crate::fakeroot::is_root() {
+            std::ffi::OsStr::new("sh")
+        } else {
+            std::ffi::OsStr::new("fakeroot")
+        };
+        assert_eq!(install_cmd.get_program(), expected);
     }
 
     #[test]

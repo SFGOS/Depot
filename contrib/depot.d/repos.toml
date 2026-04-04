@@ -1,22 +1,38 @@
+# Example /etc/depot.d/repos.toml
+#
+# Repository configuration for source specs and binary package feeds.
+# Lower priority numbers win first when multiple repos provide the same package.
+
 [settings]
+# Prefer binary packages when both a binary package and a source spec exist.
+# Set this to false if you want source specs to be preferred by default.
 prefer_binary = true
 
 [source.vertex]
+# Source repository used for spec lookup and source-build planning.
 url = "https://gitlab.com/vertex-linux/packages.git"
 enabled = true
 priority = 50
+
+# Restrict scanning to selected subdirectories inside the source repo.
 subdirs = ["core", "extra"]
 
+# Example:
+# branch = "main"
+
 [binary.core]
+# Binary repository for core packages.
 url = "https://repo.sfgos.net/core"
 enabled = true
 priority = 10
 repo_db = "repo.db.zst"
 
 [binary.core.arch.x86_64]
+# Enable this repo for x86_64 systems.
 enabled = true
 
 [binary.extra]
+# Secondary binary repository for additional packages.
 url = "https://repo.sfgos.net/extra"
 enabled = true
 priority = 20
@@ -24,3 +40,14 @@ repo_db = "repo.db.zst"
 
 [binary.extra.arch.x86_64]
 enabled = true
+
+# Additional examples:
+#
+# [binary.testing]
+# url = "https://repo.example.org/testing"
+# enabled = false
+# priority = 5
+# repo_db = "repo.db.zst"
+#
+# [binary.testing.arch.x86_64]
+# enabled = true

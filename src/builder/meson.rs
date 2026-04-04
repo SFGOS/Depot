@@ -65,7 +65,7 @@ pub fn build(
         for arg in meson_setup_args(flags, cross_file.as_deref(), &env_vars) {
             meson_cmd.arg(arg);
         }
-        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Meson)? {
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Meson, flags)? {
             meson_cmd.arg(arg);
         }
 
@@ -232,7 +232,7 @@ pub(crate) fn ensure_host_build(
         for arg in meson_setup_args(flags, None, &env_vars) {
             meson_cmd.arg(arg);
         }
-        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Meson)? {
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Meson, flags)? {
             meson_cmd.arg(arg);
         }
 

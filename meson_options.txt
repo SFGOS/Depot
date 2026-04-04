@@ -58,3 +58,9 @@ option(
   value: '',
   description: 'Compile in the helper package to auto-install before makefile builds',
 )
+option(
+  'DEPOT_DEVELOPMENT_PACKAGE',
+  type: 'string',
+  value: 'development-base',
+  description: 'Compile in the package that must already be installed before any source build runs',
+)

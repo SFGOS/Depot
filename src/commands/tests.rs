@@ -2215,6 +2215,159 @@ file = "missing.patch"
 }
 
 #[test]
+fn build_command_checks_manual_sources_before_dependency_resolution() -> Result<()> {
+    let _guard = ASSUME_YES_TEST_LOCK.lock().expect("assume-yes test lock");
+    let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+    let rootfs = temp.path().join("rootfs");
+    let spec_dir = temp.path().join("packages").join("demo");
+    fs::create_dir_all(&rootfs)?;
+    fs::create_dir_all(&spec_dir)?;
+
+    let spec_path = spec_dir.join("demo.toml");
+    fs::write(
+        &spec_path,
+        r#"[package]
+name = "demo"
+version = "1.0.0"
+revision = 1
+description = "demo"
+homepage = "https://example.test/demo"
+license = "MIT"
+
+[[source]]
+url = "https://example.test/demo-1.0.0.tar.gz"
+sha256 = "skip"
+extract_dir = "demo-1.0.0"
+
+[build]
+type = "custom"
+
+[dependencies]
+build = ["definitely-missing-dep"]
+runtime = []
+optional = []
+
+[[manual_sources]]
+file = "missing.patch"
+"#,
+    )?;
+
+    let result = run(Cli {
+        command: Commands::Build(BuildArgs {
+            rootfs_args: rootfs_args(rootfs),
+            prompt_args: prompt_args(true),
+            build_exec_args: build_exec_args(),
+            lib32_args: lib32_args(),
+            spec_pos: Some(spec_path),
+            spec: None,
+            install: false,
+            install_deps: true,
+            cleanup_deps: false,
+        }),
+    });
+
+    let err = result.expect_err("missing manual source should fail before dependency install");
+    assert!(
+        err.to_string()
+            .contains("Manual source not found: missing.patch")
+    );
+    assert!(
+        !err.to_string()
+            .contains("Failed to resolve required build tool package")
+    );
+    Ok(())
+}
+
+#[test]
+fn source_build_warning_messages_include_dependency_context() {
+    let plan = planner::ExecutionPlan {
+        steps: vec![
+            planner::PlannedStep {
+                package: "dep-src".into(),
+                action: planner::PlanAction::BuildAndInstall,
+                origin: planner::PlanOrigin::Source {
+                    path: PathBuf::from("/tmp/dep-src.toml"),
+                    local_sibling: false,
+                },
+                requested_by: vec!["dependency dep-src".into(), "app needs dep-src".into()],
+            },
+            planner::PlannedStep {
+                package: "dep-bin".into(),
+                action: planner::PlanAction::InstallBinary,
+                origin: planner::PlanOrigin::Binary {
+                    repo_name: "core".into(),
+                    record: Box::new(test_binary_repo_record(
+                        "dep-bin",
+                        "dep-bin-1.0-1-x86_64.tar.zst",
+                    )),
+                },
+                requested_by: vec!["app needs dep-bin".into()],
+            },
+        ],
+    };
+
+    assert_eq!(
+        source_build_warning_messages(&plan),
+        vec!["dep-src (requested dependency 'dep-src', needed by 'app')".to_string()]
+    );
+}
+
+#[test]
+fn planned_source_build_prereqs_check_manual_sources_before_confirmation() -> Result<()> {
+    let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+    let spec_dir = tempfile::tempdir().context("Failed to create temp spec dir")?;
+    let spec_path = spec_dir.path().join("demo.toml");
+    fs::write(
+        &spec_path,
+        r#"[package]
+name = "demo"
+version = "1.0.0"
+revision = 1
+description = "demo"
+homepage = "https://example.test/demo"
+license = "MIT"
+
+[[source]]
+url = "https://example.test/demo-1.0.0.tar.gz"
+sha256 = "skip"
+extract_dir = "demo-1.0.0"
+
+[build]
+type = "custom"
+
+[dependencies]
+build = []
+runtime = []
+optional = []
+
+[[manual_sources]]
+file = "missing.patch"
+"#,
+    )?;
+
+    let config = config::Config::for_rootfs(rootfs.path());
+    let plan = planner::ExecutionPlan {
+        steps: vec![planner::PlannedStep {
+            package: "demo".into(),
+            action: planner::PlanAction::BuildAndInstall,
+            origin: planner::PlanOrigin::Source {
+                path: spec_path,
+                local_sibling: true,
+            },
+            requested_by: vec!["requested spec".into()],
+        }],
+    };
+
+    let err = validate_source_build_prereqs_for_plan(&plan, rootfs.path(), &config)
+        .expect_err("missing local manual source should fail before confirmation");
+    assert!(
+        err.to_string()
+            .contains("Manual source not found: missing.patch")
+    );
+    Ok(())
+}
+
+#[test]
 fn suppress_nested_install_output_for_planned_context() {
     let mut env = TestEnv::new();
     env.set_var(DEPOT_INSTALL_CONTEXT_ENV, INSTALL_CONTEXT_PLANNED);

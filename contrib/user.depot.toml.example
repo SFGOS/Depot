@@ -1,18 +1,35 @@
 # Example per-user configuration (~/.config/depot.toml)
+#
+# Use this file for local preferences that should not affect other users on the
+# same machine. System-wide defaults still come from /etc/depot.toml and
+# /etc/depot.d/*.toml unless you override them here.
 
 [build]
+# A user-local prefix is useful when you are building software for your own
+# account instead of assembling system packages.
 prefix = "/usr/local"
+
+# Personal toolchain preference.
 cc = "clang"
+# cxx = "clang++"
 
 [build.flags]
+# User-local compiler preferences.
 cflags = ["-O2"]
 cflags += ["-g"]
 carch = "x86_64"
 
-[install]
-test_deps = false
+# Examples:
+# cxxflags = ["-O2", "-g"]
+# ldflags = ["-Wl,-O1"]
+# makeflags = "-j4"
 
-# Optional install directory overrides for supported builders
-#bindir = "/usr/local/bin"
-#sbindir = "/usr/local/sbin"
-#libdir = "/usr/local/lib"
+# Optional install directory overrides for supported builders.
+# bindir = "/usr/local/bin"
+# sbindir = "/usr/local/sbin"
+# libdir = "/usr/local/lib"
+# datadir = "/usr/local/share"
+
+[install]
+# Install test dependencies automatically for your own source builds.
+test_deps = false

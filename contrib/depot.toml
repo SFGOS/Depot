@@ -1,42 +1,83 @@
-# Example /etc/depot.toml - system-wide configuration for Depot
+# Example /etc/depot.toml
+#
+# This file is the main system-wide configuration for Depot.
+# Keep settings here for machine-wide defaults that should apply to every user.
+# For smaller drop-in overrides, prefer adding files under /etc/depot.d/.
+#
+# Most values here act as defaults and can still be overridden:
+# - per package in package specs
+# - per invocation with CLI flags
+# - per user in ~/.config/depot.toml
 
 [build]
-# Installation prefix for package builds
+# Installation prefix used by supported build systems when a package does not
+# override it explicitly. For a normal system package build this is usually /usr.
 prefix = "/usr"
-# Default compiler and archiver
-cc = "gcc"
+
+# Default toolchain commands. These are passed through to builders that honor
+# CC/CXX/AR and related variables.
+cc = "clang"
 ar = "ar"
 
+# Optional examples:
+# cxx = "clang++"
+# ld = "ld.lld"
+# cpp = "cpp"
+# strip = "strip"
+# ranlib = "ranlib"
+
 [build.flags]
-# Basic compiler flags
+# Baseline C compiler flags for packages that do not supply their own.
+# Keep these conservative unless you are intentionally tuning for one machine.
 cflags = ["-O2"]
-# Append additional flags (demonstrates += append support)
+
+# Appends are often clearer than rewriting the whole list. This demonstrates
+# Depot's += support for layered config files.
+# NOTE: this is NOT regular TOML syntax. The += operator is a special extension that Depot supports
 cflags += ["-g"]
 
-# Optional install directory overrides for supported builders
-#bindir = "/usr/bin"
-#sbindir = "/usr/bin"
-#libdir = "/usr/lib"
-#libexecdir = "/usr/lib"
-#sysconfdir = "/etc"
-#localstatedir = "/var"
-#sharedstatedir = "/var/lib"
-#includedir = "/usr/include"
-#datarootdir = "/usr/share"
-#datadir = "/usr/share"
-#mandir = "/usr/share/man"
-#infodir = "/usr/share/info"
-
-# Linker flags
+# Optional C++ and linker defaults:
+# cxxflags = ["-O2"]
 ldflags = ["-Wl,-O1"]
 
-# Target architecture short name (CARCH). Defaults to host arch if unset.
+# Link-time optimization defaults. When use_lto is true, Depot will inject
+# ltoflags into the appropriate compiler and linker flag sets automatically.
+# ltoflags = ["-flto=auto"]
+# use_lto = false
+
+# Target architecture short name (CARCH). If unset, Depot derives this from the
+# current host system or active cross target.
 carch = "x86_64"
 
-# Target triples (optional)
-#chost = "x86_64-pc-linux-gnu"
-#cbuild = "x86_64-pc-linux-gnu"
+# Target triples are usually only needed for cross or multilib scenarios.
+# chost = "x86_64-pc-linux-gnu"
+# cbuild = "x86_64-pc-linux-gnu"
+
+# Optional install directory overrides for supported builders. Leave these at
+# their defaults unless you are intentionally targeting a non-standard layout.
+# bindir = "/usr/bin"
+# sbindir = "/usr/bin"
+# libdir = "/usr/lib"
+# libexecdir = "/usr/lib"
+# sysconfdir = "/etc"
+# localstatedir = "/var"
+# sharedstatedir = "/var/lib"
+# includedir = "/usr/include"
+# datarootdir = "/usr/share"
+# datadir = "/usr/share"
+# mandir = "/usr/share/man"
+# infodir = "/usr/share/info"
+
+# Additional examples:
+# makeflags = "-j8"
+# env_vars = ["CCACHE_DIR=/var/cache/ccache"]
+# passthrough_env = ["http_proxy", "https_proxy"]
 
 [install]
-# Install test dependencies along with build/runtime dependencies.
+# When true, Depot will also try to install declared test dependencies while
+# resolving dependencies for source builds.
 test_deps = false
+
+# Example future-friendly place for install policy overrides:
+# assume_yes = false
+# keep_cache = true

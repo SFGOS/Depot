@@ -2,6 +2,7 @@ use crate::package::BuildType;
 use anyhow::Result;
 
 const BUILD_DEPOT_STATIC_OPTION: &str = "BUILD_DEPOT_STATIC";
+const DEPOT_DEVELOPMENT_PACKAGE_OPTION: &str = "DEPOT_DEVELOPMENT_PACKAGE";
 
 fn parse_boolish_option(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -63,9 +64,20 @@ pub(crate) fn requested_build_tool_package(build_type: BuildType) -> Option<Stri
     }
 }
 
+pub(crate) fn development_package_option() -> &'static str {
+    DEPOT_DEVELOPMENT_PACKAGE_OPTION
+}
+
+pub(crate) fn requested_development_package() -> Option<String> {
+    normalize_string_option(option_env!("DEPOT_DEVELOPMENT_PACKAGE"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_tool_package_option, normalize_string_option, parse_boolish_option};
+    use super::{
+        build_tool_package_option, development_package_option, normalize_string_option,
+        parse_boolish_option,
+    };
     use crate::package::BuildType;
 
     #[test]
@@ -98,5 +110,10 @@ mod tests {
             Some("DEPOT_CMAKE_PACKAGE")
         );
         assert_eq!(build_tool_package_option(BuildType::Bin), None);
+    }
+
+    #[test]
+    fn development_package_option_matches_expected_name() {
+        assert_eq!(development_package_option(), "DEPOT_DEVELOPMENT_PACKAGE");
     }
 }

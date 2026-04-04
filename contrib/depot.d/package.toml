@@ -1,6 +1,19 @@
 [package]
-# System-wide package overrides. Example: set default provides or package metadata
-# name = ""
+# Example /etc/depot.d/package.toml
+#
+# System-wide package metadata overrides. Use this sparingly: this is best for
+# policy defaults or local compatibility shims, not for rewriting package specs.
 
-# Example: provide a virtual runtime package name to satisfy runtime deps
+# Example fields you might override globally in a controlled environment:
+# homepage = "https://mirror.example.org/packages"
+# license = ["MIT"]
+
+# Example: provide a virtual package name to satisfy dependency expressions.
+# This can be useful on systems with a local compatibility package.
 # provides = ["filesystem"]
+
+# Example: declare that local packages replace an older naming scheme.
+# replaces = ["old-filesystem"]
+
+# Example: force a conflict relationship across locally maintained packages.
+# conflicts = ["legacy-filesystem"]

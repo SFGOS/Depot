@@ -97,7 +97,7 @@ pub fn build(
             let expanded = expand_with_envs(flag, &env_vars);
             cmake_cmd.arg(&expanded);
         }
-        for arg in crate::builder::static_build_args_for(crate::package::BuildType::CMake)? {
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::CMake, flags)? {
             cmake_cmd.arg(arg);
         }
 
@@ -317,7 +317,7 @@ pub(crate) fn ensure_host_build(
             let expanded = expand_with_envs(flag, &env_vars);
             cmake_cmd.arg(&expanded);
         }
-        for arg in crate::builder::static_build_args_for(crate::package::BuildType::CMake)? {
+        for arg in crate::builder::static_build_args_for(crate::package::BuildType::CMake, flags)? {
             cmake_cmd.arg(arg);
         }
 

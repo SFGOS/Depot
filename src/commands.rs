@@ -20,9 +20,9 @@ use walkdir::WalkDir;
 
 use build_cmd::support::{
     automatic_tests_disabled_for_outputs, build_lib32_companion_package, clean_build_workspace,
-    effective_lib32_only, make_lib32_package_spec, maybe_disable_tests_for_missing_deps,
-    maybe_prompt_to_skip_tests_for_missing_requested_deps, merge_missing_dependencies,
-    requested_outputs, should_install_test_deps,
+    effective_lib32_only, ensure_requested_development_package_installed, make_lib32_package_spec,
+    maybe_disable_tests_for_missing_deps, maybe_prompt_to_skip_tests_for_missing_requested_deps,
+    merge_missing_dependencies, requested_outputs, should_install_test_deps,
 };
 use install_cmd::archive::{
     extract_package_archive_to_staging, load_package_archive_into_staging,
@@ -1420,13 +1420,86 @@ fn actionable_plan_packages(plan: &planner::ExecutionPlan) -> Vec<String> {
         .collect()
 }
 
-fn warn_source_build_installs(count: usize) {
-    if count > 0 {
-        ui::warn(format!(
-            "{} package(s) will be built from source before installation.",
-            count
-        ));
+fn source_build_reason(reason: &str) -> String {
+    if let Some(dep) = reason.strip_prefix("dependency ") {
+        format!("requested dependency '{dep}'")
+    } else if let Some((requester, _)) = reason.split_once(" needs ") {
+        format!("needed by '{requester}'")
+    } else if reason == "requested spec" {
+        "requested spec".to_string()
+    } else if reason == "requested package" {
+        "requested package".to_string()
+    } else {
+        reason.to_string()
     }
+}
+
+fn source_build_warning_messages(plan: &planner::ExecutionPlan) -> Vec<String> {
+    let mut lines = Vec::new();
+    for step in plan.actionable_steps() {
+        if !matches!(step.action, planner::PlanAction::BuildAndInstall) {
+            continue;
+        }
+
+        let mut reasons = Vec::new();
+        for reason in &step.requested_by {
+            let label = source_build_reason(reason);
+            if !reasons.contains(&label) {
+                reasons.push(label);
+            }
+        }
+
+        if reasons.is_empty() {
+            lines.push(step.package.clone());
+        } else {
+            lines.push(format!("{} ({})", step.package, reasons.join(", ")));
+        }
+    }
+    lines
+}
+
+fn warn_source_build_plan(plan: &planner::ExecutionPlan) {
+    let lines = source_build_warning_messages(plan);
+    if lines.is_empty() {
+        return;
+    }
+
+    ui::warn(format!(
+        "{} package(s) will be built from source before installation.",
+        lines.len()
+    ));
+    for line in lines {
+        ui::warn(format!("  {line}"));
+    }
+}
+
+fn validate_source_build_prereqs_for_plan(
+    plan: &planner::ExecutionPlan,
+    rootfs: &Path,
+    config: &config::Config,
+) -> Result<()> {
+    let db_path = config.installed_db_path(rootfs);
+    let mut checked_development_package = false;
+
+    for step in plan.actionable_steps() {
+        let planner::PlanOrigin::Source { path, .. } = &step.origin else {
+            continue;
+        };
+        if !matches!(step.action, planner::PlanAction::BuildAndInstall) {
+            continue;
+        }
+
+        let mut spec = package::PackageSpec::from_file(path)
+            .with_context(|| format!("Failed to parse spec {}", path.display()))?;
+        spec.apply_config(config);
+        source::preflight_local_manual_sources(&spec)?;
+        if !checked_development_package && !spec.is_metapackage() {
+            ensure_requested_development_package_installed(&db_path)?;
+            checked_development_package = true;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1532,14 +1605,14 @@ fn execute_install_plan_with_child_commands(
         record: db::repo::BinaryRepoPackageRecord,
     }
 
-    let summary = plan.summary();
     let actionable_steps: Vec<_> = plan.actionable_steps().collect();
     if actionable_steps.is_empty() {
         ui::info("Nothing to do.");
         return Ok(());
     }
 
-    warn_source_build_installs(summary.source_build_installs);
+    validate_source_build_prereqs_for_plan(plan, rootfs, config)?;
+    warn_source_build_plan(plan);
     let planned_packages = actionable_plan_packages(plan);
     if options.confirm_installation
         && !ui::prompt_package_action("installation", &planned_packages, true)?
@@ -2083,6 +2156,14 @@ fn run_direct_install_request(
     }
 
     let requested_outputs = requested_outputs(&pkg_spec, lib32_only);
+    let db_path = config.installed_db_path(options.rootfs);
+
+    if staging_dir.is_none() {
+        source::preflight_local_manual_sources(&pkg_spec)?;
+        if !pkg_spec.is_metapackage() {
+            ensure_requested_development_package_installed(&db_path)?;
+        }
+    }
 
     let mut conflict_subjects = install_conflict_subjects_for_spec(
         &pkg_spec,
@@ -2122,11 +2203,6 @@ fn run_direct_install_request(
             config.db_dir.display()
         )
     })?;
-    let db_path = config.installed_db_path(options.rootfs);
-
-    if staging_dir.is_none() {
-        source::preflight_manual_sources(&pkg_spec, &config.cache_dir)?;
-    }
 
     if staging_dir.is_none() {
         if options.no_deps
@@ -2190,7 +2266,7 @@ fn run_direct_install_request(
                 },
             )?;
             let dep_plan_packages = actionable_plan_packages(&dep_plan);
-            warn_source_build_installs(dep_plan.summary().source_build_installs);
+            warn_source_build_plan(&dep_plan);
             let dep_prompt_packages = if dep_plan_packages.is_empty() {
                 missing_required.clone()
             } else {
@@ -2293,7 +2369,7 @@ fn run_direct_install_request(
                         },
                     )?;
                     let dep_plan_packages = actionable_plan_packages(&dep_plan);
-                    warn_source_build_installs(dep_plan.summary().source_build_installs);
+                    warn_source_build_plan(&dep_plan);
                     let dep_prompt_packages = if dep_plan_packages.is_empty() {
                         missing_test.clone()
                     } else {
@@ -2362,6 +2438,7 @@ fn run_direct_install_request(
         dir.path().to_path_buf()
     } else {
         // 1-2. Fetch + extract sources (supports archives and git URL#rev)
+        source::preflight_manual_sources(&pkg_spec, &config.cache_dir)?;
         let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
         built_src_dir = Some(src_dir.clone());
         let host_build_dir = builder::ensure_host_build(

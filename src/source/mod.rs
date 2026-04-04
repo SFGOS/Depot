@@ -62,10 +62,41 @@ fn manual_url_entries(manual: &crate::package::ManualSource) -> Vec<String> {
 /// Remote entries are fetched into the manual-source cache so build-time source
 /// preparation can reuse the verified result later. Git manual sources prime
 /// their mirror cache and validate revision reachability.
+pub fn preflight_local_manual_sources(spec: &PackageSpec) -> Result<()> {
+    if spec.manual_sources.is_empty() {
+        return Ok(());
+    }
+
+    for manual in &spec.manual_sources {
+        let local_entries = manual_local_entries(manual);
+        for raw_file in local_entries {
+            let file = expand_manual_source_value(spec, &raw_file);
+            let src_path = spec.spec_dir.join(&file);
+            if !src_path.exists() {
+                bail!(
+                    "Manual source not found: {} (expected at {})",
+                    file,
+                    src_path.display()
+                );
+            }
+
+            if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip")
+                && !verify_file_hash(&src_path, expected_hash)?
+            {
+                bail!("Checksum mismatch for {}: expected {}", file, expected_hash);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn preflight_manual_sources(spec: &PackageSpec, cache_dir: &Path) -> Result<()> {
     if spec.manual_sources.is_empty() {
         return Ok(());
     }
+
+    preflight_local_manual_sources(spec)?;
 
     let manual_entry_count: usize = spec
         .manual_sources
@@ -79,23 +110,6 @@ pub fn preflight_manual_sources(spec: &PackageSpec, cache_dir: &Path) -> Result<
         let url_entries = manual_url_entries(manual);
 
         if !local_entries.is_empty() {
-            for raw_file in local_entries {
-                let file = expand_manual_source_value(spec, &raw_file);
-                let src_path = spec.spec_dir.join(&file);
-                if !src_path.exists() {
-                    bail!(
-                        "Manual source not found: {} (expected at {})",
-                        file,
-                        src_path.display()
-                    );
-                }
-
-                if let Some(expected_hash) = manual.sha256.as_ref().filter(|h| *h != "skip")
-                    && !verify_file_hash(&src_path, expected_hash)?
-                {
-                    bail!("Checksum mismatch for {}: expected {}", file, expected_hash);
-                }
-            }
             continue;
         }
 

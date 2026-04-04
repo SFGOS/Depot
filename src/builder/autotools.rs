@@ -134,7 +134,9 @@ pub fn build(
             let expanded = expand_configure_arg(spec, arg, &env_vars);
             configure_cmd.arg(expanded);
         }
-        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Autotools)? {
+        for arg in
+            crate::builder::static_build_args_for(crate::package::BuildType::Autotools, flags)?
+        {
             add_auto_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &arg);
         }
 
@@ -444,7 +446,9 @@ pub(crate) fn ensure_host_build(
             let expanded = expand_configure_arg(&host_spec, arg, &env_vars);
             configure_cmd.arg(expanded);
         }
-        for arg in crate::builder::static_build_args_for(crate::package::BuildType::Autotools)? {
+        for arg in
+            crate::builder::static_build_args_for(crate::package::BuildType::Autotools, flags)?
+        {
             add_auto_configure_arg_if_supported(&mut configure_cmd, help_text.as_deref(), &arg);
         }
 
