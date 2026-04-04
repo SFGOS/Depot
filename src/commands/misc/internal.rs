@@ -346,9 +346,13 @@ mod tests {
             args: vec!["--component".into(), "runtime".into()],
         })?;
 
-        let fakeroot_output = fs::read_to_string(&fakeroot_log)?;
-        assert!(fakeroot_output.contains("--"));
-        assert!(fakeroot_output.contains("cmake"));
+        if !crate::fakeroot::is_root() {
+            let fakeroot_output = fs::read_to_string(&fakeroot_log)?;
+            assert!(fakeroot_output.contains("--"));
+            assert!(fakeroot_output.contains("cmake"));
+        } else {
+            assert!(!fakeroot_log.exists());
+        }
 
         let cmake_output = fs::read_to_string(&cmake_log)?;
         assert!(cmake_output.contains(&format!("DESTDIR={}", destdir.display())));

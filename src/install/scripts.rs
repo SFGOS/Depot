@@ -3,6 +3,7 @@
 use crate::fakeroot;
 use crate::package::PackageSpec;
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Component, Path, PathBuf};
@@ -12,6 +13,7 @@ use walkdir::WalkDir;
 
 const STAGED_SCRIPTS_DIR: &str = "scripts";
 const DEFERRED_HOOKS_FILE_REL: &str = "var/lib/depot/deferred-hooks.tsv";
+const BOOTSTRAP_BIN_DIR_REL: &str = "var/lib/depot/bootstrap/bin";
 const ALL_HOOKS: [Hook; 6] = [
     Hook::PreInstall,
     Hook::PostInstall,
@@ -371,7 +373,18 @@ fn should_bootstrap_host_shell(should_chroot: bool, is_root: bool, shell_exists:
     should_chroot && is_root && !shell_exists
 }
 
-fn mount_chroot_filesystems(rootfs: &Path, bootstrap_host_shell: bool) -> Result<ChrootMountGuard> {
+fn bootstrap_hook_path_env() -> String {
+    format!(
+        "/{}:{}",
+        BOOTSTRAP_BIN_DIR_REL,
+        crate::runtime_env::safe_script_path()
+    )
+}
+
+fn mount_chroot_filesystems(
+    rootfs: &Path,
+    bootstrap_script_path: Option<&Path>,
+) -> Result<ChrootMountGuard> {
     let proc_dir = rootfs.join("proc");
     let dev_dir = rootfs.join("dev");
     let dev_pts_dir = dev_dir.join("pts");
@@ -418,8 +431,8 @@ fn mount_chroot_filesystems(rootfs: &Path, bootstrap_host_shell: bool) -> Result
         )?;
     }
 
-    if bootstrap_host_shell {
-        bind_host_shell_into_chroot(&mut guard, rootfs)?;
+    if let Some(script_path) = bootstrap_script_path {
+        bind_host_shell_into_chroot(&mut guard, rootfs, script_path)?;
     }
 
     maybe_bind_host_file_into_chroot(&mut guard, rootfs, Path::new("/etc/resolv.conf"))?;
@@ -492,12 +505,28 @@ fn prepare_host_file_bind_target(rootfs: &Path, target_rel: &Path) -> Result<Pat
     Ok(target)
 }
 
-fn bind_host_shell_into_chroot(guard: &mut ChrootMountGuard, rootfs: &Path) -> Result<()> {
+fn bind_host_shell_into_chroot(
+    guard: &mut ChrootMountGuard,
+    rootfs: &Path,
+    script_path: &Path,
+) -> Result<()> {
     let shell_path =
         fs::canonicalize("/bin/sh").context("Failed to resolve host /bin/sh for hook bootstrap")?;
     bind_host_file_into_chroot_at_required(guard, rootfs, &shell_path, Path::new("bin/sh"))?;
 
-    for dependency in collect_host_shell_dependencies(&shell_path)? {
+    let mut dependency_paths = BTreeSet::new();
+    for dependency in collect_host_binary_dependencies(&shell_path)? {
+        dependency_paths.insert(dependency);
+    }
+
+    for tool in collect_bootstrap_tool_bindings(script_path)? {
+        bind_host_file_into_chroot_at_required(guard, rootfs, &tool.host_path, &tool.target_rel)?;
+        for dependency in collect_host_binary_dependencies(&tool.host_path)? {
+            dependency_paths.insert(dependency);
+        }
+    }
+
+    for dependency in dependency_paths {
         let target_rel = dependency
             .strip_prefix(Path::new("/"))
             .with_context(|| format!("Expected absolute host path: {}", dependency.display()))?;
@@ -507,23 +536,31 @@ fn bind_host_shell_into_chroot(guard: &mut ChrootMountGuard, rootfs: &Path) -> R
     Ok(())
 }
 
-fn collect_host_shell_dependencies(shell_path: &Path) -> Result<Vec<PathBuf>> {
+fn collect_host_binary_dependencies(binary_path: &Path) -> Result<Vec<PathBuf>> {
     let output = Command::new("ldd")
-        .arg(shell_path)
+        .arg(binary_path)
         .output()
         .with_context(|| {
             format!(
                 "Failed to inspect shared-library dependencies for {}",
-                shell_path.display()
+                binary_path.display()
             )
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("ldd failed for {}: {}", shell_path.display(), stderr.trim());
+        bail!(
+            "ldd failed for {}: {}",
+            binary_path.display(),
+            stderr.trim()
+        );
     }
 
-    let stdout = String::from_utf8(output.stdout)
-        .with_context(|| format!("ldd returned non-UTF-8 output for {}", shell_path.display()))?;
+    let stdout = String::from_utf8(output.stdout).with_context(|| {
+        format!(
+            "ldd returned non-UTF-8 output for {}",
+            binary_path.display()
+        )
+    })?;
     parse_ldd_dependency_paths(&stdout)
 }
 
@@ -560,6 +597,273 @@ fn parse_ldd_dependency_paths(output: &str) -> Result<Vec<PathBuf>> {
     Ok(deps)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BootstrapToolBinding {
+    host_path: PathBuf,
+    target_rel: PathBuf,
+}
+
+fn collect_bootstrap_tool_bindings(script_path: &Path) -> Result<Vec<BootstrapToolBinding>> {
+    let script = fs::read_to_string(script_path).with_context(|| {
+        format!(
+            "Failed to read lifecycle hook for bootstrap tool detection: {}",
+            script_path.display()
+        )
+    })?;
+
+    let mut bindings = BTreeSet::new();
+    for command in parse_hook_command_candidates(&script) {
+        if is_shell_builtin(&command) {
+            continue;
+        }
+
+        if command.starts_with('/') {
+            let host_path = fs::canonicalize(&command).with_context(|| {
+                format!(
+                    "Failed to resolve hook command path for bootstrap: {}",
+                    command
+                )
+            })?;
+            let target_rel = Path::new(&command)
+                .strip_prefix(Path::new("/"))
+                .with_context(|| format!("Expected absolute hook command path: {}", command))?
+                .to_path_buf();
+            bindings.insert(BootstrapToolBinding {
+                host_path,
+                target_rel,
+            });
+            continue;
+        }
+
+        if let Some(host_path) = resolve_host_tool_path(&command)? {
+            bindings.insert(BootstrapToolBinding {
+                host_path,
+                target_rel: Path::new(BOOTSTRAP_BIN_DIR_REL).join(&command),
+            });
+        }
+    }
+
+    Ok(bindings.into_iter().collect())
+}
+
+fn parse_hook_command_candidates(script: &str) -> Vec<String> {
+    let mut commands = BTreeSet::new();
+
+    for line in script.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let tokens = tokenize_hook_script_line(trimmed);
+        let mut expect_command = true;
+        for token in tokens {
+            if token.is_empty() {
+                continue;
+            }
+
+            if matches!(token.as_str(), "&&" | "||" | ";" | "|") {
+                expect_command = true;
+                continue;
+            }
+
+            if !expect_command {
+                continue;
+            }
+
+            if looks_like_env_assignment(&token) {
+                continue;
+            }
+
+            if is_shell_reserved_word(&token) {
+                continue;
+            }
+
+            if is_shell_builtin(&token) {
+                expect_command = false;
+                continue;
+            }
+
+            commands.insert(token);
+            expect_command = false;
+        }
+    }
+
+    commands.into_iter().collect()
+}
+
+fn tokenize_hook_script_line(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        if let Some(active_quote) = quote {
+            current.push(ch);
+            if ch == active_quote {
+                quote = None;
+            } else if ch == '\\'
+                && active_quote == '"'
+                && let Some(next) = chars.next()
+            {
+                current.push(next);
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                current.push(ch);
+                quote = Some(ch);
+            }
+            '\\' => {
+                current.push(ch);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            '#' => break,
+            '&' | '|' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                if chars.peek() == Some(&ch) {
+                    let _ = chars.next();
+                    tokens.push(format!("{ch}{ch}"));
+                } else {
+                    tokens.push(ch.to_string());
+                }
+            }
+            ';' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(ch.to_string());
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn is_shell_reserved_word(token: &str) -> bool {
+    matches!(
+        token,
+        "!" | "{"
+            | "}"
+            | "("
+            | ")"
+            | "then"
+            | "do"
+            | "done"
+            | "else"
+            | "elif"
+            | "fi"
+            | "if"
+            | "case"
+            | "esac"
+            | "for"
+            | "in"
+            | "while"
+            | "until"
+            | "function"
+            | "select"
+    )
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    let Some((key, _value)) = token.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && !key.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+}
+
+fn is_shell_builtin(token: &str) -> bool {
+    matches!(
+        token,
+        "." | ":"
+            | "["
+            | "alias"
+            | "bg"
+            | "break"
+            | "cd"
+            | "command"
+            | "continue"
+            | "echo"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "export"
+            | "false"
+            | "fg"
+            | "getopts"
+            | "hash"
+            | "jobs"
+            | "printf"
+            | "pwd"
+            | "read"
+            | "readonly"
+            | "return"
+            | "set"
+            | "shift"
+            | "test"
+            | "times"
+            | "trap"
+            | "true"
+            | "type"
+            | "ulimit"
+            | "umask"
+            | "unalias"
+            | "unset"
+            | "wait"
+    )
+}
+
+fn resolve_host_tool_path(command: &str) -> Result<Option<PathBuf>> {
+    for dir in crate::runtime_env::safe_script_path().split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join(command);
+        if !candidate.is_file() {
+            continue;
+        }
+        let metadata = candidate.metadata().with_context(|| {
+            format!(
+                "Failed to inspect host tool candidate {}",
+                candidate.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        return Ok(Some(fs::canonicalize(&candidate).with_context(|| {
+            format!("Failed to resolve host tool path {}", candidate.display())
+        })?));
+    }
+
+    Ok(None)
+}
+
 fn run_script_with_rootfs_context(
     script_path: &Path,
     rootfs: &Path,
@@ -582,7 +886,14 @@ fn run_script_with_rootfs_context(
         }
 
         let run_result = if let Ok(rel) = script_path.strip_prefix(rootfs) {
-            run_hook_script_in_chroot(rootfs, rel, pkg_name, hook, false, bootstrap_host_shell)
+            run_hook_script_in_chroot(
+                rootfs,
+                rel,
+                pkg_name,
+                hook,
+                false,
+                bootstrap_host_shell.then_some(script_path),
+            )
         } else {
             run_hook_script_contents_in_chroot(
                 rootfs,
@@ -590,7 +901,7 @@ fn run_script_with_rootfs_context(
                 pkg_name,
                 hook,
                 false,
-                bootstrap_host_shell,
+                bootstrap_host_shell.then_some(script_path),
             )
         };
 
@@ -657,10 +968,15 @@ fn run_hook_script_in_chroot(
     pkg_name: &str,
     hook: Hook,
     quiet: bool,
-    bootstrap_host_shell: bool,
+    bootstrap_script_path: Option<&Path>,
 ) -> Result<std::process::ExitStatus> {
-    let _mounts = mount_chroot_filesystems(rootfs, bootstrap_host_shell)?;
+    let _mounts = mount_chroot_filesystems(rootfs, bootstrap_script_path)?;
     let rel_script = format!("./{}", rel_script.to_string_lossy());
+    let path_env = if bootstrap_script_path.is_some() {
+        bootstrap_hook_path_env()
+    } else {
+        crate::runtime_env::safe_script_path().to_string()
+    };
     let mut cmd = Command::new("chroot");
     cmd.arg(rootfs)
         .arg("/bin/sh")
@@ -672,7 +988,7 @@ fn run_hook_script_in_chroot(
         .env("DEPOT_ROOTFS", "/")
         .env("DEPOT_ACTION", hook.action())
         .env("DEPOT_PHASE", hook.phase())
-        .env("PATH", crate::runtime_env::safe_script_path());
+        .env("PATH", &path_env);
     if quiet {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
@@ -691,9 +1007,14 @@ fn run_hook_script_contents_in_chroot(
     pkg_name: &str,
     hook: Hook,
     quiet: bool,
-    bootstrap_host_shell: bool,
+    bootstrap_script_path: Option<&Path>,
 ) -> Result<std::process::ExitStatus> {
-    let _mounts = mount_chroot_filesystems(rootfs, bootstrap_host_shell)?;
+    let _mounts = mount_chroot_filesystems(rootfs, bootstrap_script_path)?;
+    let path_env = if bootstrap_script_path.is_some() {
+        bootstrap_hook_path_env()
+    } else {
+        crate::runtime_env::safe_script_path().to_string()
+    };
     let mut cmd = Command::new("chroot");
     cmd.arg(rootfs)
         .arg("/bin/sh")
@@ -702,7 +1023,7 @@ fn run_hook_script_contents_in_chroot(
         .env("DEPOT_ROOTFS", "/")
         .env("DEPOT_ACTION", hook.action())
         .env("DEPOT_PHASE", hook.phase())
-        .env("PATH", crate::runtime_env::safe_script_path())
+        .env("PATH", &path_env)
         .stdin(Stdio::piped());
     if quiet {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
@@ -875,7 +1196,7 @@ pub fn run_deferred_hooks_if_possible(rootfs: &Path) -> Result<()> {
             &item.pkg_name,
             item.hook,
             true,
-            false,
+            None,
         ) {
             Ok(status) if status.success() => {}
             Ok(status) => {
@@ -1478,6 +1799,23 @@ mod tests {
             err.to_string()
                 .contains("Missing shared-library dependency")
         );
+    }
+
+    #[test]
+    fn parse_hook_command_candidates_finds_commands_after_assignments_and_operators() {
+        let commands = parse_hook_command_candidates(
+            "PATH=/tmp:$PATH grep -q foo etc/shells || echo foo >> etc/shells\ncat \"$DEPOT_ROOTFS/usr/bin/find\" | sed 's/x/y/'\n",
+        );
+        assert_eq!(
+            commands,
+            vec!["cat".to_string(), "grep".to_string(), "sed".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_hook_command_candidates_ignores_builtins_and_control_words() {
+        let commands = parse_hook_command_candidates("if true; then export FOO=bar; echo hi; fi\n");
+        assert!(commands.is_empty());
     }
 
     #[test]
