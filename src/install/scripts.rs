@@ -13,7 +13,6 @@ use walkdir::WalkDir;
 
 const STAGED_SCRIPTS_DIR: &str = "scripts";
 const DEFERRED_HOOKS_FILE_REL: &str = "var/lib/depot/deferred-hooks.tsv";
-const BOOTSTRAP_BIN_DIR_REL: &str = "var/lib/depot/bootstrap/bin";
 const ALL_HOOKS: [Hook; 6] = [
     Hook::PreInstall,
     Hook::PostInstall,
@@ -373,14 +372,6 @@ fn should_bootstrap_host_shell(should_chroot: bool, is_root: bool, shell_exists:
     should_chroot && is_root && !shell_exists
 }
 
-fn bootstrap_hook_path_env() -> String {
-    format!(
-        "/{}:{}",
-        BOOTSTRAP_BIN_DIR_REL,
-        crate::runtime_env::safe_script_path()
-    )
-}
-
 fn mount_chroot_filesystems(
     rootfs: &Path,
     bootstrap_script_path: Option<&Path>,
@@ -636,9 +627,15 @@ fn collect_bootstrap_tool_bindings(script_path: &Path) -> Result<Vec<BootstrapTo
         }
 
         if let Some(host_path) = resolve_host_tool_path(&command)? {
+            let target_rel = host_path
+                .strip_prefix(Path::new("/"))
+                .with_context(|| {
+                    format!("Expected absolute host tool path: {}", host_path.display())
+                })?
+                .to_path_buf();
             bindings.insert(BootstrapToolBinding {
                 host_path,
-                target_rel: Path::new(BOOTSTRAP_BIN_DIR_REL).join(&command),
+                target_rel,
             });
         }
     }
@@ -972,11 +969,6 @@ fn run_hook_script_in_chroot(
 ) -> Result<std::process::ExitStatus> {
     let _mounts = mount_chroot_filesystems(rootfs, bootstrap_script_path)?;
     let rel_script = format!("./{}", rel_script.to_string_lossy());
-    let path_env = if bootstrap_script_path.is_some() {
-        bootstrap_hook_path_env()
-    } else {
-        crate::runtime_env::safe_script_path().to_string()
-    };
     let mut cmd = Command::new("chroot");
     cmd.arg(rootfs)
         .arg("/bin/sh")
@@ -988,7 +980,7 @@ fn run_hook_script_in_chroot(
         .env("DEPOT_ROOTFS", "/")
         .env("DEPOT_ACTION", hook.action())
         .env("DEPOT_PHASE", hook.phase())
-        .env("PATH", &path_env);
+        .env("PATH", crate::runtime_env::safe_script_path());
     if quiet {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
@@ -1010,11 +1002,6 @@ fn run_hook_script_contents_in_chroot(
     bootstrap_script_path: Option<&Path>,
 ) -> Result<std::process::ExitStatus> {
     let _mounts = mount_chroot_filesystems(rootfs, bootstrap_script_path)?;
-    let path_env = if bootstrap_script_path.is_some() {
-        bootstrap_hook_path_env()
-    } else {
-        crate::runtime_env::safe_script_path().to_string()
-    };
     let mut cmd = Command::new("chroot");
     cmd.arg(rootfs)
         .arg("/bin/sh")
@@ -1023,7 +1010,7 @@ fn run_hook_script_contents_in_chroot(
         .env("DEPOT_ROOTFS", "/")
         .env("DEPOT_ACTION", hook.action())
         .env("DEPOT_PHASE", hook.phase())
-        .env("PATH", &path_env)
+        .env("PATH", crate::runtime_env::safe_script_path())
         .stdin(Stdio::piped());
     if quiet {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
