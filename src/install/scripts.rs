@@ -367,7 +367,11 @@ fn should_use_chroot(rootfs: &Path) -> bool {
     }
 }
 
-fn mount_chroot_filesystems(rootfs: &Path) -> Result<ChrootMountGuard> {
+fn should_bootstrap_host_shell(should_chroot: bool, is_root: bool, shell_exists: bool) -> bool {
+    should_chroot && is_root && !shell_exists
+}
+
+fn mount_chroot_filesystems(rootfs: &Path, bootstrap_host_shell: bool) -> Result<ChrootMountGuard> {
     let proc_dir = rootfs.join("proc");
     let dev_dir = rootfs.join("dev");
     let dev_pts_dir = dev_dir.join("pts");
@@ -414,6 +418,10 @@ fn mount_chroot_filesystems(rootfs: &Path) -> Result<ChrootMountGuard> {
         )?;
     }
 
+    if bootstrap_host_shell {
+        bind_host_shell_into_chroot(&mut guard, rootfs)?;
+    }
+
     maybe_bind_host_file_into_chroot(&mut guard, rootfs, Path::new("/etc/resolv.conf"))?;
     Ok(guard)
 }
@@ -423,14 +431,54 @@ fn maybe_bind_host_file_into_chroot(
     rootfs: &Path,
     host_path: &Path,
 ) -> Result<()> {
-    if !host_path.exists() {
-        return Ok(());
-    }
-
     let rel = host_path
         .strip_prefix(Path::new("/"))
         .with_context(|| format!("Expected absolute host path: {}", host_path.display()))?;
-    let target = rootfs.join(rel);
+    bind_host_file_into_chroot_at(guard, rootfs, host_path, rel)
+}
+
+fn bind_host_file_into_chroot_at(
+    guard: &mut ChrootMountGuard,
+    rootfs: &Path,
+    host_path: &Path,
+    target_rel: &Path,
+) -> Result<()> {
+    if !host_path.exists() {
+        return Ok(());
+    }
+    prepare_host_file_bind_target(rootfs, target_rel).map(|target| {
+        if let Err(err) = guard.mount_path(host_path, &target, None, MountFlags::BIND, None) {
+            crate::log_warn!(
+                "Failed to bind-mount {} into chroot at {}: {}",
+                host_path.display(),
+                target.display(),
+                err
+            );
+        }
+    })
+}
+
+fn bind_host_file_into_chroot_at_required(
+    guard: &mut ChrootMountGuard,
+    rootfs: &Path,
+    host_path: &Path,
+    target_rel: &Path,
+) -> Result<()> {
+    let target = prepare_host_file_bind_target(rootfs, target_rel)?;
+    guard
+        .mount_path(host_path, &target, None, MountFlags::BIND, None)
+        .with_context(|| {
+            format!(
+                "Failed to bind-mount {} into chroot at {}",
+                host_path.display(),
+                target.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn prepare_host_file_bind_target(rootfs: &Path, target_rel: &Path) -> Result<PathBuf> {
+    let target = rootfs.join(target_rel);
 
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
@@ -441,15 +489,75 @@ fn maybe_bind_host_file_into_chroot(
             .with_context(|| format!("Failed to create {}", target.display()))?;
     }
 
-    if let Err(err) = guard.mount_path(host_path, &target, None, MountFlags::BIND, None) {
-        crate::log_warn!(
-            "Failed to bind-mount {} into chroot at {}: {}",
-            host_path.display(),
-            target.display(),
-            err
-        );
+    Ok(target)
+}
+
+fn bind_host_shell_into_chroot(guard: &mut ChrootMountGuard, rootfs: &Path) -> Result<()> {
+    let shell_path =
+        fs::canonicalize("/bin/sh").context("Failed to resolve host /bin/sh for hook bootstrap")?;
+    bind_host_file_into_chroot_at_required(guard, rootfs, &shell_path, Path::new("bin/sh"))?;
+
+    for dependency in collect_host_shell_dependencies(&shell_path)? {
+        let target_rel = dependency
+            .strip_prefix(Path::new("/"))
+            .with_context(|| format!("Expected absolute host path: {}", dependency.display()))?;
+        bind_host_file_into_chroot_at_required(guard, rootfs, &dependency, target_rel)?;
     }
+
     Ok(())
+}
+
+fn collect_host_shell_dependencies(shell_path: &Path) -> Result<Vec<PathBuf>> {
+    let output = Command::new("ldd")
+        .arg(shell_path)
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to inspect shared-library dependencies for {}",
+                shell_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("ldd failed for {}: {}", shell_path.display(), stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("ldd returned non-UTF-8 output for {}", shell_path.display()))?;
+    parse_ldd_dependency_paths(&stdout)
+}
+
+fn parse_ldd_dependency_paths(output: &str) -> Result<Vec<PathBuf>> {
+    let mut deps = Vec::new();
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line == "statically linked" {
+            continue;
+        }
+
+        let candidate = if let Some((_, rest)) = line.split_once("=>") {
+            let token = rest.split_whitespace().next().unwrap_or_default();
+            if token == "not" {
+                bail!(
+                    "Missing shared-library dependency reported by ldd: {}",
+                    line
+                );
+            }
+            token
+        } else {
+            line.split_whitespace().next().unwrap_or_default()
+        };
+
+        if candidate.starts_with('/') {
+            let path = PathBuf::from(candidate);
+            if !deps.iter().any(|existing| existing == &path) {
+                deps.push(path);
+            }
+        }
+    }
+
+    Ok(deps)
 }
 
 fn run_script_with_rootfs_context(
@@ -459,35 +567,55 @@ fn run_script_with_rootfs_context(
     hook: Hook,
     allow_defer: bool,
 ) -> Result<HookRunOutcome> {
-    if should_use_chroot(rootfs) && fakeroot::is_root() {
-        if rootfs.join("bin/sh").exists() {
-            let status = if let Ok(rel) = script_path.strip_prefix(rootfs) {
-                run_hook_script_in_chroot(rootfs, rel, pkg_name, hook, false)?
-            } else {
-                run_hook_script_contents_in_chroot(rootfs, script_path, pkg_name, hook, false)?
-            };
-            return Ok(HookRunOutcome::Ran(status));
+    let should_chroot = should_use_chroot(rootfs);
+    let is_root = fakeroot::is_root();
+    let shell_exists = rootfs.join("bin/sh").exists();
+    let bootstrap_host_shell = should_bootstrap_host_shell(should_chroot, is_root, shell_exists);
+
+    if should_chroot && is_root {
+        if bootstrap_host_shell {
+            crate::log_info!(
+                "Temporarily binding host /bin/sh into {} for lifecycle hook {}",
+                rootfs.display(),
+                hook.canonical_name()
+            );
         }
 
-        if allow_defer {
-            let rel = script_path.strip_prefix(rootfs).with_context(|| {
-                format!(
-                    "Cannot defer lifecycle hook {} for {} because {} is outside {}",
+        let run_result = if let Ok(rel) = script_path.strip_prefix(rootfs) {
+            run_hook_script_in_chroot(rootfs, rel, pkg_name, hook, false, bootstrap_host_shell)
+        } else {
+            run_hook_script_contents_in_chroot(
+                rootfs,
+                script_path,
+                pkg_name,
+                hook,
+                false,
+                bootstrap_host_shell,
+            )
+        };
+
+        match run_result {
+            Ok(status) => return Ok(HookRunOutcome::Ran(status)),
+            Err(err) if allow_defer && bootstrap_host_shell => {
+                let rel = script_path.strip_prefix(rootfs).with_context(|| {
+                    format!(
+                        "Cannot defer lifecycle hook {} for {} because {} is outside {}",
+                        hook.canonical_name(),
+                        pkg_name,
+                        script_path.display(),
+                        rootfs.display()
+                    )
+                })?;
+                crate::log_warn!(
+                    "Deferring lifecycle hook {} for {} because host shell bootstrap failed: {}",
                     hook.canonical_name(),
                     pkg_name,
-                    script_path.display(),
-                    rootfs.display()
-                )
-            })?;
-            return Ok(HookRunOutcome::Deferred(rel.to_path_buf()));
+                    err
+                );
+                return Ok(HookRunOutcome::Deferred(rel.to_path_buf()));
+            }
+            Err(err) => return Err(err),
         }
-
-        anyhow::bail!(
-            "Lifecycle hook {} for {} requires {}/bin/sh before it can run",
-            hook.canonical_name(),
-            pkg_name,
-            rootfs.display()
-        );
     }
 
     // Live-root installs can execute directly with the host shell.
@@ -529,8 +657,9 @@ fn run_hook_script_in_chroot(
     pkg_name: &str,
     hook: Hook,
     quiet: bool,
+    bootstrap_host_shell: bool,
 ) -> Result<std::process::ExitStatus> {
-    let _mounts = mount_chroot_filesystems(rootfs)?;
+    let _mounts = mount_chroot_filesystems(rootfs, bootstrap_host_shell)?;
     let rel_script = format!("./{}", rel_script.to_string_lossy());
     let mut cmd = Command::new("chroot");
     cmd.arg(rootfs)
@@ -562,8 +691,9 @@ fn run_hook_script_contents_in_chroot(
     pkg_name: &str,
     hook: Hook,
     quiet: bool,
+    bootstrap_host_shell: bool,
 ) -> Result<std::process::ExitStatus> {
-    let _mounts = mount_chroot_filesystems(rootfs)?;
+    let _mounts = mount_chroot_filesystems(rootfs, bootstrap_host_shell)?;
     let mut cmd = Command::new("chroot");
     cmd.arg(rootfs)
         .arg("/bin/sh")
@@ -739,7 +869,14 @@ pub fn run_deferred_hooks_if_possible(rootfs: &Path) -> Result<()> {
             continue;
         }
 
-        match run_hook_script_in_chroot(rootfs, &item.script_rel, &item.pkg_name, item.hook, true) {
+        match run_hook_script_in_chroot(
+            rootfs,
+            &item.script_rel,
+            &item.pkg_name,
+            item.hook,
+            true,
+            false,
+        ) {
             Ok(status) if status.success() => {}
             Ok(status) => {
                 crate::log_info!(
@@ -1307,6 +1444,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(rootfs_abs.join("hook.out")).unwrap(),
             "ok\n"
+        );
+    }
+
+    #[test]
+    fn should_bootstrap_host_shell_only_for_chrooted_root_installs_without_shell() {
+        assert!(should_bootstrap_host_shell(true, true, false));
+        assert!(!should_bootstrap_host_shell(true, true, true));
+        assert!(!should_bootstrap_host_shell(true, false, false));
+        assert!(!should_bootstrap_host_shell(false, true, false));
+    }
+
+    #[test]
+    fn parse_ldd_dependency_paths_extracts_absolute_paths() {
+        let parsed = parse_ldd_dependency_paths(
+            "linux-vdso.so.1 (0x0000)\nlibc.so.6 => /lib/libc.so.6 (0x0000)\n/lib64/ld-linux-x86-64.so.2 (0x0000)\nlibc.so.6 => /lib/libc.so.6 (0x0001)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                PathBuf::from("/lib/libc.so.6"),
+                PathBuf::from("/lib64/ld-linux-x86-64.so.2")
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ldd_dependency_paths_rejects_missing_dependencies() {
+        let err = parse_ldd_dependency_paths("libedit.so.0 => not found\n")
+            .expect_err("expected ldd parse to fail when a dependency is missing");
+        assert!(
+            err.to_string()
+                .contains("Missing shared-library dependency")
         );
     }
 
