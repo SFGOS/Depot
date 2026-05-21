@@ -54,14 +54,12 @@ pub fn build(
     crate::builder::apply_build_helper_context_env(&mut env_vars, spec)?;
     crate::builder::apply_build_helper_dirs_env(&mut env_vars, Some(src_dir), Some(&build_dir));
 
-    // For custom builds, look for a build.sh script in the source directory
+    // For custom builds, the spec's build.sh is authoritative when present.
+    // Upstream source archives sometimes ship unrelated helper scripts with the
+    // same name, and the package spec needs to override them deterministically.
     let build_script = src_dir.join("build.sh");
-
-    // If the extracted source doesn't include build.sh but the spec directory does,
-    // copy it into the source dir (this makes `depot install <local-spec>` behave
-    // like the spec's build.sh being part of the package when appropriate).
     let spec_build = spec.spec_dir.join("build.sh");
-    if !build_script.exists() && spec_build.exists() {
+    if spec_build.exists() {
         fs::create_dir_all(src_dir)?;
         fs::copy(&spec_build, &build_script).with_context(|| {
             format!(
@@ -474,6 +472,47 @@ mod tests {
         build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None)?;
         // If we reached here, build() succeeded and build.sh was copied into src
         assert!(tmp_src.path().join("build.sh").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_prefers_spec_build_sh_over_source_build_sh() -> Result<()> {
+        let tmp_src = tempdir()?;
+        let tmp_dest = tempdir()?;
+        let spec_dir = tempdir()?;
+
+        let source_build_sh = tmp_src.path().join("build.sh");
+        std::fs::write(&source_build_sh, "#!/bin/sh\nexit 77\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&source_build_sh)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&source_build_sh, perms)?;
+        }
+
+        let spec_build_sh = spec_dir.path().join("build.sh");
+        std::fs::write(
+            &spec_build_sh,
+            "#!/bin/sh\nprintf 'from spec\\n' > \"$DESTDIR/spec-won\"\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&spec_build_sh)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&spec_build_sh, perms)?;
+        }
+
+        let mut spec = mk_spec("custom-prefer-spec", "1.0");
+        spec.spec_dir = spec_dir.path().to_path_buf();
+
+        build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None)?;
+
+        assert_eq!(
+            std::fs::read_to_string(tmp_dest.path().join("spec-won"))?,
+            "from spec\n"
+        );
         Ok(())
     }
 

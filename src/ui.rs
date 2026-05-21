@@ -50,6 +50,16 @@ pub fn success(message: impl AsRef<str>) {
     println!("{} {}", label(Stream::Stdout, "OK", "32"), message.as_ref());
 }
 
+pub fn merge_package(layer: &str, package: &str) {
+    println!(
+        "{} {} {} into layer {}",
+        paint(Stream::Stdout, ">>>", "32;1"),
+        paint(Stream::Stdout, "merging package", "36;1"),
+        paint(Stream::Stdout, package, "32;1"),
+        layer
+    );
+}
+
 pub fn warn(message: impl AsRef<str>) {
     eprintln!(
         "{} {}",

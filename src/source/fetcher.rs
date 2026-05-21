@@ -8,9 +8,17 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use url::Url;
 
 const MAX_MIRROR_RETRIES: usize = 8;
+const HTTP_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+const HTTP_FETCH_RETRY_LIMIT: usize = 2;
+const MUSL_1_2_6_SNAPSHOT_URL: &str =
+    "https://git.musl-libc.org/cgit/musl/snapshot/musl-1.2.6.tar.gz";
+const MUSL_1_2_6_RELEASE_URL: &str = "https://musl.libc.org/releases/musl-1.2.6.tar.gz";
+const MUSL_1_2_6_GENTOO_MIRROR_URL: &str =
+    "https://tw.archive.ubuntu.com/gentoo/distfiles/9d/musl-1.2.6.tar.gz";
 
 fn scheme_uses_http_transport(scheme: &str) -> bool {
     matches!(scheme, "http" | "https")
@@ -32,10 +40,6 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
         return Ok(dest_path);
     }
 
-    crate::log_info!("Fetching: {}", url);
-
-    // Parse URL early so we can handle non-HTTP schemes (FTP support)
-    let parsed_url = Url::parse(&url).with_context(|| format!("Invalid URL: {}", url))?;
     let pb = ProgressBar::new(0);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -46,256 +50,46 @@ pub fn fetch_archive(spec: &PackageSpec, source: &Source, cache_dir: &Path) -> R
             .progress_chars("#>-"),
     );
 
-    // If this is an FTP URL, fetch via suppaftp and skip the HTTP client path.
-    if parsed_url.scheme() == "ftp" {
-        // Connect and login (anonymous fallback)
-        let host = parsed_url.host_str().context("FTP URL missing host")?;
-        let port = parsed_url.port_or_known_default().unwrap_or(21);
-        let addr = format!("{}:{}", host, port);
-        let mut ftp_stream = suppaftp::FtpStream::connect(addr.as_str())
-            .with_context(|| format!("Failed to connect to FTP host: {}", addr))?;
-        let user = if parsed_url.username().is_empty() {
-            "anonymous"
+    let candidate_urls = archive_fetch_candidates(&url);
+    let mut attempt_errors = Vec::new();
+
+    for (index, candidate_url) in candidate_urls.iter().enumerate() {
+        if index == 0 {
+            crate::log_info!("Fetching: {}", candidate_url);
         } else {
-            parsed_url.username()
-        };
-        let pass = parsed_url.password().unwrap_or("anonymous@");
-        ftp_stream
-            .login(user, pass)
-            .with_context(|| format!("FTP login failed for {}", host))?;
-
-        // Retrieve the path (try with and without leading slash)
-        let path = parsed_url.path();
-        let candidates = [path.to_string(), path.trim_start_matches('/').to_string()];
-        let mut retrieved = false;
-        for p in candidates.iter().filter(|s| !s.is_empty()) {
-            match ftp_stream.retr(
-                p,
-                |reader: &mut dyn Read| -> std::result::Result<(), suppaftp::FtpError> {
-                    let mut file =
-                        File::create(&dest_path).map_err(suppaftp::FtpError::ConnectionError)?;
-                    let mut buffer = [0u8; 8192];
-                    loop {
-                        let bytes_read = reader
-                            .read(&mut buffer)
-                            .map_err(suppaftp::FtpError::ConnectionError)?;
-                        if bytes_read == 0 {
-                            break;
-                        }
-                        file.write_all(&buffer[..bytes_read])
-                            .map_err(suppaftp::FtpError::ConnectionError)?;
-                    }
-                    Ok(())
-                },
-            ) {
-                Ok(_) => {
-                    retrieved = true;
-                    break;
-                }
-                Err(_) => continue,
-            }
-        }
-        ftp_stream.quit().ok();
-        if !retrieved {
-            bail!("FTP error fetching {}", url);
-        }
-    } else {
-        if !scheme_uses_http_transport(parsed_url.scheme()) {
-            bail!(
-                "Unsupported URL scheme for source fetch: {}",
-                parsed_url.scheme()
-            );
+            crate::log_info!("Primary source failed; trying fallback: {}", candidate_url);
         }
 
-        // Download with progress bar
-        // Use a sensible default User-Agent so servers that reject empty/unknown agents (e.g. IANA)
-        // will accept requests. Include package name/version at compile time.
-        let ua = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-        let client = super::build_blocking_client(&ua, None)
-            .with_context(|| "Failed to build HTTP client")?;
-
-        let mut response = client
-            .get(&url)
-            .send()
-            .with_context(|| format!("Failed to fetch: {}", url))?;
-        // If the server returned a non-success status, read a short body preview and fail early.
-        // This prevents saving HTML error pages (which then fail checksum) and gives a clearer
-        // diagnostic to the user.
-        let status = response.status();
-        if !status.is_success() {
-            let mut preview_bytes = Vec::new();
-            // read up to 1 KiB for a preview (ignore errors while reading preview)
-            let _ = response.take(1024).read_to_end(&mut preview_bytes);
-            let preview = String::from_utf8_lossy(&preview_bytes);
-            bail!(
-                "HTTP error fetching {}: {}{}",
-                url,
-                status,
-                if preview.trim().is_empty() {
-                    "".to_string()
-                } else {
-                    format!(" — preview: {}", preview.trim())
-                }
-            );
-        }
-        let total_size = response.content_length().unwrap_or(0);
-        pb.set_length(total_size);
-
-        let mut file = File::create(&dest_path)
-            .with_context(|| format!("Failed to create: {}", dest_path.display()))?;
-
-        let mut buffer = [0u8; 8192];
-        let mut downloaded = 0u64;
-
-        loop {
-            let bytes_read = response.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-            file.write_all(&buffer[..bytes_read])?;
-            downloaded += bytes_read as u64;
-            pb.set_position(downloaded);
-        }
-
-        pb.finish_with_message("Download complete");
-    }
-
-    // Quick validation: ensure the downloaded file looks like the expected
-    // archive (detect obvious HTML error pages or wrong formats by magic).
-    // If validation returns an alternate URL (e.g. SourceForge mirror), follow
-    // and retry a few times.
-    let mut next_alt = validate_downloaded_archive(&dest_path, &filename, &url)?;
-    let mut seen_alts: HashSet<String> = HashSet::new();
-    let mut retries = 0usize;
-    while let Some(alt) = next_alt {
-        retries += 1;
-        if retries > MAX_MIRROR_RETRIES {
-            bail!(
-                "Exceeded mirror retry limit ({}) while fetching {}",
-                MAX_MIRROR_RETRIES,
-                url
-            );
-        }
-        if !seen_alts.insert(alt.clone()) {
-            bail!("Mirror retry loop detected for URL: {}", alt);
-        }
-        crate::log_info!("Retrying download from mirror: {}", alt);
+        pb.set_position(0);
+        pb.set_length(0);
         fs::remove_file(&dest_path).ok();
 
-        // If mirror URL is FTP -> use suppaftp; otherwise use HTTP retry.
-        if let Ok(alt_url) = Url::parse(&alt) {
-            if alt_url.scheme() == "ftp" {
-                // FTP mirror retrieval
-                let host = alt_url.host_str().context("FTP mirror URL missing host")?;
-                let port = alt_url.port_or_known_default().unwrap_or(21);
-                let addr = format!("{}:{}", host, port);
-                let mut ftp_stream = suppaftp::FtpStream::connect(addr.as_str())
-                    .with_context(|| format!("Failed to connect to FTP host: {}", addr))?;
-                let user = if alt_url.username().is_empty() {
-                    "anonymous"
-                } else {
-                    alt_url.username()
-                };
-                let pass = alt_url.password().unwrap_or("anonymous@");
-                ftp_stream
-                    .login(user, pass)
-                    .with_context(|| format!("FTP login failed for {}", host))?;
-
-                let path = alt_url.path();
-                let candidates = [path.to_string(), path.trim_start_matches('/').to_string()];
-                let mut retrieved = false;
-                for p in candidates.iter().filter(|s| !s.is_empty()) {
-                    match ftp_stream.retr(
-                        p,
-                        |reader: &mut dyn Read| -> std::result::Result<(), suppaftp::FtpError> {
-                            let mut file = File::create(&dest_path)
-                                .map_err(suppaftp::FtpError::ConnectionError)?;
-                            let mut buffer = [0u8; 8192];
-                            let mut downloaded = 0u64;
-                            loop {
-                                let bytes_read = reader
-                                    .read(&mut buffer)
-                                    .map_err(suppaftp::FtpError::ConnectionError)?;
-                                if bytes_read == 0 {
-                                    break;
-                                }
-                                file.write_all(&buffer[..bytes_read])
-                                    .map_err(suppaftp::FtpError::ConnectionError)?;
-                                downloaded += bytes_read as u64;
-                                pb.set_position(downloaded);
-                            }
-                            Ok(())
-                        },
-                    ) {
-                        Ok(_) => {
-                            retrieved = true;
-                            break;
-                        }
-                        Err(_) => continue,
-                    }
-                }
-                ftp_stream.quit().ok();
-                if !retrieved {
-                    bail!("FTP mirror error fetching {}", alt);
-                }
-            } else {
-                // HTTP(S) mirror retry (recreate client for retry)
-                let ua = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-                let client = super::build_blocking_client(&ua, None)
-                    .with_context(|| "Failed to build HTTP client")?;
-                let mut response = client
-                    .get(&alt)
-                    .send()
-                    .with_context(|| format!("Failed to fetch mirror URL: {}", alt))?;
-
-                let status = response.status();
-                if !status.is_success() {
-                    let mut preview_bytes = Vec::new();
-                    let _ = response.take(1024).read_to_end(&mut preview_bytes);
-                    let preview = String::from_utf8_lossy(&preview_bytes);
-                    bail!(
-                        "HTTP error fetching {}: {}{}",
-                        alt,
-                        status,
-                        if preview.trim().is_empty() {
-                            "".to_string()
-                        } else {
-                            format!(" — preview: {}", preview.trim())
-                        }
-                    );
+        match fetch_archive_from_candidate(candidate_url, &dest_path, &filename, &pb) {
+            Ok(()) => {
+                if !verify_checksum(&dest_path, &source.sha256)? {
+                    fs::remove_file(&dest_path)?;
+                    attempt_errors.push(format!(
+                        "{}: checksum verification failed for {}",
+                        candidate_url, filename
+                    ));
+                    continue;
                 }
 
-                let mut file = File::create(&dest_path)
-                    .with_context(|| format!("Failed to create: {}", dest_path.display()))?;
-                let mut buffer = [0u8; 8192];
-                let mut downloaded = 0u64;
-                loop {
-                    let bytes_read = response.read(&mut buffer)?;
-                    if bytes_read == 0 {
-                        break;
-                    }
-                    file.write_all(&buffer[..bytes_read])?;
-                    downloaded += bytes_read as u64;
-                    pb.set_position(downloaded);
-                }
+                crate::log_info!("Checksum verified: {}", filename);
+                return Ok(dest_path);
             }
-        } else {
-            // Fallback: unknown/malformed alt URL -> bail
-            bail!("Malformed mirror URL: {}", alt);
+            Err(err) => {
+                attempt_errors.push(format!("{}: {err:#}", candidate_url));
+                fs::remove_file(&dest_path).ok();
+            }
         }
-
-        pb.finish_with_message("Download complete (mirror)");
-        next_alt = validate_downloaded_archive(&dest_path, &filename, &alt)?;
     }
 
-    // Verify checksum
-    if !verify_checksum(&dest_path, &source.sha256)? {
-        fs::remove_file(&dest_path)?;
-        bail!("Checksum verification failed for {}", filename);
-    }
-
-    crate::log_info!("Checksum verified: {}", filename);
-    Ok(dest_path)
+    bail!(
+        "Failed to fetch {} from any candidate URL:\n{}",
+        filename,
+        attempt_errors.join("\n")
+    )
 }
 
 /// Verify checksum of a file supporting optional algorithm prefix.
@@ -336,6 +130,238 @@ pub(crate) fn derive_filename_from_url(url: &str) -> String {
     let h = hasher.finalize();
     let hex = crate::hex::encode_lower(h);
     format!("source-{}.download", &hex[..12])
+}
+
+fn archive_fetch_candidates(primary_url: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if matches!(
+        primary_url,
+        MUSL_1_2_6_SNAPSHOT_URL | MUSL_1_2_6_RELEASE_URL | MUSL_1_2_6_GENTOO_MIRROR_URL
+    ) {
+        candidates.push(MUSL_1_2_6_GENTOO_MIRROR_URL.to_string());
+    }
+    if !candidates.iter().any(|url| url == primary_url) {
+        candidates.push(primary_url.to_string());
+    }
+    if let Some(mirror_url) = musl_release_mirror_url(primary_url)
+        && !candidates.contains(&mirror_url)
+    {
+        candidates.push(mirror_url);
+    }
+    candidates
+}
+
+fn musl_release_mirror_url(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    if parsed.host_str()? != "git.musl-libc.org" {
+        return None;
+    }
+
+    let mut segments = parsed.path_segments()?;
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("cgit"), Some("musl"), Some("snapshot"), Some(filename), None)
+            if !filename.trim().is_empty() =>
+        {
+            Some(format!("https://musl.libc.org/releases/{filename}"))
+        }
+        _ => None,
+    }
+}
+
+fn fetch_archive_from_candidate(
+    candidate_url: &str,
+    dest_path: &Path,
+    filename: &str,
+    pb: &ProgressBar,
+) -> Result<()> {
+    let mut current_url = candidate_url.to_string();
+    let mut seen_alts: HashSet<String> = HashSet::new();
+    let mut retries = 0usize;
+
+    loop {
+        download_archive_from_url(&current_url, dest_path, pb)?;
+        pb.finish_with_message("Download complete");
+
+        let Some(next_alt) = validate_downloaded_archive(dest_path, filename, &current_url)? else {
+            return Ok(());
+        };
+
+        retries += 1;
+        if retries > MAX_MIRROR_RETRIES {
+            bail!(
+                "Exceeded mirror retry limit ({}) while fetching {}",
+                MAX_MIRROR_RETRIES,
+                candidate_url
+            );
+        }
+        if !seen_alts.insert(next_alt.clone()) {
+            bail!("Mirror retry loop detected for URL: {}", next_alt);
+        }
+
+        crate::log_info!("Retrying download from mirror: {}", next_alt);
+        fs::remove_file(dest_path).ok();
+        pb.set_position(0);
+        pb.set_length(0);
+        current_url = next_alt;
+    }
+}
+
+fn download_archive_from_url(url: &str, dest_path: &Path, pb: &ProgressBar) -> Result<()> {
+    let parsed_url = Url::parse(url).with_context(|| format!("Invalid URL: {}", url))?;
+    if parsed_url.scheme() == "ftp" {
+        return download_ftp_archive(&parsed_url, dest_path, pb);
+    }
+    if !scheme_uses_http_transport(parsed_url.scheme()) {
+        bail!(
+            "Unsupported URL scheme for source fetch: {}",
+            parsed_url.scheme()
+        );
+    }
+    download_http_archive(url, dest_path, pb)
+}
+
+fn download_ftp_archive(parsed_url: &Url, dest_path: &Path, pb: &ProgressBar) -> Result<()> {
+    let host = parsed_url.host_str().context("FTP URL missing host")?;
+    let port = parsed_url.port_or_known_default().unwrap_or(21);
+    let addr = format!("{}:{}", host, port);
+    let mut ftp_stream = suppaftp::FtpStream::connect(addr.as_str())
+        .with_context(|| format!("Failed to connect to FTP host: {}", addr))?;
+    let user = if parsed_url.username().is_empty() {
+        "anonymous"
+    } else {
+        parsed_url.username()
+    };
+    let pass = parsed_url.password().unwrap_or("anonymous@");
+    ftp_stream
+        .login(user, pass)
+        .with_context(|| format!("FTP login failed for {}", host))?;
+
+    let path = parsed_url.path();
+    let candidates = [path.to_string(), path.trim_start_matches('/').to_string()];
+    let mut retrieved = false;
+    for candidate in candidates.iter().filter(|path| !path.is_empty()) {
+        match ftp_stream.retr(
+            candidate,
+            |reader: &mut dyn Read| -> std::result::Result<(), suppaftp::FtpError> {
+                let mut file =
+                    File::create(dest_path).map_err(suppaftp::FtpError::ConnectionError)?;
+                let mut buffer = [0u8; 8192];
+                let mut downloaded = 0u64;
+                loop {
+                    let bytes_read = reader
+                        .read(&mut buffer)
+                        .map_err(suppaftp::FtpError::ConnectionError)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    file.write_all(&buffer[..bytes_read])
+                        .map_err(suppaftp::FtpError::ConnectionError)?;
+                    downloaded += bytes_read as u64;
+                    pb.set_position(downloaded);
+                }
+                Ok(())
+            },
+        ) {
+            Ok(_) => {
+                retrieved = true;
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    ftp_stream.quit().ok();
+    if !retrieved {
+        bail!("FTP error fetching {}", parsed_url);
+    }
+    Ok(())
+}
+
+fn download_http_archive(url: &str, dest_path: &Path, pb: &ProgressBar) -> Result<()> {
+    let ua = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    let mut last_err = None;
+
+    for attempt in 1..=HTTP_FETCH_RETRY_LIMIT {
+        match download_http_archive_once(url, dest_path, pb, &ua) {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < HTTP_FETCH_RETRY_LIMIT && is_transient_http_error(&err) => {
+                crate::log_info!(
+                    "Fetch attempt {} for {} failed with a transient network error; retrying",
+                    attempt,
+                    url
+                );
+                fs::remove_file(dest_path).ok();
+                pb.set_position(0);
+                pb.set_length(0);
+                last_err = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Failed to fetch: {}", url)))
+}
+
+fn download_http_archive_once(
+    url: &str,
+    dest_path: &Path,
+    pb: &ProgressBar,
+    ua: &str,
+) -> Result<()> {
+    let client = super::build_blocking_client(ua, Some(HTTP_FETCH_TIMEOUT))
+        .with_context(|| "Failed to build HTTP client")?;
+    let mut response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("Failed to fetch: {}", url))?;
+    let status = response.status();
+    if !status.is_success() {
+        let mut preview_bytes = Vec::new();
+        let _ = response.take(1024).read_to_end(&mut preview_bytes);
+        let preview = String::from_utf8_lossy(&preview_bytes);
+        bail!(
+            "HTTP error fetching {}: {}{}",
+            url,
+            status,
+            if preview.trim().is_empty() {
+                "".to_string()
+            } else {
+                format!(" — preview: {}", preview.trim())
+            }
+        );
+    }
+
+    let total_size = response.content_length().unwrap_or(0);
+    pb.set_length(total_size);
+
+    let mut file = File::create(dest_path)
+        .with_context(|| format!("Failed to create: {}", dest_path.display()))?;
+    let mut buffer = [0u8; 8192];
+    let mut downloaded = 0u64;
+    loop {
+        let bytes_read = response.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..bytes_read])?;
+        downloaded += bytes_read as u64;
+        pb.set_position(downloaded);
+    }
+
+    Ok(())
+}
+
+fn is_transient_http_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|inner| inner.is_timeout() || inner.is_connect() || inner.is_request())
+    })
 }
 
 /// Validate downloaded file's magic header to make sure it is the expected
@@ -645,6 +671,45 @@ mod tests {
     fn filename_from_non_url_string() {
         let name = derive_filename_from_url("not-a-url-at-all");
         assert!(name.starts_with("source-") && name.ends_with(".download"));
+    }
+
+    #[test]
+    fn musl_snapshot_candidates_prefer_known_gentoo_mirror() {
+        let candidates = archive_fetch_candidates(MUSL_1_2_6_SNAPSHOT_URL);
+        assert_eq!(
+            candidates,
+            vec![
+                MUSL_1_2_6_GENTOO_MIRROR_URL.to_string(),
+                MUSL_1_2_6_SNAPSHOT_URL.to_string(),
+                "https://musl.libc.org/releases/musl-1.2.6.tar.gz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn musl_release_candidates_prefer_known_gentoo_mirror() {
+        let candidates = archive_fetch_candidates(MUSL_1_2_6_RELEASE_URL);
+        assert_eq!(
+            candidates,
+            vec![
+                MUSL_1_2_6_GENTOO_MIRROR_URL.to_string(),
+                MUSL_1_2_6_RELEASE_URL.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn musl_release_mirror_only_matches_snapshot_urls() {
+        assert_eq!(
+            musl_release_mirror_url(
+                "https://git.musl-libc.org/cgit/musl/snapshot/musl-1.2.5.tar.gz"
+            ),
+            Some("https://musl.libc.org/releases/musl-1.2.5.tar.gz".to_string())
+        );
+        assert_eq!(
+            musl_release_mirror_url("https://musl.libc.org/releases/musl-1.2.5.tar.gz"),
+            None
+        );
     }
 
     #[test]

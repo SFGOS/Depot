@@ -283,6 +283,42 @@ fn clean_build_workspace_noops_when_dirs_are_missing() -> Result<()> {
 }
 
 #[test]
+fn clean_build_source_dirs_removes_build_dir_only() -> Result<()> {
+    let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+    let mut cfg = config::Config::for_rootfs(rootfs.path());
+    cfg.build_dir = rootfs.path().join("tmp/build");
+    cfg.cache_dir = rootfs.path().join("tmp/sources");
+
+    fs::create_dir_all(&cfg.build_dir)
+        .with_context(|| format!("Failed to create {}", cfg.build_dir.display()))?;
+    fs::create_dir_all(&cfg.cache_dir)
+        .with_context(|| format!("Failed to create {}", cfg.cache_dir.display()))?;
+
+    clean_build_source_dirs(&cfg)?;
+
+    assert!(!cfg.build_dir.exists());
+    assert!(cfg.cache_dir.exists());
+    Ok(())
+}
+
+#[test]
+fn clean_build_source_dirs_noops_when_build_dir_missing() -> Result<()> {
+    let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+    let mut cfg = config::Config::for_rootfs(rootfs.path());
+    cfg.build_dir = rootfs.path().join("tmp/build");
+    cfg.cache_dir = rootfs.path().join("tmp/sources");
+
+    fs::create_dir_all(&cfg.cache_dir)
+        .with_context(|| format!("Failed to create {}", cfg.cache_dir.display()))?;
+
+    clean_build_source_dirs(&cfg)?;
+
+    assert!(!cfg.build_dir.exists());
+    assert!(cfg.cache_dir.exists());
+    Ok(())
+}
+
+#[test]
 fn binary_install_path_uses_repo_record_metadata_without_archive_metadata() -> Result<()> {
     let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
     let pkg_dir = tempfile::tempdir().context("Failed to create temp package dir")?;

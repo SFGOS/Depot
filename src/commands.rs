@@ -1,10 +1,11 @@
 use crate::cli::{
     BuildArgs, Cli, Commands, ConfigArgs, ConvertArgs, InfoArgs, InstallArgs, InternalCommands,
-    ListArgs, OwnsArgs, RemoveArgs, RepoCommands, RepoKindArg, SearchArgs, SignArgs, UpdateArgs,
+    ListArgs, OwnsArgs, RemoveArgs, RepoCommands, RepoKindArg, SearchArgs, SignArgs, SystemArgs,
+    UpdateArgs,
 };
 use crate::{
-    builder, cli_assets, config, cross, db, deps, index, install, locking, package, planner,
-    signing, source, staging, ui,
+    bootstrap, builder, cli_assets, config, cross, db, deps, index, install, locking, package,
+    planner, signing, source, staging, ui,
 };
 use anyhow::{Context, Result};
 use git2::Direction;
@@ -19,10 +20,11 @@ use url::Url;
 use walkdir::WalkDir;
 
 use build_cmd::support::{
-    automatic_tests_disabled_for_outputs, build_lib32_companion_package, clean_build_workspace,
-    effective_lib32_only, ensure_requested_development_package_installed, make_lib32_package_spec,
-    maybe_disable_tests_for_missing_deps, maybe_prompt_to_skip_tests_for_missing_requested_deps,
-    merge_missing_dependencies, requested_outputs, should_install_test_deps,
+    automatic_tests_disabled_for_outputs, build_lib32_companion_package, clean_build_source_dirs,
+    clean_build_workspace, effective_lib32_only, ensure_requested_development_package_installed,
+    make_lib32_package_spec, maybe_disable_tests_for_missing_deps,
+    maybe_prompt_to_skip_tests_for_missing_requested_deps, merge_missing_dependencies,
+    requested_outputs, should_install_test_deps,
 };
 use install_cmd::archive::{
     extract_package_archive_to_staging, load_package_archive_into_staging,
@@ -89,6 +91,7 @@ fn command_rootfs(command: &Commands) -> Option<&Path> {
         Commands::Install(args) => Some(&args.rootfs_args.rootfs),
         Commands::Remove(args) => Some(&args.rootfs_args.rootfs),
         Commands::Build(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Bootstrap(args) => Some(&args.sysroot),
         Commands::Update(args) => Some(&args.rootfs_args.rootfs),
         Commands::Info(args) => Some(&args.rootfs_args.rootfs),
         Commands::Search(args) => Some(&args.rootfs_args.rootfs),
@@ -97,6 +100,7 @@ fn command_rootfs(command: &Commands) -> Option<&Path> {
         Commands::Sign(args) => Some(&args.rootfs_args.rootfs),
         Commands::Repo(args) => Some(repo_command_rootfs(&args.command)),
         Commands::Config(args) => Some(&args.rootfs_args.rootfs),
+        Commands::System(args) => Some(&args.rootfs_args.rootfs),
         Commands::Check(_)
         | Commands::Convert(_)
         | Commands::GenerateArtifacts(_)
@@ -110,6 +114,7 @@ fn command_assume_yes(command: &Commands) -> bool {
         Commands::Install(args) => args.prompt_args.yes,
         Commands::Remove(args) => args.prompt_args.yes,
         Commands::Build(args) => args.prompt_args.yes,
+        Commands::Bootstrap(_) => false,
         Commands::Update(args) => args.prompt_args.yes,
         Commands::Check(_)
         | Commands::Convert(_)
@@ -120,6 +125,7 @@ fn command_assume_yes(command: &Commands) -> bool {
         | Commands::Sign(_)
         | Commands::Repo(_)
         | Commands::Config(_)
+        | Commands::System(_)
         | Commands::GenerateArtifacts(_)
         | Commands::MakeSpec(_)
         | Commands::Internal(_) => false,
@@ -913,7 +919,7 @@ fn collect_installed_replacement_packages(
     Ok(replacements)
 }
 
-fn remove_installed_package_with_hooks(
+pub(crate) fn remove_installed_package_with_hooks(
     package: &str,
     rootfs: &Path,
     config: &config::Config,
@@ -2054,6 +2060,27 @@ fn run_direct_archive_install_requests(
     Ok(true)
 }
 
+struct SourceBuildCleanupGuard<'a> {
+    config: &'a config::Config,
+    enabled: bool,
+}
+
+impl<'a> SourceBuildCleanupGuard<'a> {
+    fn new(config: &'a config::Config, enabled: bool) -> Self {
+        Self { config, enabled }
+    }
+}
+
+impl Drop for SourceBuildCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if self.enabled
+            && let Err(err) = clean_build_source_dirs(self.config)
+        {
+            crate::log_warn!("Failed to clean build source dirs: {}", err);
+        }
+    }
+}
+
 fn run_direct_install_request(
     options: DirectInstallOptions<'_>,
     config: &config::Config,
@@ -2142,6 +2169,8 @@ fn run_direct_install_request(
             pkg_spec.apply_config(config);
             (pkg_spec, None)
         };
+    let built_from_source = staging_dir.is_none();
+    let _source_cleanup_guard = SourceBuildCleanupGuard::new(config, built_from_source);
 
     if options.lib32_only && staging_dir.is_some() {
         anyhow::bail!("--lib32-only is only supported when installing from a package spec");
@@ -2438,6 +2467,7 @@ fn run_direct_install_request(
         dir.path().to_path_buf()
     } else {
         // 1-2. Fetch + extract sources (supports archives and git URL#rev)
+        clean_build_source_dirs(config)?;
         source::preflight_manual_sources(&pkg_spec, &config.cache_dir)?;
         let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
         built_src_dir = Some(src_dir.clone());
@@ -2551,7 +2581,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Install(args) => args.build_exec_args.test_deps,
         Commands::Build(args) => args.build_exec_args.test_deps,
         Commands::Update(args) => args.build_exec_args.test_deps,
-        Commands::Check(_)
+        Commands::Bootstrap(_)
+        | Commands::Check(_)
         | Commands::Remove(_)
         | Commands::Info(_)
         | Commands::Search(_)
@@ -2560,6 +2591,7 @@ pub fn run(cli: Cli) -> Result<()> {
         | Commands::Sign(_)
         | Commands::Repo(_)
         | Commands::Config(_)
+        | Commands::System(_)
         | Commands::GenerateArtifacts(_)
         | Commands::Convert(_)
         | Commands::MakeSpec(_)
@@ -2570,6 +2602,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Install(args) => install_cmd::run_install(args, cli_test_deps)?,
         Commands::Remove(args) => install_cmd::run_remove(args)?,
         Commands::Build(args) => build_cmd::run_build(args, cli_test_deps)?,
+        Commands::Bootstrap(args) => bootstrap::run(args)?,
         Commands::Update(args) => update::run_update(args, cli_test_deps)?,
         Commands::Check(args) => check::run_check(args)?,
         Commands::Info(args) => misc::run_info(args)?,
@@ -2580,6 +2613,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Repo(args) => repo::run_repo(args.command)?,
         Commands::GenerateArtifacts(args) => misc::run_generate_artifacts(args)?,
         Commands::Config(args) => misc::run_config(args)?,
+        Commands::System(args) => misc::run_system(args)?,
         Commands::MakeSpec(args) => misc::run_make_spec(args)?,
         Commands::Convert(args) => misc::run_convert(args)?,
         Commands::Internal(args) => misc::run_internal(args)?,

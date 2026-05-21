@@ -115,6 +115,22 @@ pub(crate) fn clean_build_workspace(config: &config::Config) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn clean_build_source_dirs(config: &config::Config) -> Result<()> {
+    if config.build_dir.exists() {
+        fs::remove_dir_all(&config.build_dir).with_context(|| {
+            format!(
+                "Failed to clean build source dirs: {}",
+                config.build_dir.display()
+            )
+        })?;
+        ui::success(format!(
+            "Cleaned build source dirs: {}",
+            config.build_dir.display()
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn warn_if_running_as_root_for_build(command: &str, rootfs: &Path) {
     if crate::fakeroot::is_root() {
         ui::warn(format!("Running '{}' as root is discouraged.", command));

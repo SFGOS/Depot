@@ -41,20 +41,27 @@ impl CrossConfig {
         let cc = find_tool(prefix, &["gcc", "clang"], true)?;
         let cxx = find_tool(prefix, &["g++", "clang++"], false)
             .unwrap_or_else(|_| format!("{}-g++", prefix));
-        let ar = find_tool(prefix, &["ar", "llvm-ar"], true)?;
+        let ar =
+            find_tool_with_unprefixed_fallback(prefix, &["ar", "llvm-ar"], &["llvm-ar"], true)?;
         let ranlib = find_tool(prefix, &["ranlib", "llvm-ranlib"], false)
+            .or_else(|_| find_unprefixed_tool(&["llvm-ranlib", "llvm-ar"], false))
             .unwrap_or_else(|_| format!("{}-ranlib", prefix));
         let strip = find_tool(prefix, &["strip", "llvm-strip"], false)
+            .or_else(|_| find_unprefixed_tool(&["llvm-strip", "llvm-objcopy"], false))
             .unwrap_or_else(|_| format!("{}-strip", prefix));
         let ld = find_tool(prefix, &["ld", "ld.lld"], false)
             .unwrap_or_else(|_| format!("{}-ld", prefix));
         let nm = find_tool(prefix, &["nm", "llvm-nm"], false)
+            .or_else(|_| find_unprefixed_tool(&["llvm-nm"], false))
             .unwrap_or_else(|_| format!("{}-nm", prefix));
         let objcopy = find_tool(prefix, &["objcopy", "llvm-objcopy"], false)
+            .or_else(|_| find_unprefixed_tool(&["llvm-objcopy"], false))
             .unwrap_or_else(|_| format!("{}-objcopy", prefix));
         let objdump = find_tool(prefix, &["objdump", "llvm-objdump"], false)
+            .or_else(|_| find_unprefixed_tool(&["llvm-objdump"], false))
             .unwrap_or_else(|_| format!("{}-objdump", prefix));
         let readelf = find_tool(prefix, &["readelf", "llvm-readelf"], false)
+            .or_else(|_| find_unprefixed_tool(&["llvm-readelf", "llvm-readobj"], false))
             .unwrap_or_else(|_| format!("{}-readelf", prefix));
 
         crate::log_info!("Cross-compilation tools discovered:");
@@ -239,6 +246,32 @@ fn find_tool(prefix: &str, suffixes: &[&str], required: bool) -> Result<String> 
             prefix,
             suffixes.join("|")
         );
+    }
+
+    Err(anyhow::anyhow!("Tool not found"))
+}
+
+fn find_tool_with_unprefixed_fallback(
+    prefix: &str,
+    suffixes: &[&str],
+    unprefixed: &[&str],
+    required: bool,
+) -> Result<String> {
+    find_tool(prefix, suffixes, false).or_else(|_| find_unprefixed_tool(unprefixed, required))
+}
+
+fn find_unprefixed_tool(names: &[&str], required: bool) -> Result<String> {
+    for name in names {
+        if let Ok(output) = Command::new("which").arg(name).output()
+            && output.status.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Ok(path);
+        }
+    }
+
+    if required {
+        anyhow::bail!("Could not find tool: {{{}}}", names.join("|"));
     }
 
     Err(anyhow::anyhow!("Tool not found"))

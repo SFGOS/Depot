@@ -4,11 +4,11 @@ pub(crate) mod support;
 
 use self::support::{
     RequestedBuildToolPackageInstall, automatic_tests_disabled_for_outputs,
-    build_lib32_companion_package, clean_build_workspace, effective_lib32_only,
-    ensure_requested_build_tool_package_installed, ensure_requested_development_package_installed,
-    maybe_disable_tests_for_missing_deps, maybe_prompt_to_skip_tests_for_missing_requested_deps,
-    merge_missing_dependencies, requested_outputs, should_install_test_deps,
-    warn_if_running_as_root_for_build,
+    build_lib32_companion_package, clean_build_source_dirs, clean_build_workspace,
+    effective_lib32_only, ensure_requested_build_tool_package_installed,
+    ensure_requested_development_package_installed, maybe_disable_tests_for_missing_deps,
+    maybe_prompt_to_skip_tests_for_missing_requested_deps, merge_missing_dependencies,
+    requested_outputs, should_install_test_deps, warn_if_running_as_root_for_build,
 };
 
 pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
@@ -303,6 +303,7 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
             watcher.check()?;
         }
 
+        clean_build_source_dirs(&config)?;
         source::preflight_manual_sources(&pkg_spec, &config.cache_dir)?;
         let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
         if let Some(watcher) = interrupt_watcher.as_ref() {
@@ -507,6 +508,7 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
                     false,
                 )?;
             }
+            clean_build_source_dirs(&config)?;
             if clean {
                 clean_build_workspace(&config)?;
             }
@@ -528,6 +530,12 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
                         clean_err
                     ));
                 }
+            }
+            if let Err(clean_err) = clean_build_source_dirs(&config) {
+                ui::warn(format!(
+                    "Failed to clean build source dirs after failed build: {}",
+                    clean_err
+                ));
             }
             if interrupted {
                 anyhow::bail!("Build interrupted by Ctrl-C");

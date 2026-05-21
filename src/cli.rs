@@ -144,6 +144,30 @@ pub struct BuildArgs {
     pub cleanup_deps: bool,
 }
 
+/// Arguments for importing the Linux by Intent book package plan into Depot layers.
+#[derive(Debug, Clone, Args)]
+pub struct BootstrapArgs {
+    /// Target sysroot whose Depot system state should receive the parsed layers
+    #[arg(value_name = "SYSROOT")]
+    pub sysroot: PathBuf,
+
+    /// Target triple used for cross and staged bootstrap builds
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Target architecture component used by build defaults
+    #[arg(long)]
+    pub arch: Option<String>,
+
+    /// URL of the Linux by Intent PDF to parse
+    #[arg(long, default_value = "https://www.vertexlinux.net/lbi/book.pdf")]
+    pub book_url: String,
+
+    /// Use a local PDF instead of fetching book-url
+    #[arg(long, value_name = "PDF")]
+    pub book_pdf: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct UpdateArgs {
     #[command(flatten)]
@@ -226,6 +250,70 @@ pub struct ConfigArgs {
     pub rootfs_args: RootfsArgs,
 }
 
+/// Arguments for Depot system-build state management commands.
+#[derive(Debug, Clone, Args)]
+pub struct SystemArgs {
+    /// Root filesystem whose system state should be inspected or modified.
+    #[command(flatten)]
+    pub rootfs_args: RootfsArgs,
+
+    /// Requested system state subcommand.
+    #[command(subcommand)]
+    pub command: SystemCommands,
+}
+
+/// System-build state and Linux by Intent layout commands.
+#[derive(Subcommand, Debug, Clone)]
+pub enum SystemCommands {
+    /// Show tracked system build stage and package layers
+    Status,
+    /// Move the tracked system status to a build stage
+    Stage {
+        /// New stage name, such as cross-tools, minimal, chroot, stage2, or bootable
+        stage: String,
+    },
+    /// Manage package layer membership
+    Layer {
+        #[command(subcommand)]
+        command: SystemLayerCommands,
+    },
+    /// Initialize the Linux by Intent /system layout and Depot build defaults
+    InitLbi {
+        /// Target triple used for cross and staged builds
+        #[arg(long, default_value = "x86_64-unknown-linux-musl")]
+        target: String,
+        /// Target architecture component used by build defaults
+        #[arg(long)]
+        arch: Option<String>,
+        /// Replace an existing Depot build config generated for the target rootfs
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// Package layer membership commands.
+#[derive(Subcommand, Debug, Clone)]
+pub enum SystemLayerCommands {
+    /// Add packages to a named layer
+    Add {
+        /// Layer name, such as base, devel, toolchain, or boot
+        layer: String,
+        /// Package names to add to the layer
+        #[arg(required = true, num_args = 1..)]
+        packages: Vec<String>,
+    },
+    /// Remove packages from a named layer
+    Remove {
+        /// Layer name
+        layer: String,
+        /// Package names to remove from the layer
+        #[arg(required = true, num_args = 1..)]
+        packages: Vec<String>,
+    },
+    /// List all tracked layers
+    List,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct GenerateArtifactsArgs {
     /// Output directory for generated files
@@ -265,6 +353,8 @@ pub enum Commands {
     Remove(RemoveArgs),
     /// Build a package without installing
     Build(BuildArgs),
+    /// Parse the Linux by Intent book and populate temp/base/devel layers
+    Bootstrap(BootstrapArgs),
     /// Update installed packages from configured repositories
     Update(UpdateArgs),
     /// Scan package specs for upstream version updates
@@ -283,6 +373,8 @@ pub enum Commands {
     Repo(RepoArgs),
     /// Show current configuration
     Config(ConfigArgs),
+    /// Manage system build stage, package layers, and book-style layout state
+    System(SystemArgs),
     /// Generate shell completion scripts and a man page into an output directory.
     #[command(hide = true)]
     GenerateArtifacts(GenerateArtifactsArgs),
@@ -316,6 +408,19 @@ pub enum InternalCommands {
     },
     #[command(hide = true)]
     Clone { repo: String, dest: Option<PathBuf> },
+    #[command(hide = true)]
+    BootstrapChroot {
+        #[arg(long)]
+        rootfs: PathBuf,
+        #[arg(long)]
+        sources: PathBuf,
+        #[arg(long)]
+        destdir: PathBuf,
+        #[arg(long)]
+        workdir: String,
+        #[arg(long)]
+        script: String,
+    },
     #[command(hide = true)]
     AutotoolsConfigure {
         #[arg(value_name = "ARG", num_args = 0.., allow_hyphen_values = true)]

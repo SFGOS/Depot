@@ -19,9 +19,12 @@ pub const INTERNAL_DEPOT_DIR: &str = ".depot";
 pub const INTERNAL_OUTPUTS_DIR: &str = ".depot/outputs";
 
 fn is_info_dir_index_path(rel_path: &str) -> bool {
-    matches!(rel_path, "usr/info/dir" | "usr/share/info/dir")
-        || rel_path.starts_with("usr/info/dir.")
+    matches!(
+        rel_path,
+        "usr/info/dir" | "usr/share/info/dir" | "system/documentation/info/dir"
+    ) || rel_path.starts_with("usr/info/dir.")
         || rel_path.starts_with("usr/share/info/dir.")
+        || rel_path.starts_with("system/documentation/info/dir.")
 }
 
 fn is_purged_install_basename(rel_path: &str) -> bool {
@@ -43,6 +46,8 @@ fn is_skipped_install_path(rel_path: &str) -> bool {
         || p == INTERNAL_DEPOT_DIR
         || p.strip_prefix(INTERNAL_DEPOT_DIR)
             .is_some_and(|rest| rest.starts_with('/'))
+        || p == "destdir"
+        || p.starts_with("destdir/")
         || p == "scripts"
         || p.starts_with("scripts/")
         || is_purged_payload_path(p)
@@ -340,12 +345,26 @@ fn move_tree_preserving_layout(src: &Path, dst: &Path) -> Result<()> {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
-        if dst.symlink_metadata().is_ok() {
-            anyhow::bail!(
-                "Failed to move {} into {}: destination already exists",
-                src.display(),
-                dst.display()
-            );
+        match dst.symlink_metadata() {
+            Ok(dst_metadata)
+                if duplicate_staged_path_is_equivalent(src, &metadata, dst, &dst_metadata)? =>
+            {
+                fs::remove_file(src).with_context(|| {
+                    format!("Failed to remove duplicate staged path {}", src.display())
+                })?;
+                return Ok(());
+            }
+            Ok(_) => {
+                anyhow::bail!(
+                    "Failed to move {} into {}: destination already exists",
+                    src.display(),
+                    dst.display()
+                );
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to inspect {}", dst.display()));
+            }
         }
         fs::rename(src, dst).with_context(|| {
             format!(
@@ -357,6 +376,59 @@ fn move_tree_preserving_layout(src: &Path, dst: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn duplicate_staged_path_is_equivalent(
+    src: &Path,
+    src_metadata: &fs::Metadata,
+    dst: &Path,
+    dst_metadata: &fs::Metadata,
+) -> Result<bool> {
+    let src_type = src_metadata.file_type();
+    let dst_type = dst_metadata.file_type();
+
+    if src_type.is_symlink() || dst_type.is_symlink() {
+        if !(src_type.is_symlink() && dst_type.is_symlink()) {
+            return Ok(false);
+        }
+        let src_target = fs::read_link(src)
+            .with_context(|| format!("Failed to read symlink {}", src.display()))?;
+        let dst_target = fs::read_link(dst)
+            .with_context(|| format!("Failed to read symlink {}", dst.display()))?;
+        return Ok(src_target == dst_target);
+    }
+
+    if !src_metadata.is_file() || !dst_metadata.is_file() {
+        return Ok(false);
+    }
+    if src_metadata.len() != dst_metadata.len() {
+        return Ok(false);
+    }
+
+    files_have_same_contents(src, dst)
+}
+
+fn files_have_same_contents(left: &Path, right: &Path) -> Result<bool> {
+    let mut left = fs::File::open(left)
+        .with_context(|| format!("Failed to open staged file {}", left.display()))?;
+    let mut right = fs::File::open(right)
+        .with_context(|| format!("Failed to open staged file {}", right.display()))?;
+    let mut left_buf = [0u8; 8192];
+    let mut right_buf = [0u8; 8192];
+
+    loop {
+        let left_read = left.read(&mut left_buf)?;
+        let right_read = right.read(&mut right_buf)?;
+        if left_read != right_read {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+        if left_buf[..left_read] != right_buf[..right_read] {
+            return Ok(false);
+        }
+    }
 }
 
 fn split_docs_for_output(
@@ -829,7 +901,180 @@ pub fn process(destdir: &Path, spec: &PackageSpec) -> Result<()> {
         );
     }
 
+    let normalized = normalize_lbi_layout(destdir)?;
+    if normalized > 0 {
+        crate::log_info!("Normalized {} path(s) into the /system layout", normalized);
+    }
+
     Ok(())
+}
+
+fn normalize_lbi_layout(destdir: &Path) -> Result<usize> {
+    let mut roots = vec![destdir.to_path_buf()];
+    let outputs = output_staging_root(destdir);
+    if outputs.exists() {
+        let mut output_dirs = fs::read_dir(&outputs)
+            .with_context(|| format!("Failed to read {}", outputs.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| {
+                format!(
+                    "Failed to read output staging entry from {}",
+                    outputs.display()
+                )
+            })?;
+        output_dirs.sort_by_key(|entry| entry.file_name());
+        for entry in output_dirs {
+            let path = entry.path();
+            if path.is_dir() {
+                roots.push(path);
+            }
+        }
+    }
+
+    let mut changed = 0usize;
+    for root in roots {
+        changed += normalize_lbi_tree_paths(&root)?;
+        changed += rewrite_lbi_pkgconfig_files(&root)?;
+    }
+    Ok(changed)
+}
+
+fn normalize_lbi_tree_paths(root: &Path) -> Result<usize> {
+    let mappings = [
+        ("usr/share/man", "system/documentation/man-pages"),
+        ("usr/share/info", "system/documentation/info"),
+        ("usr/bin", "system/binaries"),
+        ("usr/sbin", "system/systembinaries"),
+        ("usr/lib64", "system/libraries"),
+        ("usr/lib", "system/libraries"),
+        ("usr/include", "system/headers"),
+        ("usr/share", "system/share"),
+        ("bin", "system/binaries"),
+        ("sbin", "system/systembinaries"),
+        ("lib64", "system/libraries"),
+        ("lib", "system/libraries"),
+        ("include", "system/headers"),
+        ("etc", "system/configuration"),
+        ("var", "system/variable"),
+        ("system/bin", "system/binaries"),
+        ("system/sbin", "system/systembinaries"),
+        ("system/lib64", "system/libraries"),
+        ("system/lib", "system/libraries"),
+        ("system/include", "system/headers"),
+        ("system/share/man", "system/documentation/man-pages"),
+        ("system/share/info", "system/documentation/info"),
+    ];
+
+    let mut changed = 0usize;
+    for (from, to) in mappings {
+        let src = root.join(from);
+        if !src.exists() {
+            continue;
+        }
+        let dst = root.join(to);
+        move_lbi_path(&src, &dst)?;
+        changed += 1;
+    }
+    prune_empty_dirs(root, &["usr", "system"])?;
+    Ok(changed)
+}
+
+fn move_lbi_path(src: &Path, dst: &Path) -> Result<()> {
+    if src == dst {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    if !dst.exists() {
+        fs::rename(src, dst)
+            .with_context(|| format!("Failed to move {} to {}", src.display(), dst.display()))?;
+        return Ok(());
+    }
+
+    let src_meta = fs::symlink_metadata(src)
+        .with_context(|| format!("Failed to inspect {}", src.display()))?;
+    let dst_meta = fs::symlink_metadata(dst)
+        .with_context(|| format!("Failed to inspect {}", dst.display()))?;
+    if src_meta.is_dir() && dst_meta.is_dir() {
+        move_directory_contents(src, dst)?;
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "Refusing to overwrite existing path while normalizing /system layout: {}",
+        dst.display()
+    );
+}
+
+fn prune_empty_dirs(root: &Path, dirs: &[&str]) -> Result<()> {
+    for dir in dirs {
+        let path = root.join(dir);
+        if path.exists() && path.is_dir() && is_directory_empty(&path)? {
+            fs::remove_dir(&path)
+                .with_context(|| format!("Failed to remove empty directory {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_lbi_pkgconfig_files(root: &Path) -> Result<usize> {
+    let mut changed = 0usize;
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry.with_context(|| format!("Failed to walk {}", root.display()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("pc") {
+            continue;
+        }
+        let Ok(original) = fs::read_to_string(path) else {
+            continue;
+        };
+        let rewritten = rewrite_lbi_pkgconfig_text(&original);
+        if rewritten != original {
+            fs::write(path, rewritten)
+                .with_context(|| format!("Failed to rewrite pkg-config file {}", path.display()))?;
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+fn rewrite_lbi_pkgconfig_text(input: &str) -> String {
+    input
+        .replace("prefix=/usr", "prefix=/system")
+        .replace("exec_prefix=/usr", "exec_prefix=/system")
+        .replace("bindir=${prefix}/bin", "bindir=${prefix}/binaries")
+        .replace("sbindir=${prefix}/sbin", "sbindir=${prefix}/systembinaries")
+        .replace("libdir=${prefix}/lib64", "libdir=${prefix}/libraries")
+        .replace("libdir=${prefix}/lib", "libdir=${prefix}/libraries")
+        .replace(
+            "includedir=${prefix}/include",
+            "includedir=${prefix}/headers",
+        )
+        .replace(
+            "mandir=${prefix}/share/man",
+            "mandir=${prefix}/documentation/man-pages",
+        )
+        .replace(
+            "infodir=${prefix}/share/info",
+            "infodir=${prefix}/documentation/info",
+        )
+        .replace("/usr/sbin", "/system/systembinaries")
+        .replace("/usr/bin", "/system/binaries")
+        .replace("/usr/lib64", "/system/libraries")
+        .replace("/usr/lib", "/system/libraries")
+        .replace("/usr/include", "/system/headers")
+        .replace("/usr/share/man", "/system/documentation/man-pages")
+        .replace("/usr/share/info", "/system/documentation/info")
+        .replace("/usr/share", "/system/share")
 }
 
 /// Copy license files into the staged tree.
@@ -1539,9 +1784,9 @@ mod tests {
         let spec = mk_spec_for_stage_processing();
         process(&destdir, &spec).unwrap();
 
-        assert!(!destdir.join("usr/lib/libfoo.a").exists());
-        assert!(!destdir.join("usr/lib/libfoo.la").exists());
-        assert!(destdir.join("usr/lib/libfoo.so").exists());
+        assert!(!destdir.join("system/libraries/libfoo.a").exists());
+        assert!(!destdir.join("system/libraries/libfoo.la").exists());
+        assert!(destdir.join("system/libraries/libfoo.so").exists());
     }
 
     #[test]
@@ -1556,8 +1801,8 @@ mod tests {
         spec.build.flags.no_delete_static = true;
         process(&destdir, &spec).unwrap();
 
-        assert!(destdir.join("usr/lib/libfoo.a").exists());
-        assert!(!destdir.join("usr/lib/libfoo.la").exists());
+        assert!(destdir.join("system/libraries/libfoo.a").exists());
+        assert!(!destdir.join("system/libraries/libfoo.la").exists());
     }
 
     #[test]
@@ -1580,18 +1825,18 @@ mod tests {
         process(&destdir, &spec).unwrap();
 
         let docs_destdir = output_staging_dir(&destdir, "foo-docs");
-        assert!(docs_destdir.join("usr/share/doc/foo/README").exists());
+        assert!(docs_destdir.join("system/share/doc/foo/README").exists());
         assert!(
             docs_destdir
-                .join("usr/share/gtk-doc/html/foo/index.html")
+                .join("system/share/gtk-doc/html/foo/index.html")
                 .exists()
         );
         assert!(docs_destdir.join("opt/foo-docs/guide.txt").exists());
-        assert!(destdir.join("usr/bin/foo").exists());
-        assert!(!destdir.join("usr/share/doc/foo/README").exists());
+        assert!(destdir.join("system/binaries/foo").exists());
+        assert!(!destdir.join("system/share/doc/foo/README").exists());
         assert!(
             !destdir
-                .join("usr/share/gtk-doc/html/foo/index.html")
+                .join("system/share/gtk-doc/html/foo/index.html")
                 .exists()
         );
         assert!(!destdir.join("opt/foo-docs/guide.txt").exists());
@@ -1623,9 +1868,129 @@ mod tests {
         process(&destdir, &spec).unwrap();
 
         let docs_destdir = output_staging_dir(&destdir, "foo-dev-docs");
-        assert!(docs_destdir.join("usr/share/doc/foo-dev/README").exists());
-        assert!(dev_destdir.join("usr/include/foo.h").exists());
-        assert!(!dev_destdir.join("usr/share/doc/foo-dev/README").exists());
+        assert!(
+            docs_destdir
+                .join("system/share/doc/foo-dev/README")
+                .exists()
+        );
+        assert!(dev_destdir.join("system/headers/foo.h").exists());
+        assert!(!dev_destdir.join("system/share/doc/foo-dev/README").exists());
+    }
+
+    #[test]
+    fn process_normalizes_usr_paths_into_system_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/lib/pkgconfig")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/include/foo")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/share/man/man1")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/share/info")).unwrap();
+        std::fs::write(destdir.join("usr/bin/foo"), "bin").unwrap();
+        std::fs::write(destdir.join("usr/share/man/man1/foo.1"), "man").unwrap();
+        std::fs::write(destdir.join("usr/share/info/foo.info"), "info").unwrap();
+        std::fs::write(
+            destdir.join("usr/lib/pkgconfig/foo.pc"),
+            "prefix=/usr\nbindir=${prefix}/bin\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\nmandir=${prefix}/share/man\ninfodir=${prefix}/share/info\n",
+        )
+        .unwrap();
+
+        let spec = mk_spec_for_stage_processing();
+        process(&destdir, &spec).unwrap();
+
+        assert!(destdir.join("system/binaries/foo").exists());
+        assert!(destdir.join("system/headers/foo").is_dir());
+        assert!(
+            destdir
+                .join("system/documentation/man-pages/man1/foo.1")
+                .exists()
+        );
+        assert!(destdir.join("system/documentation/info/foo.info").exists());
+        let pc =
+            std::fs::read_to_string(destdir.join("system/libraries/pkgconfig/foo.pc")).unwrap();
+        assert!(pc.contains("prefix=/system"));
+        assert!(pc.contains("bindir=${prefix}/binaries"));
+        assert!(pc.contains("libdir=${prefix}/libraries"));
+        assert!(pc.contains("includedir=${prefix}/headers"));
+        assert!(pc.contains("mandir=${prefix}/documentation/man-pages"));
+        assert!(pc.contains("infodir=${prefix}/documentation/info"));
+        assert!(!destdir.join("usr").exists());
+    }
+
+    #[test]
+    fn process_normalizes_duplicate_identical_lbi_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("system/lib/clang/22/include")).unwrap();
+        std::fs::create_dir_all(destdir.join("system/libraries/clang/22/include")).unwrap();
+        std::fs::write(
+            destdir.join("system/lib/clang/22/include/builtins.h"),
+            "same header\n",
+        )
+        .unwrap();
+        std::fs::write(
+            destdir.join("system/libraries/clang/22/include/builtins.h"),
+            "same header\n",
+        )
+        .unwrap();
+
+        let spec = mk_spec_for_stage_processing();
+        process(&destdir, &spec).unwrap();
+
+        assert!(
+            !destdir
+                .join("system/lib/clang/22/include/builtins.h")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_to_string(destdir.join("system/libraries/clang/22/include/builtins.h"))
+                .unwrap(),
+            "same header\n"
+        );
+    }
+
+    #[test]
+    fn process_rejects_conflicting_lbi_normalized_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("system/lib/clang/22/include")).unwrap();
+        std::fs::create_dir_all(destdir.join("system/libraries/clang/22/include")).unwrap();
+        std::fs::write(
+            destdir.join("system/lib/clang/22/include/builtins.h"),
+            "left header\n",
+        )
+        .unwrap();
+        std::fs::write(
+            destdir.join("system/libraries/clang/22/include/builtins.h"),
+            "right header\n",
+        )
+        .unwrap();
+
+        let spec = mk_spec_for_stage_processing();
+        let err = process(&destdir, &spec).unwrap_err();
+
+        assert!(
+            err.to_string().contains("destination already exists"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn process_normalizes_split_output_usr_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        let out = destdir.join(".depot/outputs/foo-devel/usr/lib/pkgconfig");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("foo.pc"), "prefix=/usr\nlibdir=/usr/lib\n").unwrap();
+
+        let spec = mk_spec_for_stage_processing();
+        process(&destdir, &spec).unwrap();
+
+        let pc_path = destdir.join(".depot/outputs/foo-devel/system/libraries/pkgconfig/foo.pc");
+        assert!(pc_path.exists());
+        let pc = std::fs::read_to_string(pc_path).unwrap();
+        assert!(pc.contains("prefix=/system"));
+        assert!(pc.contains("libdir=/system/libraries"));
     }
 
     #[test]
@@ -2426,6 +2791,34 @@ mod tests {
             !manifest
                 .files
                 .contains(&".depot/outputs/clang/usr/bin/clang".to_string())
+        );
+    }
+
+    #[test]
+    fn generate_manifest_skips_bootstrap_chroot_destdir_mountpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("system/binaries")).unwrap();
+        std::fs::create_dir_all(destdir.join("destdir/system/documentation/xz")).unwrap();
+        std::fs::write(destdir.join("system/binaries/xz"), "ok").unwrap();
+        std::fs::write(
+            destdir.join("destdir/system/documentation/xz/README"),
+            "stale staging",
+        )
+        .unwrap();
+
+        let manifest = generate_manifest_with_dirs(&destdir).unwrap();
+
+        assert!(manifest.files.contains(&"system/binaries/xz".to_string()));
+        assert!(
+            !manifest
+                .files
+                .contains(&"destdir/system/documentation/xz/README".to_string())
+        );
+        assert!(
+            !manifest
+                .directories
+                .contains(&"destdir/system/documentation/xz".to_string())
         );
     }
 }

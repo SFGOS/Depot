@@ -10,12 +10,22 @@ use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 
+const DEPOT_BOOTSTRAP_IGNORE_SBASE_CONFLICTS: &str = "DEPOT_BOOTSTRAP_IGNORE_SBASE_CONFLICTS";
+
 fn format_licenses(licenses: &[String]) -> String {
     licenses.join(", ")
 }
 
 fn verbose_remove_output() -> bool {
     std::env::var_os("DEPOT_VERBOSE_REMOVE").is_some()
+}
+
+fn should_ignore_sbase_conflicts() -> bool {
+    std::env::var_os(DEPOT_BOOTSTRAP_IGNORE_SBASE_CONFLICTS).is_some()
+}
+
+fn should_auto_clear_conflict(owner: &str, path: &str) -> bool {
+    (owner == "sbase" && should_ignore_sbase_conflicts()) || is_auto_removable_path(path)
 }
 
 /// Installed package row from the local package database.
@@ -213,7 +223,7 @@ pub fn register_package_with_replacement(
         if let Ok(owner) = owner_res
             && owner != spec.package.name
         {
-            if is_auto_removable_path(file) {
+            if should_auto_clear_conflict(&owner, file) {
                 auto_conflicts.push((file.clone(), owner));
             } else {
                 fatal_conflicts.push((file.clone(), owner));
@@ -241,6 +251,15 @@ pub fn register_package_with_replacement(
             )?;
 
             if let Some(rootfs) = &rootfs_opt {
+                if destdir.join(f).symlink_metadata().is_ok() {
+                    crate::log_info!(
+                        "Auto-cleared DB ownership for path: {} (previously owned by {})",
+                        f,
+                        owner
+                    );
+                    continue;
+                }
+
                 let disk_path = rootfs.join(f);
                 if disk_path.exists() {
                     let _ = std::fs::remove_file(&disk_path);
@@ -1056,6 +1075,7 @@ mod tests {
     use crate::package::{
         Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source,
     };
+    use crate::test_support::TestEnv;
     use std::path::PathBuf;
 
     fn mk_spec(name: &str, version: &str) -> PackageSpec {
@@ -1241,6 +1261,69 @@ mod tests {
         assert!(!files_a.contains(&"usr/share/perl5/shared.pm".to_string()));
         let files_b = get_package_files(&db_path, "beta").unwrap();
         assert!(files_b.contains(&"usr/share/perl5/shared.pm".to_string()));
+    }
+
+    #[test]
+    fn register_package_auto_clears_sbase_conflicts_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let db_path = crate::config::Config::for_rootfs(&rootfs).installed_db_path(&rootfs);
+        std::fs::create_dir_all(rootfs.join("system/binaries")).unwrap();
+        std::fs::write(rootfs.join("system/binaries/find"), "sbase find").unwrap();
+
+        let spec_a = mk_spec("sbase", "1.0");
+        let dest_a = tmp.path().join("dest_a");
+        std::fs::create_dir_all(dest_a.join("system/binaries")).unwrap();
+        std::fs::write(dest_a.join("system/binaries/find"), "sbase find").unwrap();
+        register_package(&db_path, &spec_a, &dest_a).unwrap();
+
+        let spec_b = mk_spec("bfs", "4.1");
+        let dest_b = tmp.path().join("dest_b");
+        std::fs::create_dir_all(dest_b.join("system/binaries")).unwrap();
+        std::fs::write(dest_b.join("system/binaries/find"), "bfs find").unwrap();
+
+        let mut env = TestEnv::new();
+        env.set_var(DEPOT_BOOTSTRAP_IGNORE_SBASE_CONFLICTS, "1");
+        register_package(&db_path, &spec_b, &dest_b).unwrap();
+
+        let files_sbase = get_package_files(&db_path, "sbase").unwrap();
+        assert!(!files_sbase.contains(&"system/binaries/find".to_string()));
+        let files_bfs = get_package_files(&db_path, "bfs").unwrap();
+        assert!(files_bfs.contains(&"system/binaries/find".to_string()));
+    }
+
+    #[test]
+    fn register_package_auto_clear_preserves_new_payload_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let db_path = crate::config::Config::for_rootfs(&rootfs).installed_db_path(&rootfs);
+        std::fs::create_dir_all(rootfs.join("system/binaries")).unwrap();
+        std::fs::write(rootfs.join("system/binaries/find"), "sbase find").unwrap();
+
+        let spec_a = mk_spec("sbase", "1.0");
+        let dest_a = tmp.path().join("dest_a");
+        std::fs::create_dir_all(dest_a.join("system/binaries")).unwrap();
+        std::fs::write(dest_a.join("system/binaries/find"), "sbase find").unwrap();
+        register_package(&db_path, &spec_a, &dest_a).unwrap();
+
+        std::fs::write(rootfs.join("system/binaries/find"), "bfs find").unwrap();
+        let spec_b = mk_spec("bfs", "4.1");
+        let dest_b = tmp.path().join("dest_b");
+        std::fs::create_dir_all(dest_b.join("system/binaries")).unwrap();
+        std::fs::write(dest_b.join("system/binaries/find"), "bfs find").unwrap();
+
+        let mut env = TestEnv::new();
+        env.set_var(DEPOT_BOOTSTRAP_IGNORE_SBASE_CONFLICTS, "1");
+        register_package(&db_path, &spec_b, &dest_b).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("system/binaries/find")).unwrap(),
+            "bfs find"
+        );
+        let files_sbase = get_package_files(&db_path, "sbase").unwrap();
+        assert!(!files_sbase.contains(&"system/binaries/find".to_string()));
+        let files_bfs = get_package_files(&db_path, "bfs").unwrap();
+        assert!(files_bfs.contains(&"system/binaries/find".to_string()));
     }
 
     #[test]

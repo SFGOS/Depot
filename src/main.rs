@@ -1,6 +1,7 @@
 //! Depot - Not Your Average Package Manager
 //! A source-based package manager for Linux
 
+mod bootstrap;
 mod build_options;
 mod builder;
 mod cli;
@@ -24,6 +25,7 @@ mod shell_helpers;
 mod signing;
 mod source;
 mod staging;
+mod system_state;
 #[cfg(test)]
 mod test_support;
 mod ui;

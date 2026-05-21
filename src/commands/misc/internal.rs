@@ -143,6 +143,13 @@ pub(crate) fn run_internal_command(command: InternalCommands) -> Result<()> {
                 &[],
             )
         }
+        InternalCommands::BootstrapChroot {
+            rootfs,
+            sources,
+            destdir,
+            workdir,
+            script,
+        } => crate::bootstrap::run_bootstrap_chroot(&rootfs, &sources, &destdir, &workdir, &script),
         InternalCommands::AutotoolsConfigure { args } => {
             let env_vars = current_process_env_vars();
             let context = current_build_helper_context()?;
