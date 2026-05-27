@@ -10,8 +10,11 @@
 prefix = "/usr/local"
 
 # Personal toolchain preference.
+# tool_dir = "/usr/bin"
 cc = "clang"
-# cxx = "clang++"
+# cxx = "$TOOL_DIR/clang++"
+# ranlib = "$TOOL_DIR/ranlib"
+# strip = "$TOOL_DIR/strip"
 
 [build.flags]
 # User-local compiler preferences.
@@ -22,6 +25,7 @@ carch = "x86_64"
 # Examples:
 # cxxflags = ["-O2", "-g"]
 # ldflags = ["-Wl,-O1"]
+# fuse_ld = "lld"
 # makeflags = "-j4"
 
 # Optional install directory overrides for supported builders.

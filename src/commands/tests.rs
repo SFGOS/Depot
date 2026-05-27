@@ -41,6 +41,90 @@ fn lib32_args() -> Lib32Args {
     Lib32Args { lib32_only: false }
 }
 
+#[test]
+fn build_env_rootfs_uses_selected_non_live_rootfs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let expected = tmp.path().canonicalize().unwrap();
+
+    assert_eq!(
+        build_cmd::build_env_rootfs(tmp.path()),
+        expected.to_string_lossy()
+    );
+    assert_eq!(build_cmd::build_env_rootfs(Path::new("/")), "/");
+}
+
+#[test]
+fn install_post_extract_env_uses_selected_non_live_rootfs() -> Result<()> {
+    let _guard = assume_yes_test_lock();
+    let temp = tempfile::tempdir().context("Failed to create temp dir")?;
+    let rootfs = temp.path().join("rootfs");
+    let spec_dir = temp.path().join("packages").join("demo");
+    let source_dir = temp.path().join("source").join("demo-1.0.0");
+    let observed_env = temp.path().join("post-extract-rootfs.txt");
+    fs::create_dir_all(&rootfs)?;
+    fs::create_dir_all(&spec_dir)?;
+    fs::create_dir_all(&source_dir)?;
+    fs::write(source_dir.join("README"), "demo source")?;
+    fs::write(
+        spec_dir.join("build.sh"),
+        "mkdir -p \"$DESTDIR/usr/bin\"\nprintf demo > \"$DESTDIR/usr/bin/demo\"\n",
+    )?;
+
+    let spec_path = spec_dir.join("demo.toml");
+    fs::write(
+        &spec_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "1.0.0"
+revision = 1
+description = "demo"
+homepage = "https://example.test/demo"
+license = "MIT"
+
+[[source]]
+url = "file://{}"
+sha256 = "skip"
+extract_dir = "demo-1.0.0"
+post_extract = ["printf '%s' \"$DEPOT_ROOTFS\" > '{}'"]
+
+[build]
+type = "custom"
+
+[dependencies]
+build = []
+runtime = []
+optional = []
+"#,
+            source_dir.display(),
+            observed_env.display()
+        ),
+    )?;
+
+    let config = config::Config::for_rootfs(&rootfs);
+    register_required_development_package_if_configured(&config, &rootfs)?;
+
+    run(Cli {
+        command: Commands::Install(InstallArgs {
+            rootfs_args: rootfs_args(rootfs.clone()),
+            prompt_args: prompt_args(true),
+            build_exec_args: BuildExecArgs {
+                no_deps: true,
+                ..build_exec_args()
+            },
+            lib32_args: lib32_args(),
+            spec_or_archive: vec![spec_path],
+            spec: None,
+        }),
+    })?;
+
+    assert_eq!(
+        fs::read_to_string(&observed_env)?,
+        build_cmd::build_env_rootfs(&rootfs)
+    );
+    Ok(())
+}
+
 fn test_binary_repo_record(name: &str, filename: &str) -> db::repo::BinaryRepoPackageRecord {
     db::repo::BinaryRepoPackageRecord {
         repo_name: "core".into(),
@@ -378,7 +462,7 @@ fn binary_install_path_uses_repo_record_metadata_without_archive_metadata() -> R
     assert_eq!(installed[0].package.name, "pkg");
     assert!(rootfs.path().join("usr/bin/hello").exists());
 
-    let db_path = cfg.db_dir.join("packages.db");
+    let db_path = cfg.installed_db_path(rootfs.path());
     assert_eq!(
         db::get_package_version(&db_path, "pkg")?,
         Some("1.0".into())

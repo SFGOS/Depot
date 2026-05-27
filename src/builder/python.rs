@@ -36,7 +36,6 @@ pub fn build(
 ) -> Result<()> {
     let flags = &spec.build.flags;
     let actual_src = resolve_actual_src(spec, src_dir)?;
-    let config_settings = normalize_pep517_config_settings(spec)?;
     fs::create_dir_all(destdir)
         .with_context(|| format!("Failed to create DESTDIR: {}", destdir.display()))?;
 
@@ -44,6 +43,7 @@ pub fn build(
     crate::builder::set_env_var(&mut env_vars, "PYTHONNOUSERSITE", "1");
     crate::builder::set_env_var(&mut env_vars, "PYTHONDONTWRITEBYTECODE", "1");
     crate::builder::set_env_var(&mut env_vars, "SETUPTOOLS_USE_DISTUTILS", "local");
+    let config_settings = normalize_pep517_config_settings(spec, &env_vars)?;
 
     let mut state = StateTracker::new_with_namespace(
         &actual_src,
@@ -84,10 +84,13 @@ pub fn build(
     Ok(())
 }
 
-fn normalize_pep517_config_settings(spec: &PackageSpec) -> Result<Vec<String>> {
+fn normalize_pep517_config_settings(
+    spec: &PackageSpec,
+    env_vars: &[(String, String)],
+) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for raw in &spec.build.flags.config_settings {
-        let expanded = spec.expand_vars(raw);
+        let expanded = crate::builder::expand_with_envs(&spec.expand_vars(raw), env_vars);
         let trimmed = expanded.trim();
         if trimmed.is_empty() {
             continue;
@@ -821,9 +824,11 @@ mod tests {
             "setup-args=--plat-name=x86_64".into(),
             "builddir".into(),
             "version=$version".into(),
+            "libdir=$LIBDIR".into(),
         ];
 
-        let normalized = normalize_pep517_config_settings(&spec)?;
+        let env_vars = crate::builder::standard_build_env(&spec, None, false, true);
+        let normalized = normalize_pep517_config_settings(&spec, &env_vars)?;
         assert_eq!(
             normalized,
             vec![
@@ -831,6 +836,7 @@ mod tests {
                 "setup-args=--plat-name=x86_64".to_string(),
                 "builddir=".to_string(),
                 "version=1.2.3".to_string(),
+                "libdir=/usr/lib".to_string(),
             ]
         );
         Ok(())
@@ -840,7 +846,8 @@ mod tests {
     fn normalize_pep517_config_settings_rejects_invalid_key() {
         let mut spec = mk_spec();
         spec.build.flags.config_settings = vec!["bad key=value".into()];
-        let err = normalize_pep517_config_settings(&spec)
+        let env_vars = crate::builder::standard_build_env(&spec, None, false, true);
+        let err = normalize_pep517_config_settings(&spec, &env_vars)
             .expect_err("invalid config setting key should fail");
         assert!(err.to_string().contains("expected KEY=VALUE or KEY"));
     }

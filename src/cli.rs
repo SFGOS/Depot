@@ -250,6 +250,32 @@ pub struct ConfigArgs {
     pub rootfs_args: RootfsArgs,
 }
 
+/// Arguments for selecting canonical tool aliases in the configured tool directory.
+#[derive(Debug, Clone, Args)]
+pub struct SetArgs {
+    #[command(flatten)]
+    pub rootfs_args: RootfsArgs,
+
+    /// Tool role to configure, such as compiler, linker, or shell.
+    #[arg(value_enum)]
+    pub role: ToolRoleArg,
+
+    /// Literal separator used by commands like `depot set compiler to clang`.
+    #[arg(value_name = "to")]
+    pub connector: String,
+
+    /// Tool implementation to select for the requested role.
+    pub implementation: String,
+}
+
+/// Tool alias role configurable through `depot set`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ToolRoleArg {
+    Compiler,
+    Linker,
+    Shell,
+}
+
 /// Arguments for Depot system-build state management commands.
 #[derive(Debug, Clone, Args)]
 pub struct SystemArgs {
@@ -373,6 +399,8 @@ pub enum Commands {
     Repo(RepoArgs),
     /// Show current configuration
     Config(ConfigArgs),
+    /// Select canonical tool aliases, e.g. `depot set compiler to clang`
+    Set(SetArgs),
     /// Manage system build stage, package layers, and book-style layout state
     System(SystemArgs),
     /// Generate shell completion scripts and a man page into an output directory.
@@ -591,7 +619,7 @@ pub enum RepoKindArg {
 mod tests {
     use super::{
         BuildArgs, Cli, Commands, ConvertArgs, InstallArgs, RepoArgs, RepoCommands, SearchArgs,
-        UpdateArgs,
+        SetArgs, ToolRoleArg, UpdateArgs,
     };
     use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
@@ -628,6 +656,52 @@ mod tests {
                 assert_eq!(spec, Some(PathBuf::from("pkg.toml")));
             }
             _ => panic!("expected install command"),
+        }
+    }
+
+    #[test]
+    fn set_accepts_role_to_implementation_form() {
+        let cli = Cli::try_parse_from([
+            "depot",
+            "set",
+            "--rootfs",
+            "/tmp/rootfs",
+            "compiler",
+            "to",
+            "clang",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Set(SetArgs {
+                rootfs_args,
+                role,
+                connector,
+                implementation,
+            }) => {
+                assert_eq!(rootfs_args.rootfs, PathBuf::from("/tmp/rootfs"));
+                assert_eq!(role, ToolRoleArg::Compiler);
+                assert_eq!(connector, "to");
+                assert_eq!(implementation, "clang");
+            }
+            _ => panic!("expected set command"),
+        }
+    }
+
+    #[test]
+    fn set_accepts_shell_role() {
+        let cli = Cli::try_parse_from(["depot", "set", "shell", "to", "dash"]).unwrap();
+        match cli.command {
+            Commands::Set(SetArgs {
+                role,
+                connector,
+                implementation,
+                ..
+            }) => {
+                assert_eq!(role, ToolRoleArg::Shell);
+                assert_eq!(connector, "to");
+                assert_eq!(implementation, "dash");
+            }
+            _ => panic!("expected set command"),
         }
     }
 

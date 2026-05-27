@@ -205,9 +205,36 @@ pub fn set_env_var(env_vars: &mut EnvVars, key: &str, value: impl Into<String>) 
     }
 }
 
+fn set_expanded_env_var(env_vars: &mut EnvVars, key: &str, value: impl AsRef<str>) {
+    let expanded = expand_with_envs(value.as_ref(), env_vars);
+    set_env_var(env_vars, key, expanded);
+}
+
+fn configured_tool_or_default(configured: &str, default: &str) -> String {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        default.to_string()
+    } else {
+        configured.to_string()
+    }
+}
+
+fn configured_defaulted_tool_or_default(
+    configured: &str,
+    implicit_default: &str,
+    default: &str,
+) -> String {
+    let configured = configured.trim();
+    if configured.is_empty() || configured == implicit_default {
+        default.to_string()
+    } else {
+        configured.to_string()
+    }
+}
+
 fn apply_declared_env_vars(spec: &PackageSpec, env_vars: &mut EnvVars) {
     for raw in &spec.build.flags.env_vars {
-        let expanded = spec.expand_vars(raw);
+        let expanded = expand_with_envs(&spec.expand_vars(raw), env_vars);
         let entry = expanded.trim();
         if entry.is_empty() {
             continue;
@@ -232,6 +259,21 @@ fn apply_declared_env_vars(spec: &PackageSpec, env_vars: &mut EnvVars) {
 
         set_env_var(env_vars, key, value.to_string());
     }
+}
+
+/// Expand environment variables in a string using Depot's build env first,
+/// falling back to the parent process environment.
+pub(crate) fn expand_with_envs(input: &str, envs: &[(String, String)]) -> String {
+    let mut result = input.to_string();
+    for (key, value) in envs {
+        result = result.replace(&format!("${key}"), value);
+        result = result.replace(&format!("${{{key}}}"), value);
+    }
+    for (key, value) in std::env::vars() {
+        result = result.replace(&format!("${key}"), &value);
+        result = result.replace(&format!("${{{key}}}"), &value);
+    }
+    result
 }
 
 fn default_libdir_for_variant(lib32_variant: bool) -> &'static str {
@@ -513,6 +555,23 @@ pub(crate) fn install_dirs(flags: &crate::package::BuildFlags) -> InstallDirs {
     }
 }
 
+fn apply_install_dir_env_vars(env_vars: &mut EnvVars, flags: &crate::package::BuildFlags) {
+    let dirs = install_dirs(flags);
+    set_env_var(env_vars, "PREFIX", flags.prefix.clone());
+    set_env_var(env_vars, "BINDIR", dirs.bindir);
+    set_env_var(env_vars, "SBINDIR", dirs.sbindir);
+    set_env_var(env_vars, "LIBDIR", dirs.libdir);
+    set_env_var(env_vars, "LIBEXECDIR", dirs.libexecdir);
+    set_env_var(env_vars, "SYSCONFDIR", dirs.sysconfdir);
+    set_env_var(env_vars, "LOCALSTATEDIR", dirs.localstatedir);
+    set_env_var(env_vars, "SHAREDSTATEDIR", dirs.sharedstatedir);
+    set_env_var(env_vars, "INCLUDEDIR", dirs.includedir);
+    set_env_var(env_vars, "DATAROOTDIR", dirs.datarootdir);
+    set_env_var(env_vars, "DATADIR", dirs.datadir);
+    set_env_var(env_vars, "MANDIR", dirs.mandir);
+    set_env_var(env_vars, "INFODIR", dirs.infodir);
+}
+
 pub(crate) fn install_destdir_path(
     build_dir: &Path,
     destdir: &Path,
@@ -628,6 +687,10 @@ fn compiler_flag_sets(
         "build.flags.ltoflags",
     );
 
+    if let Some(fuse_ld) = fuse_ld_flag(&flags.fuse_ld) {
+        ldflags.insert(0, fuse_ld);
+    }
+
     if flags.use_lto && !ltoflags.is_empty() {
         cflags.extend(ltoflags.iter().cloned());
         cxxflags.extend(ltoflags.iter().cloned());
@@ -635,6 +698,26 @@ fn compiler_flag_sets(
     }
 
     (cflags, cxxflags, ldflags, ltoflags)
+}
+
+fn fuse_ld_flag(fuse_ld: &str) -> Option<String> {
+    let fuse_ld = fuse_ld.trim();
+    if fuse_ld.is_empty() {
+        None
+    } else if fuse_ld.starts_with("-fuse-ld=") || fuse_ld.starts_with("--ld-path=") {
+        Some(fuse_ld.to_string())
+    } else if fuse_ld.contains('/') {
+        Some(format!("-fuse-ld={fuse_ld}"))
+    } else {
+        let driver_name = match fuse_ld {
+            "ld.lld" => "lld",
+            "ld.mold" => "mold",
+            "ld.gold" => "gold",
+            "ld.bfd" => "bfd",
+            _ => fuse_ld,
+        };
+        Some(format!("-fuse-ld={driver_name}"))
+    }
 }
 
 fn rust_ltoflags(flags: &crate::package::BuildFlags) -> Vec<String> {
@@ -664,21 +747,25 @@ pub fn standard_build_env(
     let mut env_vars: EnvVars = Vec::new();
     let export_compiler_flags = export_compiler_flags && !flags.no_flags;
 
+    if !flags.tool_dir.trim().is_empty() {
+        set_expanded_env_var(&mut env_vars, "TOOL_DIR", flags.tool_dir.trim());
+    }
+
     if include_compiler_env && export_compiler_flags {
         let (cflags, cxxflags, ldflags, ltoflags) = compiler_flag_sets(flags);
 
         if !cflags.is_empty() {
-            set_env_var(&mut env_vars, "CFLAGS", cflags.join(" "));
+            set_expanded_env_var(&mut env_vars, "CFLAGS", cflags.join(" "));
         }
         if !cxxflags.is_empty() {
-            set_env_var(&mut env_vars, "CXXFLAGS", cxxflags.join(" "));
+            set_expanded_env_var(&mut env_vars, "CXXFLAGS", cxxflags.join(" "));
         }
         if !ltoflags.is_empty() {
-            set_env_var(&mut env_vars, "LTOFLAGS", ltoflags.join(" "));
+            set_expanded_env_var(&mut env_vars, "LTOFLAGS", ltoflags.join(" "));
         }
         let rust_ltoflags = rust_ltoflags(flags);
         if !rust_ltoflags.is_empty() {
-            set_env_var(&mut env_vars, "RUSTLTOFLAGS", rust_ltoflags.join(" "));
+            set_expanded_env_var(&mut env_vars, "RUSTLTOFLAGS", rust_ltoflags.join(" "));
         }
 
         let ldflags = if !ldflags.is_empty() || !flags.libc.is_empty() {
@@ -693,7 +780,7 @@ pub fn standard_build_env(
             String::new()
         };
         if !ldflags.is_empty() {
-            set_env_var(&mut env_vars, "LDFLAGS", ldflags);
+            set_expanded_env_var(&mut env_vars, "LDFLAGS", ldflags);
         }
     }
 
@@ -712,15 +799,9 @@ pub fn standard_build_env(
     if !effective_carch.is_empty() {
         set_env_var(&mut env_vars, "CARCH", effective_carch);
     }
-    if !flags.prefix.is_empty() {
-        set_env_var(&mut env_vars, "PREFIX", flags.prefix.clone());
-    }
+    apply_install_dir_env_vars(&mut env_vars, flags);
     if !flags.makeflags.trim().is_empty() {
-        set_env_var(
-            &mut env_vars,
-            "MAKEFLAGS",
-            flags.makeflags.trim().to_string(),
-        );
+        set_expanded_env_var(&mut env_vars, "MAKEFLAGS", flags.makeflags.trim());
     }
 
     set_env_var(&mut env_vars, "DEPOT_ROOTFS", flags.rootfs.clone());
@@ -732,13 +813,60 @@ pub fn standard_build_env(
 
     if include_compiler_env {
         if let Some(cc_cfg) = cross {
-            set_env_var(&mut env_vars, "CC", cc_cfg.cc.clone());
-            set_env_var(&mut env_vars, "CXX", cc_cfg.cxx.clone());
-            set_env_var(&mut env_vars, "AR", cc_cfg.ar.clone());
-            set_env_var(&mut env_vars, "RANLIB", cc_cfg.ranlib.clone());
-            set_env_var(&mut env_vars, "STRIP", cc_cfg.strip.clone());
-            set_env_var(&mut env_vars, "LD", cc_cfg.ld.clone());
-            set_env_var(&mut env_vars, "NM", cc_cfg.nm.clone());
+            let default_flags = BuildFlags::default();
+            set_expanded_env_var(
+                &mut env_vars,
+                "CC",
+                configured_defaulted_tool_or_default(&flags.cc, &default_flags.cc, &cc_cfg.cc),
+            );
+            set_expanded_env_var(
+                &mut env_vars,
+                "CXX",
+                configured_defaulted_tool_or_default(&flags.cxx, &default_flags.cxx, &cc_cfg.cxx),
+            );
+            set_expanded_env_var(
+                &mut env_vars,
+                "AR",
+                configured_defaulted_tool_or_default(&flags.ar, &default_flags.ar, &cc_cfg.ar),
+            );
+            set_expanded_env_var(
+                &mut env_vars,
+                "RANLIB",
+                configured_tool_or_default(&flags.ranlib, &cc_cfg.ranlib),
+            );
+            set_expanded_env_var(
+                &mut env_vars,
+                "STRIP",
+                configured_tool_or_default(&flags.strip, &cc_cfg.strip),
+            );
+            set_expanded_env_var(
+                &mut env_vars,
+                "LD",
+                configured_tool_or_default(&flags.ld, &cc_cfg.ld),
+            );
+            set_expanded_env_var(
+                &mut env_vars,
+                "NM",
+                configured_tool_or_default(&flags.nm, &cc_cfg.nm),
+            );
+            set_expanded_env_var(
+                &mut env_vars,
+                "OBJCOPY",
+                configured_tool_or_default(&flags.objcopy, &cc_cfg.objcopy),
+            );
+            set_expanded_env_var(
+                &mut env_vars,
+                "OBJDUMP",
+                configured_tool_or_default(&flags.objdump, &cc_cfg.objdump),
+            );
+            set_expanded_env_var(
+                &mut env_vars,
+                "READELF",
+                configured_tool_or_default(&flags.readelf, &cc_cfg.readelf),
+            );
+            if !flags.cpp.trim().is_empty() {
+                set_expanded_env_var(&mut env_vars, "CPP", flags.cpp.trim());
+            }
             set_env_var(&mut env_vars, "CROSS_PREFIX", cc_cfg.prefix.clone());
             set_env_var(
                 &mut env_vars,
@@ -746,14 +874,32 @@ pub fn standard_build_env(
                 format!("{}-", cc_cfg.prefix),
             );
         } else {
-            set_env_var(&mut env_vars, "CC", flags.cc.clone());
-            set_env_var(&mut env_vars, "CXX", flags.cxx.clone());
-            set_env_var(&mut env_vars, "AR", flags.ar.clone());
+            set_expanded_env_var(&mut env_vars, "CC", flags.cc.trim());
+            set_expanded_env_var(&mut env_vars, "CXX", flags.cxx.trim());
+            set_expanded_env_var(&mut env_vars, "AR", flags.ar.trim());
+            if !flags.ranlib.trim().is_empty() {
+                set_expanded_env_var(&mut env_vars, "RANLIB", flags.ranlib.trim());
+            }
+            if !flags.strip.trim().is_empty() {
+                set_expanded_env_var(&mut env_vars, "STRIP", flags.strip.trim());
+            }
             if !flags.ld.trim().is_empty() {
-                set_env_var(&mut env_vars, "LD", flags.ld.clone());
+                set_expanded_env_var(&mut env_vars, "LD", flags.ld.trim());
+            }
+            if !flags.nm.trim().is_empty() {
+                set_expanded_env_var(&mut env_vars, "NM", flags.nm.trim());
+            }
+            if !flags.objcopy.trim().is_empty() {
+                set_expanded_env_var(&mut env_vars, "OBJCOPY", flags.objcopy.trim());
+            }
+            if !flags.objdump.trim().is_empty() {
+                set_expanded_env_var(&mut env_vars, "OBJDUMP", flags.objdump.trim());
+            }
+            if !flags.readelf.trim().is_empty() {
+                set_expanded_env_var(&mut env_vars, "READELF", flags.readelf.trim());
             }
             if !flags.cpp.trim().is_empty() {
-                set_env_var(&mut env_vars, "CPP", flags.cpp.clone());
+                set_expanded_env_var(&mut env_vars, "CPP", flags.cpp.trim());
             }
         }
     }
@@ -1026,6 +1172,12 @@ mod tests {
         }
     }
 
+    fn env_value<'a>(env: &'a EnvVars, key: &str) -> Option<&'a str> {
+        env.iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.as_str())
+    }
+
     #[test]
     fn test_prepare_command() {
         let mut cmd = Command::new("ls");
@@ -1143,12 +1295,119 @@ mod tests {
     #[test]
     fn test_standard_build_env_exports_native_linker_and_cpp() {
         let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.ranlib = "llvm-ranlib".to_string();
+        spec.build.flags.strip = "llvm-strip".to_string();
         spec.build.flags.ld = "ld.lld".to_string();
+        spec.build.flags.nm = "llvm-nm".to_string();
+        spec.build.flags.objcopy = "llvm-objcopy".to_string();
+        spec.build.flags.objdump = "llvm-objdump".to_string();
+        spec.build.flags.readelf = "llvm-readelf".to_string();
         spec.build.flags.cpp = "clang-cpp".to_string();
 
         let env = standard_build_env(&spec, None, true, true);
+        assert!(env.iter().any(|(k, v)| k == "RANLIB" && v == "llvm-ranlib"));
+        assert!(env.iter().any(|(k, v)| k == "STRIP" && v == "llvm-strip"));
         assert!(env.iter().any(|(k, v)| k == "LD" && v == "ld.lld"));
+        assert!(env.iter().any(|(k, v)| k == "NM" && v == "llvm-nm"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "OBJCOPY" && v == "llvm-objcopy")
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "OBJDUMP" && v == "llvm-objdump")
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "READELF" && v == "llvm-readelf")
+        );
         assert!(env.iter().any(|(k, v)| k == "CPP" && v == "clang-cpp"));
+    }
+
+    #[test]
+    fn test_standard_build_env_exports_tool_dir_and_expands_tool_commands() {
+        let mut spec = mk_spec(
+            vec!["--gcc-toolchain=$TOOL_DIR"],
+            vec!["-B$TOOL_DIR", "-Wl,--as-needed"],
+        );
+        spec.build.flags.tool_dir = "/opt/depot-tools/bin".to_string();
+        spec.build.flags.cc = "$TOOL_DIR/clang".to_string();
+        spec.build.flags.cxx = "$TOOL_DIR/clang++".to_string();
+        spec.build.flags.ar = "$TOOL_DIR/llvm-ar".to_string();
+        spec.build.flags.ranlib = "$TOOL_DIR/llvm-ranlib".to_string();
+        spec.build.flags.ld = "$TOOL_DIR/ld.lld".to_string();
+        spec.build.flags.env_vars = vec!["LLVM_CONFIG=$TOOL_DIR/llvm-config".to_string()];
+
+        let env = standard_build_env(&spec, None, true, true);
+
+        assert_eq!(env_value(&env, "TOOL_DIR"), Some("/opt/depot-tools/bin"));
+        assert_eq!(env_value(&env, "CC"), Some("/opt/depot-tools/bin/clang"));
+        assert_eq!(env_value(&env, "CXX"), Some("/opt/depot-tools/bin/clang++"));
+        assert_eq!(env_value(&env, "AR"), Some("/opt/depot-tools/bin/llvm-ar"));
+        assert_eq!(
+            env_value(&env, "RANLIB"),
+            Some("/opt/depot-tools/bin/llvm-ranlib")
+        );
+        assert_eq!(env_value(&env, "LD"), Some("/opt/depot-tools/bin/ld.lld"));
+        assert_eq!(
+            env_value(&env, "CFLAGS"),
+            Some("--gcc-toolchain=/opt/depot-tools/bin")
+        );
+        assert_eq!(
+            env_value(&env, "LDFLAGS"),
+            Some("-B/opt/depot-tools/bin -Wl,--as-needed")
+        );
+        assert_eq!(
+            env_value(&env, "LLVM_CONFIG"),
+            Some("/opt/depot-tools/bin/llvm-config")
+        );
+    }
+
+    #[test]
+    fn test_standard_build_env_cross_uses_package_tool_overrides() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.cc = "/tools/bin/clang".to_string();
+        spec.build.flags.cxx = "/tools/bin/clang++".to_string();
+        spec.build.flags.ar = "/tools/bin/llvm-ar".to_string();
+        spec.build.flags.ranlib = "/tools/bin/llvm-ranlib".to_string();
+        spec.build.flags.strip = "/tools/bin/llvm-strip".to_string();
+        spec.build.flags.ld = "/tools/bin/ld.lld".to_string();
+        spec.build.flags.nm = "/tools/bin/llvm-nm".to_string();
+        spec.build.flags.objcopy = "/tools/bin/llvm-objcopy".to_string();
+        spec.build.flags.objdump = "/tools/bin/llvm-objdump".to_string();
+        spec.build.flags.readelf = "/tools/bin/llvm-readelf".to_string();
+        spec.build.flags.cpp = "/tools/bin/clang-cpp".to_string();
+        let cross = CrossConfig {
+            prefix: "x86_64-test-linux-gnu".into(),
+            cc: "x86_64-test-linux-gnu-gcc".into(),
+            cxx: "x86_64-test-linux-gnu-g++".into(),
+            ar: "x86_64-test-linux-gnu-ar".into(),
+            ranlib: "x86_64-test-linux-gnu-ranlib".into(),
+            strip: "x86_64-test-linux-gnu-strip".into(),
+            ld: "x86_64-test-linux-gnu-ld".into(),
+            nm: "x86_64-test-linux-gnu-nm".into(),
+            objcopy: "x86_64-test-linux-gnu-objcopy".into(),
+            objdump: "x86_64-test-linux-gnu-objdump".into(),
+            readelf: "x86_64-test-linux-gnu-readelf".into(),
+        };
+
+        let env = standard_build_env(&spec, Some(&cross), true, true);
+
+        assert_eq!(env_value(&env, "CC"), Some("/tools/bin/clang"));
+        assert_eq!(env_value(&env, "CXX"), Some("/tools/bin/clang++"));
+        assert_eq!(env_value(&env, "AR"), Some("/tools/bin/llvm-ar"));
+        assert_eq!(env_value(&env, "RANLIB"), Some("/tools/bin/llvm-ranlib"));
+        assert_eq!(env_value(&env, "STRIP"), Some("/tools/bin/llvm-strip"));
+        assert_eq!(env_value(&env, "LD"), Some("/tools/bin/ld.lld"));
+        assert_eq!(env_value(&env, "NM"), Some("/tools/bin/llvm-nm"));
+        assert_eq!(env_value(&env, "OBJCOPY"), Some("/tools/bin/llvm-objcopy"));
+        assert_eq!(env_value(&env, "OBJDUMP"), Some("/tools/bin/llvm-objdump"));
+        assert_eq!(env_value(&env, "READELF"), Some("/tools/bin/llvm-readelf"));
+        assert_eq!(env_value(&env, "CPP"), Some("/tools/bin/clang-cpp"));
+        assert_eq!(
+            env_value(&env, "CROSS_PREFIX"),
+            Some("x86_64-test-linux-gnu")
+        );
     }
 
     #[test]
@@ -1174,6 +1433,24 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "CARCH" && v == "aarch64"),
             "expected cross builds to export target CARCH"
+        );
+        assert!(
+            cross_env
+                .iter()
+                .any(|(k, v)| k == "OBJCOPY" && v == "aarch64-linux-gnu-objcopy"),
+            "expected cross builds to export OBJCOPY"
+        );
+        assert!(
+            cross_env
+                .iter()
+                .any(|(k, v)| k == "OBJDUMP" && v == "aarch64-linux-gnu-objdump"),
+            "expected cross builds to export OBJDUMP"
+        );
+        assert!(
+            cross_env
+                .iter()
+                .any(|(k, v)| k == "READELF" && v == "aarch64-linux-gnu-readelf"),
+            "expected cross builds to export READELF"
         );
 
         let mut lib32_spec = spec.clone();
@@ -1269,6 +1546,29 @@ mod tests {
                 .any(|(k, v)| k == "LTOFLAGS" && v == "-flto=auto -fuse-linker-plugin"),
             "expected LTOFLAGS variable to be exported"
         );
+    }
+
+    #[test]
+    fn test_standard_build_env_injects_fuse_ld_into_ldflags() {
+        let mut spec = mk_spec(Vec::new(), vec!["-Wl,--as-needed"]);
+        spec.build.flags.fuse_ld = "/usr/bin/ld.lld".into();
+
+        let env = standard_build_env(&spec, None, true, true);
+
+        assert_eq!(
+            env_value(&env, "LDFLAGS"),
+            Some("-fuse-ld=/usr/bin/ld.lld -Wl,--as-needed")
+        );
+    }
+
+    #[test]
+    fn test_standard_build_env_normalizes_fuse_ld_tool_names() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.fuse_ld = "ld.lld".into();
+
+        let env = standard_build_env(&spec, None, true, true);
+
+        assert_eq!(env_value(&env, "LDFLAGS"), Some("-fuse-ld=lld"));
     }
 
     #[test]
@@ -1384,6 +1684,62 @@ mod tests {
     }
 
     #[test]
+    fn test_standard_build_env_exports_install_dir_vars() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.prefix = "/system".into();
+        spec.build.flags.bindir = "/system/binaries".into();
+        spec.build.flags.sbindir = "/system/systembinaries".into();
+        spec.build.flags.libdir = "/system/libraries".into();
+        spec.build.flags.libexecdir = "/system/libexec".into();
+        spec.build.flags.sysconfdir = "/system/configuration".into();
+        spec.build.flags.localstatedir = "/system/variable".into();
+        spec.build.flags.sharedstatedir = "/system/variable/lib".into();
+        spec.build.flags.includedir = "/system/headers".into();
+        spec.build.flags.datarootdir = "/system/share".into();
+        spec.build.flags.datadir = "/system/data".into();
+        spec.build.flags.mandir = "/system/documentation/man-pages".into();
+        spec.build.flags.infodir = "/system/documentation/info".into();
+
+        let env = standard_build_env(&spec, None, false, true);
+
+        assert_eq!(env_value(&env, "PREFIX"), Some("/system"));
+        assert_eq!(env_value(&env, "BINDIR"), Some("/system/binaries"));
+        assert_eq!(env_value(&env, "SBINDIR"), Some("/system/systembinaries"));
+        assert_eq!(env_value(&env, "LIBDIR"), Some("/system/libraries"));
+        assert_eq!(env_value(&env, "LIBEXECDIR"), Some("/system/libexec"));
+        assert_eq!(env_value(&env, "SYSCONFDIR"), Some("/system/configuration"));
+        assert_eq!(env_value(&env, "LOCALSTATEDIR"), Some("/system/variable"));
+        assert_eq!(
+            env_value(&env, "SHAREDSTATEDIR"),
+            Some("/system/variable/lib")
+        );
+        assert_eq!(env_value(&env, "INCLUDEDIR"), Some("/system/headers"));
+        assert_eq!(env_value(&env, "DATAROOTDIR"), Some("/system/share"));
+        assert_eq!(env_value(&env, "DATADIR"), Some("/system/data"));
+        assert_eq!(
+            env_value(&env, "MANDIR"),
+            Some("/system/documentation/man-pages")
+        );
+        assert_eq!(
+            env_value(&env, "INFODIR"),
+            Some("/system/documentation/info")
+        );
+    }
+
+    #[test]
+    fn test_standard_build_env_install_dir_vars_use_effective_defaults() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.lib32_variant = true;
+
+        let env = standard_build_env(&spec, None, false, true);
+
+        assert_eq!(env_value(&env, "LIBDIR"), Some("/usr/lib32"));
+        assert_eq!(env_value(&env, "LIBEXECDIR"), Some("/usr/lib32"));
+        assert_eq!(env_value(&env, "DATAROOTDIR"), Some("/usr/share"));
+        assert_eq!(env_value(&env, "DATADIR"), Some("/usr/share"));
+    }
+
+    #[test]
     fn test_standard_build_env_exports_passthrough_env() {
         let mut spec = mk_spec(Vec::new(), Vec::new());
         spec.build.flags.passthrough_env = vec!["RUSTFLAGS".into()];
@@ -1407,6 +1763,7 @@ mod tests {
         spec.build.flags.env_vars = vec![
             "SETUPTOOLS_SCM_PRETEND_VERSION=$version".into(),
             "PYO3_CONFIG_FILE=$specdir/pyo3.toml".into(),
+            "PKG_CONFIG_PATH=$LIBDIR/pkgconfig".into(),
         ];
 
         let env = standard_build_env(&spec, None, false, true);
@@ -1419,6 +1776,11 @@ mod tests {
             env.iter()
                 .any(|(k, v)| k == "PYO3_CONFIG_FILE" && v == "/tmp/specs/demo/pyo3.toml"),
             "expected env_vars values to expand specdir variables"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "PKG_CONFIG_PATH" && v == "/usr/lib/pkgconfig"),
+            "expected env_vars values to expand install directory variables"
         );
     }
 

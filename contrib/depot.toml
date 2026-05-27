@@ -16,15 +16,20 @@ prefix = "/usr"
 
 # Default toolchain commands. These are passed through to builders that honor
 # CC/CXX/AR and related variables.
+# tool_dir = "/usr/bin"
 cc = "clang"
 ar = "ar"
 
 # Optional examples:
-# cxx = "clang++"
-# ld = "ld.lld"
-# cpp = "cpp"
-# strip = "strip"
-# ranlib = "ranlib"
+# cxx = "$TOOL_DIR/clang++"
+# ld = "$TOOL_DIR/ld.lld"
+# cpp = "$TOOL_DIR/cpp"
+# strip = "$TOOL_DIR/strip"
+# ranlib = "$TOOL_DIR/ranlib"
+# nm = "$TOOL_DIR/nm"
+# objcopy = "$TOOL_DIR/objcopy"
+# objdump = "$TOOL_DIR/objdump"
+# readelf = "$TOOL_DIR/readelf"
 
 [build.flags]
 # Baseline C compiler flags for packages that do not supply their own.
@@ -39,6 +44,8 @@ cflags += ["-g"]
 # Optional C++ and linker defaults:
 # cxxflags = ["-O2"]
 ldflags = ["-Wl,-O1"]
+# Select a linker through compiler drivers such as clang/gcc.
+# fuse_ld = "lld"
 
 # Link-time optimization defaults. When use_lto is true, Depot will inject
 # ltoflags into the appropriate compiler and linker flag sets automatically.

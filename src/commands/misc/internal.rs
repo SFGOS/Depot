@@ -35,6 +35,7 @@ fn current_process_env_vars() -> Vec<(String, String)> {
         "RUSTLTOFLAGS",
         "SETUPTOOLS_USE_DISTUTILS",
         "STRIP",
+        "TOOL_DIR",
     ];
 
     ALLOWED_ENV_VARS

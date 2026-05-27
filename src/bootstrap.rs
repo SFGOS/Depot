@@ -335,6 +335,7 @@ fn bootstrap_package_is_complete(
 fn bootstrap_required_payload_paths(package: &str) -> &'static [&'static str] {
     match package {
         "bmake" => &["system/binaries/bmake", "system/share/mk/sys.mk"],
+        "byacc" => &["system/binaries/yacc"],
         "llvm-clang-pass1" => &[
             "system/tools/bin/llvm-config",
             "system/tools/bin/llvm-tblgen",
@@ -348,6 +349,7 @@ fn bootstrap_required_payload_paths(package: &str) -> &'static [&'static str] {
 fn bootstrap_recipe_revision(package: &str) -> Option<u32> {
     match package {
         "bmake" => Some(2),
+        "byacc" => Some(1),
         "llvm" => Some(3),
         "ubase" => Some(1),
         _ => None,
@@ -1584,7 +1586,7 @@ fn write_generated_recipe(
     }
     spec.push_str("no_strip = true\n");
     spec.push_str(
-        "passthrough_env = [\"DEPOT_LBI_CHROOT\", \"DEPOT_LBI_CHROOT_ROOT\", \"DEPOT_LBI_DEPOT_EXE\", \"DEPOT_LBI_SYSROOT\", \"LWI_MAKE_FLAGS\", \"LWI_MAKE_JOBS\"]\n\n",
+        "passthrough_env = [\"DEPOT_LBI_CHROOT\", \"DEPOT_LBI_CHROOT_ROOT\", \"DEPOT_LBI_DEPOT_EXE\", \"DEPOT_LBI_SYSROOT\", \"LBI_CCACHE\", \"LWI_MAKE_FLAGS\", \"LWI_MAKE_JOBS\"]\n\n",
     );
 
     if let Some(primary) = primary_source {
@@ -1753,6 +1755,19 @@ fi
     script.push_str("export LWI_CFLAGS=\"${LWI_CFLAGS:-${CFLAGS:-}}\"\n");
     script.push_str("export LWI_CXXFLAGS=\"${LWI_CXXFLAGS:-$LWI_CFLAGS}\"\n");
     script.push_str("export LBI_CUSTOM_LDFLAGS=\"${LBI_CUSTOM_LDFLAGS:-${LDFLAGS:-}}\"\n\n");
+    if uses_llvm_cmake_ccache(package) {
+        script.push_str(
+            r#"if [ -z "${LBI_CCACHE:-}" ]; then
+    LBI_CCACHE="$(command -v ccache)" || {
+        echo "depot: LLVM bootstrap requires ccache in PATH for the CMake compiler launcher" >&2
+        exit 1
+    }
+fi
+export LBI_CCACHE
+
+"#,
+        );
+    }
     let uses_cross_toolchain = use_cross_toolchain_by_default(package);
     if uses_cross_toolchain {
         script.push_str(
@@ -2112,6 +2127,8 @@ fn apply_bootstrap_package_overrides(package: &BookPackage, command: &str) -> St
         ensure_mandoc_postinstall_uses_staged_man(command)
     } else if package.name == "bmake" {
         ensure_bmake_install_avoids_double_destdir(command)
+    } else if package.name == "byacc" {
+        ensure_byacc_exposes_unprefixed_yacc(command)
     } else if package.name == "ubase" {
         ensure_ubase_moves_bin_payload(command)
     } else if package.name == "sqlite" {
@@ -2137,6 +2154,23 @@ fn ensure_ubase_moves_bin_payload(command: &str) -> String {
         done
     fi
     rmdir "$DESTDIR/system/bin" 2>/dev/null || true
+fi"#
+    )
+}
+
+fn ensure_byacc_exposes_unprefixed_yacc(command: &str) -> String {
+    if !command_runs_install_step(command) {
+        return command.to_string();
+    }
+
+    format!(
+        "{command}\n{}",
+        r#"if [ ! -e "$DESTDIR/system/binaries/yacc" ] && [ -e "$DESTDIR/system/binaries/$LBI_TARGET-yacc" ]; then
+    ln -sf "$LBI_TARGET-yacc" "$DESTDIR/system/binaries/yacc"
+fi
+if [ ! -e "$DESTDIR/system/documentation/man-pages/man1/yacc.1" ] \
+    && [ -e "$DESTDIR/system/documentation/man-pages/man1/$LBI_TARGET-yacc.1" ]; then
+    ln -sf "$LBI_TARGET-yacc.1" "$DESTDIR/system/documentation/man-pages/man1/yacc.1"
 fi"#
     )
 }
@@ -2479,25 +2513,46 @@ fn ensure_llvm_runtime_links_skip_missing_crt(command: &str) -> String {
 }
 
 fn ensure_llvm_cmake_uses_ccache(command: &str) -> String {
-    if command.contains("-DLLVM_CCACHE_BUILD=ON") {
-        return command.to_string();
+    let command = command
+        .replace("    -DLLVM_CCACHE_BUILD=ON \\\n", "")
+        .replace("    -DLLVM_CCACHE_BUILD=ON \\", "")
+        .replace("-DLLVM_CCACHE_BUILD=ON", "");
+
+    if command.contains("-DCMAKE_C_COMPILER_LAUNCHER=")
+        && command.contains("-DCMAKE_CXX_COMPILER_LAUNCHER=")
+        && command.contains("-DCMAKE_ASM_COMPILER_LAUNCHER=")
+    {
+        return command;
     }
+
+    let launcher_flags = concat!(
+        "    -DCMAKE_C_COMPILER_LAUNCHER=\"$LBI_CCACHE\" \\\n",
+        "    -DCMAKE_CXX_COMPILER_LAUNCHER=\"$LBI_CCACHE\" \\\n",
+        "    -DCMAKE_ASM_COMPILER_LAUNCHER=\"$LBI_CCACHE\" \\"
+    );
 
     if command.contains("lbi_cmake build-llvm") {
         return command.replace(
             "lbi_cmake build-llvm \\",
-            "lbi_cmake build-llvm \\\n    -DLLVM_CCACHE_BUILD=ON \\",
+            &format!("lbi_cmake build-llvm \\\n{launcher_flags}"),
         );
     }
 
     if command.contains("cmake -G Ninja \"../llvm\"") {
         return command.replace(
             "cmake -G Ninja \"../llvm\" \\",
-            "cmake -G Ninja \"../llvm\" \\\n    -DLLVM_CCACHE_BUILD=ON \\",
+            &format!("cmake -G Ninja \"../llvm\" \\\n{launcher_flags}"),
         );
     }
 
-    command.to_string()
+    command
+}
+
+fn uses_llvm_cmake_ccache(package: &BookPackage) -> bool {
+    matches!(
+        package.name.as_str(),
+        "llvm-clang-pass1" | "llvm-clang-pass2"
+    )
 }
 
 fn ensure_llvm_pass2_uses_pass1_native_tools(command: &str) -> String {
@@ -4688,10 +4743,13 @@ EOF"#
         let build_script =
             generated_build_script(&package, &recipe, "x86_64-unknown-linux-musl", "x86_64");
 
-        assert!(build_script.contains("-DLLVM_CCACHE_BUILD=ON"));
-        assert!(
-            build_script.contains("cmake -G Ninja \"../llvm\" \\\n    -DLLVM_CCACHE_BUILD=ON \\")
-        );
+        assert!(build_script.contains("export LBI_CCACHE"));
+        assert!(build_script.contains(
+            "cmake -G Ninja \"../llvm\" \\\n    -DCMAKE_C_COMPILER_LAUNCHER=\"$LBI_CCACHE\" \\"
+        ));
+        assert!(build_script.contains("-DCMAKE_CXX_COMPILER_LAUNCHER=\"$LBI_CCACHE\""));
+        assert!(build_script.contains("-DCMAKE_ASM_COMPILER_LAUNCHER=\"$LBI_CCACHE\""));
+        assert!(!build_script.contains("-DLLVM_CCACHE_BUILD=ON"));
         assert!(build_script.contains("-DLLVM_NATIVE_TOOL_DIR=\"$LBI_SYSROOT/system/tools/bin\""));
         assert!(
             build_script
@@ -6232,6 +6290,43 @@ sed -i \
     }
 
     #[test]
+    fn byacc_generated_script_exposes_unprefixed_yacc() {
+        let mut package = test_recipe(8).package;
+        package.name = "byacc".to_string();
+        package.title = "byacc stage 2 20260126".to_string();
+        package.version = "20260126".to_string();
+        package.recipe_id = "8-12-byacc".to_string();
+        let recipe = PageRecipe {
+            input_files: vec!["byacc-20260126.tgz".to_string()],
+            source_urls: vec!["https://example.invalid/byacc-20260126.tgz".to_string()],
+            extract_dir: Some("byacc-20260126".to_string()),
+            commands: vec![
+                "lbi_configure --with-manpage-format=normal".to_string(),
+                "make $LWI_MAKE_FLAGS".to_string(),
+                "make ${LWI_MAKE_FLAGS:-} install".to_string(),
+            ],
+            dependencies: Vec::new(),
+            license: "BSD-3-Clause".to_string(),
+            description: "byacc".to_string(),
+        };
+
+        let build_script =
+            generated_build_script(&package, &recipe, "x86_64-lbi-linux-musl", "x86_64");
+
+        assert!(
+            build_script.contains(r#"ln -sf "$LBI_TARGET-yacc" "$DESTDIR/system/binaries/yacc""#)
+        );
+        assert!(build_script.contains(
+            r#"ln -sf "$LBI_TARGET-yacc.1" "$DESTDIR/system/documentation/man-pages/man1/yacc.1""#
+        ));
+        assert_eq!(
+            bootstrap_required_payload_paths("byacc"),
+            &["system/binaries/yacc"]
+        );
+        assert_eq!(bootstrap_recipe_revision("byacc"), Some(1));
+    }
+
+    #[test]
     fn generated_python_bootstrap_specs_use_custom_chroot_script() {
         let tmp = tempfile::tempdir().unwrap();
         let recipe = PageRecipe {
@@ -6329,10 +6424,13 @@ sed -i \
         assert!(build_script.contains("export LBI_SYSROOT=\"${DEPOT_LBI_SYSROOT:-$LBI_ROOT}\""));
         assert!(build_script.contains("export LWI_CXXFLAGS=\"${LWI_CXXFLAGS:-$LWI_CFLAGS}\""));
         assert!(build_script.contains("rm -rf build-llvm"));
-        assert!(build_script.contains("-DLLVM_CCACHE_BUILD=ON"));
-        assert!(
-            build_script.contains("cmake -G Ninja \"../llvm\" \\\n    -DLLVM_CCACHE_BUILD=ON \\")
-        );
+        assert!(build_script.contains("LBI_CCACHE=\"$(command -v ccache)\""));
+        assert!(build_script.contains(
+            "cmake -G Ninja \"../llvm\" \\\n    -DCMAKE_C_COMPILER_LAUNCHER=\"$LBI_CCACHE\" \\"
+        ));
+        assert!(build_script.contains("-DCMAKE_CXX_COMPILER_LAUNCHER=\"$LBI_CCACHE\""));
+        assert!(build_script.contains("-DCMAKE_ASM_COMPILER_LAUNCHER=\"$LBI_CCACHE\""));
+        assert!(!build_script.contains("-DLLVM_CCACHE_BUILD=ON"));
         assert!(build_script.contains("LLVM_ENABLE_RUNTIMES=\"compiler-rt\""));
         assert!(build_script.contains("COMPILER_RT_BUILD_BUILTINS=ON"));
         assert!(build_script.contains("COMPILER_RT_DEFAULT_TARGET_ONLY=ON"));
@@ -6456,6 +6554,7 @@ sed -i \
 
         assert!(build_script.contains("        --target=\"$LBI_TARGET\" \\\n"));
         assert!(build_script.contains("        --host=\"$LBI_TARGET\" \\\n"));
+        assert!(!build_script.contains("        --build=\"$LBI_TARGET\" \\\n"));
         assert!(build_script.contains("-DCMAKE_C_COMPILER_TARGET=\"$LBI_TARGET\""));
         assert!(build_script.contains("-DCMAKE_CXX_COMPILER_TARGET=\"$LBI_TARGET\""));
         assert!(
@@ -6468,6 +6567,18 @@ sed -i \
         assert!(
             build_script.contains("cpp_args = ['--target=$LBI_TARGET', '--sysroot=$LBI_SYSROOT']")
         );
+    }
+
+    #[test]
+    fn copied_build_profile_does_not_default_build_tuple() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        copy_build_profile(tmp.path(), "x86_64-unknown-linux-musl", "x86_64").unwrap();
+
+        let profile = fs::read_to_string(tmp.path().join("etc/profile.d/lbi-build.sh")).unwrap();
+        assert!(profile.contains("        --target=\"$LBI_TARGET\" \\\n"));
+        assert!(profile.contains("        --host=\"$LBI_TARGET\" \\\n"));
+        assert!(!profile.contains("        --build=\"$LBI_TARGET\" \\\n"));
     }
 
     #[test]

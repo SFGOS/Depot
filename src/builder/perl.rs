@@ -58,7 +58,10 @@ pub fn build(
             configure_cmd.arg("INSTALLDIRS=vendor");
         }
         for arg in &flags.configure {
-            configure_cmd.arg(spec.expand_vars(arg));
+            configure_cmd.arg(crate::builder::expand_with_envs(
+                &spec.expand_vars(arg),
+                &env_vars,
+            ));
         }
         for arg in crate::builder::static_build_args_for(crate::package::BuildType::Perl, flags)? {
             configure_cmd.arg(arg);
@@ -291,13 +294,19 @@ pub(crate) fn run_helper_configure(
         configure_cmd.arg("INSTALLDIRS=vendor");
     }
     for arg in &flags.configure {
-        configure_cmd.arg(context.expand_vars(arg));
+        configure_cmd.arg(crate::builder::expand_with_envs(
+            &context.expand_vars(arg),
+            &helper_env,
+        ));
     }
     for arg in crate::builder::static_build_args_for(crate::package::BuildType::Perl, &flags)? {
         configure_cmd.arg(arg);
     }
     for arg in extra_args {
-        configure_cmd.arg(context.expand_vars(arg));
+        configure_cmd.arg(crate::builder::expand_with_envs(
+            &context.expand_vars(arg),
+            &helper_env,
+        ));
     }
     crate::builder::prepare_tool_command(&mut configure_cmd, &helper_env);
 
@@ -350,12 +359,15 @@ pub(crate) fn run_helper_install(
         for target in &install_targets {
             install_cmd.arg(target);
         }
-        for arg in extra_args {
-            install_cmd.arg(context.expand_vars(arg));
-        }
-
         let mut install_env = env_vars.to_vec();
         crate::builder::set_env_var(&mut install_env, "DESTDIR", destdir.clone());
+        for arg in extra_args {
+            install_cmd.arg(crate::builder::expand_with_envs(
+                &context.expand_vars(arg),
+                &install_env,
+            ));
+        }
+
         crate::builder::prepare_tool_command(&mut install_cmd, &install_env);
 
         let status = command_status_with_sh_fallback(&mut install_cmd).with_context(|| {

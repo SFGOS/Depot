@@ -11,10 +11,41 @@ const BUILD_OPTION_KEYS: &[&str] = &[
 ];
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=CC");
     for key in BUILD_OPTION_KEYS {
         println!("cargo:rerun-if-env-changed={key}");
         if let Ok(value) = std::env::var(key) {
             println!("cargo:rustc-env={key}={value}");
         }
+    }
+
+    if std::env::var_os("CARGO_FEATURE_STATIC_EXCEPT_LIBC").is_some()
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+    {
+        let libgcc_eh = gcc_runtime_archive("libgcc_eh.a").unwrap_or_else(|| {
+            panic!("static-except-libc requires libgcc_eh.a for static libgcc linkage")
+        });
+        println!("cargo:rustc-link-arg-bin=depot=-Wl,--whole-archive");
+        println!("cargo:rustc-link-arg-bin=depot={libgcc_eh}");
+        println!("cargo:rustc-link-arg-bin=depot=-Wl,--no-whole-archive");
+        println!("cargo:rustc-link-arg-bin=depot=-static-libgcc");
+    }
+}
+
+fn gcc_runtime_archive(name: &str) -> Option<String> {
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let output = std::process::Command::new(compiler)
+        .arg(format!("-print-file-name={name}"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    if path.is_empty() || path == name || !std::path::Path::new(path).exists() {
+        None
+    } else {
+        Some(path.to_string())
     }
 }

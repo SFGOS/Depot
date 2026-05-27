@@ -5,10 +5,17 @@
 # apply everywhere without crowding the main /etc/depot.toml.
 
 # Toolchain selection.
+# tool_dir = "/usr/bin"
 cc = "clang"
-# cxx = "clang++"
-# ar = "ar"
-# ld = "ld.lld"
+# cxx = "$TOOL_DIR/clang++"
+# ar = "$TOOL_DIR/ar"
+# ranlib = "$TOOL_DIR/ranlib"
+# strip = "$TOOL_DIR/strip"
+# ld = "$TOOL_DIR/ld.lld"
+# nm = "$TOOL_DIR/nm"
+# objcopy = "$TOOL_DIR/objcopy"
+# objdump = "$TOOL_DIR/objdump"
+# readelf = "$TOOL_DIR/readelf"
 
 # Compiler defaults. These are merged with package-level flags unless a package
 # explicitly replaces them.
@@ -18,6 +25,8 @@ cflags += ["-pipe"]
 
 # Linker defaults.
 ldflags = ["-Wl,-O1"]
+# Select a linker through compiler drivers such as clang/gcc.
+# fuse_ld = "lld"
 
 # Link-time optimization policy.
 ltoflags = ["-flto=auto"]

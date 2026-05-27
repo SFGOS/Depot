@@ -1,7 +1,7 @@
 use crate::cli::{
     BuildArgs, Cli, Commands, ConfigArgs, ConvertArgs, InfoArgs, InstallArgs, InternalCommands,
-    ListArgs, OwnsArgs, RemoveArgs, RepoCommands, RepoKindArg, SearchArgs, SignArgs, SystemArgs,
-    UpdateArgs,
+    ListArgs, OwnsArgs, RemoveArgs, RepoCommands, RepoKindArg, SearchArgs, SetArgs, SignArgs,
+    SystemArgs, UpdateArgs,
 };
 use crate::{
     bootstrap, builder, cli_assets, config, cross, db, deps, index, install, locking, package,
@@ -66,7 +66,7 @@ fn rootfs_is_system_root(rootfs: &Path) -> bool {
 fn command_requires_live_root(command: &Commands) -> bool {
     matches!(
         command,
-        Commands::Install(_) | Commands::Remove(_) | Commands::Update(_)
+        Commands::Install(_) | Commands::Remove(_) | Commands::Update(_) | Commands::Set(_)
     )
 }
 
@@ -100,6 +100,7 @@ fn command_rootfs(command: &Commands) -> Option<&Path> {
         Commands::Sign(args) => Some(&args.rootfs_args.rootfs),
         Commands::Repo(args) => Some(repo_command_rootfs(&args.command)),
         Commands::Config(args) => Some(&args.rootfs_args.rootfs),
+        Commands::Set(args) => Some(&args.rootfs_args.rootfs),
         Commands::System(args) => Some(&args.rootfs_args.rootfs),
         Commands::Check(_)
         | Commands::Convert(_)
@@ -125,6 +126,7 @@ fn command_assume_yes(command: &Commands) -> bool {
         | Commands::Sign(_)
         | Commands::Repo(_)
         | Commands::Config(_)
+        | Commands::Set(_)
         | Commands::System(_)
         | Commands::GenerateArtifacts(_)
         | Commands::MakeSpec(_)
@@ -2167,6 +2169,7 @@ fn run_direct_install_request(
             // Install from spec (normal build)
             let mut pkg_spec = package::PackageSpec::from_file(&spec_path)?;
             pkg_spec.apply_config(config);
+            pkg_spec.build.flags.rootfs = build_cmd::build_env_rootfs(options.rootfs);
             (pkg_spec, None)
         };
     let built_from_source = staging_dir.is_none();
@@ -2567,6 +2570,7 @@ mod check;
 mod install_cmd;
 mod misc;
 mod repo;
+mod set;
 mod update;
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -2591,6 +2595,7 @@ pub fn run(cli: Cli) -> Result<()> {
         | Commands::Sign(_)
         | Commands::Repo(_)
         | Commands::Config(_)
+        | Commands::Set(_)
         | Commands::System(_)
         | Commands::GenerateArtifacts(_)
         | Commands::Convert(_)
@@ -2613,6 +2618,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Repo(args) => repo::run_repo(args.command)?,
         Commands::GenerateArtifacts(args) => misc::run_generate_artifacts(args)?,
         Commands::Config(args) => misc::run_config(args)?,
+        Commands::Set(args) => set::run_set(args)?,
         Commands::System(args) => misc::run_system(args)?,
         Commands::MakeSpec(args) => misc::run_make_spec(args)?,
         Commands::Convert(args) => misc::run_convert(args)?,

@@ -269,11 +269,16 @@ impl Config {
                 home.join(".local/share/depot"),
             )
         } else {
+            let variable_root = if is_system_root {
+                abs_rootfs.join("var")
+            } else {
+                abs_rootfs.join("system/variable")
+            };
             (
-                abs_rootfs.join("var/cache/depot/sources"),
-                abs_rootfs.join("var/cache/depot/packages"),
-                abs_rootfs.join("var/cache/depot/build"),
-                abs_rootfs.join("var/lib/depot"),
+                variable_root.join("cache/depot/sources"),
+                variable_root.join("cache/depot/packages"),
+                variable_root.join("cache/depot/build"),
+                variable_root.join("lib/depot"),
             )
         };
 
@@ -307,7 +312,11 @@ impl Config {
     /// to per-user directories under `$HOME`.
     pub fn installed_db_path(&self, rootfs: &Path) -> PathBuf {
         let abs_rootfs = resolve_rootfs_base(rootfs);
-        abs_rootfs.join("var/lib/depot/packages.db")
+        if abs_rootfs == Path::new("/") || abs_rootfs.as_os_str() == "/" {
+            abs_rootfs.join("var/lib/depot/packages.db")
+        } else {
+            abs_rootfs.join("system/variable/lib/depot/packages.db")
+        }
     }
 
     /// Load system-level and user-level overrides
@@ -592,15 +601,20 @@ mod tests {
             config
                 .cache_dir
                 .to_string_lossy()
-                .contains("var/cache/depot/sources")
+                .contains("system/variable/cache/depot/sources")
         );
         assert!(
             config
                 .build_dir
                 .to_string_lossy()
-                .contains("var/cache/depot/build")
+                .contains("system/variable/cache/depot/build")
         );
-        assert!(config.db_dir.to_string_lossy().contains("var/lib/depot"));
+        assert!(
+            config
+                .db_dir
+                .to_string_lossy()
+                .contains("system/variable/lib/depot")
+        );
     }
 
     #[test]
@@ -713,7 +727,7 @@ cflags += ["-g"]
         let config = Config::for_rootfs(&root);
         assert_eq!(
             config.installed_db_path(&root),
-            PathBuf::from("/tmp/test_root/var/lib/depot/packages.db")
+            PathBuf::from("/tmp/test_root/system/variable/lib/depot/packages.db")
         );
     }
 
@@ -738,6 +752,7 @@ cflags += ["-g"]
             r#"
 [build]
 prefix = "/opt/depot"
+tool_dir = "/opt/toolchain/bin"
 cc = "clang"
 
 [build.flags]
@@ -762,6 +777,13 @@ test_deps = true
         assert_eq!(
             config.build_overrides.get("cc").and_then(|v| v.as_str()),
             Some("clang")
+        );
+        assert_eq!(
+            config
+                .build_overrides
+                .get("tool_dir")
+                .and_then(|v| v.as_str()),
+            Some("/opt/toolchain/bin")
         );
         assert_eq!(
             config

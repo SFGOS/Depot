@@ -1014,6 +1014,12 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
             ),
         );
     }
+    if !spec.build.flags.fuse_ld.is_empty() {
+        flags_tbl.insert(
+            "fuse_ld".into(),
+            Value::String(spec.build.flags.fuse_ld.clone()),
+        );
+    }
     if !spec.build.flags.ltoflags.is_empty() {
         flags_tbl.insert(
             "ltoflags".into(),
@@ -1113,6 +1119,45 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
     }
     if spec.build.flags.ar != defaults.ar {
         flags_tbl.insert("ar".into(), Value::String(spec.build.flags.ar.clone()));
+    }
+    if !spec.build.flags.ranlib.is_empty() {
+        flags_tbl.insert(
+            "ranlib".into(),
+            Value::String(spec.build.flags.ranlib.clone()),
+        );
+    }
+    if !spec.build.flags.strip.is_empty() {
+        flags_tbl.insert(
+            "strip".into(),
+            Value::String(spec.build.flags.strip.clone()),
+        );
+    }
+    if !spec.build.flags.ld.is_empty() {
+        flags_tbl.insert("ld".into(), Value::String(spec.build.flags.ld.clone()));
+    }
+    if !spec.build.flags.nm.is_empty() {
+        flags_tbl.insert("nm".into(), Value::String(spec.build.flags.nm.clone()));
+    }
+    if !spec.build.flags.objcopy.is_empty() {
+        flags_tbl.insert(
+            "objcopy".into(),
+            Value::String(spec.build.flags.objcopy.clone()),
+        );
+    }
+    if !spec.build.flags.objdump.is_empty() {
+        flags_tbl.insert(
+            "objdump".into(),
+            Value::String(spec.build.flags.objdump.clone()),
+        );
+    }
+    if !spec.build.flags.readelf.is_empty() {
+        flags_tbl.insert(
+            "readelf".into(),
+            Value::String(spec.build.flags.readelf.clone()),
+        );
+    }
+    if !spec.build.flags.cpp.is_empty() {
+        flags_tbl.insert("cpp".into(), Value::String(spec.build.flags.cpp.clone()));
     }
     if !spec.build.flags.libc.is_empty() {
         flags_tbl.insert("libc".into(), Value::String(spec.build.flags.libc.clone()));
@@ -1849,6 +1894,7 @@ mod tests {
             config_settings: vec!["editable_mode=compat".into()],
             rustflags: vec!["-Ctarget-cpu=native".into()],
             cxxflags: vec!["-O2".into(), "-fno-rtti".into()],
+            fuse_ld: "lld".into(),
             ltoflags: vec!["-flto=auto".into()],
             target: "x86_64-unknown-linux-gnu".into(),
             keep: vec!["etc/locale.gen".into()],
@@ -1928,6 +1974,7 @@ mod tests {
         assert!(toml.contains("config_setting = ["));
         assert!(toml.contains("rustflags = ["));
         assert!(toml.contains("cxxflags = ["));
+        assert!(toml.contains("fuse_ld = \"lld\""));
         assert!(toml.contains("ltoflags = ["));
         assert!(toml.contains("target = \"x86_64-unknown-linux-gnu\""));
         assert!(toml.contains("keep = ["));

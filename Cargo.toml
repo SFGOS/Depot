@@ -6,6 +6,18 @@ edition = "2024"
 [lints.rust]
 warnings = "deny"
 
+[features]
+default = []
+# Prefer vendored/static native libraries while keeping libc dynamically linked.
+static-except-libc = [
+    "git2/vendored-libgit2",
+    "git2/vendored-openssl",
+    "git2/zlib-ng-compat",
+    "reqwest/native-tls-vendored",
+    "rusqlite/bundled",
+    "xz2/static",
+]
+
 [dependencies]
 anyhow = "1.0.102"
 ar = "0.9.0"
@@ -20,7 +32,7 @@ semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
 yaml-rust2 = "0.11.0"
 sha2 = "0.11.0"
-tar = "0.4.45"
+tar = "0.4.46"
 tempfile = "=3.27.0"
 thiserror = "2.0.18"
 toml = "1.1.2"
@@ -35,7 +47,7 @@ suppaftp = "8.0.2"
 minisign = "0.9.1"
 petgraph = "0.8.3"
 fd-lock = "4.0.4"
-reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "native-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "native-tls"] }
 filetime = "0.2.29"
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"

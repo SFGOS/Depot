@@ -531,8 +531,14 @@ fn is_elf_file(path: &Path) -> Result<bool> {
     Ok(n == 4 && magic == [0x7F, b'E', b'L', b'F'])
 }
 
-fn auto_strip_elf_files(destdir: &Path) -> Result<usize> {
+fn auto_strip_elf_files(destdir: &Path, strip_command: &str) -> Result<usize> {
     let mut stripped = 0usize;
+    let strip_command = strip_command.trim();
+    let strip_command = if strip_command.is_empty() {
+        "strip"
+    } else {
+        strip_command
+    };
     for entry in WalkDir::new(destdir).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
@@ -542,19 +548,21 @@ fn auto_strip_elf_files(destdir: &Path) -> Result<usize> {
             continue;
         }
 
-        let status = Command::new("strip")
+        let status = Command::new(strip_command)
             .arg("--strip-debug")
             .arg(path)
             .status()
             .with_context(|| {
                 format!(
-                    "Failed to execute strip for {} (disable with build.flags.no_strip = true)",
+                    "Failed to execute {} for {} (disable with build.flags.no_strip = true)",
+                    strip_command,
                     path.display()
                 )
             })?;
         if !status.success() {
             anyhow::bail!(
-                "strip failed for {} with status {} (disable with build.flags.no_strip = true)",
+                "{} failed for {} with status {} (disable with build.flags.no_strip = true)",
+                strip_command,
                 path.display(),
                 status
             );
@@ -878,7 +886,7 @@ pub fn process(destdir: &Path, spec: &PackageSpec) -> Result<()> {
     if spec.build.flags.no_strip {
         crate::log_info!("Skipping auto-strip: disabled by build.flags.no_strip");
     } else {
-        let stripped = auto_strip_elf_files(destdir)?;
+        let stripped = auto_strip_elf_files(destdir, &spec.build.flags.strip)?;
         if stripped > 0 {
             crate::log_info!("Stripped {} ELF file(s)", stripped);
         }
@@ -968,7 +976,14 @@ fn normalize_lbi_tree_paths(root: &Path) -> Result<usize> {
     let mut changed = 0usize;
     for (from, to) in mappings {
         let src = root.join(from);
-        if !src.exists() {
+        let src_meta = match fs::symlink_metadata(&src) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to inspect {}", src.display()));
+            }
+        };
+        if src_meta.file_type().is_symlink() {
             continue;
         }
         let dst = root.join(to);
@@ -1242,7 +1257,10 @@ fn copy_tree_preserving_layout_no_overwrite(
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
 
-        if dst_path.symlink_metadata().is_ok() {
+        if let Ok(dst_metadata) = dst_path.symlink_metadata() {
+            if duplicate_staged_path_is_equivalent(src_path, &metadata, &dst_path, &dst_metadata)? {
+                continue;
+            }
             anyhow::bail!(
                 "Failed to replay relocated path into {}: destination already exists",
                 dst_path.display()
@@ -1279,6 +1297,65 @@ fn copy_tree_preserving_layout_no_overwrite(
     }
 
     Ok(())
+}
+
+fn symlink_target_path_inside_rootfs(
+    rootfs: &Path,
+    link_rel: &str,
+    target: &Path,
+) -> Result<Option<PathBuf>> {
+    let mut normalized = PathBuf::new();
+    if target.is_absolute() {
+        for component in target.components() {
+            match component {
+                Component::RootDir => {}
+                Component::CurDir => {}
+                Component::Normal(segment) => normalized.push(segment),
+                Component::ParentDir | Component::Prefix(_) => return Ok(None),
+            }
+        }
+    } else {
+        if let Some(parent) = Path::new(link_rel).parent() {
+            normalized.push(parent);
+        }
+        for component in target.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(segment) => normalized.push(segment),
+                Component::ParentDir => {
+                    if !normalized.pop() {
+                        return Ok(None);
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => return Ok(None),
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(rootfs.join(normalized)))
+}
+
+fn can_relocate_directory_for_symlink_swap(
+    rootfs: &Path,
+    link_rel: &str,
+    symlink_path: &Path,
+) -> Result<bool> {
+    let target = fs::read_link(symlink_path)
+        .with_context(|| format!("Failed to read symlink {}", symlink_path.display()))?;
+    let Some(target_path) = symlink_target_path_inside_rootfs(rootfs, link_rel, &target)? else {
+        return Ok(false);
+    };
+
+    match target_path.symlink_metadata() {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("Failed to inspect symlink target {}", target_path.display())),
+    }
 }
 
 fn remove_path_in_place(path: &Path, rel: &str) -> Result<()> {
@@ -1530,8 +1607,24 @@ impl FsTransaction {
 
     /// Commit the transaction (delete backup directory).
     pub fn commit(self) -> Result<()> {
+        let tx_base_dir = self.tx_dir.parent().map(Path::to_path_buf);
         if self.tx_dir.exists() {
             fs::remove_dir_all(&self.tx_dir)?;
+        }
+        if let Some(tx_base_dir) = tx_base_dir {
+            match fs::remove_dir(&tx_base_dir) {
+                Ok(()) => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound
+                    ) => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("Failed to remove tx dir {}", tx_base_dir.display())
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -1548,6 +1641,11 @@ pub fn install_atomic(
     remove_paths: &[String],
     keep_paths: &[String],
 ) -> Result<FsTransaction> {
+    let tx_base_dir = if rootfs != Path::new("/") && tx_base_dir.starts_with(rootfs) {
+        rootfs.join(".depot-tx")
+    } else {
+        tx_base_dir.to_path_buf()
+    };
     let keep_rules: Vec<KeepMatcher> = keep_paths
         .iter()
         .map(|p| KeepMatcher::from_spec(p))
@@ -1561,7 +1659,7 @@ pub fn install_atomic(
         .collect();
     let remove_set: HashSet<&str> = remove_paths.iter().map(String::as_str).collect();
 
-    fs::create_dir_all(tx_base_dir)
+    fs::create_dir_all(&tx_base_dir)
         .with_context(|| format!("Failed to create tx dir: {}", tx_base_dir.display()))?;
 
     let ts = SystemTime::now()
@@ -1655,7 +1753,13 @@ pub fn install_atomic(
             if let Ok(dest_meta) = dest_path.symlink_metadata() {
                 let backup_path = tx.backup_path(&install_rel_path);
                 if dest_meta.file_type().is_dir() {
-                    if !remove_set.contains(install_rel_path.as_str()) {
+                    let can_relocate = file_type.is_symlink()
+                        && can_relocate_directory_for_symlink_swap(
+                            rootfs,
+                            &install_rel_path,
+                            src_path,
+                        )?;
+                    if !remove_set.contains(install_rel_path.as_str()) && !can_relocate {
                         anyhow::bail!(
                             "Refusing to replace existing directory with packaged file/symlink: {}",
                             install_rel_path
@@ -1684,7 +1788,11 @@ pub fn install_atomic(
             // Remove destination if it exists (we backed it up) so we can overwrite
             if let Ok(dest_meta) = dest_path.symlink_metadata() {
                 if dest_meta.file_type().is_dir() {
-                    if !remove_set.contains(install_rel_path.as_str()) {
+                    let relocated_for_symlink_swap =
+                        tx.relocated.iter().any(|rel| rel == &install_rel_path);
+                    if !remove_set.contains(install_rel_path.as_str())
+                        && !relocated_for_symlink_swap
+                    {
                         anyhow::bail!(
                             "Refusing to replace existing directory with packaged file/symlink: {}",
                             install_rel_path
@@ -1703,7 +1811,8 @@ pub fn install_atomic(
             }
 
             if file_type.is_symlink() {
-                let target = fs::read_link(src_path)?;
+                let target = fs::read_link(src_path)
+                    .with_context(|| format!("Failed to read staged symlink {}", rel_path))?;
                 std::os::unix::fs::symlink(target, &dest_path)
                     .with_context(|| format!("Failed to create symlink: {}", install_rel_path))?;
                 tx.replay_relocated_dir_if_present(&install_rel_path)?;
@@ -1947,6 +2056,49 @@ mod tests {
                 .unwrap(),
             "same header\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_preserves_lbi_compatibility_symlinks() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("system/binaries")).unwrap();
+        std::fs::create_dir_all(destdir.join("system/documentation/man-pages")).unwrap();
+        std::fs::create_dir_all(destdir.join("system/share")).unwrap();
+        std::fs::create_dir_all(destdir.join("usr")).unwrap();
+
+        unix_fs::symlink("system/binaries", destdir.join("bin")).unwrap();
+        unix_fs::symlink("../system/binaries", destdir.join("usr/bin")).unwrap();
+        unix_fs::symlink("../system/share", destdir.join("usr/share")).unwrap();
+        unix_fs::symlink(
+            "../documentation/man-pages",
+            destdir.join("system/share/man"),
+        )
+        .unwrap();
+
+        let spec = mk_spec_for_stage_processing();
+        process(&destdir, &spec).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(destdir.join("bin")).unwrap(),
+            PathBuf::from("system/binaries")
+        );
+        assert_eq!(
+            std::fs::read_link(destdir.join("usr/bin")).unwrap(),
+            PathBuf::from("../system/binaries")
+        );
+        assert_eq!(
+            std::fs::read_link(destdir.join("usr/share")).unwrap(),
+            PathBuf::from("../system/share")
+        );
+        assert_eq!(
+            std::fs::read_link(destdir.join("system/share/man")).unwrap(),
+            PathBuf::from("../documentation/man-pages")
+        );
+        assert!(destdir.join("system/documentation/man-pages").is_dir());
     }
 
     #[test]
@@ -2253,6 +2405,43 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Refusing to replace existing directory with packaged file/symlink")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_atomic_relocates_existing_directory_into_packaged_symlink_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = rootfs.join("var/cache/depot/build/tx");
+        std::fs::create_dir_all(rootfs.join("var/lib/depot")).unwrap();
+        std::fs::write(rootfs.join("var/lib/depot/lock"), "state").unwrap();
+        std::fs::create_dir_all(rootfs.join("system/variable/lib/depot")).unwrap();
+        std::fs::write(rootfs.join("system/variable/lib/depot/lock"), "state").unwrap();
+        std::fs::create_dir_all(destdir.join("system/variable/lib/misc")).unwrap();
+        std::os::unix::fs::symlink("system/variable", destdir.join("var")).unwrap();
+
+        let tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
+
+        let var_meta = rootfs.join("var").symlink_metadata().unwrap();
+        assert!(var_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(rootfs.join("var")).unwrap(),
+            PathBuf::from("system/variable")
+        );
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("system/variable/lib/depot/lock")).unwrap(),
+            "state"
+        );
+        assert!(rootfs.join("system/variable/lib/misc").is_dir());
+
+        tx.rollback().unwrap();
+        let restored = rootfs.join("var").symlink_metadata().unwrap();
+        assert!(restored.file_type().is_dir());
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("var/lib/depot/lock")).unwrap(),
+            "state"
         );
     }
 

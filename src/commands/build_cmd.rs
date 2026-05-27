@@ -11,6 +11,17 @@ use self::support::{
     requested_outputs, should_install_test_deps, warn_if_running_as_root_for_build,
 };
 
+pub(crate) fn build_env_rootfs(rootfs: &Path) -> String {
+    if rootfs == Path::new("/") {
+        return "/".to_string();
+    }
+    rootfs
+        .canonicalize()
+        .unwrap_or_else(|_| rootfs.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
     let BuildArgs {
         rootfs_args,
@@ -46,6 +57,7 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
     let mut auto_installed_deps = AutoInstalledDependencyTracker::default();
     let build_result: Result<()> = (|| {
         pkg_spec.apply_config(&config);
+        pkg_spec.build.flags.rootfs = build_env_rootfs(&rootfs);
         let lib32_only = effective_lib32_only(&pkg_spec, cli_lib32_only);
         let requested_outputs = requested_outputs(&pkg_spec, lib32_only);
         let db_path = config.installed_db_path(&rootfs);

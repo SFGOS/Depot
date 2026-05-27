@@ -368,7 +368,16 @@ impl PackageSpec {
         }
     }
 
+    fn apply_default_string(target: &mut String, default: &str, value: &toml::Value) {
+        if let Some(s) = value.as_str()
+            && (target.trim().is_empty() || target == default)
+        {
+            *target = s.to_string();
+        }
+    }
+
     fn apply_flags_table(&mut self, table: &toml::map::Map<String, toml::Value>) {
+        let default_flags = BuildFlags::default();
         for (k, v) in table {
             // match case-insensitively for common keys (allow CXX/Cc etc.)
             match k.to_lowercase().as_str() {
@@ -471,6 +480,20 @@ impl PackageSpec {
                         self.build.flags.ldflags = vec![s.to_string()];
                     }
                 }
+                "fuse_ld" | "fuse-ld" => {
+                    Self::apply_default_string(
+                        &mut self.build.flags.fuse_ld,
+                        &default_flags.fuse_ld,
+                        v,
+                    );
+                }
+                "tool_dir" | "tool-dir" | "tools_dir" | "tools-dir" => {
+                    Self::apply_default_string(
+                        &mut self.build.flags.tool_dir,
+                        &default_flags.tool_dir,
+                        v,
+                    );
+                }
                 "replace_ldflags" | "replace-ldflags" => {
                     if let Some(arr) = v.as_array() {
                         self.build.flags.replace_ldflags = arr
@@ -565,109 +588,169 @@ impl PackageSpec {
                     }
                 }
                 "cc" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.cc = s.to_string();
-                    }
+                    Self::apply_default_string(&mut self.build.flags.cc, &default_flags.cc, v);
                 }
                 "cxx" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.cxx = s.to_string();
-                    }
+                    Self::apply_default_string(&mut self.build.flags.cxx, &default_flags.cxx, v);
                 }
                 "ar" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.ar = s.to_string();
-                    }
+                    Self::apply_default_string(&mut self.build.flags.ar, &default_flags.ar, v);
+                }
+                "ranlib" => {
+                    Self::apply_default_string(
+                        &mut self.build.flags.ranlib,
+                        &default_flags.ranlib,
+                        v,
+                    );
+                }
+                "strip" => {
+                    Self::apply_default_string(
+                        &mut self.build.flags.strip,
+                        &default_flags.strip,
+                        v,
+                    );
                 }
                 "ld" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.ld = s.to_string();
-                    }
+                    Self::apply_default_string(&mut self.build.flags.ld, &default_flags.ld, v);
+                }
+                "nm" => {
+                    Self::apply_default_string(&mut self.build.flags.nm, &default_flags.nm, v);
+                }
+                "objcopy" => {
+                    Self::apply_default_string(
+                        &mut self.build.flags.objcopy,
+                        &default_flags.objcopy,
+                        v,
+                    );
+                }
+                "objdump" => {
+                    Self::apply_default_string(
+                        &mut self.build.flags.objdump,
+                        &default_flags.objdump,
+                        v,
+                    );
+                }
+                "readelf" => {
+                    Self::apply_default_string(
+                        &mut self.build.flags.readelf,
+                        &default_flags.readelf,
+                        v,
+                    );
                 }
                 "cpp" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.cpp = s.to_string();
-                    }
+                    Self::apply_default_string(&mut self.build.flags.cpp, &default_flags.cpp, v);
                 }
                 "prefix" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.prefix = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.prefix,
+                        &default_flags.prefix,
+                        v,
+                    );
                 }
                 "bindir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.bindir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.bindir,
+                        &default_flags.bindir,
+                        v,
+                    );
                 }
                 "sbindir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.sbindir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.sbindir,
+                        &default_flags.sbindir,
+                        v,
+                    );
                 }
                 "libdir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.libdir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.libdir,
+                        &default_flags.libdir,
+                        v,
+                    );
                 }
                 "libexecdir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.libexecdir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.libexecdir,
+                        &default_flags.libexecdir,
+                        v,
+                    );
                 }
                 "sysconfdir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.sysconfdir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.sysconfdir,
+                        &default_flags.sysconfdir,
+                        v,
+                    );
                 }
                 "localstatedir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.localstatedir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.localstatedir,
+                        &default_flags.localstatedir,
+                        v,
+                    );
                 }
                 "sharedstatedir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.sharedstatedir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.sharedstatedir,
+                        &default_flags.sharedstatedir,
+                        v,
+                    );
                 }
                 "includedir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.includedir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.includedir,
+                        &default_flags.includedir,
+                        v,
+                    );
                 }
                 "datarootdir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.datarootdir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.datarootdir,
+                        &default_flags.datarootdir,
+                        v,
+                    );
                 }
                 "datadir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.datadir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.datadir,
+                        &default_flags.datadir,
+                        v,
+                    );
                 }
                 "mandir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.mandir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.mandir,
+                        &default_flags.mandir,
+                        v,
+                    );
                 }
                 "infodir" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.infodir = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.infodir,
+                        &default_flags.infodir,
+                        v,
+                    );
                 }
                 "chost" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.chost = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.chost,
+                        &default_flags.chost,
+                        v,
+                    );
                 }
                 "cbuild" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.cbuild = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.cbuild,
+                        &default_flags.cbuild,
+                        v,
+                    );
                 }
                 "carch" => {
-                    if let Some(s) = v.as_str() {
-                        self.build.flags.carch = s.to_string();
-                    }
+                    Self::apply_default_string(
+                        &mut self.build.flags.carch,
+                        &default_flags.carch,
+                        v,
+                    );
                 }
                 "makeflags" | "make_flags" | "make-flags" => {
                     if let Some(s) = v.as_str() {
@@ -1318,14 +1401,49 @@ impl PackageSpec {
                     self.build.flags.cc = s.to_string();
                 }
             }
+            "cxx" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.cxx = s.to_string();
+                }
+            }
             "ar" => {
                 if let Some(s) = values.last().and_then(|v| v.as_str()) {
                     self.build.flags.ar = s.to_string();
                 }
             }
+            "ranlib" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.ranlib = s.to_string();
+                }
+            }
+            "strip" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.strip = s.to_string();
+                }
+            }
             "ld" => {
                 if let Some(s) = values.last().and_then(|v| v.as_str()) {
                     self.build.flags.ld = s.to_string();
+                }
+            }
+            "nm" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.nm = s.to_string();
+                }
+            }
+            "objcopy" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.objcopy = s.to_string();
+                }
+            }
+            "objdump" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.objdump = s.to_string();
+                }
+            }
+            "readelf" => {
+                if let Some(s) = values.last().and_then(|v| v.as_str()) {
+                    self.build.flags.readelf = s.to_string();
                 }
             }
             "cpp" => {
@@ -2511,8 +2629,17 @@ type = "custom"
             r#"
 [flags]
 cc = "my-cc"
+cxx = "my-cxx"
+ar = "my-ar"
+ranlib = "my-ranlib"
+strip = "my-strip"
 ld = "ld.lld"
+nm = "my-nm"
+objcopy = "my-objcopy"
+objdump = "my-objdump"
+readelf = "my-readelf"
 CPP = "clang-cpp"
+tool_dir = "/opt/toolchain/bin"
 cflags = ["-O2"]
 replace_cflags = ["-O2=>-O3"]
 cxxflags = ["-O2", "-pipe"]
@@ -2672,8 +2799,17 @@ post_configure = ["echo configured"]
         spec.apply_config(&config);
 
         assert_eq!(spec.build.flags.cc, "my-cc");
+        assert_eq!(spec.build.flags.cxx, "my-cxx");
+        assert_eq!(spec.build.flags.ar, "my-ar");
+        assert_eq!(spec.build.flags.ranlib, "my-ranlib");
+        assert_eq!(spec.build.flags.strip, "my-strip");
         assert_eq!(spec.build.flags.ld, "ld.lld");
+        assert_eq!(spec.build.flags.nm, "my-nm");
+        assert_eq!(spec.build.flags.objcopy, "my-objcopy");
+        assert_eq!(spec.build.flags.objdump, "my-objdump");
+        assert_eq!(spec.build.flags.readelf, "my-readelf");
         assert_eq!(spec.build.flags.cpp, "clang-cpp");
+        assert_eq!(spec.build.flags.tool_dir, "/opt/toolchain/bin");
         assert!(spec.build.flags.cflags.contains(&"-O2".to_string()));
         assert!(spec.build.flags.cflags.contains(&"-g".to_string()));
         assert!(
@@ -2874,6 +3010,33 @@ post_configure = ["echo configured"]
     }
 
     #[test]
+    fn test_apply_config_preserves_package_scalar_tool_and_layout_overrides() {
+        let mut spec = mk_spec("foo", "1.0");
+        spec.build.flags.ld = "ld.lld".to_string();
+        spec.build.flags.libdir = "/package/lib".to_string();
+        spec.build.flags.sysconfdir = "/package/etc".to_string();
+        let mut config = crate::config::Config::for_rootfs(Path::new("/tmp/nonexistent"));
+        config.build_overrides = toml::from_str(
+            r#"
+ld = "/config/bin/ld"
+fuse_ld = "/config/bin/ld.lld"
+ranlib = "/config/bin/ranlib"
+libdir = "/config/lib"
+sysconfdir = "/config/etc"
+"#,
+        )
+        .unwrap();
+
+        spec.apply_config(&config);
+
+        assert_eq!(spec.build.flags.ld, "ld.lld");
+        assert_eq!(spec.build.flags.libdir, "/package/lib");
+        assert_eq!(spec.build.flags.sysconfdir, "/package/etc");
+        assert_eq!(spec.build.flags.ranlib, "/config/bin/ranlib");
+        assert_eq!(spec.build.flags.fuse_ld, "/config/bin/ld.lld");
+    }
+
+    #[test]
     fn parse_no_flags_from_spec() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pkg.toml");
@@ -2904,6 +3067,61 @@ no_flags = true
 
         let spec = PackageSpec::from_file(&path).unwrap();
         assert!(spec.build.flags.no_flags);
+    }
+
+    #[test]
+    fn parse_tool_commands_from_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+
+[build.flags]
+cc = "/tools/bin/cc"
+cxx = "/tools/bin/c++"
+ar = "/tools/bin/ar"
+ranlib = "/tools/bin/ranlib"
+strip = "/tools/bin/strip"
+ld = "/tools/bin/ld"
+fuse_ld = "/usr/bin/ld.lld"
+nm = "/tools/bin/nm"
+objcopy = "/tools/bin/objcopy"
+objdump = "/tools/bin/objdump"
+readelf = "/tools/bin/readelf"
+cpp = "/tools/bin/cpp"
+"#,
+        )
+        .unwrap();
+
+        let spec = PackageSpec::from_file(&path).unwrap();
+        assert_eq!(spec.build.flags.cc, "/tools/bin/cc");
+        assert_eq!(spec.build.flags.cxx, "/tools/bin/c++");
+        assert_eq!(spec.build.flags.ar, "/tools/bin/ar");
+        assert_eq!(spec.build.flags.ranlib, "/tools/bin/ranlib");
+        assert_eq!(spec.build.flags.strip, "/tools/bin/strip");
+        assert_eq!(spec.build.flags.ld, "/tools/bin/ld");
+        assert_eq!(spec.build.flags.fuse_ld, "/usr/bin/ld.lld");
+        assert_eq!(spec.build.flags.nm, "/tools/bin/nm");
+        assert_eq!(spec.build.flags.objcopy, "/tools/bin/objcopy");
+        assert_eq!(spec.build.flags.objdump, "/tools/bin/objdump");
+        assert_eq!(spec.build.flags.readelf, "/tools/bin/readelf");
+        assert_eq!(spec.build.flags.cpp, "/tools/bin/cpp");
     }
 
     #[test]
@@ -4282,6 +4500,9 @@ pub struct BuildFlags {
     /// Extra flags exported to `LDFLAGS`.
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub ldflags: Vec<String>,
+    /// Linker selected through compiler drivers with `-fuse-ld=<value>`.
+    #[serde(default, alias = "fuse-ld")]
+    pub fuse_ld: String,
     /// Ordered replacement rules applied to `ldflags` before export.
     #[serde(
         default,
@@ -4416,6 +4637,9 @@ pub struct BuildFlags {
     /// Autotools configure script path, relative to source root or absolute.
     #[serde(default, alias = "configure-file")]
     pub configure_file: String,
+    /// Directory containing the configured compiler, linker, and binutils tools.
+    #[serde(default, alias = "tool-dir", alias = "tools_dir", alias = "tools-dir")]
+    pub tool_dir: String,
     /// C compiler
     #[serde(default = "default_cc")]
     pub cc: String,
@@ -4425,9 +4649,27 @@ pub struct BuildFlags {
     /// Archiver
     #[serde(default = "default_ar")]
     pub ar: String,
+    /// Archive indexer exported as `RANLIB` when configured.
+    #[serde(default)]
+    pub ranlib: String,
+    /// Strip executable exported as `STRIP` when configured.
+    #[serde(default)]
+    pub strip: String,
     /// Linker executable or linker flavor override for supported builders.
     #[serde(default)]
     pub ld: String,
+    /// Symbol table dumper exported as `NM` when configured.
+    #[serde(default)]
+    pub nm: String,
+    /// Object copy tool exported as `OBJCOPY` when configured.
+    #[serde(default)]
+    pub objcopy: String,
+    /// Object dump tool exported as `OBJDUMP` when configured.
+    #[serde(default)]
+    pub objdump: String,
+    /// ELF reader exported as `READELF` when configured.
+    #[serde(default)]
+    pub readelf: String,
     /// C preprocessor executable exported as `CPP` when configured.
     #[serde(default, alias = "CPP")]
     pub cpp: String,
@@ -4700,6 +4942,7 @@ impl Default for BuildFlags {
             cxxflags_lib32: Vec::new(),
             replace_cxxflags_lib32: Vec::new(),
             ldflags: Vec::new(),
+            fuse_ld: String::new(),
             replace_ldflags: Vec::new(),
             ltoflags: Vec::new(),
             rustltoflags: Vec::new(),
@@ -4720,10 +4963,17 @@ impl Default for BuildFlags {
             config_settings: Vec::new(),
             configure_lib32: Vec::new(),
             configure_file: String::new(),
+            tool_dir: String::new(),
             cc: default_cc(),
             cxx: default_cxx(),
             ar: default_ar(),
+            ranlib: String::new(),
+            strip: String::new(),
             ld: String::new(),
+            nm: String::new(),
+            objcopy: String::new(),
+            objdump: String::new(),
+            readelf: String::new(),
             cpp: String::new(),
             libc: String::new(),
             rootfs: default_rootfs(),

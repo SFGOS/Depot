@@ -138,7 +138,7 @@ pub(crate) fn package_spec_from_repo_record(
             runtime: record.runtime_dependencies.clone(),
             test: Vec::new(),
             optional: record.optional_dependencies.clone(),
-            groups: Vec::new(),
+            groups: record.groups.clone(),
             lib32: None,
         },
         package_alternatives: Default::default(),
