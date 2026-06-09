@@ -15,11 +15,9 @@ use crate::package::PackageSpec;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use url::Url;
-use walkdir::WalkDir;
 
 fn expand_manual_source_value(spec: &PackageSpec, raw: &str) -> String {
     let carch = spec.build.flags.carch.as_str();
@@ -642,25 +640,7 @@ fn prepare_one(
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in WalkDir::new(src) {
-        crate::interrupts::check()?;
-        let entry = entry?;
-        let rel = entry.path().strip_prefix(src).unwrap();
-        let target = dst.join(rel);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)?;
-        } else if entry.file_type().is_symlink() {
-            let target_link = fs::read_link(entry.path())?;
-            unix_fs::symlink(target_link, &target)?;
-        } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
+    crate::fs_copy::copy_tree_preserving_links(src, dst)
 }
 
 pub(crate) fn split_git_url(url: &str) -> Option<(String, String)> {
@@ -686,9 +666,9 @@ pub(crate) fn split_git_url(url: &str) -> Option<(String, String)> {
         return Some((base.to_string(), rev.to_string()));
     }
 
-    // Check for bare .git URL without revision - default to HEAD
+    // Check for bare .git URL or explicit git:// URL without revision - default to HEAD.
     let lower = url.to_ascii_lowercase();
-    if lower.ends_with(".git") {
+    if lower.ends_with(".git") || lower.starts_with("git://") {
         return Some((url.to_string(), "HEAD".to_string()));
     }
 
@@ -872,6 +852,13 @@ mod tests {
     fn split_git_url_accepts_bare_git_url() {
         let (base, rev) = split_git_url("https://example.com/repo.git").unwrap();
         assert_eq!(base, "https://example.com/repo.git");
+        assert_eq!(rev, "HEAD");
+    }
+
+    #[test]
+    fn split_git_url_accepts_bare_git_scheme_url() {
+        let (base, rev) = split_git_url("git://git.suckless.org/ubase").unwrap();
+        assert_eq!(base, "git://git.suckless.org/ubase");
         assert_eq!(rev, "HEAD");
     }
 

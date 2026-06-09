@@ -1,6 +1,6 @@
 [package]
 name = "depot"
-version = "0.36.0"
+version = "0.50.0"
 edition = "2024"
 
 [lints.rust]
@@ -43,7 +43,7 @@ zip = "8.5.0"
 zstd = { version = "0.13.3", features = ["zstdmt"] }
 inquire = "0.9.4"
 md5 = "0.8.0"
-suppaftp = "8.0.2"
+suppaftp = "8.0.4"
 minisign = "0.9.1"
 petgraph = "0.8.3"
 fd-lock = "4.0.4"
@@ -56,7 +56,7 @@ time = { version = "0.3.47", features = ["formatting", "parsing"] }
 b2sum-rust = "0.3.0"
 serde_ignored = "0.1.14"
 lz4_flex = "0.13.1"
-lzma-rust2 = "0.16.2"
+lzma-rust2 = "0.16.4"
 signal-hook = "0.4.4"
 sha1 = "0.11.0"
 pdf-extract = "0.10.0"

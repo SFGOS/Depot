@@ -844,6 +844,30 @@ pub fn get_installed_packages(db_path: &Path) -> Result<std::collections::HashSe
     Ok(names)
 }
 
+/// Get installed dependency names, including stable `real_name` aliases.
+pub(crate) fn get_installed_dependency_names(
+    db_path: &Path,
+) -> Result<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+
+    if !db_path.exists() {
+        return Ok(HashSet::new());
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT name FROM packages
+         UNION
+         SELECT real_name FROM packages WHERE real_name IS NOT NULL",
+    )?;
+    let names: HashSet<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(names)
+}
+
 /// List installed packages with version and revision metadata.
 pub fn list_installed_package_records(db_path: &Path) -> Result<Vec<InstalledPackageRecord>> {
     if !db_path.exists() {
@@ -1038,6 +1062,27 @@ pub fn get_package_version(db_path: &Path, name: &str) -> Result<Option<String>>
     Ok(version)
 }
 
+/// Get an installed package version by package name or stable `real_name`.
+pub(crate) fn get_dependency_version(db_path: &Path, name: &str) -> Result<Option<String>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let version = conn
+        .query_row(
+            "SELECT version FROM packages
+             WHERE name = ?1 OR real_name = ?1
+             ORDER BY CASE WHEN name = ?1 THEN 0 ELSE 1 END, name
+             LIMIT 1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(version)
+}
+
 /// Find the installed package that owns a filesystem path from the local DB.
 pub fn owns_path(db_path: &Path, path: &Path) -> Result<Option<String>> {
     if !db_path.exists() {
@@ -1166,6 +1211,28 @@ mod tests {
     }
 
     #[test]
+    fn installed_dependency_names_include_real_name_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(&destdir).unwrap();
+
+        let mut spec = mk_spec("libressl43", "4.3.2");
+        spec.package.real_name = Some("libressl".into());
+        register_package(&db_path, &spec, &destdir).unwrap();
+
+        let names = get_installed_dependency_names(&db_path).unwrap();
+        assert!(names.contains("libressl43"));
+        assert!(names.contains("libressl"));
+        assert_eq!(
+            get_dependency_version(&db_path, "libressl")
+                .unwrap()
+                .as_deref(),
+            Some("4.3.2")
+        );
+    }
+
+    #[test]
     fn register_package_uses_metadata_completed_at_when_present() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("packages.db");
@@ -1268,28 +1335,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let rootfs = tmp.path().join("rootfs");
         let db_path = crate::config::Config::for_rootfs(&rootfs).installed_db_path(&rootfs);
-        std::fs::create_dir_all(rootfs.join("system/binaries")).unwrap();
-        std::fs::write(rootfs.join("system/binaries/find"), "sbase find").unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::fs::write(rootfs.join("usr/bin/find"), "sbase find").unwrap();
 
         let spec_a = mk_spec("sbase", "1.0");
         let dest_a = tmp.path().join("dest_a");
-        std::fs::create_dir_all(dest_a.join("system/binaries")).unwrap();
-        std::fs::write(dest_a.join("system/binaries/find"), "sbase find").unwrap();
+        std::fs::create_dir_all(dest_a.join("usr/bin")).unwrap();
+        std::fs::write(dest_a.join("usr/bin/find"), "sbase find").unwrap();
         register_package(&db_path, &spec_a, &dest_a).unwrap();
 
         let spec_b = mk_spec("bfs", "4.1");
         let dest_b = tmp.path().join("dest_b");
-        std::fs::create_dir_all(dest_b.join("system/binaries")).unwrap();
-        std::fs::write(dest_b.join("system/binaries/find"), "bfs find").unwrap();
+        std::fs::create_dir_all(dest_b.join("usr/bin")).unwrap();
+        std::fs::write(dest_b.join("usr/bin/find"), "bfs find").unwrap();
 
         let mut env = TestEnv::new();
         env.set_var(DEPOT_BOOTSTRAP_IGNORE_SBASE_CONFLICTS, "1");
         register_package(&db_path, &spec_b, &dest_b).unwrap();
 
         let files_sbase = get_package_files(&db_path, "sbase").unwrap();
-        assert!(!files_sbase.contains(&"system/binaries/find".to_string()));
+        assert!(!files_sbase.contains(&"usr/bin/find".to_string()));
         let files_bfs = get_package_files(&db_path, "bfs").unwrap();
-        assert!(files_bfs.contains(&"system/binaries/find".to_string()));
+        assert!(files_bfs.contains(&"usr/bin/find".to_string()));
     }
 
     #[test]
@@ -1297,33 +1364,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let rootfs = tmp.path().join("rootfs");
         let db_path = crate::config::Config::for_rootfs(&rootfs).installed_db_path(&rootfs);
-        std::fs::create_dir_all(rootfs.join("system/binaries")).unwrap();
-        std::fs::write(rootfs.join("system/binaries/find"), "sbase find").unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::fs::write(rootfs.join("usr/bin/find"), "sbase find").unwrap();
 
         let spec_a = mk_spec("sbase", "1.0");
         let dest_a = tmp.path().join("dest_a");
-        std::fs::create_dir_all(dest_a.join("system/binaries")).unwrap();
-        std::fs::write(dest_a.join("system/binaries/find"), "sbase find").unwrap();
+        std::fs::create_dir_all(dest_a.join("usr/bin")).unwrap();
+        std::fs::write(dest_a.join("usr/bin/find"), "sbase find").unwrap();
         register_package(&db_path, &spec_a, &dest_a).unwrap();
 
-        std::fs::write(rootfs.join("system/binaries/find"), "bfs find").unwrap();
+        std::fs::write(rootfs.join("usr/bin/find"), "bfs find").unwrap();
         let spec_b = mk_spec("bfs", "4.1");
         let dest_b = tmp.path().join("dest_b");
-        std::fs::create_dir_all(dest_b.join("system/binaries")).unwrap();
-        std::fs::write(dest_b.join("system/binaries/find"), "bfs find").unwrap();
+        std::fs::create_dir_all(dest_b.join("usr/bin")).unwrap();
+        std::fs::write(dest_b.join("usr/bin/find"), "bfs find").unwrap();
 
         let mut env = TestEnv::new();
         env.set_var(DEPOT_BOOTSTRAP_IGNORE_SBASE_CONFLICTS, "1");
         register_package(&db_path, &spec_b, &dest_b).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(rootfs.join("system/binaries/find")).unwrap(),
+            std::fs::read_to_string(rootfs.join("usr/bin/find")).unwrap(),
             "bfs find"
         );
         let files_sbase = get_package_files(&db_path, "sbase").unwrap();
-        assert!(!files_sbase.contains(&"system/binaries/find".to_string()));
+        assert!(!files_sbase.contains(&"usr/bin/find".to_string()));
         let files_bfs = get_package_files(&db_path, "bfs").unwrap();
-        assert!(files_bfs.contains(&"system/binaries/find".to_string()));
+        assert!(files_bfs.contains(&"usr/bin/find".to_string()));
     }
 
     #[test]

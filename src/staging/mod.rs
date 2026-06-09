@@ -2,12 +2,13 @@
 
 use crate::package::PackageSpec;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::io::Read;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -17,6 +18,12 @@ use walkdir::WalkDir;
 
 pub const INTERNAL_DEPOT_DIR: &str = ".depot";
 pub const INTERNAL_OUTPUTS_DIR: &str = ".depot/outputs";
+
+type HardlinkKey = (u64, u64);
+
+fn hardlink_key(metadata: &fs::Metadata) -> Option<HardlinkKey> {
+    (metadata.nlink() > 1).then_some((metadata.dev(), metadata.ino()))
+}
 
 fn is_info_dir_index_path(rel_path: &str) -> bool {
     matches!(
@@ -46,8 +53,6 @@ fn is_skipped_install_path(rel_path: &str) -> bool {
         || p == INTERNAL_DEPOT_DIR
         || p.strip_prefix(INTERNAL_DEPOT_DIR)
             .is_some_and(|rest| rest.starts_with('/'))
-        || p == "destdir"
-        || p.starts_with("destdir/")
         || p == "scripts"
         || p.starts_with("scripts/")
         || is_purged_payload_path(p)
@@ -533,18 +538,58 @@ fn is_elf_file(path: &Path) -> Result<bool> {
 
 fn auto_strip_elf_files(destdir: &Path, strip_command: &str) -> Result<usize> {
     let mut stripped = 0usize;
+    let mut hardlink_keys_by_path: HashMap<PathBuf, HardlinkKey> = HashMap::new();
+    let mut stripped_hardlinks: HashMap<HardlinkKey, PathBuf> = HashMap::new();
     let strip_command = strip_command.trim();
     let strip_command = if strip_command.is_empty() {
         "strip"
     } else {
         strip_command
     };
+
     for entry in WalkDir::new(destdir).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
         }
         let path = entry.path();
+        let metadata = path
+            .symlink_metadata()
+            .with_context(|| format!("Failed to inspect {}", path.display()))?;
+        if let Some(key) = hardlink_key(&metadata) {
+            hardlink_keys_by_path.insert(path.to_path_buf(), key);
+        }
+    }
+
+    for entry in WalkDir::new(destdir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = path
+            .symlink_metadata()
+            .with_context(|| format!("Failed to inspect {}", path.display()))?;
+        let hardlink_key = hardlink_keys_by_path
+            .get(path)
+            .copied()
+            .or_else(|| hardlink_key(&metadata));
         if !is_elf_file(path)? {
+            continue;
+        }
+        if let Some(stripped_path) = hardlink_key.and_then(|key| stripped_hardlinks.get(&key)) {
+            fs::remove_file(path).with_context(|| {
+                format!(
+                    "Failed to replace hardlinked ELF after stripping: {}",
+                    path.display()
+                )
+            })?;
+            fs::hard_link(stripped_path, path).with_context(|| {
+                format!(
+                    "Failed to restore stripped hardlink {} -> {}",
+                    path.display(),
+                    stripped_path.display()
+                )
+            })?;
+            stripped += 1;
             continue;
         }
 
@@ -568,6 +613,9 @@ fn auto_strip_elf_files(destdir: &Path, strip_command: &str) -> Result<usize> {
             );
         }
         stripped += 1;
+        if let Some(key) = hardlink_key {
+            stripped_hardlinks.insert(key, path.to_path_buf());
+        }
     }
     Ok(stripped)
 }
@@ -909,187 +957,7 @@ pub fn process(destdir: &Path, spec: &PackageSpec) -> Result<()> {
         );
     }
 
-    let normalized = normalize_lbi_layout(destdir)?;
-    if normalized > 0 {
-        crate::log_info!("Normalized {} path(s) into the /system layout", normalized);
-    }
-
     Ok(())
-}
-
-fn normalize_lbi_layout(destdir: &Path) -> Result<usize> {
-    let mut roots = vec![destdir.to_path_buf()];
-    let outputs = output_staging_root(destdir);
-    if outputs.exists() {
-        let mut output_dirs = fs::read_dir(&outputs)
-            .with_context(|| format!("Failed to read {}", outputs.display()))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .with_context(|| {
-                format!(
-                    "Failed to read output staging entry from {}",
-                    outputs.display()
-                )
-            })?;
-        output_dirs.sort_by_key(|entry| entry.file_name());
-        for entry in output_dirs {
-            let path = entry.path();
-            if path.is_dir() {
-                roots.push(path);
-            }
-        }
-    }
-
-    let mut changed = 0usize;
-    for root in roots {
-        changed += normalize_lbi_tree_paths(&root)?;
-        changed += rewrite_lbi_pkgconfig_files(&root)?;
-    }
-    Ok(changed)
-}
-
-fn normalize_lbi_tree_paths(root: &Path) -> Result<usize> {
-    let mappings = [
-        ("usr/share/man", "system/documentation/man-pages"),
-        ("usr/share/info", "system/documentation/info"),
-        ("usr/bin", "system/binaries"),
-        ("usr/sbin", "system/systembinaries"),
-        ("usr/lib64", "system/libraries"),
-        ("usr/lib", "system/libraries"),
-        ("usr/include", "system/headers"),
-        ("usr/share", "system/share"),
-        ("bin", "system/binaries"),
-        ("sbin", "system/systembinaries"),
-        ("lib64", "system/libraries"),
-        ("lib", "system/libraries"),
-        ("include", "system/headers"),
-        ("etc", "system/configuration"),
-        ("var", "system/variable"),
-        ("system/bin", "system/binaries"),
-        ("system/sbin", "system/systembinaries"),
-        ("system/lib64", "system/libraries"),
-        ("system/lib", "system/libraries"),
-        ("system/include", "system/headers"),
-        ("system/share/man", "system/documentation/man-pages"),
-        ("system/share/info", "system/documentation/info"),
-    ];
-
-    let mut changed = 0usize;
-    for (from, to) in mappings {
-        let src = root.join(from);
-        let src_meta = match fs::symlink_metadata(&src) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(err).with_context(|| format!("Failed to inspect {}", src.display()));
-            }
-        };
-        if src_meta.file_type().is_symlink() {
-            continue;
-        }
-        let dst = root.join(to);
-        move_lbi_path(&src, &dst)?;
-        changed += 1;
-    }
-    prune_empty_dirs(root, &["usr", "system"])?;
-    Ok(changed)
-}
-
-fn move_lbi_path(src: &Path, dst: &Path) -> Result<()> {
-    if src == dst {
-        return Ok(());
-    }
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
-    if !dst.exists() {
-        fs::rename(src, dst)
-            .with_context(|| format!("Failed to move {} to {}", src.display(), dst.display()))?;
-        return Ok(());
-    }
-
-    let src_meta = fs::symlink_metadata(src)
-        .with_context(|| format!("Failed to inspect {}", src.display()))?;
-    let dst_meta = fs::symlink_metadata(dst)
-        .with_context(|| format!("Failed to inspect {}", dst.display()))?;
-    if src_meta.is_dir() && dst_meta.is_dir() {
-        move_directory_contents(src, dst)?;
-        return Ok(());
-    }
-
-    anyhow::bail!(
-        "Refusing to overwrite existing path while normalizing /system layout: {}",
-        dst.display()
-    );
-}
-
-fn prune_empty_dirs(root: &Path, dirs: &[&str]) -> Result<()> {
-    for dir in dirs {
-        let path = root.join(dir);
-        if path.exists() && path.is_dir() && is_directory_empty(&path)? {
-            fs::remove_dir(&path)
-                .with_context(|| format!("Failed to remove empty directory {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn rewrite_lbi_pkgconfig_files(root: &Path) -> Result<usize> {
-    let mut changed = 0usize;
-    if !root.exists() {
-        return Ok(0);
-    }
-
-    for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry.with_context(|| format!("Failed to walk {}", root.display()))?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("pc") {
-            continue;
-        }
-        let Ok(original) = fs::read_to_string(path) else {
-            continue;
-        };
-        let rewritten = rewrite_lbi_pkgconfig_text(&original);
-        if rewritten != original {
-            fs::write(path, rewritten)
-                .with_context(|| format!("Failed to rewrite pkg-config file {}", path.display()))?;
-            changed += 1;
-        }
-    }
-    Ok(changed)
-}
-
-fn rewrite_lbi_pkgconfig_text(input: &str) -> String {
-    input
-        .replace("prefix=/usr", "prefix=/system")
-        .replace("exec_prefix=/usr", "exec_prefix=/system")
-        .replace("bindir=${prefix}/bin", "bindir=${prefix}/binaries")
-        .replace("sbindir=${prefix}/sbin", "sbindir=${prefix}/systembinaries")
-        .replace("libdir=${prefix}/lib64", "libdir=${prefix}/libraries")
-        .replace("libdir=${prefix}/lib", "libdir=${prefix}/libraries")
-        .replace(
-            "includedir=${prefix}/include",
-            "includedir=${prefix}/headers",
-        )
-        .replace(
-            "mandir=${prefix}/share/man",
-            "mandir=${prefix}/documentation/man-pages",
-        )
-        .replace(
-            "infodir=${prefix}/share/info",
-            "infodir=${prefix}/documentation/info",
-        )
-        .replace("/usr/sbin", "/system/systembinaries")
-        .replace("/usr/bin", "/system/binaries")
-        .replace("/usr/lib64", "/system/libraries")
-        .replace("/usr/lib", "/system/libraries")
-        .replace("/usr/include", "/system/headers")
-        .replace("/usr/share/man", "/system/documentation/man-pages")
-        .replace("/usr/share/info", "/system/documentation/info")
-        .replace("/usr/share", "/system/share")
 }
 
 /// Copy license files into the staged tree.
@@ -1682,6 +1550,7 @@ pub fn install_atomic(
         removed: Vec::new(),
     };
     let mut staged_paths = HashSet::new();
+    let mut installed_hardlinks: HashMap<HardlinkKey, String> = HashMap::new();
 
     let result: Result<()> = (|| {
         // First, create all directories from destdir (for packages with only directories)
@@ -1817,9 +1686,29 @@ pub fn install_atomic(
                     .with_context(|| format!("Failed to create symlink: {}", install_rel_path))?;
                 tx.replay_relocated_dir_if_present(&install_rel_path)?;
             } else {
-                fs::copy(src_path, &dest_path)
-                    .with_context(|| format!("Failed to install: {}", install_rel_path))?;
-                apply_unix_mode(&dest_path, &metadata)?;
+                let hardlink_key = if keep_as_depotnew {
+                    None
+                } else {
+                    hardlink_key(&metadata)
+                };
+                if let Some(first_rel_path) =
+                    hardlink_key.and_then(|key| installed_hardlinks.get(&key))
+                {
+                    let first_path = rootfs.join(first_rel_path);
+                    fs::hard_link(&first_path, &dest_path).with_context(|| {
+                        format!(
+                            "Failed to install hardlink: {} -> {}",
+                            install_rel_path, first_rel_path
+                        )
+                    })?;
+                } else {
+                    fs::copy(src_path, &dest_path)
+                        .with_context(|| format!("Failed to install: {}", install_rel_path))?;
+                    apply_unix_mode(&dest_path, &metadata)?;
+                    if let Some(key) = hardlink_key {
+                        installed_hardlinks.insert(key, install_rel_path.clone());
+                    }
+                }
             }
             staged_paths.insert(install_rel_path);
         }
@@ -1893,9 +1782,9 @@ mod tests {
         let spec = mk_spec_for_stage_processing();
         process(&destdir, &spec).unwrap();
 
-        assert!(!destdir.join("system/libraries/libfoo.a").exists());
-        assert!(!destdir.join("system/libraries/libfoo.la").exists());
-        assert!(destdir.join("system/libraries/libfoo.so").exists());
+        assert!(!destdir.join("usr/lib/libfoo.a").exists());
+        assert!(!destdir.join("usr/lib/libfoo.la").exists());
+        assert!(destdir.join("usr/lib/libfoo.so").exists());
     }
 
     #[test]
@@ -1910,8 +1799,8 @@ mod tests {
         spec.build.flags.no_delete_static = true;
         process(&destdir, &spec).unwrap();
 
-        assert!(destdir.join("system/libraries/libfoo.a").exists());
-        assert!(!destdir.join("system/libraries/libfoo.la").exists());
+        assert!(destdir.join("usr/lib/libfoo.a").exists());
+        assert!(!destdir.join("usr/lib/libfoo.la").exists());
     }
 
     #[test]
@@ -1934,18 +1823,18 @@ mod tests {
         process(&destdir, &spec).unwrap();
 
         let docs_destdir = output_staging_dir(&destdir, "foo-docs");
-        assert!(docs_destdir.join("system/share/doc/foo/README").exists());
+        assert!(docs_destdir.join("usr/share/doc/foo/README").exists());
         assert!(
             docs_destdir
-                .join("system/share/gtk-doc/html/foo/index.html")
+                .join("usr/share/gtk-doc/html/foo/index.html")
                 .exists()
         );
         assert!(docs_destdir.join("opt/foo-docs/guide.txt").exists());
-        assert!(destdir.join("system/binaries/foo").exists());
-        assert!(!destdir.join("system/share/doc/foo/README").exists());
+        assert!(destdir.join("usr/bin/foo").exists());
+        assert!(!destdir.join("usr/share/doc/foo/README").exists());
         assert!(
             !destdir
-                .join("system/share/gtk-doc/html/foo/index.html")
+                .join("usr/share/gtk-doc/html/foo/index.html")
                 .exists()
         );
         assert!(!destdir.join("opt/foo-docs/guide.txt").exists());
@@ -1977,172 +1866,9 @@ mod tests {
         process(&destdir, &spec).unwrap();
 
         let docs_destdir = output_staging_dir(&destdir, "foo-dev-docs");
-        assert!(
-            docs_destdir
-                .join("system/share/doc/foo-dev/README")
-                .exists()
-        );
-        assert!(dev_destdir.join("system/headers/foo.h").exists());
-        assert!(!dev_destdir.join("system/share/doc/foo-dev/README").exists());
-    }
-
-    #[test]
-    fn process_normalizes_usr_paths_into_system_layout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let destdir = tmp.path().join("dest");
-        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
-        std::fs::create_dir_all(destdir.join("usr/lib/pkgconfig")).unwrap();
-        std::fs::create_dir_all(destdir.join("usr/include/foo")).unwrap();
-        std::fs::create_dir_all(destdir.join("usr/share/man/man1")).unwrap();
-        std::fs::create_dir_all(destdir.join("usr/share/info")).unwrap();
-        std::fs::write(destdir.join("usr/bin/foo"), "bin").unwrap();
-        std::fs::write(destdir.join("usr/share/man/man1/foo.1"), "man").unwrap();
-        std::fs::write(destdir.join("usr/share/info/foo.info"), "info").unwrap();
-        std::fs::write(
-            destdir.join("usr/lib/pkgconfig/foo.pc"),
-            "prefix=/usr\nbindir=${prefix}/bin\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\nmandir=${prefix}/share/man\ninfodir=${prefix}/share/info\n",
-        )
-        .unwrap();
-
-        let spec = mk_spec_for_stage_processing();
-        process(&destdir, &spec).unwrap();
-
-        assert!(destdir.join("system/binaries/foo").exists());
-        assert!(destdir.join("system/headers/foo").is_dir());
-        assert!(
-            destdir
-                .join("system/documentation/man-pages/man1/foo.1")
-                .exists()
-        );
-        assert!(destdir.join("system/documentation/info/foo.info").exists());
-        let pc =
-            std::fs::read_to_string(destdir.join("system/libraries/pkgconfig/foo.pc")).unwrap();
-        assert!(pc.contains("prefix=/system"));
-        assert!(pc.contains("bindir=${prefix}/binaries"));
-        assert!(pc.contains("libdir=${prefix}/libraries"));
-        assert!(pc.contains("includedir=${prefix}/headers"));
-        assert!(pc.contains("mandir=${prefix}/documentation/man-pages"));
-        assert!(pc.contains("infodir=${prefix}/documentation/info"));
-        assert!(!destdir.join("usr").exists());
-    }
-
-    #[test]
-    fn process_normalizes_duplicate_identical_lbi_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let destdir = tmp.path().join("dest");
-        std::fs::create_dir_all(destdir.join("system/lib/clang/22/include")).unwrap();
-        std::fs::create_dir_all(destdir.join("system/libraries/clang/22/include")).unwrap();
-        std::fs::write(
-            destdir.join("system/lib/clang/22/include/builtins.h"),
-            "same header\n",
-        )
-        .unwrap();
-        std::fs::write(
-            destdir.join("system/libraries/clang/22/include/builtins.h"),
-            "same header\n",
-        )
-        .unwrap();
-
-        let spec = mk_spec_for_stage_processing();
-        process(&destdir, &spec).unwrap();
-
-        assert!(
-            !destdir
-                .join("system/lib/clang/22/include/builtins.h")
-                .exists()
-        );
-        assert_eq!(
-            std::fs::read_to_string(destdir.join("system/libraries/clang/22/include/builtins.h"))
-                .unwrap(),
-            "same header\n"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn process_preserves_lbi_compatibility_symlinks() {
-        use std::os::unix::fs as unix_fs;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let destdir = tmp.path().join("dest");
-        std::fs::create_dir_all(destdir.join("system/binaries")).unwrap();
-        std::fs::create_dir_all(destdir.join("system/documentation/man-pages")).unwrap();
-        std::fs::create_dir_all(destdir.join("system/share")).unwrap();
-        std::fs::create_dir_all(destdir.join("usr")).unwrap();
-
-        unix_fs::symlink("system/binaries", destdir.join("bin")).unwrap();
-        unix_fs::symlink("../system/binaries", destdir.join("usr/bin")).unwrap();
-        unix_fs::symlink("../system/share", destdir.join("usr/share")).unwrap();
-        unix_fs::symlink(
-            "../documentation/man-pages",
-            destdir.join("system/share/man"),
-        )
-        .unwrap();
-
-        let spec = mk_spec_for_stage_processing();
-        process(&destdir, &spec).unwrap();
-
-        assert_eq!(
-            std::fs::read_link(destdir.join("bin")).unwrap(),
-            PathBuf::from("system/binaries")
-        );
-        assert_eq!(
-            std::fs::read_link(destdir.join("usr/bin")).unwrap(),
-            PathBuf::from("../system/binaries")
-        );
-        assert_eq!(
-            std::fs::read_link(destdir.join("usr/share")).unwrap(),
-            PathBuf::from("../system/share")
-        );
-        assert_eq!(
-            std::fs::read_link(destdir.join("system/share/man")).unwrap(),
-            PathBuf::from("../documentation/man-pages")
-        );
-        assert!(destdir.join("system/documentation/man-pages").is_dir());
-    }
-
-    #[test]
-    fn process_rejects_conflicting_lbi_normalized_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let destdir = tmp.path().join("dest");
-        std::fs::create_dir_all(destdir.join("system/lib/clang/22/include")).unwrap();
-        std::fs::create_dir_all(destdir.join("system/libraries/clang/22/include")).unwrap();
-        std::fs::write(
-            destdir.join("system/lib/clang/22/include/builtins.h"),
-            "left header\n",
-        )
-        .unwrap();
-        std::fs::write(
-            destdir.join("system/libraries/clang/22/include/builtins.h"),
-            "right header\n",
-        )
-        .unwrap();
-
-        let spec = mk_spec_for_stage_processing();
-        let err = process(&destdir, &spec).unwrap_err();
-
-        assert!(
-            err.to_string().contains("destination already exists"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn process_normalizes_split_output_usr_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let destdir = tmp.path().join("dest");
-        let out = destdir.join(".depot/outputs/foo-devel/usr/lib/pkgconfig");
-        std::fs::create_dir_all(&out).unwrap();
-        std::fs::write(out.join("foo.pc"), "prefix=/usr\nlibdir=/usr/lib\n").unwrap();
-
-        let spec = mk_spec_for_stage_processing();
-        process(&destdir, &spec).unwrap();
-
-        let pc_path = destdir.join(".depot/outputs/foo-devel/system/libraries/pkgconfig/foo.pc");
-        assert!(pc_path.exists());
-        let pc = std::fs::read_to_string(pc_path).unwrap();
-        assert!(pc.contains("prefix=/system"));
-        assert!(pc.contains("libdir=/system/libraries"));
+        assert!(docs_destdir.join("usr/share/doc/foo-dev/README").exists());
+        assert!(dev_destdir.join("usr/include/foo.h").exists());
+        assert!(!dev_destdir.join("usr/share/doc/foo-dev/README").exists());
     }
 
     #[test]
@@ -2320,6 +2046,29 @@ mod tests {
     }
 
     #[test]
+    fn install_atomic_preserves_staged_hardlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("root");
+        let destdir = tmp.path().join("dest");
+        let tx_base = tmp.path().join("tx");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(destdir.join("usr/bin")).unwrap();
+
+        let coreutils = destdir.join("usr/bin/coreutils");
+        let ls = destdir.join("usr/bin/ls");
+        std::fs::write(&coreutils, "multicall").unwrap();
+        std::fs::hard_link(&coreutils, &ls).unwrap();
+
+        let _tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
+
+        let coreutils_meta = rootfs.join("usr/bin/coreutils").metadata().unwrap();
+        let ls_meta = rootfs.join("usr/bin/ls").metadata().unwrap();
+        assert_eq!(coreutils_meta.ino(), ls_meta.ino());
+        assert_eq!(coreutils_meta.nlink(), 2);
+        assert_eq!(ls_meta.nlink(), 2);
+    }
+
+    #[test]
     fn install_atomic_keep_wildcard_matches_directory_children() {
         let tmp = tempfile::tempdir().unwrap();
         let rootfs = tmp.path().join("root");
@@ -2415,32 +2164,32 @@ mod tests {
         let rootfs = tmp.path().join("root");
         let destdir = tmp.path().join("dest");
         let tx_base = rootfs.join("var/cache/depot/build/tx");
-        std::fs::create_dir_all(rootfs.join("var/lib/depot")).unwrap();
-        std::fs::write(rootfs.join("var/lib/depot/lock"), "state").unwrap();
-        std::fs::create_dir_all(rootfs.join("system/variable/lib/depot")).unwrap();
-        std::fs::write(rootfs.join("system/variable/lib/depot/lock"), "state").unwrap();
-        std::fs::create_dir_all(destdir.join("system/variable/lib/misc")).unwrap();
-        std::os::unix::fs::symlink("system/variable", destdir.join("var")).unwrap();
+        std::fs::create_dir_all(rootfs.join("lib/depot")).unwrap();
+        std::fs::write(rootfs.join("lib/depot/lock"), "state").unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/lib/depot")).unwrap();
+        std::fs::write(rootfs.join("usr/lib/depot/lock"), "state").unwrap();
+        std::fs::create_dir_all(destdir.join("usr/lib/misc")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", destdir.join("lib")).unwrap();
 
         let tx = install_atomic(&destdir, &rootfs, &tx_base, &[], &[]).unwrap();
 
-        let var_meta = rootfs.join("var").symlink_metadata().unwrap();
-        assert!(var_meta.file_type().is_symlink());
+        let lib_meta = rootfs.join("lib").symlink_metadata().unwrap();
+        assert!(lib_meta.file_type().is_symlink());
         assert_eq!(
-            std::fs::read_link(rootfs.join("var")).unwrap(),
-            PathBuf::from("system/variable")
+            std::fs::read_link(rootfs.join("lib")).unwrap(),
+            PathBuf::from("usr/lib")
         );
         assert_eq!(
-            std::fs::read_to_string(rootfs.join("system/variable/lib/depot/lock")).unwrap(),
+            std::fs::read_to_string(rootfs.join("usr/lib/depot/lock")).unwrap(),
             "state"
         );
-        assert!(rootfs.join("system/variable/lib/misc").is_dir());
+        assert!(rootfs.join("usr/lib/misc").is_dir());
 
         tx.rollback().unwrap();
-        let restored = rootfs.join("var").symlink_metadata().unwrap();
+        let restored = rootfs.join("lib").symlink_metadata().unwrap();
         assert!(restored.file_type().is_dir());
         assert_eq!(
-            std::fs::read_to_string(rootfs.join("var/lib/depot/lock")).unwrap(),
+            std::fs::read_to_string(rootfs.join("lib/depot/lock")).unwrap(),
             "state"
         );
     }
@@ -2589,6 +2338,44 @@ mod tests {
 
         assert!(is_elf_file(&elf).unwrap());
         assert!(!is_elf_file(&text).unwrap());
+    }
+
+    #[test]
+    fn auto_strip_elf_files_restores_hardlinks_when_strip_replaces_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let bin = dest.join("usr/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        let fake_strip = tmp.path().join("fake-strip");
+        std::fs::write(
+            &fake_strip,
+            "#!/bin/sh\nfor arg do path=$arg; done\ntmp=\"$path.tmp\"\ncp \"$path\" \"$tmp\"\nprintf stripped >> \"$tmp\"\nmv \"$tmp\" \"$path\"\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_strip).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_strip, perms).unwrap();
+
+        let coreutils = bin.join("coreutils");
+        let ls = bin.join("ls");
+        std::fs::write(&coreutils, [0x7F, b'E', b'L', b'F', 0x02, 0x01]).unwrap();
+        std::fs::hard_link(&coreutils, &ls).unwrap();
+
+        let stripped = auto_strip_elf_files(&dest, fake_strip.to_str().unwrap()).unwrap();
+
+        let coreutils_meta = coreutils.metadata().unwrap();
+        let ls_meta = ls.metadata().unwrap();
+        assert_eq!(stripped, 2);
+        assert_eq!(coreutils_meta.ino(), ls_meta.ino());
+        assert_eq!(coreutils_meta.nlink(), 2);
+        assert_eq!(ls_meta.nlink(), 2);
+        assert_eq!(
+            std::fs::read(&coreutils).unwrap(),
+            std::fs::read(&ls).unwrap()
+        );
     }
 
     #[test]
@@ -2980,34 +2767,6 @@ mod tests {
             !manifest
                 .files
                 .contains(&".depot/outputs/clang/usr/bin/clang".to_string())
-        );
-    }
-
-    #[test]
-    fn generate_manifest_skips_bootstrap_chroot_destdir_mountpoint() {
-        let tmp = tempfile::tempdir().unwrap();
-        let destdir = tmp.path().join("dest");
-        std::fs::create_dir_all(destdir.join("system/binaries")).unwrap();
-        std::fs::create_dir_all(destdir.join("destdir/system/documentation/xz")).unwrap();
-        std::fs::write(destdir.join("system/binaries/xz"), "ok").unwrap();
-        std::fs::write(
-            destdir.join("destdir/system/documentation/xz/README"),
-            "stale staging",
-        )
-        .unwrap();
-
-        let manifest = generate_manifest_with_dirs(&destdir).unwrap();
-
-        assert!(manifest.files.contains(&"system/binaries/xz".to_string()));
-        assert!(
-            !manifest
-                .files
-                .contains(&"destdir/system/documentation/xz/README".to_string())
-        );
-        assert!(
-            !manifest
-                .directories
-                .contains(&"destdir/system/documentation/xz".to_string())
         );
     }
 }

@@ -1,11 +1,11 @@
 use crate::cli::{
     BuildArgs, Cli, Commands, ConfigArgs, ConvertArgs, InfoArgs, InstallArgs, InternalCommands,
     ListArgs, OwnsArgs, RemoveArgs, RepoCommands, RepoKindArg, SearchArgs, SetArgs, SignArgs,
-    SystemArgs, UpdateArgs,
+    UpdateArgs,
 };
 use crate::{
-    bootstrap, builder, cli_assets, config, cross, db, deps, index, install, locking, package,
-    planner, signing, source, staging, ui,
+    builder, cli_assets, config, cross, db, deps, index, install, locking, package, planner,
+    signing, source, staging, ui,
 };
 use anyhow::{Context, Result};
 use git2::Direction;
@@ -91,7 +91,6 @@ fn command_rootfs(command: &Commands) -> Option<&Path> {
         Commands::Install(args) => Some(&args.rootfs_args.rootfs),
         Commands::Remove(args) => Some(&args.rootfs_args.rootfs),
         Commands::Build(args) => Some(&args.rootfs_args.rootfs),
-        Commands::Bootstrap(args) => Some(&args.sysroot),
         Commands::Update(args) => Some(&args.rootfs_args.rootfs),
         Commands::Info(args) => Some(&args.rootfs_args.rootfs),
         Commands::Search(args) => Some(&args.rootfs_args.rootfs),
@@ -101,7 +100,6 @@ fn command_rootfs(command: &Commands) -> Option<&Path> {
         Commands::Repo(args) => Some(repo_command_rootfs(&args.command)),
         Commands::Config(args) => Some(&args.rootfs_args.rootfs),
         Commands::Set(args) => Some(&args.rootfs_args.rootfs),
-        Commands::System(args) => Some(&args.rootfs_args.rootfs),
         Commands::Check(_)
         | Commands::Convert(_)
         | Commands::GenerateArtifacts(_)
@@ -115,7 +113,6 @@ fn command_assume_yes(command: &Commands) -> bool {
         Commands::Install(args) => args.prompt_args.yes,
         Commands::Remove(args) => args.prompt_args.yes,
         Commands::Build(args) => args.prompt_args.yes,
-        Commands::Bootstrap(_) => false,
         Commands::Update(args) => args.prompt_args.yes,
         Commands::Check(_)
         | Commands::Convert(_)
@@ -127,7 +124,6 @@ fn command_assume_yes(command: &Commands) -> bool {
         | Commands::Repo(_)
         | Commands::Config(_)
         | Commands::Set(_)
-        | Commands::System(_)
         | Commands::GenerateArtifacts(_)
         | Commands::MakeSpec(_)
         | Commands::Internal(_) => false,
@@ -2585,8 +2581,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Install(args) => args.build_exec_args.test_deps,
         Commands::Build(args) => args.build_exec_args.test_deps,
         Commands::Update(args) => args.build_exec_args.test_deps,
-        Commands::Bootstrap(_)
-        | Commands::Check(_)
+        Commands::Check(_)
         | Commands::Remove(_)
         | Commands::Info(_)
         | Commands::Search(_)
@@ -2596,7 +2591,6 @@ pub fn run(cli: Cli) -> Result<()> {
         | Commands::Repo(_)
         | Commands::Config(_)
         | Commands::Set(_)
-        | Commands::System(_)
         | Commands::GenerateArtifacts(_)
         | Commands::Convert(_)
         | Commands::MakeSpec(_)
@@ -2607,7 +2601,6 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Install(args) => install_cmd::run_install(args, cli_test_deps)?,
         Commands::Remove(args) => install_cmd::run_remove(args)?,
         Commands::Build(args) => build_cmd::run_build(args, cli_test_deps)?,
-        Commands::Bootstrap(args) => bootstrap::run(args)?,
         Commands::Update(args) => update::run_update(args, cli_test_deps)?,
         Commands::Check(args) => check::run_check(args)?,
         Commands::Info(args) => misc::run_info(args)?,
@@ -2619,7 +2612,6 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::GenerateArtifacts(args) => misc::run_generate_artifacts(args)?,
         Commands::Config(args) => misc::run_config(args)?,
         Commands::Set(args) => set::run_set(args)?,
-        Commands::System(args) => misc::run_system(args)?,
         Commands::MakeSpec(args) => misc::run_make_spec(args)?,
         Commands::Convert(args) => misc::run_convert(args)?,
         Commands::Internal(args) => misc::run_internal(args)?,

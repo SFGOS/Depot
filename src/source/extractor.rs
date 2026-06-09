@@ -13,7 +13,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::{NamedTempFile, tempdir};
-use walkdir::WalkDir;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -599,24 +598,7 @@ fn copy_file_preserve_metadata(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn copy_dir_recursive_local(src: &Path, dst: &Path) -> Result<()> {
-    for entry in WalkDir::new(src) {
-        crate::interrupts::check()?;
-        let entry = entry?;
-        let rel = entry.path().strip_prefix(src).unwrap();
-        let target = dst.join(rel);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)?;
-        } else if entry.file_type().is_symlink() {
-            let target_link = fs::read_link(entry.path())?;
-            unix_fs::symlink(target_link, &target)?;
-        } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            copy_file_preserve_metadata(entry.path(), &target)?;
-        }
-    }
-    Ok(())
+    crate::fs_copy::copy_tree_preserving_links(src, dst)
 }
 
 fn extract_zip_archive<R: Read + std::io::Seek>(

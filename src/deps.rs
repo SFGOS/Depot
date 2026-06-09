@@ -149,7 +149,7 @@ fn is_dep_satisfied(
     };
 
     // Check version matches
-    if let Some(installed_version) = db::get_package_version(db_path, parsed.name)? {
+    if let Some(installed_version) = db::get_dependency_version(db_path, parsed.name)? {
         Ok(compare_versions(&installed_version, required, parsed.op))
     } else {
         // Package might be satisfied by an alternative or replacement, accept it.
@@ -174,7 +174,7 @@ pub fn is_dep_satisfied_in_db(dep: &str, db_path: &Path) -> Result<bool> {
         return Ok(false);
     }
 
-    let installed = db::get_installed_packages(db_path)?;
+    let installed = db::get_installed_dependency_names(db_path)?;
     let provides = db::get_all_provides(db_path)?;
     let replaces = db::get_all_replaces(db_path)?;
     is_dep_satisfied(dep, &installed, &provides, &replaces, db_path)
@@ -255,7 +255,7 @@ pub(crate) fn check_build_deps_for_outputs(
         return Ok(build_deps);
     }
 
-    let installed = db::get_installed_packages(db_path)?;
+    let installed = db::get_installed_dependency_names(db_path)?;
     let provides = db::get_all_provides(db_path)?;
     let replaces = db::get_all_replaces(db_path)?;
 
@@ -287,7 +287,7 @@ pub(crate) fn check_runtime_deps_for_outputs(
         return Ok(missing);
     }
 
-    let installed = db::get_installed_packages(db_path)?;
+    let installed = db::get_installed_dependency_names(db_path)?;
     let provides = db::get_all_provides(db_path)?;
     let replaces = db::get_all_replaces(db_path)?;
 
@@ -316,7 +316,7 @@ pub(crate) fn check_test_deps_for_outputs(
         return Ok(test_deps);
     }
 
-    let installed = db::get_installed_packages(db_path)?;
+    let installed = db::get_installed_dependency_names(db_path)?;
     let provides = db::get_all_provides(db_path)?;
     let replaces = db::get_all_replaces(db_path)?;
 
@@ -778,6 +778,25 @@ mod tests {
 
         assert!(is_dep_satisfied_in_db("patch", &db_path).unwrap());
         assert!(is_dep_satisfied_in_db("grep", &db_path).unwrap());
+    }
+
+    #[test]
+    fn test_installed_real_name_satisfies_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/lib")).unwrap();
+        std::fs::write(destdir.join("usr/lib/libssl.so"), "ssl").unwrap();
+
+        let mut spec = test_spec_with_build(BuildType::Custom, None, &[]);
+        spec.package.name = "libressl43".into();
+        spec.package.real_name = Some("libressl".into());
+        spec.package.version = "4.3.2".into();
+
+        crate::db::register_package(&db_path, &spec, &destdir).unwrap();
+
+        assert!(is_dep_satisfied_in_db("libressl", &db_path).unwrap());
+        assert!(is_dep_satisfied_in_db("libressl>=4.3.0", &db_path).unwrap());
     }
 
     #[test]

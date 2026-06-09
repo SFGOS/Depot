@@ -4,9 +4,7 @@ use crate::cross::CrossConfig;
 use crate::package::PackageSpec;
 use anyhow::{Context, Result};
 use std::fs;
-use std::os::unix::fs as unix_fs;
 use std::path::Path;
-use walkdir::WalkDir;
 
 /// For binary packages we simply copy the extracted files into DESTDIR (preserving
 /// directory structure). This is useful for .deb packages where extract step
@@ -28,29 +26,7 @@ pub fn build(
     fs::create_dir_all(destdir)
         .with_context(|| format!("Failed to create destdir: {}", destdir.display()))?;
 
-    for entry in WalkDir::new(src_dir) {
-        let entry = entry?;
-        let rel = entry.path().strip_prefix(src_dir).unwrap();
-        let target = destdir.join(rel);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)?;
-        } else if entry.file_type().is_symlink() {
-            let link_target = fs::read_link(entry.path())?;
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            // overwrite existing links/files
-            if target.exists() {
-                let _ = fs::remove_file(&target);
-            }
-            unix_fs::symlink(link_target, &target)?;
-        } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(entry.path(), &target)?;
-        }
-    }
+    crate::fs_copy::copy_tree_preserving_links(src_dir, destdir)?;
 
     Ok(())
 }

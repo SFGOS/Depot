@@ -65,7 +65,7 @@ fn configured_alias_dir(config: &config::Config) -> PathBuf {
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("/system/binaries");
+        .unwrap_or("/usr/bin");
     PathBuf::from(configured)
 }
 
@@ -242,12 +242,12 @@ mod tests {
             etc.join("build.toml"),
             r#"
 [flags]
-tool_dir = "/system/tools/bin"
-bindir = "/system/binaries"
-"#,
+    tool_dir = "/usr/lib/depot/tools/bin"
+    bindir = "/usr/bin"
+    "#,
         )
         .unwrap();
-        let tool_dir = rootfs.join("system/binaries");
+        let tool_dir = rootfs.join("usr/bin");
         fs::create_dir_all(&tool_dir).unwrap();
         tool_dir
     }
@@ -258,17 +258,14 @@ bindir = "/system/binaries"
         make_tool_dir(tmp.path());
         let config = config::Config::for_rootfs(tmp.path());
 
-        assert_eq!(
-            configured_alias_dir(&config),
-            PathBuf::from("/system/binaries")
-        );
+        assert_eq!(configured_alias_dir(&config), PathBuf::from("/usr/bin"));
     }
 
     #[test]
     fn dir_in_rootfs_does_not_duplicate_host_absolute_rootfs_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let rootfs = tmp.path().canonicalize().unwrap();
-        let host_dir = rootfs.join("system/binaries");
+        let host_dir = rootfs.join("usr/bin");
 
         assert_eq!(dir_in_rootfs(&rootfs, &host_dir), host_dir);
     }

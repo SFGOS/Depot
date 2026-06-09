@@ -3,9 +3,9 @@
 use crate::cross::CrossConfig;
 use crate::package::PackageSpec;
 use crate::source::hooks;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn build(
@@ -17,13 +17,14 @@ pub fn build(
     _host_build_dir: Option<&Path>,
 ) -> Result<()> {
     let flags = &spec.build.flags;
+    let actual_src = resolve_actual_src(spec, src_dir)?;
 
     // Create destdir
     fs::create_dir_all(destdir)?;
 
     // Isolate from parent workspace by adding empty [workspace] if not present
     // This prevents "believes it's in a workspace when it's not" errors
-    let cargo_toml = src_dir.join("Cargo.toml");
+    let cargo_toml = actual_src.join("Cargo.toml");
     if cargo_toml.exists() {
         let contents = fs::read_to_string(&cargo_toml)
             .with_context(|| format!("Failed to read {}", cargo_toml.display()))?;
@@ -75,7 +76,7 @@ pub fn build(
         crate::builder::set_env_var(&mut env_vars, "RUSTUP_TOOLCHAIN", "stable");
     }
 
-    hooks::run_post_configure_commands(spec, src_dir, destdir)?;
+    hooks::run_post_configure_commands(spec, &actual_src, destdir)?;
 
     // Run cargo build
     crate::log_info!(
@@ -83,7 +84,7 @@ pub fn build(
         if is_release { "release" } else { "debug" }
     );
     let mut cargo_cmd = Command::new("cargo");
-    cargo_cmd.current_dir(src_dir);
+    cargo_cmd.current_dir(&actual_src);
     cargo_cmd.arg("build");
 
     if is_release {
@@ -110,16 +111,16 @@ pub fn build(
     }
 
     // Run post-compile hooks
-    hooks::run_post_compile_commands(spec, src_dir, destdir)?;
+    hooks::run_post_compile_commands(spec, &actual_src, destdir)?;
 
     // Install binaries to destdir
     crate::log_info!("Installing binaries to DESTDIR...");
 
     // Determine target directory
     let target_dir = if let Some(ref t) = target {
-        src_dir.join("target").join(t).join(profile_dir)
+        actual_src.join("target").join(t).join(profile_dir)
     } else {
-        src_dir.join("target").join(profile_dir)
+        actual_src.join("target").join(profile_dir)
     };
 
     // Use bindir from flags (default: /usr/bin)
@@ -127,6 +128,7 @@ pub fn build(
     fs::create_dir_all(&bin_dir)?;
 
     // Find and copy executable files
+    let mut hardlink_tracker = crate::fs_copy::HardlinkCopyTracker::new();
     if target_dir.exists() {
         for entry in fs::read_dir(&target_dir)
             .with_context(|| format!("Failed to read target directory: {}", target_dir.display()))?
@@ -164,9 +166,7 @@ pub fn build(
                 {
                     let dest = bin_dir.join(&*file_name);
                     crate::log_info!("  Installing: {}", file_name);
-                    fs::copy(&path, &dest).with_context(|| {
-                        format!("Failed to copy {} to {}", path.display(), dest.display())
-                    })?;
+                    hardlink_tracker.copy_file(&path, &dest)?;
 
                     // Preserve executable permission
                     let mut perms = fs::metadata(&dest)?.permissions();
@@ -178,7 +178,106 @@ pub fn build(
     }
 
     // Run post-install hooks
-    hooks::run_post_install_commands(spec, src_dir, destdir)?;
+    hooks::run_post_install_commands(spec, &actual_src, destdir)?;
 
     Ok(())
+}
+
+fn resolve_actual_src(spec: &PackageSpec, src_dir: &Path) -> Result<PathBuf> {
+    let source_subdir = spec.expand_vars(&spec.build.flags.source_subdir);
+    if source_subdir.is_empty() {
+        return Ok(src_dir.to_path_buf());
+    }
+
+    let candidate = Path::new(&source_subdir);
+    if candidate.is_absolute() {
+        if candidate.exists() {
+            return Ok(candidate.to_path_buf());
+        }
+        bail!(
+            "Source directory not found: {} (source_subdir: {} -> {})",
+            candidate.display(),
+            spec.build.flags.source_subdir,
+            source_subdir
+        );
+    }
+
+    let under_src = src_dir.join(&source_subdir);
+    if under_src.exists() {
+        return Ok(under_src);
+    }
+
+    let under_spec = spec.spec_dir.join(&source_subdir);
+    if under_spec.exists() {
+        return Ok(under_spec);
+    }
+
+    if candidate.exists() {
+        return Ok(candidate.to_path_buf());
+    }
+
+    bail!(
+        "Source directory not found: {} (expanded from '{}'; tried src_dir, spec_dir, and absolute path)",
+        source_subdir,
+        spec.build.flags.source_subdir
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::package::{Build, BuildFlags, BuildType, PackageInfo};
+    use tempfile::tempdir;
+
+    fn test_spec(spec_dir: PathBuf, source_subdir: &str) -> PackageSpec {
+        PackageSpec {
+            package: PackageInfo {
+                name: "red".into(),
+                real_name: None,
+                version: "1.0.2".into(),
+                revision: 1,
+                description: String::new(),
+                homepage: String::new(),
+                abi_breaking: false,
+                license: vec!["MIT".into()],
+            },
+            packages: Vec::new(),
+            alternatives: Default::default(),
+            manual_sources: Vec::new(),
+            source: Vec::new(),
+            build: Build {
+                build_type: BuildType::Rust,
+                flags: BuildFlags {
+                    source_subdir: source_subdir.into(),
+                    ..BuildFlags::default()
+                },
+            },
+            dependencies: Default::default(),
+            package_alternatives: Default::default(),
+            package_dependencies: Default::default(),
+            spec_dir,
+        }
+    }
+
+    #[test]
+    fn resolve_actual_src_supports_source_subdir() {
+        let tmp = tempdir().unwrap();
+        let src_dir = tmp.path().join("source");
+        let nested = src_dir.join("red-1.0.2");
+        fs::create_dir_all(&nested).unwrap();
+
+        let spec = test_spec(tmp.path().join("spec"), "$name-$version");
+        assert_eq!(resolve_actual_src(&spec, &src_dir).unwrap(), nested);
+    }
+
+    #[test]
+    fn resolve_actual_src_rejects_missing_source_subdir() {
+        let tmp = tempdir().unwrap();
+        let src_dir = tmp.path().join("source");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let spec = test_spec(tmp.path().join("spec"), "missing");
+        let error = resolve_actual_src(&spec, &src_dir).unwrap_err();
+        assert!(error.to_string().contains("Source directory not found"));
+    }
 }

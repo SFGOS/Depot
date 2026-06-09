@@ -141,13 +141,13 @@ pub fn build(
     }
 
     if !state.is_done(BuildStep::PostInstallDone) {
-        // Run meson install with fakeroot if not root
+        // Run meson install with internal fakeroot if not root
         crate::log_info!(
             "Running meson install{}...",
             if fakeroot::is_root() {
                 ""
             } else {
-                " (with fakeroot)"
+                " (with internal fakeroot)"
             }
         );
 
@@ -750,11 +750,11 @@ mod tests {
 
     #[test]
     fn test_meson_setup_args_include_configure_flags() {
-        let mut flags = BuildFlags {
+        let flags = BuildFlags {
             prefix: "/usr".to_string(),
+            configure: vec!["-Dmanpages=false".to_string()],
             ..BuildFlags::default()
         };
-        flags.configure = vec!["-Dmanpages=false".to_string()];
 
         let args = meson_setup_args(&flags, None, &[]);
         assert!(args.iter().any(|a| a == "-Dmanpages=false"));
@@ -764,8 +764,10 @@ mod tests {
 
     #[test]
     fn test_meson_setup_args_expand_host_build_dir() {
-        let mut flags = BuildFlags::default();
-        flags.configure = vec!["-Dtools_dir=$DEPOT_BUILD_HOST_DIR/bin".into()];
+        let flags = BuildFlags {
+            configure: vec!["-Dtools_dir=$DEPOT_BUILD_HOST_DIR/bin".into()],
+            ..BuildFlags::default()
+        };
 
         let args = meson_setup_args(
             &flags,

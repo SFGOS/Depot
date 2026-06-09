@@ -293,7 +293,7 @@ pub fn build(
     }
 
     if !state.is_done(BuildStep::PostInstallDone) {
-        // Run make install with fakeroot if not root
+        // Run make install with internal fakeroot if not root
         crate::log_info!(
             "Running {} {}{}...",
             make_exec,

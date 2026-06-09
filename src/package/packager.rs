@@ -4,10 +4,18 @@ use crate::config::Config;
 use crate::metadata_time;
 use crate::package::PackageSpec;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use tar::Builder;
+use tar::{Builder, EntryType};
 use zstd::stream::write::Encoder;
+
+type HardlinkKey = (u64, u64);
+
+fn hardlink_key(metadata: &fs::Metadata) -> Option<HardlinkKey> {
+    (metadata.nlink() > 1).then_some((metadata.dev(), metadata.ino()))
+}
 
 fn is_internal_staging_rel_path(rel_path: &Path) -> bool {
     let s = rel_path.to_string_lossy();
@@ -78,6 +86,7 @@ impl Packager {
         let _ = encoder.multithread(num_cpus() as u32);
 
         let mut tar = Builder::new(encoder);
+        let mut archived_hardlinks: HashMap<HardlinkKey, PathBuf> = HashMap::new();
 
         // Manual walk to ensure symlinks aren't followed (preserving them as links)
         for entry in walkdir::WalkDir::new(&self.destdir)
@@ -112,8 +121,23 @@ impl Packager {
                 tar.append_link(&mut header, rel_path, target)?;
             } else {
                 // Files
-                let mut file = fs::File::open(path)?;
-                tar.append_file(rel_path, &mut file)?;
+                let metadata = fs::symlink_metadata(path)?;
+                let hardlink_key = hardlink_key(&metadata);
+                if let Some(first_rel_path) =
+                    hardlink_key.and_then(|key| archived_hardlinks.get(&key))
+                {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_metadata_in_mode(&metadata, tar::HeaderMode::Deterministic);
+                    header.set_entry_type(EntryType::Link);
+                    header.set_size(0);
+                    tar.append_link(&mut header, rel_path, first_rel_path)?;
+                } else {
+                    let mut file = fs::File::open(path)?;
+                    tar.append_file(rel_path, &mut file)?;
+                    if let Some(key) = hardlink_key {
+                        archived_hardlinks.insert(key, rel_path.to_path_buf());
+                    }
+                }
             }
         }
 
@@ -320,6 +344,7 @@ mod tests {
     use super::*;
     use crate::package::{Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo};
     use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
 
     fn mk_packager(destdir: PathBuf) -> Packager {
         Packager::new(
@@ -607,5 +632,35 @@ mod tests {
         assert!(paths.contains(&"usr/bin/foo".to_string()));
         assert!(paths.contains(&".metadata.toml".to_string()));
         assert!(paths.contains(&".files.yaml".to_string()));
+    }
+
+    #[test]
+    fn test_create_package_preserves_hardlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let out = tmp.path().join("out");
+        let extract = tmp.path().join("extract");
+        fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(&extract).unwrap();
+
+        let coreutils = dest.join("usr/bin/coreutils");
+        let ls = dest.join("usr/bin/ls");
+        fs::write(&coreutils, "multicall").unwrap();
+        fs::hard_link(&coreutils, &ls).unwrap();
+
+        let packager = mk_packager(dest.clone());
+        let archive_path = packager.create_package(&out, "x86_64").unwrap();
+
+        let archive_file = fs::File::open(&archive_path).unwrap();
+        let decoder = zstd::Decoder::new(archive_file).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(&extract).unwrap();
+
+        let coreutils_meta = extract.join("usr/bin/coreutils").metadata().unwrap();
+        let ls_meta = extract.join("usr/bin/ls").metadata().unwrap();
+        assert_eq!(coreutils_meta.ino(), ls_meta.ino());
+        assert_eq!(coreutils_meta.nlink(), 2);
+        assert_eq!(ls_meta.nlink(), 2);
     }
 }

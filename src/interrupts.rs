@@ -259,8 +259,10 @@ mod tests {
         });
 
         let start = Instant::now();
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("sleep 10");
+        // Other parallel tests temporarily replace the process-wide PATH.
+        // Use an absolute executable so this test only exercises interruption.
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("10");
         configure_child_process_group(&mut cmd);
         let mut child = cmd.spawn().expect("sleep command should spawn");
         let status = wait_for_child_with(&mut child, || interrupted.load(Ordering::Relaxed))

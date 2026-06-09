@@ -134,7 +134,7 @@ pub fn build(
         let function_mode = custom_function_mode_enabled(&abs_build_script)?;
         if function_mode {
             crate::log_info!(
-                "Running custom build script (function mode; fakeroot only during install)..."
+                "Running custom build script (function mode; internal fakeroot only during install)..."
             );
             crate::log_info!(
                 "Using custom build.sh function mode (per-output install functions enabled)"
@@ -152,7 +152,7 @@ pub fn build(
                 if fakeroot::is_root() {
                     ""
                 } else {
-                    " (with fakeroot)"
+                    " (with internal fakeroot)"
                 }
             );
             // Use POSIX `sh` (doing something wrong if your system doesn't have it...)
@@ -580,15 +580,11 @@ depot_install_dev_pkg() {
             &build_sh,
             r#"#!/bin/sh
 depot_build() {
-  if [ "${FAKEROOT_ACTIVE:-0}" = 1 ]; then
-    echo yes > build-fakeroot.txt
-  else
-    echo no > build-fakeroot.txt
-  fi
+  id -u > build-uid.txt
 }
 depot_install() {
   mkdir -p "$DESTDIR/usr/share"
-  echo installed > "$DESTDIR/usr/share/install-fakeroot.txt"
+  id -u > "$DESTDIR/usr/share/install-uid.txt"
 }
 "#,
         )?;
@@ -604,12 +600,12 @@ depot_install() {
         build(&spec, tmp_src.path(), tmp_dest.path(), None, true, None)?;
 
         assert_eq!(
-            std::fs::read_to_string(tmp_src.path().join("build-fakeroot.txt"))?,
-            "no\n"
+            std::fs::read_to_string(tmp_src.path().join("build-uid.txt"))?,
+            format!("{}\n", nix::unistd::geteuid().as_raw())
         );
         assert_eq!(
-            std::fs::read_to_string(tmp_dest.path().join("usr/share/install-fakeroot.txt"))?,
-            "installed\n"
+            std::fs::read_to_string(tmp_dest.path().join("usr/share/install-uid.txt"))?,
+            "0\n"
         );
         Ok(())
     }
@@ -626,12 +622,7 @@ depot_install() {
         let spec = mk_spec("custom-function-fakeroot-split", "1.0");
         let install_cmd =
             build_function_mode_install_command(&spec, install_destdir, build_script, true);
-        let expected = if crate::fakeroot::is_root() {
-            std::ffi::OsStr::new("sh")
-        } else {
-            std::ffi::OsStr::new("fakeroot")
-        };
-        assert_eq!(install_cmd.get_program(), expected);
+        assert_eq!(install_cmd.get_program(), std::ffi::OsStr::new("sh"));
     }
 
     #[test]
@@ -710,7 +701,6 @@ exit 0
     fn test_build_lib32_stages_only_usr_lib_payload() -> Result<()> {
         let tmp_src = tempdir()?;
         let tmp_dest = tempdir()?;
-        let tmp_tools = tempdir()?;
 
         let build_sh = tmp_src.path().join("build.sh");
         std::fs::write(
@@ -728,31 +718,6 @@ printf 'manpage' > "$DESTDIR/usr/share/man/man1/foo.1"
             perms.set_mode(0o755);
             std::fs::set_permissions(&build_sh, perms)?;
         }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let fakeroot = tmp_tools.path().join("fakeroot");
-            std::fs::write(
-                &fakeroot,
-                r#"#!/bin/sh
-if [ "$1" = "--" ]; then
-    shift
-fi
-exec "$@"
-"#,
-            )?;
-            let mut perms = std::fs::metadata(&fakeroot)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fakeroot, perms)?;
-        }
-
-        let mut env = crate::test_support::TestEnv::new();
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        env.set_var(
-            "PATH",
-            format!("{}:{}", tmp_tools.path().display(), old_path),
-        );
 
         let mut spec = mk_spec("custom-lib32", "1.0");
         spec.build.flags.lib32_variant = true;

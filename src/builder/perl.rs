@@ -598,16 +598,6 @@ case "$target" in
 esac
 "#,
         )?;
-        write_executable(
-            &tools_path.join("fakeroot"),
-            r#"#!/bin/sh
-if [ "$1" = "--" ]; then
-    shift
-fi
-exec "$@"
-"#,
-        )?;
-
         let mut env = TestEnv::new();
         let old_path = std::env::var("PATH").unwrap_or_default();
         env.set_var("PATH", format!("{}:{}", tools_path.display(), old_path));

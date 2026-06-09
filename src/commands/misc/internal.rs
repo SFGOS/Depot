@@ -144,13 +144,6 @@ pub(crate) fn run_internal_command(command: InternalCommands) -> Result<()> {
                 &[],
             )
         }
-        InternalCommands::BootstrapChroot {
-            rootfs,
-            sources,
-            destdir,
-            workdir,
-            script,
-        } => crate::bootstrap::run_bootstrap_chroot(&rootfs, &sources, &destdir, &workdir, &script),
         InternalCommands::AutotoolsConfigure { args } => {
             let env_vars = current_process_env_vars();
             let context = current_build_helper_context()?;
@@ -312,27 +305,19 @@ mod tests {
     }
 
     #[test]
-    fn cmake_install_uses_fakeroot_and_destdir() -> Result<()> {
+    fn cmake_install_uses_internal_fakeroot_and_destdir() -> Result<()> {
         let source = tempdir()?;
         let build_dir = source.path().join("build");
         let tools = tempdir()?;
-        let fakeroot_log = tools.path().join("fakeroot.log");
         let cmake_log = tools.path().join("cmake.log");
         let destdir = source.path().join("dest");
         fs::create_dir_all(&build_dir)?;
         fs::create_dir_all(&destdir)?;
 
         write_executable(
-            &tools.path().join("fakeroot"),
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n[ \"$1\" = \"--\" ]\nshift\nexec \"$@\"\n",
-                fakeroot_log.display()
-            ),
-        )?;
-        write_executable(
             &tools.path().join("cmake"),
             &format!(
-                "#!/bin/sh\n{{ printf 'DESTDIR=%s\\n' \"$DESTDIR\"; printf '%s\\n' \"$@\"; }} > '{}'\n",
+                "#!/bin/sh\n{{ printf 'UID=%s\\n' \"$(id -u)\"; printf 'DESTDIR=%s\\n' \"$DESTDIR\"; printf '%s\\n' \"$@\"; }} > '{}'\n",
                 cmake_log.display()
             ),
         )?;
@@ -354,15 +339,8 @@ mod tests {
             args: vec!["--component".into(), "runtime".into()],
         })?;
 
-        if !crate::fakeroot::is_root() {
-            let fakeroot_output = fs::read_to_string(&fakeroot_log)?;
-            assert!(fakeroot_output.contains("--"));
-            assert!(fakeroot_output.contains("cmake"));
-        } else {
-            assert!(!fakeroot_log.exists());
-        }
-
         let cmake_output = fs::read_to_string(&cmake_log)?;
+        assert!(cmake_output.contains("UID=0"));
         assert!(cmake_output.contains(&format!("DESTDIR={}", destdir.display())));
         assert!(cmake_output.contains("--install"));
         assert!(cmake_output.contains(build_dir.to_string_lossy().as_ref()));

@@ -74,6 +74,9 @@ pub fn build(
         for arg in cmake_lib32_target_args(flags, cross) {
             cmake_cmd.arg(arg);
         }
+        for arg in cmake_depot_sysroot_args(flags, depot_rootfs_from_env(&env_vars)) {
+            cmake_cmd.arg(arg);
+        }
 
         // Add toolchain file for cross-compilation
         if let Some(ref tf) = toolchain_file {
@@ -193,13 +196,13 @@ pub fn build(
     }
 
     if !state.is_done(BuildStep::PostInstallDone) {
-        // Run cmake install with fakeroot if not root
+        // Run cmake install with internal fakeroot if not root
         crate::log_info!(
             "Running cmake install{}...",
             if fakeroot::is_root() {
                 ""
             } else {
-                " (with fakeroot)"
+                " (with internal fakeroot)"
             }
         );
 
@@ -400,6 +403,9 @@ pub(crate) fn run_helper_configure(
         cmake_cmd.arg(arg);
     }
     for arg in cmake_lib32_target_args(&flags, cross) {
+        cmake_cmd.arg(arg);
+    }
+    for arg in cmake_depot_sysroot_args(&flags, depot_rootfs_from_env(env_vars)) {
         cmake_cmd.arg(arg);
     }
     if let Some(toolchain_file) = &toolchain_file {
@@ -684,6 +690,34 @@ fn cmake_lib32_target_args(
         .filter(|(variable, _)| cmake_cache_entry_value(&flags.configure, variable).is_none())
         .map(|(variable, value)| format!("-D{variable}={value}"))
         .collect()
+}
+
+fn cmake_depot_sysroot_args(flags: &crate::package::BuildFlags, depot_rootfs: &str) -> Vec<String> {
+    let depot_rootfs = depot_rootfs.trim();
+    if depot_rootfs.is_empty() || depot_rootfs == "/" {
+        return Vec::new();
+    }
+
+    let defaults = [
+        ("CMAKE_SYSROOT", depot_rootfs.to_string()),
+        ("CMAKE_FIND_ROOT_PATH_MODE_PROGRAM", "NEVER".to_string()),
+        ("CMAKE_FIND_ROOT_PATH_MODE_LIBRARY", "ONLY".to_string()),
+        ("CMAKE_FIND_ROOT_PATH_MODE_INCLUDE", "ONLY".to_string()),
+        ("CMAKE_FIND_ROOT_PATH_MODE_PACKAGE", "ONLY".to_string()),
+    ];
+
+    defaults
+        .into_iter()
+        .filter(|(variable, _)| cmake_cache_entry_value(&flags.configure, variable).is_none())
+        .map(|(variable, value)| format!("-D{variable}={value}"))
+        .collect()
+}
+
+fn depot_rootfs_from_env(env_vars: &[(String, String)]) -> &str {
+    env_vars
+        .iter()
+        .find_map(|(key, value)| (key == "DEPOT_ROOTFS").then_some(value.as_str()))
+        .unwrap_or("/")
 }
 
 fn lib32_target_triple(
@@ -1027,6 +1061,57 @@ mod tests {
         assert!(
             args.iter()
                 .any(|a| a == "-DCMAKE_CXX_COMPILER_TARGET=i686-sfg-linux-gnu")
+        );
+    }
+
+    #[test]
+    fn test_cmake_depot_sysroot_args_skip_live_rootfs() {
+        let args = cmake_depot_sysroot_args(&BuildFlags::default(), "/");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_cmake_depot_sysroot_args_include_non_live_rootfs_defaults() {
+        let args = cmake_depot_sysroot_args(&BuildFlags::default(), "/tmp/depot-root");
+        assert!(args.iter().any(|a| a == "-DCMAKE_SYSROOT=/tmp/depot-root"));
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY")
+        );
+    }
+
+    #[test]
+    fn test_cmake_depot_sysroot_args_respect_explicit_configure_overrides() {
+        let flags = BuildFlags {
+            configure: vec![
+                "-DCMAKE_SYSROOT=/opt/custom-root".into(),
+                "-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY:STRING=BOTH".into(),
+            ],
+            ..BuildFlags::default()
+        };
+
+        let args = cmake_depot_sysroot_args(&flags, "/tmp/depot-root");
+        assert!(!args.iter().any(|a| a.starts_with("-DCMAKE_SYSROOT=")));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY="))
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER")
         );
     }
 

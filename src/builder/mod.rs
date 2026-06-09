@@ -15,10 +15,8 @@ use crate::cross::CrossConfig;
 use crate::package::{BuildFlags, BuildType, PackageSpec};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use walkdir::WalkDir;
 
 pub type EnvVars = Vec<(String, String)>;
 pub(crate) const DEPOT_BUILD_HOST_DIR_ENV: &str = "DEPOT_BUILD_HOST_DIR";
@@ -292,6 +290,10 @@ fn normalized_arch(arch: &str) -> &str {
     }
 }
 
+fn normalized_arch_key(arch: &str) -> String {
+    normalized_arch(arch).to_ascii_lowercase().replace('-', "_")
+}
+
 fn lib32_arch_for(arch: &str) -> String {
     match normalized_arch(arch) {
         "x86_64" => "i686".to_string(),
@@ -374,7 +376,46 @@ pub(crate) fn host_build_spec(spec: &PackageSpec) -> PackageSpec {
     host_spec.build.flags.carch = host_arch().to_string();
     host_spec.build.flags.host_build_dir = None;
     host_spec.build.flags.build_dir = Some(default_host_build_dir_name(&spec.build.flags));
+    append_configure_for_arch(&mut host_spec.build.flags, host_arch());
     host_spec
+}
+
+fn append_configure_for_target_arch(
+    flags: &mut crate::package::BuildFlags,
+    cross: Option<&CrossConfig>,
+    kind: TargetBuildKind,
+) {
+    let arch = effective_target_arch(flags, cross, kind);
+    append_configure_for_arch(flags, &arch);
+}
+
+fn append_configure_for_arch(flags: &mut crate::package::BuildFlags, arch: &str) {
+    if flags.configure_arch.is_empty() {
+        return;
+    }
+
+    let target_arch = normalized_arch_key(arch);
+    let matching_args: Vec<String> = flags
+        .configure_arch
+        .iter()
+        .filter(|(key, _)| normalized_arch_key(key) == target_arch)
+        .flat_map(|(_, values)| values.iter().cloned())
+        .collect();
+    flags.configure.extend(matching_args);
+}
+
+fn spec_with_target_configure(
+    spec: &PackageSpec,
+    cross: Option<&CrossConfig>,
+    kind: TargetBuildKind,
+) -> Option<PackageSpec> {
+    if spec.build.flags.configure_arch.is_empty() {
+        return None;
+    }
+
+    let mut spec = spec.clone();
+    append_configure_for_target_arch(&mut spec.build.flags, cross, kind);
+    Some(spec)
 }
 
 pub(crate) fn requested_static_build() -> Result<Option<bool>> {
@@ -395,11 +436,16 @@ fn static_build_args_for_request(
     }
 
     match build_type {
-        BuildType::Autotools => vec![if enabled {
-            "--enable-static".to_string()
-        } else {
-            "--disable-static".to_string()
-        }],
+        BuildType::Autotools => {
+            if enabled {
+                vec!["--enable-static".to_string()]
+            } else {
+                vec![
+                    "--enable-shared".to_string(),
+                    "--disable-static".to_string(),
+                ]
+            }
+        }
         BuildType::CMake => vec![format!(
             "-DBUILD_SHARED_LIBS={}",
             if enabled { "OFF" } else { "ON" }
@@ -586,64 +632,10 @@ pub(crate) fn install_destdir_path(
 
 pub(crate) fn stage_lib32_install_tree(staging_destdir: &Path, destdir: &Path) -> Result<()> {
     let lib_rel = lib32_stage_source_rel(staging_destdir)?;
-    copy_tree_preserving_links(&staging_destdir.join(&lib_rel), &destdir.join("usr/lib32"))
-}
-
-fn copy_tree_preserving_links(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)
-        .with_context(|| format!("Failed to create destination dir: {}", dst.display()))?;
-
-    for entry in WalkDir::new(src) {
-        let entry = entry?;
-        let rel = entry
-            .path()
-            .strip_prefix(src)
-            .with_context(|| format!("Failed to strip prefix: {}", src.display()))?;
-        let target = dst.join(rel);
-
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)
-                .with_context(|| format!("Failed to create dir: {}", target.display()))?;
-            continue;
-        }
-
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create dir: {}", parent.display()))?;
-        }
-
-        if entry.file_type().is_symlink() {
-            let link_target = fs::read_link(entry.path())
-                .with_context(|| format!("Failed to read symlink: {}", entry.path().display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs as unix_fs;
-                unix_fs::symlink(&link_target, &target).with_context(|| {
-                    format!(
-                        "Failed to create symlink {} -> {}",
-                        target.display(),
-                        link_target.display()
-                    )
-                })?;
-            }
-            #[cfg(not(unix))]
-            {
-                anyhow::bail!(
-                    "Symlink-preserving lib32 staging copy is only supported on unix hosts"
-                );
-            }
-        } else {
-            fs::copy(entry.path(), &target).with_context(|| {
-                format!(
-                    "Failed to copy {} to {}",
-                    entry.path().display(),
-                    target.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(())
+    crate::fs_copy::copy_tree_preserving_links(
+        &staging_destdir.join(&lib_rel),
+        &destdir.join("usr/lib32"),
+    )
 }
 fn lib32_stage_source_rel(staging_destdir: &Path) -> Result<PathBuf> {
     let staged_lib32 = PathBuf::from("usr/lib32");
@@ -1028,6 +1020,14 @@ pub fn build(
     export_compiler_flags: bool,
     host_build_dir: Option<&Path>,
 ) -> Result<()> {
+    let target_kind = if spec.build.flags.lib32_variant {
+        TargetBuildKind::Lib32
+    } else {
+        TargetBuildKind::Primary
+    };
+    let target_configured_spec = spec_with_target_configure(spec, cross, target_kind);
+    let spec = target_configured_spec.as_ref().unwrap_or(spec);
+
     if let Some(cc) = cross {
         crate::log_info!(
             "Cross-compiling for {} with {:?}...",
@@ -1131,6 +1131,7 @@ mod tests {
     use crate::test_support::TestEnv;
     use std::collections::HashMap;
     use std::ffi::OsStr;
+    use std::fs;
     use std::path::PathBuf;
 
     fn mk_spec(cflags: Vec<&str>, ldflags: Vec<&str>) -> PackageSpec {
@@ -1284,7 +1285,22 @@ mod tests {
     fn test_static_build_args_keep_other_requested_modes() {
         assert_eq!(
             static_build_args_for_request(BuildType::Autotools, Some(false), false),
-            vec!["--disable-static".to_string()]
+            vec![
+                "--enable-shared".to_string(),
+                "--disable-static".to_string()
+            ]
+        );
+        assert_eq!(
+            static_build_args_for_request(BuildType::CMake, Some(false), false),
+            vec!["-DBUILD_SHARED_LIBS=ON".to_string()]
+        );
+        assert_eq!(
+            static_build_args_for_request(BuildType::Meson, Some(false), false),
+            vec!["-Ddefault_library=shared".to_string()]
+        );
+        assert_eq!(
+            static_build_args_for_request(BuildType::Perl, Some(false), false),
+            vec!["LINKTYPE=dynamic".to_string()]
         );
         assert_eq!(
             static_build_args_for_request(BuildType::Meson, Some(true), true),
@@ -1460,6 +1476,60 @@ mod tests {
         assert!(
             lib32_env.iter().any(|(k, v)| k == "CARCH" && v == "i686"),
             "expected lib32 builds to export i686 CARCH"
+        );
+    }
+
+    #[test]
+    fn test_spec_with_target_configure_appends_matching_arch_args() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.configure = vec!["--base".to_string()];
+        spec.build
+            .flags
+            .configure_arch
+            .insert("aarch64".to_string(), vec!["--for-aarch64".to_string()]);
+        spec.build
+            .flags
+            .configure_arch
+            .insert("x86_64".to_string(), vec!["--for-x86".to_string()]);
+        let cross = CrossConfig {
+            prefix: "aarch64-linux-gnu".into(),
+            cc: "aarch64-linux-gnu-gcc".into(),
+            cxx: "aarch64-linux-gnu-g++".into(),
+            ar: "aarch64-linux-gnu-ar".into(),
+            ranlib: "aarch64-linux-gnu-ranlib".into(),
+            strip: "aarch64-linux-gnu-strip".into(),
+            ld: "aarch64-linux-gnu-ld".into(),
+            nm: "aarch64-linux-gnu-nm".into(),
+            objcopy: "aarch64-linux-gnu-objcopy".into(),
+            objdump: "aarch64-linux-gnu-objdump".into(),
+            readelf: "aarch64-linux-gnu-readelf".into(),
+        };
+
+        let adjusted = spec_with_target_configure(&spec, Some(&cross), TargetBuildKind::Primary)
+            .expect("expected arch-specific configure args");
+
+        assert_eq!(
+            adjusted.build.flags.configure,
+            vec!["--base".to_string(), "--for-aarch64".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_spec_with_target_configure_uses_lib32_arch() {
+        let mut spec = mk_spec(Vec::new(), Vec::new());
+        spec.build.flags.lib32_variant = true;
+        spec.build.flags.carch = "x86_64".to_string();
+        spec.build
+            .flags
+            .configure_arch
+            .insert("i686".to_string(), vec!["--for-lib32".to_string()]);
+
+        let adjusted = spec_with_target_configure(&spec, None, TargetBuildKind::Lib32)
+            .expect("expected lib32 configure args");
+
+        assert_eq!(
+            adjusted.build.flags.configure,
+            vec!["--for-lib32".to_string()]
         );
     }
 
@@ -1686,44 +1756,35 @@ mod tests {
     #[test]
     fn test_standard_build_env_exports_install_dir_vars() {
         let mut spec = mk_spec(Vec::new(), Vec::new());
-        spec.build.flags.prefix = "/system".into();
-        spec.build.flags.bindir = "/system/binaries".into();
-        spec.build.flags.sbindir = "/system/systembinaries".into();
-        spec.build.flags.libdir = "/system/libraries".into();
-        spec.build.flags.libexecdir = "/system/libexec".into();
-        spec.build.flags.sysconfdir = "/system/configuration".into();
-        spec.build.flags.localstatedir = "/system/variable".into();
-        spec.build.flags.sharedstatedir = "/system/variable/lib".into();
-        spec.build.flags.includedir = "/system/headers".into();
-        spec.build.flags.datarootdir = "/system/share".into();
-        spec.build.flags.datadir = "/system/data".into();
-        spec.build.flags.mandir = "/system/documentation/man-pages".into();
-        spec.build.flags.infodir = "/system/documentation/info".into();
+        spec.build.flags.prefix = "/opt/vertex".into();
+        spec.build.flags.bindir = "/opt/vertex/bin".into();
+        spec.build.flags.sbindir = "/opt/vertex/sbin".into();
+        spec.build.flags.libdir = "/opt/vertex/lib".into();
+        spec.build.flags.libexecdir = "/opt/vertex/libexec".into();
+        spec.build.flags.sysconfdir = "/etc/vertex".into();
+        spec.build.flags.localstatedir = "/var".into();
+        spec.build.flags.sharedstatedir = "/var/lib".into();
+        spec.build.flags.includedir = "/opt/vertex/include".into();
+        spec.build.flags.datarootdir = "/opt/vertex/share".into();
+        spec.build.flags.datadir = "/opt/vertex/share/data".into();
+        spec.build.flags.mandir = "/opt/vertex/share/man".into();
+        spec.build.flags.infodir = "/opt/vertex/share/info".into();
 
         let env = standard_build_env(&spec, None, false, true);
 
-        assert_eq!(env_value(&env, "PREFIX"), Some("/system"));
-        assert_eq!(env_value(&env, "BINDIR"), Some("/system/binaries"));
-        assert_eq!(env_value(&env, "SBINDIR"), Some("/system/systembinaries"));
-        assert_eq!(env_value(&env, "LIBDIR"), Some("/system/libraries"));
-        assert_eq!(env_value(&env, "LIBEXECDIR"), Some("/system/libexec"));
-        assert_eq!(env_value(&env, "SYSCONFDIR"), Some("/system/configuration"));
-        assert_eq!(env_value(&env, "LOCALSTATEDIR"), Some("/system/variable"));
-        assert_eq!(
-            env_value(&env, "SHAREDSTATEDIR"),
-            Some("/system/variable/lib")
-        );
-        assert_eq!(env_value(&env, "INCLUDEDIR"), Some("/system/headers"));
-        assert_eq!(env_value(&env, "DATAROOTDIR"), Some("/system/share"));
-        assert_eq!(env_value(&env, "DATADIR"), Some("/system/data"));
-        assert_eq!(
-            env_value(&env, "MANDIR"),
-            Some("/system/documentation/man-pages")
-        );
-        assert_eq!(
-            env_value(&env, "INFODIR"),
-            Some("/system/documentation/info")
-        );
+        assert_eq!(env_value(&env, "PREFIX"), Some("/opt/vertex"));
+        assert_eq!(env_value(&env, "BINDIR"), Some("/opt/vertex/bin"));
+        assert_eq!(env_value(&env, "SBINDIR"), Some("/opt/vertex/sbin"));
+        assert_eq!(env_value(&env, "LIBDIR"), Some("/opt/vertex/lib"));
+        assert_eq!(env_value(&env, "LIBEXECDIR"), Some("/opt/vertex/libexec"));
+        assert_eq!(env_value(&env, "SYSCONFDIR"), Some("/etc/vertex"));
+        assert_eq!(env_value(&env, "LOCALSTATEDIR"), Some("/var"));
+        assert_eq!(env_value(&env, "SHAREDSTATEDIR"), Some("/var/lib"));
+        assert_eq!(env_value(&env, "INCLUDEDIR"), Some("/opt/vertex/include"));
+        assert_eq!(env_value(&env, "DATAROOTDIR"), Some("/opt/vertex/share"));
+        assert_eq!(env_value(&env, "DATADIR"), Some("/opt/vertex/share/data"));
+        assert_eq!(env_value(&env, "MANDIR"), Some("/opt/vertex/share/man"));
+        assert_eq!(env_value(&env, "INFODIR"), Some("/opt/vertex/share/info"));
     }
 
     #[test]
@@ -1950,6 +2011,30 @@ mod tests {
         );
         assert!(!dest.join("usr/share/man/man1/foo.1").exists());
         assert!(!dest.join("usr/lib").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_stage_lib32_install_tree_preserves_hardlinks() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir()?;
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(staging.join("usr/lib32"))?;
+        fs::write(staging.join("usr/lib32/libfoo.so.1"), "lib32")?;
+        fs::hard_link(
+            staging.join("usr/lib32/libfoo.so.1"),
+            staging.join("usr/lib32/libfoo-current.so"),
+        )?;
+
+        stage_lib32_install_tree(&staging, &dest)?;
+
+        let first = dest.join("usr/lib32/libfoo.so.1").metadata()?;
+        let second = dest.join("usr/lib32/libfoo-current.so").metadata()?;
+        assert_eq!(first.ino(), second.ino());
+        assert_eq!(first.nlink(), 2);
+        assert_eq!(second.nlink(), 2);
         Ok(())
     }
 }

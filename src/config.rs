@@ -269,11 +269,7 @@ impl Config {
                 home.join(".local/share/depot"),
             )
         } else {
-            let variable_root = if is_system_root {
-                abs_rootfs.join("var")
-            } else {
-                abs_rootfs.join("system/variable")
-            };
+            let variable_root = abs_rootfs.join("var");
             (
                 variable_root.join("cache/depot/sources"),
                 variable_root.join("cache/depot/packages"),
@@ -306,17 +302,9 @@ impl Config {
     }
 
     /// Return the package database path used to query what is installed in `rootfs`.
-    ///
-    /// For the live system root (`/`), non-root processes still read the system DB
-    /// from `/var/lib/depot/packages.db` even though writable state is redirected
-    /// to per-user directories under `$HOME`.
     pub fn installed_db_path(&self, rootfs: &Path) -> PathBuf {
         let abs_rootfs = resolve_rootfs_base(rootfs);
-        if abs_rootfs == Path::new("/") || abs_rootfs.as_os_str() == "/" {
-            abs_rootfs.join("var/lib/depot/packages.db")
-        } else {
-            abs_rootfs.join("system/variable/lib/depot/packages.db")
-        }
+        abs_rootfs.join("var/lib/depot/packages.db")
     }
 
     /// Load system-level and user-level overrides
@@ -596,25 +584,9 @@ mod tests {
         let root = PathBuf::from("/tmp/test_root");
         let config = Config::for_rootfs(&root);
 
-        // Canonicalization might happen, so let's just check ends_with or construct reliably
-        assert!(
-            config
-                .cache_dir
-                .to_string_lossy()
-                .contains("system/variable/cache/depot/sources")
-        );
-        assert!(
-            config
-                .build_dir
-                .to_string_lossy()
-                .contains("system/variable/cache/depot/build")
-        );
-        assert!(
-            config
-                .db_dir
-                .to_string_lossy()
-                .contains("system/variable/lib/depot")
-        );
+        assert_eq!(config.cache_dir, root.join("var/cache/depot/sources"));
+        assert_eq!(config.build_dir, root.join("var/cache/depot/build"));
+        assert_eq!(config.db_dir, root.join("var/lib/depot"));
     }
 
     #[test]
@@ -727,7 +699,7 @@ cflags += ["-g"]
         let config = Config::for_rootfs(&root);
         assert_eq!(
             config.installed_db_path(&root),
-            PathBuf::from("/tmp/test_root/system/variable/lib/depot/packages.db")
+            PathBuf::from("/tmp/test_root/var/lib/depot/packages.db")
         );
     }
 

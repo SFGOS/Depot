@@ -66,13 +66,13 @@ pub fn build(
     }
 
     if !state.is_done(BuildStep::PostInstallDone) {
-        // Run install commands with fakeroot
+        // Run install commands with internal fakeroot
         crate::log_info!(
             "Running makefile install commands{}...",
             if crate::fakeroot::is_root() {
                 ""
             } else {
-                " (with fakeroot)"
+                " (with internal fakeroot)"
             }
         );
 
@@ -99,7 +99,7 @@ pub fn build(
             let cmd_str = spec.expand_vars(cmd_str);
             crate::log_info!("  Executing: {}", cmd_str);
 
-            // We need to run each command under fakeroot
+            // We need to run each command under internal fakeroot
             let mut cmd = crate::fakeroot::wrap_install_command("sh", &install_destdir);
             cmd.arg("-c").arg(&cmd_str);
             cmd.current_dir(src_dir);
@@ -136,20 +136,9 @@ pub fn build(
 mod tests {
     use super::*;
     use crate::package::{Build, BuildFlags, BuildType, Dependencies, PackageInfo};
-    use crate::test_support::TestEnv;
     use std::fs;
+    use std::os::unix::fs::MetadataExt;
     use tempfile::tempdir;
-
-    #[cfg(unix)]
-    fn write_executable(path: &std::path::Path, contents: &str) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::write(path, contents)?;
-        let mut perms = fs::metadata(path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms)?;
-        Ok(())
-    }
 
     fn mk_spec(name: &str, version: &str) -> PackageSpec {
         PackageSpec {
@@ -189,24 +178,8 @@ mod tests {
     fn test_makefile_build_runs_commands() -> Result<()> {
         let tmp_src = tempdir()?;
         let tmp_dest = tempdir()?;
-        let tmp_tools = tempdir()?;
         let src_path = tmp_src.path();
         let dest_path = tmp_dest.path();
-        let tools_path = tmp_tools.path();
-
-        write_executable(
-            &tools_path.join("fakeroot"),
-            r#"#!/bin/sh
-if [ "$1" = "--" ]; then
-    shift
-fi
-exec "$@"
-"#,
-        )?;
-
-        let mut env = TestEnv::new();
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        env.set_var("PATH", format!("{}:{}", tools_path.display(), old_path));
 
         let mut spec = mk_spec("test-make", "1.0");
         spec.build.flags.makefile_commands = vec![
@@ -242,27 +215,36 @@ exec "$@"
     }
 
     #[test]
+    fn test_makefile_install_preserves_staged_hardlinks() -> Result<()> {
+        let tmp_src = tempdir()?;
+        let tmp_dest = tempdir()?;
+        let src_path = tmp_src.path();
+        let dest_path = tmp_dest.path();
+
+        let mut spec = mk_spec("uutils-like", "1.0");
+        spec.build.flags.makefile_install_commands = vec![
+            "mkdir -p \"$DESTDIR/usr/bin\"".into(),
+            "printf 'multicall' > \"$DESTDIR/usr/bin/uutils\"".into(),
+            "ln \"$DESTDIR/usr/bin/uutils\" \"$DESTDIR/usr/bin/ls\"".into(),
+        ];
+
+        build(&spec, src_path, dest_path, None, true, None)?;
+
+        let uutils = dest_path.join("usr/bin/uutils").metadata()?;
+        let ls = dest_path.join("usr/bin/ls").metadata()?;
+        assert_eq!(uutils.ino(), ls.ino());
+        assert_eq!(uutils.nlink(), 2);
+        assert_eq!(ls.nlink(), 2);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_makefile_lib32_install_relocates_usr_lib_without_copying_other_paths() -> Result<()> {
         let tmp_src = tempdir()?;
         let tmp_dest = tempdir()?;
-        let tmp_tools = tempdir()?;
         let src_path = tmp_src.path();
         let dest_path = tmp_dest.path();
-        let tools_path = tmp_tools.path();
-
-        write_executable(
-            &tools_path.join("fakeroot"),
-            r#"#!/bin/sh
-if [ "$1" = "--" ]; then
-    shift
-fi
-exec "$@"
-"#,
-        )?;
-
-        let mut env = TestEnv::new();
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        env.set_var("PATH", format!("{}:{}", tools_path.display(), old_path));
 
         let mut spec = mk_spec("lib32-test-make", "1.0");
         spec.build.flags.lib32_variant = true;

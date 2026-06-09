@@ -144,6 +144,7 @@ struct NodeData {
 #[derive(Debug, Clone)]
 struct LocalSpecHit {
     spec_name: String,
+    real_name: Option<String>,
     path: PathBuf,
     provides: Vec<String>,
     replaces: Vec<String>,
@@ -433,7 +434,11 @@ impl<'a> Resolver<'a> {
             .or_else(|| self.opts.local_sibling_root.clone());
         if let Some(root) = local_sibling_root {
             for hit in self.local_sibling_hits(&root)? {
-                let exact = hit.spec_name.eq_ignore_ascii_case(dep_name);
+                let exact = hit.spec_name.eq_ignore_ascii_case(dep_name)
+                    || hit
+                        .real_name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(dep_name));
                 let replaces = hit
                     .replaces
                     .iter()
@@ -626,6 +631,7 @@ impl<'a> Resolver<'a> {
                     spec.apply_config(self.config);
                     hits.push(LocalSpecHit {
                         spec_name: spec.package.name.clone(),
+                        real_name: spec.package.real_name.clone(),
                         path: path.to_path_buf(),
                         provides: spec.alternatives.provides.clone(),
                         replaces: spec.alternatives.replaces.clone(),
@@ -1247,6 +1253,56 @@ version = "1.0.0"
             err.to_string(),
             "Dependency cycle detected: alpha -> beta -> alpha"
         );
+    }
+
+    #[test]
+    fn build_dependency_install_plan_matches_local_sibling_real_name() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let repo_root = tempfile::tempdir().unwrap();
+        let config = Config::for_rootfs(rootfs.path());
+
+        let libressl_dir = repo_root.path().join("libressl43");
+        fs::create_dir_all(&libressl_dir).unwrap();
+        fs::write(
+            libressl_dir.join("libressl43.toml"),
+            r#"
+[build]
+type = "meta"
+
+[package]
+description = "LibreSSL"
+homepage = "https://www.libressl.org/"
+license = "ISC"
+name = "libressl43"
+real_name = "libressl"
+version = "4.3.2"
+"#,
+        )
+        .unwrap();
+
+        let plan = build_dependency_install_plan(
+            &config,
+            rootfs.path(),
+            &["libressl".to_string()],
+            PlannerOptions {
+                assume_yes: false,
+                prefer_binary: false,
+                local_sibling_root: Some(repo_root.path().to_path_buf()),
+                include_test_deps: false,
+                lib32_only_requested_specs: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].package, "libressl43");
+        assert!(matches!(
+            plan.steps[0].origin,
+            super::PlanOrigin::Source {
+                local_sibling: true,
+                ..
+            }
+        ));
     }
 
     #[test]
