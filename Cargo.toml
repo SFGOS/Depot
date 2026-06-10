@@ -24,10 +24,10 @@ ar = "0.9.0"
 bzip2 = "0.6.1"
 clap = { version = "4.6.0", features = ["derive"] }
 flate2 = "1.1.9"
-git2 = "0.20.4"
+git2 = "0.21.0"
 indicatif = "0.18.4"
 nix = { version = "0.31.3", features = ["user"] }
-rusqlite = "0.39.0"
+rusqlite = "0.40.1"
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
 yaml-rust2 = "0.11.0"
@@ -50,7 +50,6 @@ fd-lock = "4.0.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "native-tls"] }
 filetime = "0.2.29"
 clap_complete = "4.6.5"
-clap_mangen = "0.3.0"
 sys-mount = { version = "3.1.0", default-features = false }
 time = { version = "0.3.47", features = ["formatting", "parsing"] }
 b2sum-rust = "0.3.0"

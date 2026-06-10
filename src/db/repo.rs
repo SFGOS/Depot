@@ -4,7 +4,7 @@ use crate::metadata_time;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256, Sha512};
-use std::collections::{HashMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -2538,7 +2538,7 @@ pub fn mirrors_status(
                 let head = repo.head().ok();
                 let branch = head
                     .as_ref()
-                    .and_then(|h| h.shorthand().map(|s| s.to_string()))
+                    .and_then(|h| h.shorthand().ok().map(|s| s.to_string()))
                     .unwrap_or_else(|| "(no branch)".to_string());
 
                 // Latest commit OID

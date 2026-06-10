@@ -170,7 +170,7 @@ fn apply_cherry_picks(repo: &Repository, cherry_pick_revs: &[String]) -> Result<
         let tree = repo
             .find_tree(tree_id)
             .with_context(|| format!("Failed to find tree after cherry-pick {}", rev))?;
-        let message = commit.summary().unwrap_or("cherry-pick");
+        let message = commit.summary().ok().flatten().unwrap_or("cherry-pick");
         let new_head = repo
             .commit(
                 None,
@@ -336,7 +336,7 @@ fn repair_mirror_refs(repo: &Repository) -> Result<()> {
 fn sync_remote_tracking_heads(repo: &Repository) -> Result<()> {
     for reference_result in repo.references_glob("refs/remotes/origin/*")? {
         let reference = reference_result?;
-        let Some(name) = reference.name() else {
+        let Ok(name) = reference.name() else {
             continue;
         };
         if name == "refs/remotes/origin/HEAD" {
@@ -368,7 +368,7 @@ fn ensure_valid_local_head(repo: &Repository) -> Result<()> {
     let mut candidates: Vec<String> = Vec::new();
     for reference_result in repo.references_glob("refs/heads/*")? {
         let reference = reference_result?;
-        let Some(name) = reference.name() else {
+        let Ok(name) = reference.name() else {
             continue;
         };
         candidates.push(name.to_string());
@@ -517,7 +517,7 @@ fn resolve_remote_head_like<'a>(repo: &'a Repository) -> Result<Option<git2::Obj
     let mut candidates: Vec<(String, Oid)> = Vec::new();
     for reference_result in repo.references_glob("refs/remotes/origin/*")? {
         let reference = reference_result?;
-        let Some(name) = reference.name() else {
+        let Ok(name) = reference.name() else {
             continue;
         };
         if name == "refs/remotes/origin/HEAD" {
@@ -1049,7 +1049,7 @@ mod tests {
 
         assert_eq!(
             repo.head().unwrap().resolve().unwrap().name(),
-            Some("refs/heads/main")
+            Ok("refs/heads/main")
         );
     }
 

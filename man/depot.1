@@ -1,0 +1,471 @@
+.TH DEPOT 1 "2026-06-10" "depot 0.50.0" "User Commands"
+.SH NAME
+depot \- source-based package manager for Linux
+.SH SYNOPSIS
+.SY depot
+.I COMMAND
+.RI [ COMMAND_OPTIONS ]
+.YS
+.SH DESCRIPTION
+.B depot
+builds, installs, removes, updates, signs, indexes, and queries Depot packages.
+Depot commands operate on a root filesystem, using
+.B /
+by default, and use configured source and binary repositories for dependency and
+update resolution.
+.SH GLOBAL OPTIONS
+.TP
+.B \-h, \-\-help
+Print help for
+.B depot
+or for the selected command.
+.TP
+.B \-V, \-\-version
+Print the Depot version.
+.SH COMMON OPTIONS
+.TP
+.B \-r, \-\-rootfs \fIROOTFS\fR
+Use a custom root filesystem path. The default is
+.BR / .
+.TP
+.B \-y, \-\-yes
+Automatically answer yes to prompts and pick the default provider choice.
+.TP
+.B \-\-no\-deps
+Skip dependency checks.
+.TP
+.B \-\-no\-flags\fR[\fB=\fITRUE_OR_FALSE\fR]
+Do not export
+.BR CFLAGS ,
+.BR CXXFLAGS ,
+or
+.B LDFLAGS
+to build commands. Accepted values are
+.B true
+and
+.BR false ;
+when the option is present without a value it means
+.BR true .
+.TP
+.B \-\-cross\-prefix \fICROSS_PREFIX\fR
+Use a cross-compilation prefix such as
+.B x86_64-linux-musl
+or
+.BR aarch64-linux-gnu .
+.TP
+.B \-\-clean
+Clean the build workspace and source cache after a successful install or build.
+.TP
+.B \-\-dry\-run
+Show what would happen without performing builds or installs.
+.TP
+.B \-\-test\-deps
+Install test dependencies alongside build and runtime dependencies.
+.TP
+.B \-\-lib32\-only
+Build or install only the lib32 companion package path, skipping the primary
+package output.
+.SH COMMANDS
+.SS depot install
+.SY depot install
+.RI [ OPTIONS ]
+.RI [ SPEC_OR_ARCHIVE ...]
+.YS
+Build and install one or more package names, package spec paths
+.RB ( .toml ),
+or package archives
+.RB ( .tar.zst ).
+Use
+.B \-s, \-\-spec \fISPEC\fR
+to explicitly select one spec file instead of positional targets. The visible
+alias
+.B \-\-package
+and compatibility alias
+.B \-p
+are also accepted.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs ;
+.BR \-y ", " \-\-yes ;
+.BR \-\-no\-deps ;
+.BR \-\-no\-flags ;
+.BR \-\-cross\-prefix ;
+.BR \-\-clean ;
+.BR \-\-dry\-run ;
+.BR \-\-test\-deps ;
+.BR \-\-lib32\-only ;
+.BR \-s ", " \-\-spec .
+.SS depot remove
+.SY depot remove
+.RI [ OPTIONS ]
+.I PACKAGE
+.YS
+Remove an installed package.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs ;
+.BR \-y ", " \-\-yes .
+.SS depot build
+.SY depot build
+.RI [ OPTIONS ]
+.RI [ SPEC ]
+.YS
+Build a package without installing it by default. The spec may be positional or
+provided with
+.B \-s, \-\-spec \fISPEC\fR
+using the visible alias
+.B \-\-package
+or compatibility alias
+.BR \-p .
+.PP
+Options:
+.BR \-r ", " \-\-rootfs ;
+.BR \-y ", " \-\-yes ;
+.BR \-\-no\-deps ;
+.BR \-\-no\-flags ;
+.BR \-\-cross\-prefix ;
+.BR \-\-clean ;
+.BR \-\-dry\-run ;
+.BR \-\-test\-deps ;
+.BR \-\-lib32\-only ;
+.BR \-s ", " \-\-spec ;
+.BR \-\-install ;
+.BR \-\-install\-deps ;
+.BR \-\-cleanup\-deps .
+.TP
+.B \-\-install
+Install package archives to the root filesystem after creating them.
+.TP
+.B \-\-install\-deps
+Automatically install missing dependencies before building.
+.TP
+.B \-\-cleanup\-deps
+Remove dependencies auto-installed for this build after the command finishes.
+.SS depot update
+.SY depot update
+.RI [ OPTIONS ]
+.RI [ PACKAGE ...]
+.YS
+Update installed packages from configured repositories. If no package names are
+given, Depot checks all installed packages with available upgrades.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs ;
+.BR \-y ", " \-\-yes ;
+.BR \-\-no\-deps ;
+.BR \-\-no\-flags ;
+.BR \-\-cross\-prefix ;
+.BR \-\-clean ;
+.BR \-\-dry\-run ;
+.BR \-\-test\-deps .
+.SS depot check
+.SY depot check
+.RI [ DIR ]
+.YS
+Scan package specs recursively for upstream version updates. The default
+directory is
+.BR . .
+.SS depot info
+.SY depot info
+.RI [ OPTIONS ]
+.I PACKAGE
+.YS
+Show information about an installed package name or a package spec path.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot search
+.SY depot search
+.RI [ OPTIONS ]
+.I QUERY
+.YS
+Search configured source and binary repositories by package name or provides.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs ;
+.BR \-\-files .
+.TP
+.B \-\-files
+Search repository file lists from binary repo metadata by path substring.
+.SS depot owns
+.SY depot owns
+.RI [ OPTIONS ]
+.I PATH
+.YS
+Show which installed package owns an absolute path or a path relative to the
+root filesystem.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot list
+.SY depot list
+.RI [ OPTIONS ]
+.YS
+List installed packages.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot sign
+.SY depot sign
+.RI [ OPTIONS ]
+.I FILE
+.RI [ FILE ...]
+.YS
+Create detached minisign signatures for one or more
+.B .zst
+files.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot repo
+.SY depot repo
+.I REPO_COMMAND
+.RI [ REPO_OPTIONS ]
+.YS
+Manage source and binary repositories.
+.SS depot repo create
+.SY depot repo create
+.RI [ OPTIONS ]
+.RI [ DIR ]
+.YS
+Create a repository database from a directory containing
+.B .depot.pkg.tar.zst
+files. The default directory is
+.BR . .
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot repo sync
+.SY depot repo sync
+.RI [ OPTIONS ]
+.YS
+Sync git mirrors configured in
+.B /etc/depot.d/mirrors.toml
+into
+.BR /usr/src/depot .
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot repo update
+.SY depot repo update
+.RI [ OPTIONS ]
+.RI [ NAME ]
+.YS
+Sync source repositories configured in
+.B /etc/depot.d/repos.toml
+into
+.BR /usr/src/depot .
+When
+.I NAME
+is provided, update only that source repo.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot repo index
+.SY depot repo index
+.RI [ OPTIONS ]
+.RI [ DIR ]
+.YS
+Create or update a source index at the root of a source repository. The default
+directory is
+.BR . .
+.PP
+Options:
+.BR \-r ", " \-\-rootfs ;
+.BR \-\-subdir .
+.TP
+.B \-\-subdir \fISUBDIR\fR
+Optional source repo subdirectory to scan. May be repeated, for example
+.B \-\-subdir core \-\-subdir extra\fR.
+.SS depot repo list
+.SY depot repo list
+.RI [ OPTIONS ]
+.YS
+List configured source and binary repositories.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot repo add
+.SY depot repo add
+.RI [ OPTIONS ]
+.I NAME
+.I URL
+.YS
+Add or update a repository entry in
+.BR /etc/depot.d/repos.toml .
+.I NAME
+is the repo name, and
+.I URL
+is a source git URL or binary repo base URL.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs ;
+.BR \-\-kind ;
+.BR \-\-subdir ;
+.BR \-\-priority ;
+.BR \-\-disabled ;
+.BR \-\-arch ;
+.BR \-\-repo\-db ;
+.BR \-\-allow\-unsigned .
+.TP
+.B \-\-kind \fIsource|binary\fR
+Repo kind. The default is
+.BR source .
+.TP
+.B \-\-subdir \fISUBDIR\fR
+Optional source repo subdirectory to index. May be repeated.
+.TP
+.B \-\-priority \fIPRIORITY\fR
+Repo priority. Lower values have higher priority. The default is
+.BR 0 .
+.TP
+.B \-\-disabled
+Add the repo as disabled.
+.TP
+.B \-\-arch \fIARCH\fR
+Binary repo architecture table entry to add or update. Defaults to this
+machine's architecture.
+.TP
+.B \-\-repo\-db \fIREPO_DB\fR
+Binary repo database filename or path relative to the repo URL. The default is
+.BR repo.db.zst .
+.TP
+.B \-\-allow\-unsigned
+Allow unsigned repo metadata for this binary repo.
+.SS depot repo remove
+.SY depot repo remove
+.RI [ OPTIONS ]
+.I NAME
+.YS
+Remove a repo entry from
+.BR /etc/depot.d/repos.toml .
+.PP
+Options:
+.BR \-r ", " \-\-rootfs ;
+.BR \-\-kind .
+.TP
+.B \-\-kind \fIsource|binary\fR
+Repo kind. If omitted, Depot auto-detects the kind when the repo name is unique.
+.SS depot repo enable
+.SY depot repo enable
+.RI [ OPTIONS ]
+.I NAME
+.YS
+Enable a repo entry in
+.BR /etc/depot.d/repos.toml .
+.PP
+Options:
+.BR \-r ", " \-\-rootfs ;
+.BR \-\-kind .
+.TP
+.B \-\-kind \fIsource|binary\fR
+Repo kind. If omitted, Depot auto-detects the kind when the repo name is unique.
+.SS depot repo disable
+.SY depot repo disable
+.RI [ OPTIONS ]
+.I NAME
+.YS
+Disable a repo entry in
+.BR /etc/depot.d/repos.toml .
+.PP
+Options:
+.BR \-r ", " \-\-rootfs ;
+.BR \-\-kind .
+.TP
+.B \-\-kind \fIsource|binary\fR
+Repo kind. If omitted, Depot auto-detects the kind when the repo name is unique.
+.SS depot repo owns
+.SY depot repo owns
+.RI [ OPTIONS ]
+.I PATH
+.YS
+Query binary repo metadata for the package that owns an absolute path or a
+relative install path.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot repo status
+.SY depot repo status
+.RI [ OPTIONS ]
+.YS
+Show status of configured git mirrors.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot config
+.SY depot config
+.RI [ OPTIONS ]
+.YS
+Show the current Depot configuration.
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot set
+.SY depot set
+.RI [ OPTIONS ]
+.I ROLE
+.B to
+.I IMPLEMENTATION
+.YS
+Select canonical tool aliases in the configured tool directory. Supported roles
+are
+.BR compiler ,
+.BR linker ,
+and
+.BR shell .
+For example:
+.PP
+.EX
+depot set compiler to clang
+.EE
+.PP
+Options:
+.BR \-r ", " \-\-rootfs .
+.SS depot make-spec
+.SY depot make-spec
+.RI [ OPTIONS ]
+.YS
+Create a new package specification interactively.
+.PP
+Options:
+.BR \-o ", " \-\-output .
+.TP
+.B \-o, \-\-output \fIOUTPUT\fR
+Output file path. If omitted, Depot writes
+.BI name .toml
+from the selected package name.
+.SS depot convert
+.SY depot convert
+.RI [ OPTIONS ]
+.RI [ INPUT ]
+.YS
+Convert a legacy
+.B STARBUILD
+file into a Depot package spec. The default input is
+.BR STARBUILD .
+.PP
+Options:
+.BR \-o ", " \-\-output .
+.TP
+.B \-o, \-\-output \fIOUTPUT\fR
+Output TOML path. If omitted, Depot writes
+.BI mainpkgname .toml
+beside the STARBUILD.
+.SH FILES
+.TP
+.B /etc/depot.toml
+System configuration file.
+.TP
+.B /etc/depot.d/repos.toml
+Configured source and binary repositories.
+.TP
+.B /etc/depot.d/mirrors.toml
+Configured git mirrors.
+.TP
+.B /usr/src/depot
+Default source repository and mirror clone directory.
+.SH EXIT STATUS
+.B depot
+exits with status 0 on success and a non-zero status on error.
+.SH SEE ALSO
+.BR minisign (1)
