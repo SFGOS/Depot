@@ -101,7 +101,6 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
         }
 
         if !no_deps {
-            deps::print_dep_status_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
             let missing_build =
                 deps::check_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
             let missing_runtime =

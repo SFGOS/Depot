@@ -16,9 +16,6 @@ pub(super) fn run_info(args: InfoArgs) -> Result<()> {
         let _info_lock_guard = locking::try_read(&info_lock, &info_lock_path, "info")?;
         let pkg_spec = package::PackageSpec::from_file(&path)?;
         println!("{}", pkg_spec);
-
-        let db_path = config.installed_db_path(&rootfs);
-        deps::print_dep_status(&pkg_spec, &db_path)?;
     } else {
         let config = config::Config::for_rootfs(&rootfs);
         let info_lock = locking::open_lock(&config)?;

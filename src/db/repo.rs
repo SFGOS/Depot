@@ -4,8 +4,7 @@ use crate::metadata_time;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256, Sha512};
-use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1185,11 +1184,7 @@ pub fn fetch_binary_repo_db(
 
     let repo_db_url = join_repo_url(base_url, repo_db_rel)?;
     let repo_sig_url = join_repo_url(base_url, &format!("{}.sig", repo_db_rel))?;
-    crate::log_info!(
-        "Fetching binary repo DB for '{}' from {}",
-        repo_name,
-        repo_db_url
-    );
+    crate::log_info!("Fetching binary repo DB for '{}'", repo_name);
 
     let client = reqwest::blocking::Client::builder()
         .build()
@@ -1292,14 +1287,12 @@ pub fn fetch_binary_repo_db(
     if sig_downloaded {
         let mut trusted_keys = crate::signing::list_trusted_public_keys(rootfs)?;
         if trusted_keys.is_empty() {
-            if let Some(installed_key) = try_trust_repo_public_key_for_repo_db(
+            if try_trust_repo_public_key_for_repo_db(
                 repo_name, base_url, rootfs, &cache_dir, &client, &tmp_zst, &tmp_sig,
-            )? {
-                crate::log_info!(
-                    "Trusted repo key for '{}' installed at {}",
-                    repo_name,
-                    installed_key.display()
-                );
+            )?
+            .is_some()
+            {
+                crate::log_info!("Trusted repo key for '{}' installed", repo_name);
             } else if !repo.allow_unsigned {
                 anyhow::bail!(
                     "No trusted minisign public key found for binary repo '{}' and no trusted key was accepted from {}/keys/",
@@ -1318,39 +1311,34 @@ pub fn fetch_binary_repo_db(
         if trusted_keys.is_empty() {
             // No key was trusted/installed, and allow_unsigned=true already handled above.
         } else {
-            let verified_key = match verify_with_any_trusted_public_key(rootfs, &tmp_zst, &tmp_sig)
+            if let Err(initial_err) = verify_with_any_trusted_public_key(rootfs, &tmp_zst, &tmp_sig)
             {
-                Ok(key) => key,
-                Err(initial_err) => {
-                    if let Some(installed_key) = try_trust_repo_public_key_for_repo_db(
-                        repo_name, base_url, rootfs, &cache_dir, &client, &tmp_zst, &tmp_sig,
-                    )? {
-                        crate::log_info!(
-                            "Trusted repo key for '{}' installed at {}",
-                            repo_name,
-                            installed_key.display()
-                        );
-                        verify_with_any_trusted_public_key(rootfs, &tmp_zst, &tmp_sig)
-                            .with_context(|| {
-                                format!(
-                                    "Failed to verify detached signature for binary repo '{}'",
-                                    repo_name
-                                )
-                            })?
-                    } else {
-                        return Err(initial_err).with_context(|| {
+                if try_trust_repo_public_key_for_repo_db(
+                    repo_name, base_url, rootfs, &cache_dir, &client, &tmp_zst, &tmp_sig,
+                )?
+                .is_some()
+                {
+                    crate::log_info!("Trusted repo key for '{}' installed", repo_name);
+                    verify_with_any_trusted_public_key(rootfs, &tmp_zst, &tmp_sig).with_context(
+                        || {
                             format!(
                                 "Failed to verify detached signature for binary repo '{}'",
                                 repo_name
                             )
-                        });
-                    }
+                        },
+                    )?;
+                } else {
+                    return Err(initial_err).with_context(|| {
+                        format!(
+                            "Failed to verify detached signature for binary repo '{}'",
+                            repo_name
+                        )
+                    });
                 }
-            };
+            }
             crate::log_info!(
-                "Verified detached signature for binary repo '{}' using {}",
-                repo_name,
-                verified_key.display()
+                "Verified detached signature for binary repo '{}'",
+                repo_name
             );
         }
     }

@@ -9,8 +9,7 @@
 //! - `package<=1.2.3` - less than or equal to 1.2.3
 
 use crate::db;
-use crate::package::{BuildType, PackageSpec};
-use crate::ui;
+use crate::package::PackageSpec;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::Path;
@@ -155,17 +154,6 @@ fn is_dep_satisfied(
         // Package might be satisfied by an alternative or replacement, accept it.
         Ok(provides.contains(parsed.name) || replaces.contains(parsed.name))
     }
-}
-
-fn build_type_runs_automatic_tests(spec: &PackageSpec) -> bool {
-    matches!(
-        spec.build.build_type,
-        BuildType::Autotools | BuildType::CMake | BuildType::Meson | BuildType::Perl
-    )
-}
-
-fn automatic_tests_disabled_for_outputs(spec: &PackageSpec, outputs: RequestedOutputs) -> bool {
-    spec.should_skip_automatic_tests() || outputs.includes_lib32()
 }
 
 /// Check whether a dependency expression is satisfied by the installed package DB.
@@ -329,106 +317,6 @@ pub(crate) fn check_test_deps_for_outputs(
     Ok(missing)
 }
 
-/// Print dependency status
-pub fn print_dep_status(spec: &PackageSpec, db_path: &Path) -> Result<()> {
-    print_dep_status_for_outputs(spec, db_path, RequestedOutputs::PrimaryOnly)
-}
-
-fn print_named_dep_status(label: &str, deps: &[String], missing: &[String], warn_on_missing: bool) {
-    if deps.is_empty() {
-        return;
-    }
-
-    ui::info(format!("{label}: {}", deps.join(", ")));
-    if warn_on_missing && !missing.is_empty() {
-        ui::warn(format!("{label} missing: {}", missing.join(", ")));
-    }
-}
-
-/// Print dependency status for the selected outputs.
-pub(crate) fn print_dep_status_for_outputs(
-    spec: &PackageSpec,
-    db_path: &Path,
-    outputs: RequestedOutputs,
-) -> Result<()> {
-    let primary = spec.dependencies.primary_dependencies();
-    let lib32 = spec.lib32_dependencies();
-
-    if matches!(
-        outputs,
-        RequestedOutputs::PrimaryOnly | RequestedOutputs::PrimaryAndLib32
-    ) {
-        let missing_build =
-            check_build_deps_for_outputs(spec, db_path, RequestedOutputs::PrimaryOnly)?;
-        let missing_runtime =
-            check_runtime_deps_for_outputs(spec, db_path, RequestedOutputs::PrimaryOnly)?;
-        let missing_test =
-            check_test_deps_for_outputs(spec, db_path, RequestedOutputs::PrimaryOnly)?;
-
-        print_named_dep_status("Build dependencies", &primary.build, &missing_build, true);
-        print_named_dep_status(
-            "Runtime dependencies",
-            &primary.runtime,
-            &missing_runtime,
-            true,
-        );
-        print_named_dep_status(
-            "Test dependencies",
-            &primary.test,
-            &missing_test,
-            !automatic_tests_disabled_for_outputs(spec, outputs)
-                && build_type_runs_automatic_tests(spec),
-        );
-        if !primary.optional.is_empty() {
-            ui::info(format!(
-                "Optional dependencies: {}",
-                primary.optional.join(", ")
-            ));
-        }
-    }
-
-    if matches!(
-        outputs,
-        RequestedOutputs::PrimaryAndLib32 | RequestedOutputs::Lib32Only
-    ) {
-        let missing_build =
-            check_build_deps_for_outputs(spec, db_path, RequestedOutputs::Lib32Only)?;
-        let missing_runtime =
-            check_runtime_deps_for_outputs(spec, db_path, RequestedOutputs::Lib32Only)?;
-        let missing_test = check_test_deps_for_outputs(spec, db_path, RequestedOutputs::Lib32Only)?;
-
-        if outputs == RequestedOutputs::Lib32Only || lib32 != primary {
-            print_named_dep_status(
-                "Lib32 build dependencies",
-                &lib32.build,
-                &missing_build,
-                true,
-            );
-            print_named_dep_status(
-                "Lib32 runtime dependencies",
-                &lib32.runtime,
-                &missing_runtime,
-                true,
-            );
-            print_named_dep_status(
-                "Lib32 test dependencies",
-                &lib32.test,
-                &missing_test,
-                !automatic_tests_disabled_for_outputs(spec, outputs)
-                    && build_type_runs_automatic_tests(spec),
-            );
-            if !lib32.optional.is_empty() {
-                ui::info(format!(
-                    "Lib32 optional dependencies: {}",
-                    lib32.optional.join(", ")
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Verify all build dependencies are installed for the selected outputs.
 pub(crate) fn require_build_deps_for_outputs(
     spec: &PackageSpec,
@@ -486,6 +374,7 @@ pub(crate) fn require_test_deps_for_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::package::BuildType;
 
     fn test_spec_with_build(
         build_type: BuildType,
@@ -797,29 +686,5 @@ mod tests {
 
         assert!(is_dep_satisfied_in_db("libressl", &db_path).unwrap());
         assert!(is_dep_satisfied_in_db("libressl>=4.3.0", &db_path).unwrap());
-    }
-
-    #[test]
-    fn test_build_type_runs_automatic_tests_matches_builder_behavior() {
-        assert!(build_type_runs_automatic_tests(&test_spec_with_build(
-            BuildType::Autotools,
-            None,
-            &[]
-        )));
-        assert!(build_type_runs_automatic_tests(&test_spec_with_build(
-            BuildType::Perl,
-            None,
-            &[]
-        )));
-        assert!(build_type_runs_automatic_tests(&test_spec_with_build(
-            BuildType::Meson,
-            None,
-            &[]
-        )));
-        assert!(build_type_runs_automatic_tests(&test_spec_with_build(
-            BuildType::CMake,
-            None,
-            &[]
-        )));
     }
 }

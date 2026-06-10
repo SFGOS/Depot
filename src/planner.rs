@@ -44,48 +44,12 @@ pub(crate) struct PlannedStep {
     pub requested_by: Vec<String>,
 }
 
-impl PlannedStep {
-    pub(crate) fn download_size(&self) -> Option<u64> {
-        match &self.origin {
-            PlanOrigin::Binary { record, .. } => Some(record.size),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct PlanSummary {
-    pub total_packages: usize,
-    pub skipped_installed: usize,
-    pub binary_installs: usize,
-    pub source_build_installs: usize,
-    pub known_download_bytes: u64,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionPlan {
     pub steps: Vec<PlannedStep>,
 }
 
 impl ExecutionPlan {
-    pub(crate) fn summary(&self) -> PlanSummary {
-        let mut out = PlanSummary {
-            total_packages: self.steps.len(),
-            ..PlanSummary::default()
-        };
-        for step in &self.steps {
-            match step.action {
-                PlanAction::SkipInstalled => out.skipped_installed += 1,
-                PlanAction::InstallBinary => out.binary_installs += 1,
-                PlanAction::BuildAndInstall => out.source_build_installs += 1,
-            }
-            if let Some(n) = step.download_size() {
-                out.known_download_bytes = out.known_download_bytes.saturating_add(n);
-            }
-        }
-        out
-    }
-
     pub(crate) fn actionable_steps(&self) -> impl Iterator<Item = &PlannedStep> {
         self.steps
             .iter()

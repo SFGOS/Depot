@@ -1370,16 +1370,6 @@ fn install_package_outputs_to_rootfs(
 }
 
 fn print_plan_summary(plan: &planner::ExecutionPlan) {
-    let summary = plan.summary();
-    ui::info(format!(
-        "Plan summary: packages={} actions={} (binary_install={}, source_build_install={}, skip_installed={}) known_download={}",
-        summary.total_packages,
-        summary.binary_installs + summary.source_build_installs,
-        summary.binary_installs,
-        summary.source_build_installs,
-        summary.skipped_installed,
-        human_bytes(summary.known_download_bytes)
-    ));
     if std::env::var_os("DEPOT_VERBOSE_PLAN").is_none() {
         return;
     }
@@ -2256,8 +2246,6 @@ fn run_direct_install_request(
 
     // Check dependencies and prompt for auto-install if needed
     if !options.no_deps {
-        deps::print_dep_status_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
-
         let missing_required = merge_missing_dependencies(
             deps::check_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?,
             deps::check_runtime_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?,
