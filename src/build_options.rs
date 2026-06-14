@@ -14,7 +14,15 @@ fn parse_boolish_option(value: &str) -> Option<bool> {
 
 fn normalize_string_option(value: Option<&'static str>) -> Option<String> {
     value.and_then(|value| {
-        let trimmed = value.trim();
+        let mut trimmed = value.trim();
+        if trimmed.len() >= 2 {
+            let bytes = trimmed.as_bytes();
+            let quoted = (bytes[0] == b'\'' && bytes[trimmed.len() - 1] == b'\'')
+                || (bytes[0] == b'"' && bytes[trimmed.len() - 1] == b'"');
+            if quoted {
+                trimmed = trimmed[1..trimmed.len() - 1].trim();
+            }
+        }
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     })
 }
@@ -97,6 +105,19 @@ mod tests {
         );
         assert_eq!(normalize_string_option(Some("   ")), None);
         assert_eq!(normalize_string_option(None), None);
+    }
+
+    #[test]
+    fn normalize_string_option_strips_build_system_quotes() {
+        assert_eq!(
+            normalize_string_option(Some("'cargo'")),
+            Some("cargo".to_string())
+        );
+        assert_eq!(
+            normalize_string_option(Some("  \"meson-bootstrap\"  ")),
+            Some("meson-bootstrap".to_string())
+        );
+        assert_eq!(normalize_string_option(Some(" '' ")), None);
     }
 
     #[test]
