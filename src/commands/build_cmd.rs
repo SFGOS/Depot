@@ -22,6 +22,15 @@ pub(crate) fn build_env_rootfs(rootfs: &Path) -> String {
         .into_owned()
 }
 
+fn derive_built_against_for_package(
+    mut pkg_spec: package::PackageSpec,
+    db_path: &Path,
+) -> Result<package::PackageSpec> {
+    pkg_spec.package.built_against =
+        deps::derive_built_against_for_runtime_deps(&pkg_spec, db_path)?;
+    Ok(pkg_spec)
+}
+
 pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
     let BuildArgs {
         rootfs_args,
@@ -366,13 +375,14 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
         let arch = cross_prefix.as_deref().unwrap_or(std::env::consts::ARCH);
 
         let mut created_files = Vec::new();
-        let staged_outputs = if !lib32_only {
+        let mut staged_outputs = if !lib32_only {
             staged_output_specs(&pkg_spec, &destdir)?
         } else {
             Vec::new()
         };
         if !lib32_only {
-            for (spec_for_out, out_destdir) in &staged_outputs {
+            for (spec_for_out, out_destdir) in &mut staged_outputs {
+                *spec_for_out = derive_built_against_for_package(spec_for_out.clone(), &db_path)?;
                 let packager = package::Packager::new(
                     spec_for_out.clone(),
                     out_destdir.clone(),
@@ -395,6 +405,7 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
             !no_flags,
             lib32_only,
         )? {
+            let lib32_spec = derive_built_against_for_package(lib32_spec, &db_path)?;
             let packager =
                 package::Packager::new(lib32_spec.clone(), lib32_destdir.clone(), config.clone());
             let pkg_file = packager.create_package(Path::new("."), arch)?;

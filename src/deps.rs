@@ -230,6 +230,27 @@ pub(crate) fn declared_test_deps(spec: &PackageSpec, outputs: RequestedOutputs) 
     deps
 }
 
+/// Derive concrete ABI-breaking provider packages for an output's runtime deps.
+///
+/// This is intentionally computed from the installed database after dependency
+/// installation, not from static package spec metadata. For a dependency such
+/// as `libressl`, this records the currently installed concrete ABI package
+/// name, for example `libressl43`.
+pub(crate) fn derive_built_against_for_runtime_deps(
+    spec: &PackageSpec,
+    db_path: &Path,
+) -> Result<Vec<String>> {
+    let mut built_against = Vec::new();
+    for dep in &spec.dependencies.runtime {
+        if let Some(provider) =
+            db::get_abi_breaking_provider_for_dependency(db_path, dep_name(dep))?
+        {
+            push_unique(&mut built_against, provider);
+        }
+    }
+    Ok(built_against)
+}
+
 /// Check if all build dependencies are satisfied for the selected outputs.
 pub(crate) fn check_build_deps_for_outputs(
     spec: &PackageSpec,
@@ -691,5 +712,29 @@ mod tests {
 
         assert!(is_dep_satisfied_in_db("libressl", &db_path).unwrap());
         assert!(is_dep_satisfied_in_db("libressl>=4.3.0", &db_path).unwrap());
+    }
+
+    #[test]
+    fn test_derive_built_against_uses_installed_abi_breaking_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        let destdir = tmp.path().join("dest");
+        std::fs::create_dir_all(destdir.join("usr/lib")).unwrap();
+        std::fs::write(destdir.join("usr/lib/libssl.so"), "ssl").unwrap();
+
+        let mut provider = test_spec_with_build(BuildType::Custom, None, &[]);
+        provider.package.name = "libressl43".into();
+        provider.package.real_name = Some("libressl".into());
+        provider.package.version = "4.3.2".into();
+        provider.package.abi_breaking = true;
+
+        crate::db::register_package(&db_path, &provider, &destdir).unwrap();
+
+        let mut consumer = test_spec_with_build(BuildType::Custom, None, &[]);
+        consumer.package.name = "libssh2".into();
+        consumer.dependencies.runtime = vec!["zlib".into(), "libressl>=4.3.0".into()];
+
+        let built_against = derive_built_against_for_runtime_deps(&consumer, &db_path).unwrap();
+        assert_eq!(built_against, vec!["libressl43".to_string()]);
     }
 }

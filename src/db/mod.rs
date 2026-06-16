@@ -1124,6 +1124,54 @@ pub(crate) fn get_dependency_version(db_path: &Path, name: &str) -> Result<Optio
     Ok(version)
 }
 
+/// Return the concrete installed ABI-breaking package satisfying a dependency name.
+///
+/// Dependency aliases are matched through the package name, stable `real_name`,
+/// `provides`, and `replaces` metadata. The returned value is always the
+/// concrete installed `packages.name` so packages built against renamed streams
+/// can remember the ABI-carrying package they actually used.
+pub(crate) fn get_abi_breaking_provider_for_dependency(
+    db_path: &Path,
+    name: &str,
+) -> Result<Option<String>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let conn = Connection::open(db_path)?;
+    init_db(&conn)?;
+    let provider = conn
+        .query_row(
+            "SELECT p.name
+             FROM packages p
+             WHERE p.abi_breaking = 1
+               AND (
+                    p.name = ?1
+                 OR p.real_name = ?1
+                 OR EXISTS (
+                    SELECT 1 FROM provides pr
+                    WHERE pr.package_id = p.id AND pr.provides_name = ?1
+                 )
+                 OR EXISTS (
+                    SELECT 1 FROM replaces r
+                    WHERE r.package_id = p.id AND r.replaces_name = ?1
+                 )
+               )
+             ORDER BY
+               CASE
+                 WHEN p.name = ?1 THEN 0
+                 WHEN p.real_name = ?1 THEN 1
+                 ELSE 2
+               END,
+               p.name
+             LIMIT 1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(provider)
+}
+
 /// Find the installed package that owns a filesystem path from the local DB.
 pub fn owns_path(db_path: &Path, path: &Path) -> Result<Option<String>> {
     if !db_path.exists() {
