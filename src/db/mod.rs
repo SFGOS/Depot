@@ -41,6 +41,8 @@ pub struct InstalledPackageRecord {
     pub revision: u32,
     /// Whether renamed updates should retain versioned shared libraries.
     pub abi_breaking: bool,
+    /// Concrete package names this package was built against for ABI-sensitive dependencies.
+    pub built_against: Vec<String>,
     /// Package completion timestamp if known.
     pub completed_at: Option<i64>,
 }
@@ -140,8 +142,8 @@ pub fn register_package_with_replacement(
 
     // Insert/update package without changing its primary key (UPSERT keeps the existing row).
     tx.execute(
-        "INSERT INTO packages (name, real_name, version, revision, description, homepage, license, abi_breaking, completed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO packages (name, real_name, version, revision, description, homepage, license, abi_breaking, built_against, completed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(name) DO UPDATE SET
             real_name=excluded.real_name,
             version=excluded.version,
@@ -150,6 +152,7 @@ pub fn register_package_with_replacement(
             homepage=excluded.homepage,
             license=excluded.license,
             abi_breaking=excluded.abi_breaking,
+            built_against=excluded.built_against,
             completed_at=excluded.completed_at",
         params![
             spec.package.name,
@@ -160,6 +163,7 @@ pub fn register_package_with_replacement(
             spec.package.homepage,
             format_licenses(&spec.package.license),
             spec.package.abi_breaking,
+            format_built_against(&spec.package.built_against),
             completed_at,
         ],
     )?;
@@ -575,6 +579,7 @@ fn init_db(conn: &Connection) -> Result<()> {
             homepage TEXT,
             license TEXT,
             abi_breaking INTEGER NOT NULL DEFAULT 0,
+            built_against TEXT NOT NULL DEFAULT '',
             completed_at INTEGER
         );
 
@@ -632,6 +637,7 @@ fn init_db(conn: &Connection) -> Result<()> {
     ensure_packages_completed_at_column(conn)?;
     ensure_packages_real_name_column(conn)?;
     ensure_packages_abi_breaking_column(conn)?;
+    ensure_packages_built_against_column(conn)?;
     Ok(())
 }
 
@@ -690,6 +696,39 @@ fn ensure_packages_abi_breaking_column(conn: &Connection) -> Result<()> {
         .context("Failed to add abi_breaking column to installed package DB")?;
     }
     Ok(())
+}
+
+fn ensure_packages_built_against_column(conn: &Connection) -> Result<()> {
+    let has_built_against: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'built_against'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                Ok(count > 0)
+            },
+        )
+        .context("Failed to inspect installed package DB schema")?;
+    if !has_built_against {
+        conn.execute(
+            "ALTER TABLE packages ADD COLUMN built_against TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .context("Failed to add built_against column to installed package DB")?;
+    }
+    Ok(())
+}
+
+fn format_built_against(packages: &[String]) -> String {
+    packages.join("\n")
+}
+
+fn parse_built_against(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 fn delete_package_rows(conn: &Connection, pkg_id: i64) -> Result<()> {
@@ -877,18 +916,20 @@ pub fn list_installed_package_records(db_path: &Path) -> Result<Vec<InstalledPac
     let conn = Connection::open(db_path)?;
     init_db(&conn)?;
     let mut stmt = conn.prepare(
-        "SELECT name, real_name, version, revision, abi_breaking, completed_at
+        "SELECT name, real_name, version, revision, abi_breaking, built_against, completed_at
          FROM packages
          ORDER BY name",
     )?;
     let rows = stmt.query_map([], |row| {
+        let built_against: String = row.get(5)?;
         Ok(InstalledPackageRecord {
             name: row.get(0)?,
             real_name: row.get(1)?,
             version: row.get(2)?,
             revision: row.get::<_, i64>(3)? as u32,
             abi_breaking: row.get(4)?,
-            completed_at: row.get(5)?,
+            built_against: parse_built_against(&built_against),
+            completed_at: row.get(6)?,
         })
     })?;
     Ok(rows.filter_map(|row| row.ok()).collect())
@@ -1133,6 +1174,7 @@ mod tests {
                 description: "d".into(),
                 homepage: "h".into(),
                 abi_breaking: false,
+                built_against: Vec::new(),
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -1563,6 +1605,23 @@ mod tests {
             get_package_groups(&db_path, "foo").unwrap(),
             vec!["base".to_string(), "desktop".to_string()]
         );
+    }
+
+    #[test]
+    fn register_package_records_built_against_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("packages.db");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("payload"), "x").unwrap();
+
+        let mut spec = mk_spec("app", "1.0");
+        spec.package.built_against = vec!["icu78".into()];
+        register_package(&db_path, &spec, &dest).unwrap();
+
+        let records = list_installed_package_records(&db_path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].built_against, vec!["icu78".to_string()]);
     }
 
     #[test]

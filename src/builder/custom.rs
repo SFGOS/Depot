@@ -412,6 +412,7 @@ mod tests {
                 description: "d".into(),
                 homepage: "h".into(),
                 abi_breaking: false,
+                built_against: Vec::new(),
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -555,6 +556,7 @@ depot_install_dev_pkg() {
             description: "d".into(),
             homepage: "h".into(),
             abi_breaking: false,
+            built_against: Vec::new(),
             license: vec!["MIT".into()],
         });
 
@@ -660,6 +662,7 @@ depot_install() {
             description: "d".into(),
             homepage: "h".into(),
             abi_breaking: false,
+            built_against: Vec::new(),
             license: vec!["MIT".into()],
         });
 

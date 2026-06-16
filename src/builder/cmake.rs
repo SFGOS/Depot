@@ -1204,6 +1204,7 @@ mod tests {
                 description: "".into(),
                 homepage: "".into(),
                 abi_breaking: false,
+                built_against: Vec::new(),
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),

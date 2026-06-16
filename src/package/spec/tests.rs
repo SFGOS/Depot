@@ -41,6 +41,37 @@ type = "custom"
 }
 
 #[test]
+fn parse_package_built_against_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pkg.toml");
+
+    std::fs::write(
+        &path,
+        r#"
+[package]
+name = "foo"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+built-against = ["icu78"]
+
+[source]
+url = "https://example.com/foo.tar.gz"
+sha256 = "skip"
+extract_dir = "foo"
+
+[build]
+type = "custom"
+"#,
+    )
+    .unwrap();
+
+    let spec = PackageSpec::from_file(&path).unwrap();
+    assert_eq!(spec.package.built_against, vec!["icu78".to_string()]);
+}
+
+#[test]
 fn parse_source_array() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("pkg.toml");
@@ -2358,6 +2389,7 @@ fn mk_spec(name: &str, version: &str) -> PackageSpec {
             description: "d".into(),
             homepage: "h".into(),
             abi_breaking: false,
+            built_against: Vec::new(),
             license: vec!["MIT".into()],
         },
         packages: Vec::new(),

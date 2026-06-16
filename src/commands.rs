@@ -603,6 +603,19 @@ fn parse_dependency_list(metadata: &toml::Value, kind: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn parse_metadata_string_list(metadata: &toml::Value, key: &str) -> Vec<String> {
+    metadata
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn parse_keep_list(metadata: &toml::Value) -> Vec<String> {
     if let Some(s) = metadata.get("keep").and_then(|v| v.as_str()) {
         return vec![s.to_string()];

@@ -472,6 +472,7 @@ impl ParsedStarbuild {
             description: primary_description,
             homepage: homepage.clone(),
             abi_breaking: false,
+            built_against: Vec::new(),
             license: self
                 .output_licenses
                 .get(self.main_package_name())
@@ -497,6 +498,7 @@ impl ParsedStarbuild {
                     .unwrap_or_else(|| primary.description.clone()),
                 homepage: homepage.clone(),
                 abi_breaking: false,
+                built_against: Vec::new(),
                 license: self
                     .output_licenses
                     .get(pkg_name)

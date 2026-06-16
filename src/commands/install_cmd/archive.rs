@@ -35,6 +35,7 @@ fn package_spec_from_archive_metadata(metadata: &toml::Value) -> package::Packag
                 .get("abi_breaking")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            built_against: super::super::parse_metadata_string_list(metadata, "built_against"),
             license: super::super::parse_licenses_from_toml(metadata),
         },
         packages: Vec::new(),
@@ -118,6 +119,7 @@ pub(crate) fn package_spec_from_repo_record(
             description: record.description.clone().unwrap_or_default(),
             homepage: record.homepage.clone().unwrap_or_default(),
             abi_breaking: record.abi_breaking,
+            built_against: record.built_against.clone(),
             license: parse_license_list_from_repo(&record.license),
         },
         packages: Vec::new(),

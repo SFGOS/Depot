@@ -1753,6 +1753,7 @@ mod tests {
                 description: "d".into(),
                 homepage: "h".into(),
                 abi_breaking: false,
+                built_against: Vec::new(),
                 license: vec!["MIT".into()],
             },
             packages: Vec::new(),
@@ -1859,6 +1860,7 @@ mod tests {
             description: "dev".into(),
             homepage: "h".into(),
             abi_breaking: false,
+            built_against: Vec::new(),
             license: vec!["MIT".into()],
         });
         spec.build.flags.split_docs = true;
@@ -1930,6 +1932,7 @@ mod tests {
             description: "dev".into(),
             homepage: "h".into(),
             abi_breaking: false,
+            built_against: Vec::new(),
             license: vec!["MIT".into()],
         });
         spec.packages.push(PackageInfo {
@@ -1940,6 +1943,7 @@ mod tests {
             description: "extras".into(),
             homepage: "h".into(),
             abi_breaking: false,
+            built_against: Vec::new(),
             license: vec!["Apache-2.0".into()],
         });
 

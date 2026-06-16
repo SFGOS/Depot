@@ -32,6 +32,31 @@ fn parse_license_text(metadata: &toml::Value) -> Option<String> {
     None
 }
 
+fn parse_string_array_metadata(metadata: &toml::Value, key: &str) -> Vec<String> {
+    metadata
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn format_built_against(packages: &[String]) -> String {
+    packages.join("\n")
+}
+
+fn parse_built_against(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 pub struct RepoManager {
     pub repo_dir: PathBuf,
 }
@@ -76,6 +101,7 @@ struct IndexedPackage {
     version: String,
     revision: u32,
     abi_breaking: bool,
+    built_against: Vec<String>,
     completed_at: Option<i64>,
     description: Option<String>,
     homepage: Option<String>,
@@ -116,6 +142,7 @@ pub struct BinaryRepoPackageRecord {
     pub version: String,
     pub revision: u32,
     pub abi_breaking: bool,
+    pub built_against: Vec<String>,
     pub completed_at: Option<i64>,
     pub filename: String,
     pub size: u64,
@@ -301,6 +328,7 @@ impl RepoManager {
                 version TEXT NOT NULL,
                 revision INTEGER NOT NULL,
                 abi_breaking INTEGER NOT NULL DEFAULT 0,
+                built_against TEXT NOT NULL DEFAULT '',
                 completed_at INTEGER,
                 description TEXT,
                 homepage TEXT,
@@ -378,6 +406,7 @@ impl RepoManager {
         let mut version = String::new();
         let mut revision = 1;
         let mut abi_breaking = false;
+        let mut built_against = Vec::new();
         let mut completed_at = path_modified_unix_timestamp(pkg_path)?;
         let mut description = None;
         let mut homepage = None;
@@ -427,6 +456,7 @@ impl RepoManager {
                         .get("abi_breaking")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    built_against = parse_string_array_metadata(&metadata, "built_against");
                     completed_at =
                         metadata_time::parse_completed_at_value(&metadata).or(completed_at);
                     description = metadata
@@ -532,6 +562,7 @@ impl RepoManager {
             version,
             revision,
             abi_breaking,
+            built_against,
             completed_at,
             description,
             homepage,
@@ -557,6 +588,7 @@ impl RepoManager {
             version,
             revision,
             abi_breaking,
+            built_against,
             completed_at,
             description,
             homepage,
@@ -576,14 +608,15 @@ impl RepoManager {
 
         // Insert into database
         conn.execute(
-            "INSERT INTO packages (name, real_name, version, revision, abi_breaking, completed_at, description, homepage, license, filename, size, sha256, sha512)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO packages (name, real_name, version, revision, abi_breaking, built_against, completed_at, description, homepage, license, filename, size, sha256, sha512)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 name,
                 real_name,
                 version,
                 revision as i64,
                 abi_breaking,
+                format_built_against(&built_against),
                 completed_at,
                 description,
                 homepage,
@@ -1675,6 +1708,19 @@ fn query_package_runtime_deps(conn: &Connection, package_id: i64) -> Result<Vec<
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+fn query_package_built_against(conn: &Connection, package_id: i64) -> Result<Vec<String>> {
+    if !repo_packages_have_built_against(conn)? {
+        return Ok(Vec::new());
+    }
+
+    let raw: String = conn.query_row(
+        "SELECT built_against FROM packages WHERE id = ?1",
+        params![package_id],
+        |row| row.get(0),
+    )?;
+    Ok(parse_built_against(&raw))
+}
+
 fn query_package_optional_deps(conn: &Connection, package_id: i64) -> Result<Vec<String>> {
     let has_dependencies_table: bool = conn
         .query_row(
@@ -1740,6 +1786,11 @@ fn find_cached_binary_repo_packages(
     } else {
         "0"
     };
+    let built_against_expr = if repo_packages_have_built_against(&conn)? {
+        "p.built_against"
+    } else {
+        "''"
+    };
     let sql = format!(
         "SELECT
             p.id,
@@ -1748,6 +1799,7 @@ fn find_cached_binary_repo_packages(
             p.version,
             p.revision,
             {abi_breaking_expr},
+            {built_against_expr},
             {completed_at_expr},
             p.filename,
             p.size,
@@ -1758,6 +1810,7 @@ fn find_cached_binary_repo_packages(
             p.license
          FROM packages p
          WHERE lower(p.name) = lower(?1)
+            OR lower({real_name_expr}) = lower(?1)
                         OR EXISTS (
                                 SELECT 1 FROM replaces rp
                                 WHERE rp.package_id = p.id
@@ -1776,6 +1829,7 @@ fn find_cached_binary_repo_packages(
                                             AND lower(rp.name) = lower(?1)
                                 ) THEN 0
                                 WHEN lower(p.name) = lower(?1) THEN 1
+                                WHEN lower({real_name_expr}) = lower(?1) THEN 2
                                 ELSE 2
                         END,
             p.name ASC"
@@ -1793,14 +1847,15 @@ fn find_cached_binary_repo_packages(
                 version: row.get(3)?,
                 revision: row.get::<_, i64>(4)? as u32,
                 abi_breaking: row.get(5)?,
-                completed_at: row.get(6)?,
-                filename: row.get(7)?,
-                size: row.get::<_, i64>(8)? as u64,
-                sha256: row.get(9)?,
-                sha512: row.get(10)?,
-                description: row.get(11)?,
-                homepage: row.get(12)?,
-                license: row.get(13)?,
+                built_against: parse_built_against(&row.get::<_, String>(6)?),
+                completed_at: row.get(7)?,
+                filename: row.get(8)?,
+                size: row.get::<_, i64>(9)? as u64,
+                sha256: row.get(10)?,
+                sha512: row.get(11)?,
+                description: row.get(12)?,
+                homepage: row.get(13)?,
+                license: row.get(14)?,
                 provides: Vec::new(),
                 conflicts: Vec::new(),
                 replaces: Vec::new(),
@@ -1818,6 +1873,7 @@ fn find_cached_binary_repo_packages(
         rec.conflicts = query_package_conflicts(&conn, package_id)?;
         rec.replaces = query_package_replaces(&conn, package_id)?;
         rec.runtime_dependencies = query_package_runtime_deps(&conn, package_id)?;
+        rec.built_against = query_package_built_against(&conn, package_id)?;
         rec.optional_dependencies = query_package_optional_deps(&conn, package_id)?;
         rec.groups = query_package_groups(&conn, package_id)?;
         out.push(rec);
@@ -1862,6 +1918,11 @@ fn find_cached_binary_repo_packages_by_group(
     } else {
         "0"
     };
+    let built_against_expr = if repo_packages_have_built_against(&conn)? {
+        "p.built_against"
+    } else {
+        "''"
+    };
     let sql = format!(
         "SELECT
             p.id,
@@ -1870,6 +1931,7 @@ fn find_cached_binary_repo_packages_by_group(
             p.version,
             p.revision,
             {abi_breaking_expr},
+            {built_against_expr},
             {completed_at_expr},
             p.filename,
             p.size,
@@ -1899,14 +1961,15 @@ fn find_cached_binary_repo_packages_by_group(
                 version: row.get(3)?,
                 revision: row.get::<_, i64>(4)? as u32,
                 abi_breaking: row.get(5)?,
-                completed_at: row.get(6)?,
-                filename: row.get(7)?,
-                size: row.get::<_, i64>(8)? as u64,
-                sha256: row.get(9)?,
-                sha512: row.get(10)?,
-                description: row.get(11)?,
-                homepage: row.get(12)?,
-                license: row.get(13)?,
+                built_against: parse_built_against(&row.get::<_, String>(6)?),
+                completed_at: row.get(7)?,
+                filename: row.get(8)?,
+                size: row.get::<_, i64>(9)? as u64,
+                sha256: row.get(10)?,
+                sha512: row.get(11)?,
+                description: row.get(12)?,
+                homepage: row.get(13)?,
+                license: row.get(14)?,
                 provides: Vec::new(),
                 conflicts: Vec::new(),
                 replaces: Vec::new(),
@@ -1924,6 +1987,7 @@ fn find_cached_binary_repo_packages_by_group(
         rec.conflicts = query_package_conflicts(&conn, package_id)?;
         rec.replaces = query_package_replaces(&conn, package_id)?;
         rec.runtime_dependencies = query_package_runtime_deps(&conn, package_id)?;
+        rec.built_against = query_package_built_against(&conn, package_id)?;
         rec.optional_dependencies = query_package_optional_deps(&conn, package_id)?;
         rec.groups = query_package_groups(&conn, package_id)?;
         out.push(rec);
@@ -1953,6 +2017,11 @@ fn list_cached_binary_repo_packages(
     } else {
         "0"
     };
+    let built_against_expr = if repo_packages_have_built_against(&conn)? {
+        "p.built_against"
+    } else {
+        "''"
+    };
     let sql = format!(
         "SELECT
             p.id,
@@ -1961,6 +2030,7 @@ fn list_cached_binary_repo_packages(
             p.version,
             p.revision,
             {abi_breaking_expr},
+            {built_against_expr},
             {completed_at_expr},
             p.filename,
             p.size,
@@ -1985,14 +2055,15 @@ fn list_cached_binary_repo_packages(
                 version: row.get(3)?,
                 revision: row.get::<_, i64>(4)? as u32,
                 abi_breaking: row.get(5)?,
-                completed_at: row.get(6)?,
-                filename: row.get(7)?,
-                size: row.get::<_, i64>(8)? as u64,
-                sha256: row.get(9)?,
-                sha512: row.get(10)?,
-                description: row.get(11)?,
-                homepage: row.get(12)?,
-                license: row.get(13)?,
+                built_against: parse_built_against(&row.get::<_, String>(6)?),
+                completed_at: row.get(7)?,
+                filename: row.get(8)?,
+                size: row.get::<_, i64>(9)? as u64,
+                sha256: row.get(10)?,
+                sha512: row.get(11)?,
+                description: row.get(12)?,
+                homepage: row.get(13)?,
+                license: row.get(14)?,
                 provides: Vec::new(),
                 conflicts: Vec::new(),
                 replaces: Vec::new(),
@@ -2010,6 +2081,7 @@ fn list_cached_binary_repo_packages(
         rec.conflicts = query_package_conflicts(&conn, package_id)?;
         rec.replaces = query_package_replaces(&conn, package_id)?;
         rec.runtime_dependencies = query_package_runtime_deps(&conn, package_id)?;
+        rec.built_against = query_package_built_against(&conn, package_id)?;
         rec.optional_dependencies = query_package_optional_deps(&conn, package_id)?;
         rec.groups = query_package_groups(&conn, package_id)?;
         out.push(rec);
@@ -2044,6 +2116,18 @@ fn repo_packages_have_real_name(conn: &Connection) -> Result<bool> {
 fn repo_packages_have_abi_breaking(conn: &Connection) -> Result<bool> {
     conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'abi_breaking'",
+        [],
+        |row| {
+            let count: i64 = row.get(0)?;
+            Ok(count > 0)
+        },
+    )
+    .context("Failed to inspect binary repo DB schema")
+}
+
+fn repo_packages_have_built_against(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('packages') WHERE name = 'built_against'",
         [],
         |row| {
             let count: i64 = row.get(0)?;
@@ -2655,6 +2739,7 @@ real_name = "icu"
 version = "1.0"
 revision = 1
 abi_breaking = true
+built_against = ["icu78"]
 description = "test description"
 homepage = "https://example.com"
 license = "MIT"
@@ -2692,6 +2777,7 @@ optional = []
             String,
             i64,
             i64,
+            String,
             Option<String>,
             Option<String>,
             Option<String>,
@@ -2699,9 +2785,21 @@ optional = []
             String,
         );
 
-        let (name, real_name, version, revision, abi_breaking, desc, home, lic, sha256, sha512): PackageRow = conn
+        let (
+            name,
+            real_name,
+            version,
+            revision,
+            abi_breaking,
+            built_against,
+            desc,
+            home,
+            lic,
+            sha256,
+            sha512,
+        ): PackageRow = conn
             .query_row(
-                "SELECT name, real_name, version, revision, abi_breaking, description, homepage, license, sha256, sha512 FROM packages",
+                "SELECT name, real_name, version, revision, abi_breaking, built_against, description, homepage, license, sha256, sha512 FROM packages",
                 [],
                 |r| {
                     Ok((
@@ -2715,6 +2813,7 @@ optional = []
                         r.get(7)?,
                         r.get(8)?,
                         r.get(9)?,
+                        r.get(10)?,
                     ))
                 },
             )
@@ -2725,6 +2824,7 @@ optional = []
         assert_eq!(version, "1.0");
         assert_eq!(revision, 1);
         assert_eq!(abi_breaking, 1);
+        assert_eq!(built_against, "icu78");
         assert_eq!(desc, Some("test description".to_string()));
         assert_eq!(home, Some("https://example.com".to_string()));
         assert_eq!(lic, Some("MIT".to_string()));
@@ -2966,6 +3066,46 @@ revision = 1
     }
 
     #[test]
+    fn test_find_cached_binary_repo_packages_matches_real_name_and_built_against() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("repo.db");
+        let mut conn = Connection::open(&db_path).unwrap();
+        let manager = RepoManager::new(tmp.path().to_path_buf());
+        manager.init_repo_schema(&mut conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO packages (id, name, real_name, version, revision, abi_breaking, built_against, description, homepage, license, filename, size, sha256, sha512)
+             VALUES (1, 'icu78', 'icu', '78.1', 1, 0, '', NULL, NULL, NULL, 'icu78.pkg', 10, 'aa', 'bb')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO packages (id, name, real_name, version, revision, abi_breaking, built_against, description, homepage, license, filename, size, sha256, sha512)
+             VALUES (2, 'app', NULL, '1.0', 1, 0, 'icu78', NULL, NULL, NULL, 'app.pkg', 10, 'cc', 'dd')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dependencies (package_id, kind, name) VALUES (2, 'runtime', 'icu')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let icu_matches = find_cached_binary_repo_packages("repo", &db_path, "icu").unwrap();
+        assert_eq!(icu_matches.len(), 1);
+        assert_eq!(icu_matches[0].name, "icu78");
+        assert_eq!(icu_matches[0].real_name.as_deref(), Some("icu"));
+
+        let app = find_cached_binary_repo_packages("repo", &db_path, "app")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(app.runtime_dependencies, vec!["icu".to_string()]);
+        assert_eq!(app.built_against, vec!["icu78".to_string()]);
+    }
+
+    #[test]
     fn test_verify_binary_package_record_checksums_accepts_valid_hashes() {
         use sha2::{Digest, Sha256, Sha512};
 
@@ -2991,6 +3131,7 @@ revision = 1
             version: "1.0".into(),
             revision: 1,
             abi_breaking: false,
+            built_against: Vec::new(),
             completed_at: None,
             filename: "pkg.depot.pkg.tar.zst".into(),
             size: 7,
@@ -3031,6 +3172,7 @@ revision = 1
             version: "1.0".into(),
             revision: 1,
             abi_breaking: false,
+            built_against: Vec::new(),
             completed_at: None,
             filename: filename.to_string(),
             size: payload.len() as u64,

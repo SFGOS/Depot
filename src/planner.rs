@@ -284,8 +284,23 @@ impl<'a> Resolver<'a> {
         requester_spec_path: Option<&Path>,
         requested_by: String,
     ) -> Result<Option<NodeIndex>> {
-        if deps::is_dep_satisfied_in_db(dep, &self.db_path)? {
+        self.resolve_dep_node_with_preferred(dep, requester_spec_path, requested_by, &[])
+    }
+
+    fn resolve_dep_node_with_preferred(
+        &mut self,
+        dep: &str,
+        requester_spec_path: Option<&Path>,
+        requested_by: String,
+        preferred_packages: &[String],
+    ) -> Result<Option<NodeIndex>> {
+        if preferred_packages.is_empty() && deps::is_dep_satisfied_in_db(dep, &self.db_path)? {
             return Ok(None);
+        }
+        for preferred in preferred_packages {
+            if deps::is_dep_satisfied_in_db(preferred, &self.db_path)? {
+                return Ok(None);
+            }
         }
 
         let dep_name = deps::dep_name(dep);
@@ -304,7 +319,7 @@ impl<'a> Resolver<'a> {
             );
         }
 
-        let chosen = self.choose_candidate(dep, &candidates)?;
+        let chosen = self.choose_candidate(dep, &candidates, preferred_packages)?;
         let idx = match chosen.kind {
             CandidateKind::Source {
                 ref path,
@@ -345,9 +360,18 @@ impl<'a> Resolver<'a> {
         self.by_package.insert(record.name.clone(), idx);
 
         for dep in &record.runtime_dependencies {
-            if let Some(dep_idx) =
-                self.resolve_dep_node(dep, None, format!("{} needs {}", record.name, dep))?
-            {
+            let preferred = self.preferred_built_against_packages(dep, &record.built_against)?;
+            let dep_label = if preferred.is_empty() {
+                dep.clone()
+            } else {
+                format!("{} (built against {})", dep, preferred.join(", "))
+            };
+            if let Some(dep_idx) = self.resolve_dep_node_with_preferred(
+                dep,
+                None,
+                format!("{} needs {}", record.name, dep_label),
+                &preferred,
+            )? {
                 self.add_dependency_edge(dep_idx, idx, &record.name)?;
             }
         }
@@ -356,10 +380,49 @@ impl<'a> Resolver<'a> {
         Ok(idx)
     }
 
-    fn choose_candidate(&self, dep: &str, candidates: &[Candidate]) -> Result<Candidate> {
+    fn preferred_built_against_packages(
+        &mut self,
+        dep: &str,
+        built_against: &[String],
+    ) -> Result<Vec<String>> {
+        if built_against.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let dep_name = deps::dep_name(dep);
+        let candidates = self.collect_candidates(dep_name, None)?;
+        let mut preferred = Vec::new();
+        for built in built_against {
+            let built_name = deps::dep_name(built);
+            if candidates
+                .iter()
+                .any(|candidate| candidate.package.eq_ignore_ascii_case(built_name))
+            {
+                push_unique(&mut preferred, built.to_string());
+            }
+        }
+        Ok(preferred)
+    }
+
+    fn choose_candidate(
+        &self,
+        dep: &str,
+        candidates: &[Candidate],
+        preferred_packages: &[String],
+    ) -> Result<Candidate> {
         let mut sorted = prune_replacement_fallback_candidates(dedupe_candidate_packages(
             sort_candidates(candidates, self.opts.prefer_binary),
         ));
+
+        for preferred in preferred_packages {
+            let preferred_name = deps::dep_name(preferred);
+            if let Some(position) = sorted
+                .iter()
+                .position(|candidate| candidate.package.eq_ignore_ascii_case(preferred_name))
+            {
+                return Ok(sorted.remove(position));
+            }
+        }
 
         if sorted.len() == 1 {
             return Ok(sorted.remove(0));
@@ -457,7 +520,12 @@ impl<'a> Resolver<'a> {
             ) {
                 Ok(records) => {
                     for rec in records {
-                        let match_kind = if rec.name.eq_ignore_ascii_case(dep_name) {
+                        let match_kind = if rec.name.eq_ignore_ascii_case(dep_name)
+                            || rec
+                                .real_name
+                                .as_deref()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(dep_name))
+                        {
                             MatchKind::Exact
                         } else if rec
                             .replaces
@@ -862,7 +930,7 @@ mod tests {
         dedupe_candidate_packages, prune_replacement_fallback_candidates, sort_candidates,
         source_deps_for_install,
     };
-    use crate::config::Config;
+    use crate::config::{BinaryRepo, Config};
     use crate::db;
     use crate::package::{
         Alternatives, Build, BuildFlags, BuildType, Dependencies, PackageInfo, PackageSpec, Source,
@@ -881,6 +949,7 @@ mod tests {
                 description: "d".into(),
                 homepage: "h".into(),
                 abi_breaking: false,
+                built_against: Vec::new(),
                 license: vec!["MIT".into()],
             },
             packages: vec![PackageInfo {
@@ -891,6 +960,7 @@ mod tests {
                 description: "d".into(),
                 homepage: "h".into(),
                 abi_breaking: false,
+                built_against: Vec::new(),
                 license: vec!["MIT".into()],
             }],
             alternatives: Alternatives::default(),
@@ -958,6 +1028,7 @@ mod tests {
                     version: "1.0.0".to_string(),
                     revision: 1,
                     abi_breaking: false,
+                    built_against: Vec::new(),
                     completed_at: None,
                     filename: format!("{name}-1.0.0-1-x86_64.depot.pkg.tar.zst"),
                     size: 1024,
@@ -1267,6 +1338,121 @@ version = "4.3.2"
                 ..
             }
         ));
+    }
+
+    fn write_compressed_repo_db(db_path: &Path, zst_path: &Path) {
+        let mut input = fs::File::open(db_path).unwrap();
+        let output = fs::File::create(zst_path).unwrap();
+        let mut encoder = zstd::stream::write::Encoder::new(output, 3).unwrap();
+        std::io::copy(&mut input, &mut encoder).unwrap();
+        encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn binary_plan_uses_built_against_concrete_dependency() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::for_rootfs(rootfs.path());
+        config.package_cache_dir = cache_dir.path().to_path_buf();
+        config.repo_settings.prefer_binary = true;
+        config.binary_repos.insert(
+            "core".into(),
+            BinaryRepo {
+                url: url::Url::from_directory_path(repo_dir.path())
+                    .expect("file URL")
+                    .to_string(),
+                allow_unsigned: true,
+                ..BinaryRepo::default()
+            },
+        );
+
+        let installed_dest = rootfs.path().join("installed");
+        fs::create_dir_all(&installed_dest).unwrap();
+        let mut installed = mk_installed_spec("icu79", "79.1");
+        installed.package.real_name = Some("icu".into());
+        db::register_package(
+            &config.installed_db_path(rootfs.path()),
+            &installed,
+            &installed_dest,
+        )
+        .unwrap();
+
+        let db_path = repo_dir.path().join("repo.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE packages (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                real_name TEXT,
+                version TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                abi_breaking INTEGER NOT NULL DEFAULT 0,
+                built_against TEXT NOT NULL DEFAULT '',
+                completed_at INTEGER,
+                description TEXT,
+                homepage TEXT,
+                license TEXT,
+                filename TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                sha512 TEXT NOT NULL
+            );
+            CREATE TABLE provides (package_id INTEGER, name TEXT NOT NULL);
+            CREATE TABLE replaces (package_id INTEGER, name TEXT NOT NULL);
+            CREATE TABLE conflicts (package_id INTEGER, name TEXT NOT NULL);
+            CREATE TABLE dependencies (package_id INTEGER, kind TEXT NOT NULL, name TEXT NOT NULL);
+            CREATE TABLE groups (package_id INTEGER, name TEXT NOT NULL);
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO packages (id, name, real_name, version, revision, abi_breaking, built_against, completed_at, description, homepage, license, filename, size, sha256, sha512)
+             VALUES (1, 'app', NULL, '1.0', 1, 0, 'icu78', NULL, NULL, NULL, NULL, 'app.pkg', 1, 'aa', 'bb')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dependencies (package_id, kind, name) VALUES (1, 'runtime', 'icu')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO packages (id, name, real_name, version, revision, abi_breaking, built_against, completed_at, description, homepage, license, filename, size, sha256, sha512)
+             VALUES (2, 'icu78', 'icu', '78.1', 1, 0, '', NULL, NULL, NULL, NULL, 'icu78.pkg', 1, 'cc', 'dd')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO packages (id, name, real_name, version, revision, abi_breaking, built_against, completed_at, description, homepage, license, filename, size, sha256, sha512)
+             VALUES (3, 'icu79', 'icu', '79.1', 1, 0, '', NULL, NULL, NULL, NULL, 'icu79.pkg', 1, 'ee', 'ff')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        write_compressed_repo_db(&db_path, &repo_dir.path().join("repo.db.zst"));
+        fs::remove_file(&db_path).unwrap();
+
+        let plan = super::build_install_plan(
+            &config,
+            rootfs.path(),
+            super::InstallTarget::PackageName("app".into()),
+            PlannerOptions {
+                assume_yes: true,
+                prefer_binary: true,
+                local_sibling_root: None,
+                include_test_deps: false,
+                lib32_only_requested_specs: false,
+            },
+        )
+        .unwrap();
+
+        let actionable: Vec<_> = plan
+            .actionable_steps()
+            .map(|step| step.package.as_str())
+            .collect();
+        assert_eq!(actionable, vec!["icu78", "app"]);
     }
 
     #[test]

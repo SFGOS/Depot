@@ -184,6 +184,19 @@ impl Packager {
             "abi_breaking".to_string(),
             toml::Value::Boolean(self.spec.package.abi_breaking),
         );
+        if !self.spec.package.built_against.is_empty() {
+            map.insert(
+                "built_against".to_string(),
+                toml::Value::Array(
+                    self.spec
+                        .package
+                        .built_against
+                        .iter()
+                        .map(|s| toml::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
         map.insert(
             "license".to_string(),
             license_value(&self.spec.package.license),
@@ -357,6 +370,7 @@ mod tests {
                     description: "d".into(),
                     homepage: "h".into(),
                     abi_breaking: false,
+                    built_against: Vec::new(),
                     license: vec!["MIT".into()],
                 },
                 packages: Vec::new(),
@@ -528,6 +542,7 @@ mod tests {
         let mut packager = mk_packager(dest.to_path_buf());
         packager.spec.package.real_name = Some("icu".into());
         packager.spec.package.abi_breaking = true;
+        packager.spec.package.built_against = vec!["icu78".into()];
         packager.generate_metadata_toml().unwrap();
 
         let meta_path = dest.join(".metadata.toml");
@@ -538,6 +553,11 @@ mod tests {
             val.get("abi_breaking").and_then(|v| v.as_bool()),
             Some(true)
         );
+        let built_against = val
+            .get("built_against")
+            .and_then(|v| v.as_array())
+            .expect("built_against should be an array");
+        assert_eq!(built_against[0].as_str(), Some("icu78"));
     }
 
     #[test]

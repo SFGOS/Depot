@@ -17,6 +17,13 @@ pub struct PackageInfo {
     /// When true, renamed updates retain versioned shared libraries from the old package.
     #[serde(default, alias = "abi-breaking")]
     pub abi_breaking: bool,
+    /// Concrete package names this package was built against for ABI-sensitive dependencies.
+    #[serde(
+        default,
+        alias = "built-against",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub built_against: Vec<String>,
     #[serde(
         deserialize_with = "deserialize_licenses",
         serialize_with = "serialize_licenses"
