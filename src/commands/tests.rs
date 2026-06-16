@@ -281,6 +281,23 @@ fn register_installed_test_package(
     Ok(())
 }
 
+fn set_installed_test_package_completed_at(
+    config: &config::Config,
+    rootfs: &Path,
+    name: &str,
+    completed_at: i64,
+) -> Result<()> {
+    let db_path = config.installed_db_path(rootfs);
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("Failed to open {}", db_path.display()))?;
+    conn.execute(
+        "UPDATE packages SET completed_at = ?1 WHERE name = ?2",
+        rusqlite::params![completed_at, name],
+    )
+    .with_context(|| format!("Failed to update completed_at for package '{}'", name))?;
+    Ok(())
+}
+
 fn register_required_development_package_if_configured(
     config: &config::Config,
     rootfs: &Path,
@@ -1765,11 +1782,16 @@ fn depot_self_update_check_allows_when_depot_is_current() -> Result<()> {
         },
     );
 
+    let repo_spec = repo_clones.join("core").join("depot.toml");
     register_installed_test_package(&config, &rootfs, DEPOT_PACKAGE_NAME, "1.1.0")?;
-    write_test_repo_spec(
-        &repo_clones.join("core").join("depot.toml"),
+    write_test_repo_spec(&repo_spec, DEPOT_PACKAGE_NAME, "1.1.0")?;
+    let repo_completed_at =
+        crate::metadata_time::system_time_to_unix(fs::metadata(&repo_spec)?.modified()?)?;
+    set_installed_test_package_completed_at(
+        &config,
+        &rootfs,
         DEPOT_PACKAGE_NAME,
-        "1.1.0",
+        repo_completed_at + 1,
     )?;
 
     ensure_depot_self_update_not_required(&config, &rootfs)?;
