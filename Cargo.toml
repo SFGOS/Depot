@@ -51,7 +51,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["blocking"
 filetime = "0.2.29"
 clap_complete = "4.6.5"
 sys-mount = { version = "3.1.0", default-features = false }
-time = { version = "0.3.47", features = ["formatting", "parsing"] }
+time = { version = "0.3.479", features = ["formatting", "parsing"] }
 b2sum-rust = "0.3.0"
 serde_ignored = "0.1.14"
 lz4_flex = "0.13.1"
