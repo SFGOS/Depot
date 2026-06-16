@@ -1131,6 +1131,7 @@ fn collect_update_candidates_matches_renamed_packages_by_real_name() -> Result<(
     config.db_dir = db_dir.clone();
     config.repo_settings.prefer_binary = false;
     config.binary_repos.clear();
+    config.source_repos.clear();
     config.source_repos.insert(
         "private".into(),
         config::SourceRepo {
@@ -1636,6 +1637,7 @@ fn collect_update_candidates_skips_source_when_prefer_binary_is_enabled() -> Res
     config.db_dir = db_dir.clone();
     config.repo_settings.prefer_binary = true;
     config.binary_repos.clear();
+    config.source_repos.clear();
     config.source_repos.insert(
         "private".into(),
         config::SourceRepo {
@@ -1711,6 +1713,7 @@ fn depot_self_update_check_blocks_when_update_is_available() -> Result<()> {
     config.db_dir = db_dir;
     config.repo_settings.prefer_binary = false;
     config.binary_repos.clear();
+    config.source_repos.clear();
     config.source_repos.insert(
         "core".into(),
         config::SourceRepo {
@@ -1751,6 +1754,7 @@ fn depot_self_update_check_allows_when_depot_is_current() -> Result<()> {
     config.db_dir = db_dir;
     config.repo_settings.prefer_binary = false;
     config.binary_repos.clear();
+    config.source_repos.clear();
     config.source_repos.insert(
         "core".into(),
         config::SourceRepo {
@@ -1789,6 +1793,7 @@ fn depot_self_update_check_is_skipped_for_nested_update_install_context() -> Res
     config.db_dir = db_dir;
     config.repo_settings.prefer_binary = false;
     config.binary_repos.clear();
+    config.source_repos.clear();
     config.source_repos.insert(
         "core".into(),
         config::SourceRepo {
