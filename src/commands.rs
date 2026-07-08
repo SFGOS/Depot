@@ -2501,6 +2501,7 @@ fn run_direct_install_request(
             // 3.1 Copy license files into staged tree
             staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
             install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
+            builder::stage_generated_lifecycle_scripts(&pkg_spec, &destdir)?;
         }
 
         destdir

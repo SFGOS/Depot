@@ -54,7 +54,7 @@ pub(crate) fn build_tool_package_option(build_type: BuildType) -> Option<&'stati
         BuildType::Python => Some("DEPOT_PYTHON_PACKAGE"),
         BuildType::Rust => Some("DEPOT_RUST_PACKAGE"),
         BuildType::Makefile => Some("DEPOT_MAKEFILE_PACKAGE"),
-        BuildType::Bin | BuildType::Meta => None,
+        BuildType::Dkms | BuildType::Bin | BuildType::Meta => None,
     }
 }
 
@@ -68,7 +68,7 @@ pub(crate) fn requested_build_tool_package(build_type: BuildType) -> Option<Stri
         BuildType::Python => normalize_string_option(option_env!("DEPOT_PYTHON_PACKAGE")),
         BuildType::Rust => normalize_string_option(option_env!("DEPOT_RUST_PACKAGE")),
         BuildType::Makefile => normalize_string_option(option_env!("DEPOT_MAKEFILE_PACKAGE")),
-        BuildType::Bin | BuildType::Meta => None,
+        BuildType::Dkms | BuildType::Bin | BuildType::Meta => None,
     }
 }
 

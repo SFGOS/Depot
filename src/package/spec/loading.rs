@@ -87,6 +87,7 @@ impl PackageSpec {
             );
         }
         spec.validate_manual_sources()?;
+        spec.validate_dkms()?;
 
         Ok(spec)
     }
@@ -166,6 +167,52 @@ impl PackageSpec {
         Ok(())
     }
 
+    fn validate_dkms(&self) -> Result<()> {
+        if !matches!(self.build.build_type, BuildType::Dkms) {
+            return Ok(());
+        }
+
+        if self.build.flags.dkms_modules.is_empty() {
+            anyhow::bail!(
+                "build.type = \"dkms\" requires at least one build.flags.dkms_modules entry"
+            );
+        }
+
+        validate_dkms_component("build.flags.dkms_name", &self.effective_dkms_name())?;
+        validate_dkms_component("build.flags.dkms_version", &self.effective_dkms_version())?;
+        validate_dkms_rel_path(
+            "build.flags.dkms_source_dir",
+            self.build.flags.dkms_source_dir.trim(),
+            true,
+        )?;
+        validate_dkms_install_dir(
+            "build.flags.dkms_install_dir",
+            self.effective_dkms_install_dir().as_str(),
+        )?;
+
+        let mut installed_names = HashSet::new();
+        for (idx, module) in self.build.flags.dkms_modules.iter().enumerate() {
+            let label = format!("build.flags.dkms_modules[{idx}]");
+            validate_dkms_component(&format!("{label}.name"), module.name.trim())?;
+            let dest_name = self.effective_dkms_module_dest_name(module);
+            validate_dkms_component(&format!("{label}.dest_name"), &dest_name)?;
+            validate_dkms_rel_path(&format!("{label}.build_dir"), module.build_dir.trim(), true)?;
+            validate_dkms_rel_path(
+                &format!("{label}.built_location"),
+                module.built_location.trim(),
+                true,
+            )?;
+            let install_dir = self.effective_dkms_module_install_dir(module);
+            validate_dkms_install_dir(&format!("{label}.install_dir"), &install_dir)?;
+
+            if !installed_names.insert(dest_name.clone()) {
+                anyhow::bail!("Duplicate DKMS destination module name: {}", dest_name);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Expand variables like `$name` and `$version` in a string.
     pub fn expand_vars(&self, input: &str) -> String {
         let specdir = self.spec_dir.to_string_lossy();
@@ -178,6 +225,56 @@ impl PackageSpec {
 
     pub fn sources(&self) -> &[Source] {
         &self.source
+    }
+
+    /// Return the effective Depot DKMS source package name.
+    pub fn effective_dkms_name(&self) -> String {
+        let configured = self.build.flags.dkms_name.trim();
+        if configured.is_empty() {
+            self.package.name.clone()
+        } else {
+            self.expand_vars(configured)
+        }
+    }
+
+    /// Return the effective Depot DKMS source package version.
+    pub fn effective_dkms_version(&self) -> String {
+        let configured = self.build.flags.dkms_version.trim();
+        if configured.is_empty() {
+            self.package.version.clone()
+        } else {
+            self.expand_vars(configured)
+        }
+    }
+
+    /// Return the default module install directory for Depot DKMS packages.
+    pub fn effective_dkms_install_dir(&self) -> String {
+        let configured = self.build.flags.dkms_install_dir.trim();
+        if configured.is_empty() {
+            "updates/depot".to_string()
+        } else {
+            normalize_dkms_install_dir(&self.expand_vars(configured))
+        }
+    }
+
+    /// Return the effective installed module name for a DKMS module entry.
+    pub fn effective_dkms_module_dest_name(&self, module: &DkmsModule) -> String {
+        let configured = module.dest_name.trim();
+        if configured.is_empty() {
+            module.name.clone()
+        } else {
+            self.expand_vars(configured)
+        }
+    }
+
+    /// Return the effective install directory for a DKMS module entry.
+    pub fn effective_dkms_module_install_dir(&self, module: &DkmsModule) -> String {
+        let configured = module.install_dir.trim();
+        if configured.is_empty() {
+            self.effective_dkms_install_dir()
+        } else {
+            normalize_dkms_install_dir(&self.expand_vars(configured))
+        }
     }
 
     /// Returns true when this spec is a metadata-only package that exists to pull dependencies.
@@ -337,6 +434,49 @@ impl PackageSpec {
             .cloned()
             .unwrap_or_else(|| self.alternatives.clone())
     }
+}
+
+fn normalize_dkms_install_dir(raw: &str) -> String {
+    raw.trim().trim_start_matches('/').to_string()
+}
+
+fn validate_dkms_component(label: &str, value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("{label} cannot be empty");
+    }
+    if value.contains('/') || value.contains('\\') {
+        anyhow::bail!("{label} cannot contain path separators: {value}");
+    }
+    if value == "." || value == ".." {
+        anyhow::bail!("{label} cannot be '.' or '..'");
+    }
+    Ok(())
+}
+
+fn validate_dkms_install_dir(label: &str, value: &str) -> Result<()> {
+    validate_dkms_rel_path(label, value.trim_start_matches('/'), false)
+}
+
+fn validate_dkms_rel_path(label: &str, value: &str, allow_empty: bool) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        if allow_empty {
+            return Ok(());
+        }
+        anyhow::bail!("{label} cannot be empty");
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        anyhow::bail!("{label} must be relative: {value}");
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => anyhow::bail!("{label} contains an unsafe path component: {value}"),
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for PackageSpec {

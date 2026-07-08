@@ -233,6 +233,19 @@ pub(crate) fn run_internal_command(command: InternalCommands) -> Result<()> {
                 &args,
             )
         }
+        InternalCommands::DkmsAutoinstall { rootfs, source } => {
+            crate::install::dkms::autoinstall(&rootfs, &source)
+        }
+        InternalCommands::DkmsRemove {
+            rootfs,
+            source,
+            name,
+        } => {
+            if source.is_none() && name.as_deref().is_none_or(|value| value.trim().is_empty()) {
+                anyhow::bail!("internal dkms-remove requires --source or --name");
+            }
+            crate::install::dkms::remove(&rootfs, source.as_deref(), name.as_deref())
+        }
     }
 }
 

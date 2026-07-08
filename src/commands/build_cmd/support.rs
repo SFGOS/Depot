@@ -354,6 +354,7 @@ pub(crate) fn build_lib32_companion_package(
         );
     }
     install::scripts::stage_scripts_from_spec_dir(&lib32_pkg_spec, &lib32_destdir)?;
+    builder::stage_generated_lifecycle_scripts(&lib32_pkg_spec, &lib32_destdir)?;
     staging::process(&lib32_destdir, &lib32_pkg_spec)?;
     staging::symlink_package_license(
         &lib32_destdir,

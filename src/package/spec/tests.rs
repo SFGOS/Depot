@@ -2379,6 +2379,102 @@ fn docs_package_for_output_derives_name_and_description() {
     assert_eq!(docs.version, "1.0");
 }
 
+#[test]
+fn parse_dkms_build_type_and_modules() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("zfs.toml");
+
+    std::fs::write(
+        &path,
+        r#"
+[package]
+name = "zfs-dkms"
+version = "2.4.3"
+description = "d"
+homepage = "h"
+license = "CDDL"
+
+[source]
+url = "https://github.com/openzfs/zfs/releases/download/zfs-$version/zfs-$version.tar.gz"
+sha256 = "skip"
+extract_dir = "zfs-$version"
+
+[build]
+type = "dkms"
+
+[build.flags]
+dkms_name = "zfs"
+dkms_version = "$version"
+dkms_source_dir = "."
+dkms_install_dir = "updates/depot"
+dkms_make_args = ["V=1"]
+dkms_pre_build = [
+  "./configure --with-config=kernel --with-linux=$kernel_build_dir --with-linux-obj=$kernel_build_dir"
+]
+
+[[build.flags.dkms_modules]]
+name = "zfs"
+path = "module"
+built_location = "module/zfs"
+
+[[build.flags.dkms_modules]]
+name = "spl"
+dest_name = "spl_compat"
+build_dir = "module"
+built_location = "module/spl"
+install_dir = "/updates/storage"
+"#,
+    )
+    .unwrap();
+
+    let spec = PackageSpec::from_file(&path).unwrap();
+    assert!(matches!(spec.build.build_type, BuildType::Dkms));
+    assert_eq!(spec.effective_dkms_name(), "zfs");
+    assert_eq!(spec.effective_dkms_version(), "2.4.3");
+    assert_eq!(spec.effective_dkms_install_dir(), "updates/depot");
+    assert_eq!(spec.build.flags.dkms_pre_build.len(), 1);
+    assert_eq!(spec.build.flags.dkms_modules.len(), 2);
+    assert_eq!(spec.build.flags.dkms_modules[0].build_dir, "module");
+    assert_eq!(
+        spec.effective_dkms_module_install_dir(&spec.build.flags.dkms_modules[1]),
+        "updates/storage"
+    );
+}
+
+#[test]
+fn parse_dkms_rejects_unsafe_module_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("bad.toml");
+
+    std::fs::write(
+        &path,
+        r#"
+[package]
+name = "bad-dkms"
+version = "1.0"
+description = "d"
+homepage = "h"
+license = "MIT"
+
+[source]
+url = "https://example.com/bad.tar.gz"
+sha256 = "skip"
+extract_dir = "bad"
+
+[build]
+type = "dkms"
+
+[[build.flags.dkms_modules]]
+name = "bad"
+path = "../outside"
+"#,
+    )
+    .unwrap();
+
+    let err = PackageSpec::from_file(&path).unwrap_err().to_string();
+    assert!(err.contains("unsafe path component"), "{err}");
+}
+
 fn mk_spec(name: &str, version: &str) -> PackageSpec {
     PackageSpec {
         package: PackageInfo {

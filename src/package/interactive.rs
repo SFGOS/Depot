@@ -22,6 +22,7 @@ impl fmt::Display for BuildType {
             BuildType::Python => write!(f, "Python"),
             BuildType::Rust => write!(f, "Rust"),
             BuildType::Makefile => write!(f, "Makefile"),
+            BuildType::Dkms => write!(f, "DKMS"),
             BuildType::Bin => write!(f, "Binary installer"),
             BuildType::Meta => write!(f, "Metapackage"),
         }
@@ -960,6 +961,7 @@ pub fn spec_to_minimal_toml(spec: &PackageSpec) -> anyhow::Result<String> {
         BuildType::Python => "python",
         BuildType::Rust => "rust",
         BuildType::Makefile => "makefile",
+        BuildType::Dkms => "dkms",
         BuildType::Bin => "bin",
         BuildType::Meta => "meta",
     };

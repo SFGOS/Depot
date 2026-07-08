@@ -217,8 +217,34 @@ pub enum BuildType {
     Python,
     Rust,
     Makefile,
+    Dkms,
     Bin,
     Meta,
+}
+
+/// One kernel module output managed by Depot's DKMS-compatible backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct DkmsModule {
+    /// Built module name without a `.ko` suffix.
+    pub name: String,
+    /// Installed module name without a `.ko` suffix. Defaults to `name`.
+    #[serde(default, alias = "dest-name", alias = "dest_name")]
+    pub dest_name: String,
+    /// Source subdirectory passed as `M=` to the kernel build system.
+    #[serde(default, alias = "path", alias = "build-dir", alias = "build_dir")]
+    pub build_dir: String,
+    /// Directory containing the resulting `.ko`. Defaults to `build_dir`.
+    #[serde(
+        default,
+        alias = "built-location",
+        alias = "built_location",
+        alias = "output-dir",
+        alias = "output_dir"
+    )]
+    pub built_location: String,
+    /// Install directory under `/lib/modules/<kernel>`. Defaults to `dkms_install_dir`.
+    #[serde(default, alias = "install-dir", alias = "install_dir")]
+    pub install_dir: String,
 }
 
 /// Build flags and toolchain configuration
@@ -715,6 +741,47 @@ pub struct BuildFlags {
     /// Binary package type when using BuildType::Bin (e.g. "deb")
     #[serde(default)]
     pub binary_type: String,
+    /// DKMS package/module name for Depot-managed kernel modules.
+    #[serde(default, alias = "dkms-name", alias = "dkms_name")]
+    pub dkms_name: String,
+    /// DKMS package/module version. Defaults to the package version.
+    #[serde(default, alias = "dkms-version", alias = "dkms_version")]
+    pub dkms_version: String,
+    /// Source subdirectory to stage into `/usr/src/<name>-<version>`.
+    #[serde(default, alias = "dkms-source-dir", alias = "dkms_source_dir")]
+    pub dkms_source_dir: String,
+    /// Default install directory under `/lib/modules/<kernel>` for built modules.
+    #[serde(default, alias = "dkms-install-dir", alias = "dkms_install_dir")]
+    pub dkms_install_dir: String,
+    /// Additional arguments appended to kernel module `make` invocations.
+    #[serde(
+        default,
+        alias = "dkms-make-args",
+        alias = "dkms_make_args",
+        deserialize_with = "deserialize_string_or_array"
+    )]
+    pub dkms_make_args: Vec<String>,
+    /// Commands run from the staged source tree before each per-kernel module build.
+    ///
+    /// Supports `$kernel`, `$kernel_build_dir`, `$source_dir`, and `$rootfs`.
+    #[serde(
+        default,
+        alias = "dkms-pre-build",
+        alias = "dkms_pre_build",
+        deserialize_with = "deserialize_string_or_array_no_split"
+    )]
+    pub dkms_pre_build: Vec<String>,
+    /// Run Depot's kernel-module build/install hook after package install/update.
+    #[serde(
+        default = "default_dkms_autoinstall",
+        alias = "dkms-autoinstall",
+        alias = "dkms_autoinstall",
+        deserialize_with = "deserialize_boolish"
+    )]
+    pub dkms_autoinstall: bool,
+    /// Kernel modules produced by this DKMS source package.
+    #[serde(default, alias = "dkms-modules", alias = "dkms_modules")]
+    pub dkms_modules: Vec<DkmsModule>,
     /// Internal runtime marker used to adjust builder behavior for the lib32 variant.
     #[serde(skip)]
     pub lib32_variant: bool,
@@ -819,6 +886,14 @@ impl Default for BuildFlags {
             source_subdir: String::new(),
             build_dir: None,
             binary_type: String::new(),
+            dkms_name: String::new(),
+            dkms_version: String::new(),
+            dkms_source_dir: String::new(),
+            dkms_install_dir: String::new(),
+            dkms_make_args: Vec::new(),
+            dkms_pre_build: Vec::new(),
+            dkms_autoinstall: default_dkms_autoinstall(),
+            dkms_modules: Vec::new(),
             lib32_variant: false,
             host_build_dir: None,
         }
@@ -955,6 +1030,10 @@ fn default_cc() -> String {
 }
 
 fn default_use_lto() -> bool {
+    true
+}
+
+fn default_dkms_autoinstall() -> bool {
     true
 }
 

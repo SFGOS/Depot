@@ -4,6 +4,7 @@ mod autotools;
 mod bin;
 mod cmake;
 mod custom;
+mod dkms;
 mod makefile;
 mod meson;
 mod perl;
@@ -487,6 +488,13 @@ pub(crate) fn development_package_option() -> &'static str {
 
 pub(crate) fn requested_development_package() -> Option<String> {
     crate::build_options::requested_development_package()
+}
+
+pub(crate) fn stage_generated_lifecycle_scripts(spec: &PackageSpec, destdir: &Path) -> Result<()> {
+    match spec.build.build_type {
+        BuildType::Dkms => dkms::stage_lifecycle_scripts(spec, destdir),
+        _ => Ok(()),
+    }
 }
 
 fn configured_install_dir(value: &str, default: &str) -> String {
@@ -1093,6 +1101,14 @@ pub fn build(
             host_build_dir,
         ),
         BuildType::Rust => rust::build(
+            spec,
+            src_dir,
+            destdir,
+            cross,
+            export_compiler_flags,
+            host_build_dir,
+        ),
+        BuildType::Dkms => dkms::build(
             spec,
             src_dir,
             destdir,

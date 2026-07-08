@@ -365,6 +365,7 @@ pub(super) fn run_build(args: BuildArgs, cli_test_deps: bool) -> Result<()> {
         if !lib32_only {
             staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
             install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
+            builder::stage_generated_lifecycle_scripts(&pkg_spec, &destdir)?;
             staging::process(&destdir, &pkg_spec)?;
             staging::stage_split_package_licenses(&src_dir, &destdir, &pkg_spec)?;
             if let Some(watcher) = interrupt_watcher.as_ref() {

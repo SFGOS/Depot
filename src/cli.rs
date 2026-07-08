@@ -384,6 +384,22 @@ pub enum InternalCommands {
         #[arg(value_name = "ARG", num_args = 0.., allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    #[command(hide = true)]
+    DkmsAutoinstall {
+        #[arg(long, default_value = "/")]
+        rootfs: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+    },
+    #[command(hide = true)]
+    DkmsRemove {
+        #[arg(long, default_value = "/")]
+        rootfs: PathBuf,
+        #[arg(long)]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
