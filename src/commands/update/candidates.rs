@@ -747,29 +747,6 @@ pub(crate) fn collect_missing_update_dependencies(
     Ok(missing)
 }
 
-fn run_update_install_command(
-    program: &Path,
-    request: &Path,
-    options: UpdateCommandOptions<'_>,
-) -> Result<()> {
-    super::super::run_install_command_with_program(
-        program,
-        &[request.to_path_buf()],
-        options.rootfs,
-        super::super::ChildInstallCommandOptions {
-            no_deps: true,
-            assume_yes: true,
-            no_flags: options.no_flags,
-            cross_prefix: options.cross_prefix,
-            clean: options.clean,
-            lib32_only: false,
-            install_test_deps: options.install_test_deps,
-            install_context: Some(super::super::INSTALL_CONTEXT_UPDATE),
-            dep_chain: None,
-        },
-    )
-}
-
 fn confirm_update_replacements(candidates: &[UpdateCandidate]) -> Result<()> {
     for candidate in candidates {
         if !candidate.replaces_installed {
@@ -865,13 +842,16 @@ pub(crate) fn run_update_command(
         confirm_update_replacements(&updates)?;
     }
 
-    super::super::resolve_installed_conflicts_for_subjects(
-        &conflict_subjects,
-        options.rootfs,
-        config,
-        options.dry_run,
-    )?;
+    if options.dry_run {
+        super::super::resolve_installed_conflicts_for_subjects(
+            &conflict_subjects,
+            options.rootfs,
+            config,
+            true,
+        )?;
+    }
 
+    let mut transaction_requests = Vec::new();
     if !missing_deps.is_empty() {
         let dep_plan = planner::build_dependency_install_plan(
             config,
@@ -892,29 +872,19 @@ pub(crate) fn run_update_command(
             return Ok(());
         }
 
-        crate::commands::execute_install_plan_with_child_commands(
+        transaction_requests.extend(super::super::install_requests_for_plan(
             &dep_plan,
-            options.rootfs,
             config,
-            crate::commands::InstallPlanExecutionOptions {
-                no_flags: options.no_flags,
-                cross_prefix: options.cross_prefix,
-                clean: options.clean,
-                dry_run: false,
-                confirm_installation: false,
-                lib32_only_requested_specs: false,
-                install_test_deps: options.install_test_deps,
-            },
-        )?;
+            options.rootfs,
+        )?);
     } else if options.dry_run {
         ui::info("Dry run enabled, stopping before update.");
         return Ok(());
     }
 
-    let exe = std::env::current_exe().context("Failed to locate depot executable")?;
     for (idx, candidate) in updates.iter().enumerate() {
         ui::info(format!(
-            "[{}/{}] updating {} v{}-{} -> {} v{}-{}",
+            "[{}/{}] staging update {} v{}-{} -> {} v{}-{}",
             idx + 1,
             updates.len(),
             candidate.installed_package,
@@ -925,8 +895,22 @@ pub(crate) fn run_update_command(
             candidate.candidate_revision
         ));
         let request = candidate_request_path(candidate, config, options.rootfs)?;
-        run_update_install_command(&exe, &request, options)?;
+        transaction_requests.push(request);
     }
+    super::super::run_update_transaction_install_requests(
+        super::super::DirectInstallOptions {
+            rootfs: options.rootfs,
+            no_deps: true,
+            no_flags: options.no_flags,
+            cross_prefix: options.cross_prefix,
+            clean: options.clean,
+            dry_run: false,
+            lib32_only: false,
+            install_test_deps: options.install_test_deps,
+        },
+        config,
+        &transaction_requests,
+    )?;
 
     if options.clean {
         crate::commands::clean_build_workspace(config)?;

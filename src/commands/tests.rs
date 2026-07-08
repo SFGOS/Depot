@@ -41,6 +41,42 @@ fn lib32_args() -> Lib32Args {
     Lib32Args { lib32_only: false }
 }
 
+fn write_basic_binary_archive(
+    archive_path: &Path,
+    package_name: &str,
+    version: &str,
+    revision: u32,
+    payload_path: &str,
+    payload: &[u8],
+) -> Result<()> {
+    let file = fs::File::create(archive_path)
+        .with_context(|| format!("Failed to create {}", archive_path.display()))?;
+    let encoder =
+        zstd::stream::write::Encoder::new(file, 3).context("Failed to create zstd encoder")?;
+    let mut tar = tar::Builder::new(encoder);
+
+    let mut payload_header = tar::Header::new_gnu();
+    payload_header.set_path(payload_path)?;
+    payload_header.set_size(payload.len() as u64);
+    payload_header.set_mode(0o755);
+    payload_header.set_cksum();
+    tar.append(&payload_header, payload)?;
+
+    let metadata = format!(
+        "name = \"{package_name}\"\nversion = \"{version}\"\nrevision = {revision}\ndescription = \"test\"\nhomepage = \"https://example.test\"\nlicense = \"MIT\"\n[dependencies]\nruntime = []\noptional = []\n"
+    );
+    let mut meta_header = tar::Header::new_gnu();
+    meta_header.set_path(".metadata.toml")?;
+    meta_header.set_size(metadata.len() as u64);
+    meta_header.set_mode(0o644);
+    meta_header.set_cksum();
+    tar.append(&meta_header, metadata.as_bytes())?;
+
+    let encoder = tar.into_inner()?;
+    encoder.finish()?;
+    Ok(())
+}
+
 #[test]
 fn build_env_rootfs_uses_selected_non_live_rootfs() {
     let tmp = tempfile::tempdir().unwrap();
@@ -687,6 +723,95 @@ fn direct_archive_install_rejects_conflicting_archives_in_same_batch() -> Result
     assert!(
         err.to_string()
             .contains("Cannot install conflicting packages in the same transaction")
+    );
+    Ok(())
+}
+
+#[test]
+fn update_transaction_runs_matching_transaction_hook_once_for_batch() -> Result<()> {
+    let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+    let pkg_dir = tempfile::tempdir().context("Failed to create temp package dir")?;
+    let old_alpha = pkg_dir.path().join("alpha-1.0-1-x86_64.depot.pkg.tar.zst");
+    let old_beta = pkg_dir.path().join("beta-1.0-1-x86_64.depot.pkg.tar.zst");
+    let new_alpha = pkg_dir.path().join("alpha-2.0-1-x86_64.depot.pkg.tar.zst");
+    let new_beta = pkg_dir.path().join("beta-2.0-1-x86_64.depot.pkg.tar.zst");
+    write_basic_binary_archive(&old_alpha, "alpha", "1.0", 1, "usr/bin/alpha", b"alpha-old")?;
+    write_basic_binary_archive(&old_beta, "beta", "1.0", 1, "usr/bin/beta", b"beta-old")?;
+    write_basic_binary_archive(&new_alpha, "alpha", "2.0", 1, "usr/bin/alpha", b"alpha-new")?;
+    write_basic_binary_archive(&new_beta, "beta", "2.0", 1, "usr/bin/beta", b"beta-new")?;
+
+    let mut cfg = config::Config::for_rootfs(rootfs.path());
+    cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+    cfg.db_dir = rootfs.path().join("var/lib/depot");
+
+    run_direct_archive_install_requests(
+        DirectInstallOptions {
+            rootfs: rootfs.path(),
+            no_deps: true,
+            no_flags: false,
+            cross_prefix: None,
+            clean: false,
+            dry_run: false,
+            lib32_only: false,
+            install_test_deps: false,
+        },
+        &cfg,
+        &[old_alpha, old_beta],
+        false,
+    )?;
+
+    let hooks_dir = install::hooks::transaction_hooks_dir(rootfs.path());
+    fs::create_dir_all(&hooks_dir)?;
+    fs::write(
+        hooks_dir.join("90-update-batch.toml"),
+        r#"
+[hook]
+name = "update batch recorder"
+
+[when]
+phase = "post"
+operation = ["update"]
+paths = ["usr/bin/*"]
+
+[exec]
+command = "printf '%s:%s\n' \"$DEPOT_ACTION\" \"$DEPOT_PACKAGE\" >> \"$DEPOT_ROOTFS/hook-runs\"; cat >> \"$DEPOT_ROOTFS/hook-targets\""
+needs_paths = true
+"#,
+    )?;
+
+    let updated = run_update_transaction_install_requests(
+        DirectInstallOptions {
+            rootfs: rootfs.path(),
+            no_deps: true,
+            no_flags: false,
+            cross_prefix: None,
+            clean: false,
+            dry_run: false,
+            lib32_only: false,
+            install_test_deps: false,
+        },
+        &cfg,
+        &[new_alpha, new_beta],
+    )?;
+
+    assert!(updated);
+    assert_eq!(
+        fs::read_to_string(rootfs.path().join("usr/bin/alpha"))?,
+        "alpha-new"
+    );
+    assert_eq!(
+        fs::read_to_string(rootfs.path().join("usr/bin/beta"))?,
+        "beta-new"
+    );
+    let hook_runs = fs::read_to_string(rootfs.path().join("hook-runs"))?;
+    assert_eq!(hook_runs.lines().collect::<Vec<_>>(), vec!["update:alpha"]);
+    let hook_targets: BTreeSet<_> = fs::read_to_string(rootfs.path().join("hook-targets"))?
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        hook_targets,
+        BTreeSet::from(["usr/bin/alpha".to_string(), "usr/bin/beta".to_string()])
     );
     Ok(())
 }

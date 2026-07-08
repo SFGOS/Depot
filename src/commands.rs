@@ -735,6 +735,30 @@ struct PlannedPackageInstall {
     staged: PlannedStagedInstall,
 }
 
+#[derive(Debug, Clone)]
+struct PlannedInstalledRemoval {
+    package: String,
+    affected_paths: Vec<String>,
+}
+
+struct PreparedDirectInstallResources<'a> {
+    _staging_dir: Option<tempfile::TempDir>,
+    _source_cleanup_guard: SourceBuildCleanupGuard<'a>,
+}
+
+struct PreparedDirectInstall<'a> {
+    plans: Vec<PlannedPackageInstall>,
+    resources: PreparedDirectInstallResources<'a>,
+}
+
+struct DirectInstallPreparationOptions<'a> {
+    build_dir: &'a Path,
+    clean_sources_before_build: bool,
+    suppress_output: bool,
+    confirm_installation: bool,
+    resolve_installed_conflicts: bool,
+}
+
 #[derive(Clone, Copy)]
 struct PendingLifecycleHook {
     hook: install::scripts::Hook,
@@ -946,6 +970,26 @@ pub(crate) fn remove_installed_package_with_hooks(
             affected_paths: &affected_paths,
         },
     )?;
+    remove_installed_package_without_transaction_hooks(package, rootfs, config, &affected_paths)?;
+    install::hooks::run_transaction_hooks(
+        rootfs,
+        &install::hooks::HookExecutionContext {
+            phase: install::hooks::HookPhase::Post,
+            operation: install::hooks::HookOperation::Remove,
+            package,
+            affected_paths: &affected_paths,
+        },
+    )?;
+    Ok(())
+}
+
+fn remove_installed_package_without_transaction_hooks(
+    package: &str,
+    rootfs: &Path,
+    config: &config::Config,
+    _affected_paths: &[String],
+) -> Result<()> {
+    let db_path = config.installed_db_path(rootfs);
     let script_dir = install::scripts::installed_scripts_dir(rootfs, package);
     let _ = install::scripts::run_hook_if_present(
         &script_dir,
@@ -963,34 +1007,25 @@ pub(crate) fn remove_installed_package_with_hooks(
     let cleanup_scripts = install::scripts::remove_installed_scripts(rootfs, package);
     post_remove?;
     cleanup_scripts?;
-    install::hooks::run_transaction_hooks(
-        rootfs,
-        &install::hooks::HookExecutionContext {
-            phase: install::hooks::HookPhase::Post,
-            operation: install::hooks::HookOperation::Remove,
-            package,
-            affected_paths: &affected_paths,
-        },
-    )?;
     ui::success(format!("Successfully removed {}", package));
     Ok(())
 }
 
-fn resolve_installed_conflicts_for_subjects(
+fn prompt_installed_conflict_removals_for_subjects(
     subjects: &[InstallConflictSubject],
     rootfs: &Path,
     config: &config::Config,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     if subjects.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let db_path = config.installed_db_path(rootfs);
     let installed = collect_installed_conflict_packages(&db_path)?;
     let removals = collect_conflicting_installed_packages(subjects, &installed)?;
     if removals.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let prompt_entries: Vec<String> = removals
@@ -1009,16 +1044,27 @@ fn resolve_installed_conflicts_for_subjects(
             "Dry run: would remove conflicting installed package(s): {}",
             prompt_entries.join(", ")
         ));
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     if !ui::prompt_package_action("conflict removal", &prompt_entries, true)? {
         anyhow::bail!("Aborted");
     }
 
-    for package in removals.keys() {
+    Ok(removals.keys().cloned().collect())
+}
+
+fn resolve_installed_conflicts_for_subjects(
+    subjects: &[InstallConflictSubject],
+    rootfs: &Path,
+    config: &config::Config,
+    dry_run: bool,
+) -> Result<()> {
+    for package in
+        prompt_installed_conflict_removals_for_subjects(subjects, rootfs, config, dry_run)?
+    {
         ui::info(format!("Removing conflicting package: {}", package));
-        remove_installed_package_with_hooks(package, rootfs, config)?;
+        remove_installed_package_with_hooks(&package, rootfs, config)?;
     }
 
     Ok(())
@@ -1326,6 +1372,15 @@ fn install_planned_packages_to_rootfs(
     rootfs: &Path,
     config: &config::Config,
 ) -> Result<()> {
+    install_planned_packages_to_rootfs_with_pre_removed(plans, rootfs, config, &HashSet::new())
+}
+
+fn install_planned_packages_to_rootfs_with_pre_removed(
+    plans: &[PlannedPackageInstall],
+    rootfs: &Path,
+    config: &config::Config,
+    pre_removed_packages: &HashSet<String>,
+) -> Result<()> {
     let mut removed_replacements = HashSet::new();
     let mut pending_post_hooks = Vec::new();
     for (idx, plan) in plans.iter().enumerate() {
@@ -1338,6 +1393,9 @@ fn install_planned_packages_to_rootfs(
             plan.spec.package.revision
         ));
         for package in &plan.staged.replacement_removals {
+            if pre_removed_packages.contains(package) {
+                continue;
+            }
             if removed_replacements.insert(package.clone()) {
                 remove_installed_package_with_hooks(package, rootfs, config)?;
             }
@@ -2082,104 +2140,31 @@ impl Drop for SourceBuildCleanupGuard<'_> {
     }
 }
 
-fn run_direct_install_request(
+fn prepare_direct_install_request<'a>(
     options: DirectInstallOptions<'_>,
-    config: &config::Config,
-    mut spec_path: PathBuf,
-) -> Result<bool> {
-    let mut install_lock = locking::open_lock(config)?;
-    let install_lock_path = locking::lock_path(config);
-    let _install_lock_guard = locking::try_write(&mut install_lock, &install_lock_path, "install")?;
-
-    // Repo clone dir is available via `config.repo_clone_dir` and
-    // is passed explicitly to index builders below.
-
-    // If the provided path doesn't exist, treat it as a package name and
-    // try to locate a spec under configured repo dir or local packages/.
-    if !spec_path.exists() {
-        let name = spec_path.to_string_lossy().to_string();
-        ui::info(format!("Looking up package '{}' in local indexes...", name));
-        let pkg_index =
-            index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
-        if let Some(found) = pkg_index.find(&name) {
-            spec_path = found;
-        } else {
-            let host_arch = std::env::consts::ARCH;
-            let mut binary_repos: Vec<_> = config
-                .binary_repos
-                .iter()
-                .filter(|(_, repo)| repo.enabled && repo.supports_arch(host_arch))
-                .collect();
-            binary_repos.sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
-
-            for (repo_name, repo_cfg) in binary_repos {
-                match db::repo::find_binary_repo_package(
-                    repo_name,
-                    repo_cfg,
-                    options.rootfs,
-                    &config.package_cache_dir,
-                    &name,
-                ) {
-                    Ok(Some(rec)) => {
-                        let archive = db::repo::fetch_binary_package_archive(
-                            repo_name,
-                            repo_cfg,
-                            options.rootfs,
-                            &rec,
-                            &config.package_cache_dir,
-                        )?;
-                        ui::info(format!(
-                            "Resolved '{}' from binary repo '{}' as {}-{} (package {}) ({} bytes){} -> {}",
-                            name,
-                            repo_name,
-                            rec.version,
-                            rec.revision,
-                            rec.name,
-                            rec.size,
-                            rec.description
-                                .as_ref()
-                                .map(|d| format!(" [{}]", d))
-                                .unwrap_or_default(),
-                            archive.display()
-                        ));
-                        spec_path = archive;
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        crate::log_warn!("Binary repo '{}': {}", repo_name, e);
-                    }
-                }
-            }
-        }
-    }
-
-    let suppress_output = suppress_nested_install_output();
-    if !suppress_output {
-        ui::info(format!("Installing package from: {}", spec_path.display()));
-    }
-
+    config: &'a config::Config,
+    spec_path: &Path,
+    preparation: DirectInstallPreparationOptions<'_>,
+) -> Result<PreparedDirectInstall<'a>> {
     let (mut pkg_spec, staging_dir): (package::PackageSpec, Option<tempfile::TempDir>) =
         if spec_path.to_string_lossy().ends_with(".tar.zst") {
-            // Install from archive
-            let (spec, tmp_dir) = load_package_archive_into_staging(config, &spec_path)?;
+            let (spec, tmp_dir) = load_package_archive_into_staging(config, spec_path)?;
             (spec, Some(tmp_dir))
         } else {
-            // Install from spec (normal build)
-            let mut pkg_spec = package::PackageSpec::from_file(&spec_path)?;
+            let mut pkg_spec = package::PackageSpec::from_file(spec_path)?;
             pkg_spec.apply_config(config);
             pkg_spec.build.flags.rootfs = build_cmd::build_env_rootfs(options.rootfs);
             (pkg_spec, None)
         };
     let built_from_source = staging_dir.is_none();
-    let _source_cleanup_guard = SourceBuildCleanupGuard::new(config, built_from_source);
+    let source_cleanup_guard = SourceBuildCleanupGuard::new(config, built_from_source);
 
     if options.lib32_only && staging_dir.is_some() {
         anyhow::bail!("--lib32-only is only supported when installing from a package spec");
     }
     let lib32_only = effective_lib32_only(&pkg_spec, options.lib32_only);
 
-    if staging_dir.is_none() && !suppress_output {
+    if staging_dir.is_none() && !preparation.suppress_output {
         ui::info(format!(
             "Package: {} v{}-{}",
             pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
@@ -2204,30 +2189,37 @@ fn run_direct_install_request(
     if staging_dir.is_some() {
         conflict_subjects = install_conflict_subjects_for_spec(&pkg_spec, true, false);
     }
-    resolve_installed_conflicts_for_subjects(
-        &conflict_subjects,
-        options.rootfs,
-        config,
-        options.dry_run,
-    )?;
+    if preparation.resolve_installed_conflicts {
+        resolve_installed_conflicts_for_subjects(
+            &conflict_subjects,
+            options.rootfs,
+            config,
+            options.dry_run,
+        )?;
+    }
 
     if options.dry_run {
         ui::info("Dry run enabled, stopping before install/build work.");
-        return Ok(false);
+        return Ok(PreparedDirectInstall {
+            plans: Vec::new(),
+            resources: PreparedDirectInstallResources {
+                _staging_dir: staging_dir,
+                _source_cleanup_guard: source_cleanup_guard,
+            },
+        });
     }
 
     let install_targets = vec![format!(
         "{} v{}-{}",
         pkg_spec.package.name, pkg_spec.package.version, pkg_spec.package.revision
     )];
-    if !suppress_output && !ui::prompt_package_action("installation", &install_targets, true)? {
+    if preparation.confirm_installation
+        && !preparation.suppress_output
+        && !ui::prompt_package_action("installation", &install_targets, true)?
+    {
         anyhow::bail!("Aborted");
     }
 
-    let _snapper_pre_install_snapshot_todo: fn() -> ! =
-        || todo!("snapper: create pre-install snapshot before install work starts");
-
-    // Ensure database directory exists
     std::fs::create_dir_all(&config.db_dir).with_context(|| {
         format!(
             "Failed to create database directory: {}",
@@ -2257,14 +2249,12 @@ fn run_direct_install_request(
         }
     }
 
-    // Check dependencies and prompt for auto-install if needed
     if !options.no_deps {
         let missing_required = merge_missing_dependencies(
             deps::check_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?,
             deps::check_runtime_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?,
         );
         if !missing_required.is_empty() {
-            // Check for dependency cycles via DEPOT_DEPCHAIN env var
             let dep_chain = std::env::var("DEPOT_DEPCHAIN").unwrap_or_default();
             let chain_set: std::collections::HashSet<&str> =
                 dep_chain.split(',').filter(|s| !s.is_empty()).collect();
@@ -2302,11 +2292,9 @@ fn run_direct_install_request(
                 dep_plan_packages
             };
             if ui::prompt_package_action("dependency installation", &dep_prompt_packages, true)? {
-                // Build package index for fast lookups
                 let pkg_index =
                     index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
 
-                // Build new dep chain
                 let new_chain = if dep_chain.is_empty() {
                     pkg_spec.package.name.clone()
                 } else {
@@ -2315,7 +2303,6 @@ fn run_direct_install_request(
 
                 let mut dep_spec_paths = Vec::new();
                 for dep in missing_required {
-                    // Use package index for O(1) lookup
                     let candidate = pkg_index.find(&dep);
 
                     if let Some(dep_spec_path) = candidate {
@@ -2348,7 +2335,6 @@ fn run_direct_install_request(
             }
         }
 
-        // Enforce required dependencies before building/installing.
         deps::require_build_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
         deps::require_runtime_deps_for_outputs(&pkg_spec, &db_path, requested_outputs)?;
         if should_install_test_deps(&pkg_spec, options.install_test_deps, requested_outputs) {
@@ -2466,10 +2452,11 @@ fn run_direct_install_request(
     let destdir = if let Some(dir) = &staging_dir {
         dir.path().to_path_buf()
     } else {
-        // 1-2. Fetch + extract sources (supports archives and git URL#rev)
-        clean_build_source_dirs(config)?;
+        if preparation.clean_sources_before_build {
+            clean_build_source_dirs(config)?;
+        }
         source::preflight_manual_sources(&pkg_spec, &config.cache_dir)?;
-        let src_dir = source::prepare(&pkg_spec, &config.cache_dir, &config.build_dir)?;
+        let src_dir = source::prepare(&pkg_spec, &config.cache_dir, preparation.build_dir)?;
         built_src_dir = Some(src_dir.clone());
         let host_build_dir = builder::ensure_host_build(
             &pkg_spec,
@@ -2482,11 +2469,14 @@ fn run_direct_install_request(
             pkg_spec.build.flags.host_build_dir = Some(host_dir.to_string_lossy().into_owned());
         }
 
-        // 3. Build
-        let destdir = config
+        let destdir = preparation
             .build_dir
             .join("destdir")
             .join(&pkg_spec.package.name);
+        if destdir.exists() {
+            fs::remove_dir_all(&destdir)
+                .with_context(|| format!("Failed to clean destdir: {}", destdir.display()))?;
+        }
 
         if !lib32_only {
             builder::build(
@@ -2498,7 +2488,6 @@ fn run_direct_install_request(
                 host_build_dir.as_deref(),
             )?;
 
-            // 3.1 Copy license files into staged tree
             staging::add_licenses(&src_dir, &destdir, &pkg_spec.package.name)?;
             install::scripts::stage_scripts_from_spec_dir(&pkg_spec, &destdir)?;
             builder::stage_generated_lifecycle_scripts(&pkg_spec, &destdir)?;
@@ -2511,16 +2500,12 @@ fn run_direct_install_request(
 
     if !lib32_only {
         if staging_dir.is_none() {
-            // Source-build path: apply staging transforms (strip/compress/static cleanup).
             staging::process(&destdir, &pkg_spec)?;
             if let Some(src_dir) = built_src_dir.as_deref() {
                 staging::stage_split_package_licenses(src_dir, &destdir, &pkg_spec)?;
             }
-        } else {
-            // Binary archive path: install as-packaged without post-build transformations.
-            if !suppress_output {
-                ui::info("Installing binary archive payload");
-            }
+        } else if !preparation.suppress_output {
+            ui::info("Installing binary archive payload");
         }
 
         let output_plans =
@@ -2546,20 +2531,334 @@ fn run_direct_install_request(
         });
     }
 
-    run_transaction_hooks_for_plans(
-        options.rootfs,
-        install::hooks::HookPhase::Pre,
-        &transaction_plans,
+    Ok(PreparedDirectInstall {
+        plans: transaction_plans,
+        resources: PreparedDirectInstallResources {
+            _staging_dir: staging_dir,
+            _source_cleanup_guard: source_cleanup_guard,
+        },
+    })
+}
+
+fn install_direct_transaction(
+    plans: &[PlannedPackageInstall],
+    rootfs: &Path,
+    config: &config::Config,
+) -> Result<()> {
+    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Pre, plans)?;
+    install_planned_packages_to_rootfs(plans, rootfs, config)?;
+    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Post, plans)?;
+    Ok(())
+}
+
+fn install_requests_for_plan(
+    plan: &planner::ExecutionPlan,
+    config: &config::Config,
+    rootfs: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut requests = Vec::new();
+    for step in plan.actionable_steps() {
+        match &step.origin {
+            planner::PlanOrigin::Source { path, .. } => {
+                requests.push(path.clone());
+            }
+            planner::PlanOrigin::Binary { repo_name, record } => {
+                let repo_cfg = config
+                    .binary_repos
+                    .get(repo_name)
+                    .with_context(|| format!("Binary repo '{}' not found in config", repo_name))?;
+                let archive = db::repo::fetch_binary_package_archive(
+                    repo_name,
+                    repo_cfg,
+                    rootfs,
+                    record,
+                    &config.package_cache_dir,
+                )
+                .with_context(|| {
+                    format!(
+                        "Failed to fetch binary package '{}' from repo '{}'",
+                        record.filename, repo_name
+                    )
+                })?;
+                requests.push(archive);
+            }
+            planner::PlanOrigin::Installed => {}
+        }
+    }
+    Ok(requests)
+}
+
+fn planned_installed_removals(
+    rootfs: &Path,
+    config: &config::Config,
+    packages: impl IntoIterator<Item = String>,
+) -> Result<Vec<PlannedInstalledRemoval>> {
+    let db_path = config.installed_db_path(rootfs);
+    let installed = db::get_installed_packages(&db_path)?;
+    let mut unique = BTreeSet::new();
+    for package in packages {
+        if installed.contains(&package) {
+            unique.insert(package);
+        }
+    }
+
+    unique
+        .into_iter()
+        .map(|package| {
+            let affected_paths = db::get_package_files(&db_path, &package)?;
+            Ok(PlannedInstalledRemoval {
+                package,
+                affected_paths,
+            })
+        })
+        .collect()
+}
+
+fn transaction_contexts_for_update(
+    removals: &[PlannedInstalledRemoval],
+    plans: &[PlannedPackageInstall],
+) -> Vec<install::hooks::HookExecutionContextOwned> {
+    let mut contexts = Vec::with_capacity(removals.len() + plans.len());
+    contexts.extend(
+        removals
+            .iter()
+            .map(|removal| install::hooks::HookExecutionContextOwned {
+                operation: install::hooks::HookOperation::Remove,
+                package: removal.package.clone(),
+                affected_paths: removal.affected_paths.clone(),
+            }),
+    );
+    contexts.extend(plans.iter().map(|plan| plan.staged.hook_context.clone()));
+    contexts
+}
+
+fn install_update_transaction(
+    plans: &[PlannedPackageInstall],
+    removals: &[PlannedInstalledRemoval],
+    rootfs: &Path,
+    config: &config::Config,
+) -> Result<()> {
+    let contexts = transaction_contexts_for_update(removals, plans);
+    install::hooks::run_transaction_hooks_batch(rootfs, install::hooks::HookPhase::Pre, &contexts)?;
+
+    for removal in removals {
+        ui::info(format!(
+            "Removing package for update transaction: {}",
+            removal.package
+        ));
+        remove_installed_package_without_transaction_hooks(
+            &removal.package,
+            rootfs,
+            config,
+            &removal.affected_paths,
+        )?;
+    }
+
+    let pre_removed_packages: HashSet<String> = removals
+        .iter()
+        .map(|removal| removal.package.clone())
+        .collect();
+    install_planned_packages_to_rootfs_with_pre_removed(
+        plans,
+        rootfs,
+        config,
+        &pre_removed_packages,
     )?;
+    install::hooks::run_transaction_hooks_batch(
+        rootfs,
+        install::hooks::HookPhase::Post,
+        &contexts,
+    )?;
+    Ok(())
+}
+
+fn run_direct_install_request(
+    options: DirectInstallOptions<'_>,
+    config: &config::Config,
+    mut spec_path: PathBuf,
+) -> Result<bool> {
+    let mut install_lock = locking::open_lock(config)?;
+    let install_lock_path = locking::lock_path(config);
+    let _install_lock_guard = locking::try_write(&mut install_lock, &install_lock_path, "install")?;
+
+    // Repo clone dir is available via `config.repo_clone_dir` and
+    // is passed explicitly to index builders below.
+
+    // If the provided path doesn't exist, treat it as a package name and
+    // try to locate a spec under configured repo dir or local packages/.
+    if !spec_path.exists() {
+        let name = spec_path.to_string_lossy().to_string();
+        ui::info(format!("Looking up package '{}' in local indexes...", name));
+        let pkg_index =
+            index::PackageIndex::build_with_repo_dir(Some(config.repo_clone_dir.clone()));
+        if let Some(found) = pkg_index.find(&name) {
+            spec_path = found;
+        } else {
+            let host_arch = std::env::consts::ARCH;
+            let mut binary_repos: Vec<_> = config
+                .binary_repos
+                .iter()
+                .filter(|(_, repo)| repo.enabled && repo.supports_arch(host_arch))
+                .collect();
+            binary_repos.sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
+
+            for (repo_name, repo_cfg) in binary_repos {
+                match db::repo::find_binary_repo_package(
+                    repo_name,
+                    repo_cfg,
+                    options.rootfs,
+                    &config.package_cache_dir,
+                    &name,
+                ) {
+                    Ok(Some(rec)) => {
+                        let archive = db::repo::fetch_binary_package_archive(
+                            repo_name,
+                            repo_cfg,
+                            options.rootfs,
+                            &rec,
+                            &config.package_cache_dir,
+                        )?;
+                        ui::info(format!(
+                            "Resolved '{}' from binary repo '{}' as {}-{} (package {}) ({} bytes){} -> {}",
+                            name,
+                            repo_name,
+                            rec.version,
+                            rec.revision,
+                            rec.name,
+                            rec.size,
+                            rec.description
+                                .as_ref()
+                                .map(|d| format!(" [{}]", d))
+                                .unwrap_or_default(),
+                            archive.display()
+                        ));
+                        spec_path = archive;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        crate::log_warn!("Binary repo '{}': {}", repo_name, e);
+                    }
+                }
+            }
+        }
+    }
+
+    let suppress_output = suppress_nested_install_output();
+    if !suppress_output {
+        ui::info(format!("Installing package from: {}", spec_path.display()));
+    }
+
+    let _snapper_pre_install_snapshot_todo: fn() -> ! =
+        || todo!("snapper: create pre-install snapshot before install work starts");
     let _snapper_post_install_snapshot_todo: fn() -> ! =
         || todo!("snapper: create post-install snapshot after install commit succeeds");
-    install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
-    run_transaction_hooks_for_plans(
-        options.rootfs,
-        install::hooks::HookPhase::Post,
-        &transaction_plans,
-    )?;
 
+    let prepared = prepare_direct_install_request(
+        options,
+        config,
+        &spec_path,
+        DirectInstallPreparationOptions {
+            build_dir: &config.build_dir,
+            clean_sources_before_build: true,
+            suppress_output,
+            confirm_installation: true,
+            resolve_installed_conflicts: true,
+        },
+    )?;
+    if options.dry_run {
+        return Ok(false);
+    }
+    let _resources = prepared.resources;
+    install_direct_transaction(&prepared.plans, options.rootfs, config)?;
+
+    Ok(true)
+}
+
+fn isolated_update_build_dir(config: &config::Config, idx: usize) -> PathBuf {
+    config
+        .build_dir
+        .join("update-tx")
+        .join(format!("{:04}", idx + 1))
+}
+
+fn run_update_transaction_install_requests(
+    options: DirectInstallOptions<'_>,
+    config: &config::Config,
+    requests: &[PathBuf],
+) -> Result<bool> {
+    if requests.is_empty() {
+        return Ok(false);
+    }
+
+    let mut install_lock = locking::open_lock(config)?;
+    let install_lock_path = locking::lock_path(config);
+    let _install_lock_guard = locking::try_write(&mut install_lock, &install_lock_path, "update")?;
+
+    let suppress_output = suppress_nested_install_output();
+    if requests
+        .iter()
+        .any(|request| !is_archive_install_request(request))
+    {
+        clean_build_source_dirs(config)?;
+    }
+
+    let mut transaction_plans = Vec::new();
+    let mut resources = Vec::with_capacity(requests.len());
+    for (idx, request) in requests.iter().enumerate() {
+        if !suppress_output {
+            ui::info(format!(
+                "[{}/{}] preparing update payload from {}",
+                idx + 1,
+                requests.len(),
+                request.display()
+            ));
+        }
+        let build_dir = isolated_update_build_dir(config, idx);
+        let prepared = prepare_direct_install_request(
+            options,
+            config,
+            request,
+            DirectInstallPreparationOptions {
+                build_dir: &build_dir,
+                clean_sources_before_build: false,
+                suppress_output,
+                confirm_installation: false,
+                resolve_installed_conflicts: false,
+            },
+        )
+        .with_context(|| {
+            format!(
+                "Failed to prepare update payload from {}",
+                request.display()
+            )
+        })?;
+        transaction_plans.extend(prepared.plans);
+        resources.push(prepared.resources);
+    }
+
+    if options.dry_run {
+        return Ok(false);
+    }
+
+    let conflict_subjects: Vec<_> = transaction_plans
+        .iter()
+        .flat_map(|plan| install_conflict_subjects_for_output_spec(&plan.spec))
+        .collect();
+    validate_no_transaction_conflicts(&conflict_subjects)?;
+    let mut removal_packages = prompt_installed_conflict_removals_for_subjects(
+        &conflict_subjects,
+        options.rootfs,
+        config,
+        false,
+    )?;
+    for plan in &transaction_plans {
+        removal_packages.extend(plan.staged.replacement_removals.iter().cloned());
+    }
+    let removals = planned_installed_removals(options.rootfs, config, removal_packages)?;
+
+    install_update_transaction(&transaction_plans, &removals, options.rootfs, config)?;
+    drop(resources);
     Ok(true)
 }
 
