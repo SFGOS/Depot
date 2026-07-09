@@ -20,25 +20,25 @@ subdirs = ["core", "extra"]
 # Example:
 # branch = "main"
 
-[binary.core-x86_64-v3]
+[binary.core-x86-64-v3]
 # Binary repository for core packages.
-url = "https://repo.sfg545.dev/core-x86_64-v3"
+url = "https://repo.sfg545.dev/core-x86-64-v3"
 enabled = true
 priority = 10
 repo_db = "repo.db.zst"
 
-[binary.core-x86_64-v3.arch.x86_64]
+[binary.core-x86-64-v3.arch.x86_64]
 # Enable this repo for x86_64 systems.
 enabled = true
 
-[binary.extra-x86_64-v3]
+[binary.extra-x86-64-v3]
 # Secondary binary repository for additional packages.
-url = "https://repo.sfg545.dev/extra-x86_64-v3"
+url = "https://repo.sfg545.dev/extra-x86-64-v3"
 enabled = true
 priority = 20
 repo_db = "repo.db.zst"
 
-[binary.extra-x86_64-v3.arch.x86_64]
+[binary.extra-x86-64-v3.arch.x86_64]
 enabled = true
 
 # Additional examples:
