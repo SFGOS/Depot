@@ -6,7 +6,10 @@ use crate::cli::{
 use crate::test_support::TestEnv;
 use git2::{Oid, Repository};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{
+    Mutex, MutexGuard,
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+};
 
 static ASSUME_YES_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -87,6 +90,21 @@ fn build_env_rootfs_uses_selected_non_live_rootfs() {
         expected.to_string_lossy()
     );
     assert_eq!(build_cmd::build_env_rootfs(Path::new("/")), "/");
+}
+
+#[test]
+fn parallel_verification_processes_every_item() -> Result<()> {
+    let items = vec![0_u8; 32];
+    let completed = AtomicUsize::new(0);
+    let progress = ProgressBar::hidden();
+
+    run_parallel_verification(&items, &progress, |_| {
+        completed.fetch_add(1, AtomicOrdering::Relaxed);
+        Ok(())
+    })?;
+
+    assert_eq!(completed.load(AtomicOrdering::Relaxed), items.len());
+    Ok(())
 }
 
 #[test]
@@ -173,7 +191,6 @@ fn test_binary_repo_record(name: &str, filename: &str) -> db::repo::BinaryRepoPa
         completed_at: None,
         filename: filename.into(),
         size: 1,
-        sha256: "sha256".into(),
         sha512: "sha512".into(),
         description: None,
         homepage: None,
@@ -499,7 +516,6 @@ fn binary_install_path_uses_repo_record_metadata_without_archive_metadata() -> R
             .unwrap_or_default()
             .to_string(),
         size: payload.len() as u64,
-        sha256: String::new(),
         sha512: String::new(),
         description: Some("test package".into()),
         homepage: Some("https://example.test".into()),
@@ -887,7 +903,6 @@ fn binary_archive_install_preserves_setuid_permissions() -> Result<()> {
             .unwrap_or_default()
             .to_string(),
         size: payload.len() as u64,
-        sha256: String::new(),
         sha512: String::new(),
         description: Some("sudo".into()),
         homepage: Some("https://example.test".into()),
@@ -1431,7 +1446,6 @@ fn update_candidate_prefers_binary_when_versions_match_and_config_does() {
                 completed_at: None,
                 filename: "pkg-1.1.0-1-x86_64.depot.pkg.tar.zst".into(),
                 size: 1,
-                sha256: String::new(),
                 sha512: String::new(),
                 description: None,
                 homepage: None,
@@ -1758,6 +1772,34 @@ fn install_planned_packages_to_rootfs_runs_post_hooks_after_batch_install() -> R
     assert_eq!(
         db::get_package_version(&cfg.installed_db_path(rootfs.path()), "busybox")?,
         Some("1.0".into())
+    );
+    Ok(())
+}
+
+#[test]
+fn install_planned_packages_sets_sole_tool_provider_before_post_hooks() -> Result<()> {
+    let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+    let mut config = config::Config::for_rootfs(rootfs.path());
+    config.db_dir = rootfs.path().join("var/lib/depot");
+    config.build_dir = rootfs.path().join("var/cache/depot/build");
+
+    let mut dash_spec = test_package_spec(package::BuildType::Bin, None, &[]);
+    dash_spec.package.name = "dash".into();
+    let dash_dest = rootfs.path().join("dash-dest");
+    fs::create_dir_all(dash_dest.join("usr/bin"))?;
+    fs::create_dir_all(dash_dest.join("scripts"))?;
+    fs::write(dash_dest.join("usr/bin/dash"), "dash")?;
+    fs::write(
+        dash_dest.join("scripts/post_install"),
+        "[ -L \"$DEPOT_ROOTFS/usr/bin/sh\" ] && [ \"$(readlink \"$DEPOT_ROOTFS/usr/bin/sh\")\" = dash ]\n",
+    )?;
+
+    let plans = plan_package_outputs_for_install(&dash_spec, &dash_dest, rootfs.path(), &config)?;
+    install_planned_packages_to_rootfs(&plans, rootfs.path(), &config)?;
+
+    assert_eq!(
+        fs::read_link(rootfs.path().join("usr/bin/sh"))?,
+        PathBuf::from("dash")
     );
     Ok(())
 }

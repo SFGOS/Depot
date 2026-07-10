@@ -15,6 +15,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    mpsc,
+};
 use std::time::Duration;
 use url::Url;
 use walkdir::WalkDir;
@@ -1406,6 +1410,9 @@ fn install_planned_packages_to_rootfs_with_pre_removed(
             pending_post_hooks.push((plan.spec.package.name.clone(), hook));
         }
     }
+    // Lifecycle hooks may invoke sh, cc, or ld. Select a sole provider before
+    // any post-install hook runs so the aliases are usable within this transaction.
+    set::auto_select_sole_tool_providers(rootfs, config)?;
     for (pkg_name, pending_hook) in pending_post_hooks {
         let installed_scripts_dir = install::scripts::installed_scripts_dir(rootfs, &pkg_name);
         let _ = install::scripts::run_hook_if_present_or_defer(
@@ -1417,6 +1424,58 @@ fn install_planned_packages_to_rootfs_with_pre_removed(
     }
     install::scripts::run_deferred_hooks_if_possible(rootfs)?;
     Ok(())
+}
+
+fn run_parallel_verification<T, F>(items: &[T], progress: &ProgressBar, verify: F) -> Result<()>
+where
+    T: Sync,
+    F: Fn(&T) -> Result<()> + Sync,
+{
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(items.len());
+    let next_index = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
+
+    std::thread::scope(|scope| -> Result<()> {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let verify = &verify;
+            let next_index = &next_index;
+            scope.spawn(move || {
+                loop {
+                    let index = next_index.fetch_add(1, AtomicOrdering::Relaxed);
+                    if index >= items.len() {
+                        break;
+                    }
+                    let result = verify(&items[index]);
+                    if sender.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        let mut results: Vec<Option<Result<()>>> = (0..items.len()).map(|_| None).collect();
+        for _ in 0..items.len() {
+            let (index, result) = receiver
+                .recv()
+                .context("Verification worker exited before reporting a result")?;
+            results[index] = Some(result);
+            progress.inc(1);
+        }
+
+        for result in results {
+            result.expect("every verification item must report a result")?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1801,7 +1860,7 @@ fn execute_install_plan_with_child_commands(
                 .progress_chars("#>-"),
         );
         checksum_pb.set_prefix("checksums");
-        for item in &binary_phase_items {
+        run_parallel_verification(&binary_phase_items, &checksum_pb, |item| {
             let cached = binary_archives
                 .get(&(item.repo_name.clone(), item.record.filename.clone()))
                 .with_context(|| {
@@ -1812,13 +1871,12 @@ fn execute_install_plan_with_child_commands(
                 })?;
             db::repo::verify_binary_package_archive_checksums(&cached.package_path, &item.record)
                 .with_context(|| {
-                format!(
-                    "Checksum verification failed for {} from repo '{}'",
-                    item.record.filename, item.repo_name
-                )
-            })?;
-            checksum_pb.inc(1);
-        }
+                    format!(
+                        "Checksum verification failed for {} from repo '{}'",
+                        item.record.filename, item.repo_name
+                    )
+                })
+        })?;
         checksum_pb.finish_and_clear();
 
         ui::info(format!(
@@ -1838,7 +1896,7 @@ fn execute_install_plan_with_child_commands(
                 .progress_chars("#>-"),
         );
         signature_pb.set_prefix("signatures");
-        for item in &binary_phase_items {
+        run_parallel_verification(&binary_phase_items, &signature_pb, |item| {
             let repo_cfg = config
                 .binary_repos
                 .get(&item.repo_name)
@@ -1863,9 +1921,8 @@ fn execute_install_plan_with_child_commands(
                     "Detached signature verification failed for {} from repo '{}'",
                     item.record.filename, item.repo_name
                 )
-            })?;
-            signature_pb.inc(1);
-        }
+            })
+        })?;
         signature_pb.finish_and_clear();
     }
 

@@ -210,6 +210,8 @@ fn build_for_kernel(
         cmd.arg("-C")
             .arg(&kernel.build_dir)
             .arg(format!("M={}", build_dir.display()))
+            .arg("-j")
+            .arg(num_cpus().to_string())
             .arg("modules")
             .args(&manifest.make_args);
         crate::builder::prepare_tool_command(&mut cmd, &Vec::new());
@@ -229,6 +231,12 @@ fn build_for_kernel(
         }
     }
     Ok(())
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
 }
 
 fn run_pre_build_commands(
@@ -543,5 +551,10 @@ mod tests {
     fn safe_rel_path_rejects_traversal() {
         assert!(safe_rel_path("../x").is_err());
         assert!(safe_rel_path("updates/depot").is_ok());
+    }
+
+    #[test]
+    fn num_cpus_is_at_least_one() {
+        assert!(num_cpus() >= 1);
     }
 }

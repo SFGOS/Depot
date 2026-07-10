@@ -1032,7 +1032,6 @@ mod tests {
                     completed_at: None,
                     filename: format!("{name}-1.0.0-1-x86_64.depot.pkg.tar.zst"),
                     size: 1024,
-                    sha256: "sha256".to_string(),
                     sha512: "sha512".to_string(),
                     description: None,
                     homepage: None,

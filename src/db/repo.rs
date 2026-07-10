@@ -146,7 +146,6 @@ pub struct BinaryRepoPackageRecord {
     pub completed_at: Option<i64>,
     pub filename: String,
     pub size: u64,
-    pub sha256: String,
     pub sha512: String,
     pub description: Option<String>,
     pub homepage: Option<String>,
@@ -1803,7 +1802,6 @@ fn find_cached_binary_repo_packages(
             {completed_at_expr},
             p.filename,
             p.size,
-            p.sha256,
             p.sha512,
             p.description,
             p.homepage,
@@ -1851,11 +1849,10 @@ fn find_cached_binary_repo_packages(
                 completed_at: row.get(7)?,
                 filename: row.get(8)?,
                 size: row.get::<_, i64>(9)? as u64,
-                sha256: row.get(10)?,
-                sha512: row.get(11)?,
-                description: row.get(12)?,
-                homepage: row.get(13)?,
-                license: row.get(14)?,
+                sha512: row.get(10)?,
+                description: row.get(11)?,
+                homepage: row.get(12)?,
+                license: row.get(13)?,
                 provides: Vec::new(),
                 conflicts: Vec::new(),
                 replaces: Vec::new(),
@@ -1935,7 +1932,6 @@ fn find_cached_binary_repo_packages_by_group(
             {completed_at_expr},
             p.filename,
             p.size,
-            p.sha256,
             p.sha512,
             p.description,
             p.homepage,
@@ -1965,11 +1961,10 @@ fn find_cached_binary_repo_packages_by_group(
                 completed_at: row.get(7)?,
                 filename: row.get(8)?,
                 size: row.get::<_, i64>(9)? as u64,
-                sha256: row.get(10)?,
-                sha512: row.get(11)?,
-                description: row.get(12)?,
-                homepage: row.get(13)?,
-                license: row.get(14)?,
+                sha512: row.get(10)?,
+                description: row.get(11)?,
+                homepage: row.get(12)?,
+                license: row.get(13)?,
                 provides: Vec::new(),
                 conflicts: Vec::new(),
                 replaces: Vec::new(),
@@ -2034,7 +2029,6 @@ fn list_cached_binary_repo_packages(
             {completed_at_expr},
             p.filename,
             p.size,
-            p.sha256,
             p.sha512,
             p.description,
             p.homepage,
@@ -2059,11 +2053,10 @@ fn list_cached_binary_repo_packages(
                 completed_at: row.get(7)?,
                 filename: row.get(8)?,
                 size: row.get::<_, i64>(9)? as u64,
-                sha256: row.get(10)?,
-                sha512: row.get(11)?,
-                description: row.get(12)?,
-                homepage: row.get(13)?,
-                license: row.get(14)?,
+                sha512: row.get(10)?,
+                description: row.get(11)?,
+                homepage: row.get(12)?,
+                license: row.get(13)?,
                 provides: Vec::new(),
                 conflicts: Vec::new(),
                 replaces: Vec::new(),
@@ -2202,59 +2195,34 @@ pub fn list_binary_repo_packages(
     list_cached_binary_repo_packages(repo_name, &db_path)
 }
 
-fn verify_hex_digest(path: &Path, algorithm: &str, expected_hex: &str) -> Result<bool> {
-    let expected = expected_hex.trim().to_ascii_lowercase();
-    if expected.is_empty() {
-        return Ok(false);
-    }
-
-    let mut file =
-        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
-    let mut buf = [0u8; 64 * 1024];
-
-    let actual = match algorithm {
-        "sha256" => {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
-            crate::hex::encode_lower(h.finalize())
-        }
-        "sha512" => {
-            use sha2::{Digest, Sha512};
-            let mut h = Sha512::new();
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
-            crate::hex::encode_lower(h.finalize())
-        }
-        _ => anyhow::bail!("Unsupported checksum algorithm: {}", algorithm),
-    };
-
-    Ok(actual == expected)
-}
-
 fn verify_binary_package_record_checksums(
     path: &Path,
     rec: &BinaryRepoPackageRecord,
 ) -> Result<()> {
-    if !verify_hex_digest(path, "sha256", &rec.sha256)? {
+    use sha2::{Digest, Sha512};
+
+    let expected = rec.sha512.trim().to_ascii_lowercase();
+    if expected.is_empty() {
         anyhow::bail!(
-            "SHA-256 mismatch for {} from repo '{}'",
+            "Missing SHA-512 checksum for {} from repo '{}'",
             path.display(),
             rec.repo_name
         );
     }
-    if !verify_hex_digest(path, "sha512", &rec.sha512)? {
+
+    let mut file =
+        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut hasher = Sha512::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+
+    if crate::hex::encode_lower(hasher.finalize()) != expected {
         anyhow::bail!(
             "SHA-512 mismatch for {} from repo '{}'",
             path.display(),
@@ -3107,17 +3075,12 @@ revision = 1
 
     #[test]
     fn test_verify_binary_package_record_checksums_accepts_valid_hashes() {
-        use sha2::{Digest, Sha256, Sha512};
+        use sha2::{Digest, Sha512};
 
         let tmp = tempfile::tempdir().unwrap();
         let pkg = tmp.path().join("pkg.depot.pkg.tar.zst");
         fs::write(&pkg, b"payload").unwrap();
 
-        let sha256 = {
-            let mut h = Sha256::new();
-            h.update(b"payload");
-            crate::hex::encode_lower(h.finalize())
-        };
         let sha512 = {
             let mut h = Sha512::new();
             h.update(b"payload");
@@ -3135,7 +3098,6 @@ revision = 1
             completed_at: None,
             filename: "pkg.depot.pkg.tar.zst".into(),
             size: 7,
-            sha256,
             sha512,
             description: None,
             homepage: None,
@@ -3151,14 +3113,27 @@ revision = 1
         verify_binary_package_record_checksums(&pkg, &rec).unwrap();
     }
 
-    fn test_record_for_payload(filename: &str, payload: &[u8]) -> BinaryRepoPackageRecord {
-        use sha2::{Digest, Sha256, Sha512};
+    #[test]
+    fn test_verify_binary_package_record_checksums_requires_valid_sha512() {
+        use sha2::{Digest, Sha512};
 
-        let sha256 = {
-            let mut h = Sha256::new();
-            h.update(payload);
-            crate::hex::encode_lower(h.finalize())
-        };
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg.depot.pkg.tar.zst");
+        fs::write(&pkg, b"payload").unwrap();
+
+        let mut rec = test_record_for_payload("pkg.depot.pkg.tar.zst", b"payload");
+        verify_binary_package_record_checksums(&pkg, &rec).unwrap();
+
+        let mut wrong_sha512 = Sha512::new();
+        wrong_sha512.update(b"different payload");
+        rec.sha512 = crate::hex::encode_lower(wrong_sha512.finalize());
+        let err = verify_binary_package_record_checksums(&pkg, &rec).unwrap_err();
+        assert!(err.to_string().contains("SHA-512 mismatch"));
+    }
+
+    fn test_record_for_payload(filename: &str, payload: &[u8]) -> BinaryRepoPackageRecord {
+        use sha2::{Digest, Sha512};
+
         let sha512 = {
             let mut h = Sha512::new();
             h.update(payload);
@@ -3176,7 +3151,6 @@ revision = 1
             completed_at: None,
             filename: filename.to_string(),
             size: payload.len() as u64,
-            sha256,
             sha512,
             description: None,
             homepage: None,

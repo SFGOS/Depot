@@ -1,5 +1,6 @@
 use super::*;
 use crate::cli::ToolRoleArg;
+use std::collections::HashSet;
 use std::io::ErrorKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7,6 +8,48 @@ struct ToolAlias {
     alias: &'static str,
     target: &'static str,
 }
+
+struct AutomaticToolProvider {
+    implementation: &'static str,
+    package_names: &'static [&'static str],
+}
+
+const COMPILER_PROVIDERS: &[AutomaticToolProvider] = &[
+    AutomaticToolProvider {
+        implementation: "clang",
+        package_names: &["clang"],
+    },
+    AutomaticToolProvider {
+        implementation: "gcc",
+        package_names: &["gcc"],
+    },
+];
+
+const LINKER_PROVIDERS: &[AutomaticToolProvider] = &[
+    AutomaticToolProvider {
+        implementation: "lld",
+        package_names: &["lld", "llvm"],
+    },
+    AutomaticToolProvider {
+        implementation: "mold",
+        package_names: &["mold"],
+    },
+];
+
+const SHELL_PROVIDERS: &[AutomaticToolProvider] = &[
+    AutomaticToolProvider {
+        implementation: "bash",
+        package_names: &["bash"],
+    },
+    AutomaticToolProvider {
+        implementation: "dash",
+        package_names: &["dash"],
+    },
+    AutomaticToolProvider {
+        implementation: "zsh",
+        package_names: &["zsh"],
+    },
+];
 
 pub(super) fn run_set(args: SetArgs) -> Result<()> {
     let SetArgs {
@@ -45,6 +88,46 @@ pub(super) fn run_set(args: SetArgs) -> Result<()> {
         implementation,
         host_alias_dir.display()
     ));
+    Ok(())
+}
+
+/// Configure tool aliases automatically when exactly one supported provider is installed.
+pub(crate) fn auto_select_sole_tool_providers(
+    rootfs: &Path,
+    config: &config::Config,
+) -> Result<()> {
+    let installed = db::get_installed_packages(&config.installed_db_path(rootfs))?;
+    if installed.is_empty() {
+        return Ok(());
+    }
+
+    let alias_dir = dir_in_rootfs(rootfs, &configured_alias_dir(config));
+    for role in [
+        ToolRoleArg::Compiler,
+        ToolRoleArg::Linker,
+        ToolRoleArg::Shell,
+    ] {
+        let Some(provider) = sole_available_provider(role, &installed, &alias_dir)? else {
+            continue;
+        };
+        let aliases = aliases_for_selection(role, provider.implementation)?;
+        if let Err(err) = configure_tool_aliases(&alias_dir, &aliases) {
+            crate::log_warn!(
+                "Could not automatically set {} to {} in {}: {}",
+                role_name(role),
+                provider.implementation,
+                alias_dir.display(),
+                err
+            );
+            continue;
+        }
+        ui::info(format!(
+            "Automatically set {} to {} in {}",
+            role_name(role),
+            provider.implementation,
+            alias_dir.display()
+        ));
+    }
     Ok(())
 }
 
@@ -151,6 +234,43 @@ fn aliases_for_selection(role: ToolRoleArg, implementation: &str) -> Result<Vec<
         }
     };
     Ok(aliases)
+}
+
+fn sole_available_provider(
+    role: ToolRoleArg,
+    installed: &HashSet<String>,
+    alias_dir: &Path,
+) -> Result<Option<&'static AutomaticToolProvider>> {
+    let providers = match role {
+        ToolRoleArg::Compiler => COMPILER_PROVIDERS,
+        ToolRoleArg::Linker => LINKER_PROVIDERS,
+        ToolRoleArg::Shell => SHELL_PROVIDERS,
+    };
+
+    let available: Vec<_> = providers
+        .iter()
+        .filter(|provider| {
+            provider
+                .package_names
+                .iter()
+                .any(|name| installed.contains(*name))
+        })
+        .filter(|provider| {
+            aliases_for_selection(role, provider.implementation)
+                .map(|aliases| {
+                    aliases
+                        .iter()
+                        .all(|alias| alias_dir.join(alias.target).exists())
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if available.len() == 1 {
+        Ok(Some(available[0]))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(unix)]
@@ -427,5 +547,46 @@ mod tests {
                 .to_string()
                 .contains("Refusing to replace non-symlink")
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sole_available_provider_selects_dash_when_it_is_the_only_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool_dir = make_tool_dir(tmp.path());
+        fs::write(tool_dir.join("dash"), "").unwrap();
+        let installed = HashSet::from(["dash".to_string()]);
+
+        let provider = sole_available_provider(ToolRoleArg::Shell, &installed, &tool_dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.implementation, "dash");
+
+        configure_tool_aliases(
+            &tool_dir,
+            &aliases_for_selection(ToolRoleArg::Shell, provider.implementation).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_link(tool_dir.join("sh")).unwrap(),
+            PathBuf::from("dash")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sole_available_provider_leaves_ambiguous_compilers_unselected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool_dir = make_tool_dir(tmp.path());
+        for tool in ["clang", "clang++", "gcc", "g++"] {
+            fs::write(tool_dir.join(tool), "").unwrap();
+        }
+        let installed = HashSet::from(["clang".to_string(), "gcc".to_string()]);
+
+        assert!(
+            sole_available_provider(ToolRoleArg::Compiler, &installed, &tool_dir)
+                .unwrap()
+                .is_none()
+        );
     }
 }
