@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use git2::Direction;
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -22,6 +22,8 @@ use std::sync::{
 use std::time::Duration;
 use url::Url;
 use walkdir::WalkDir;
+
+const MAX_PARALLEL_DOWNLOADS: usize = 8;
 
 use build_cmd::support::{
     automatic_tests_disabled_for_outputs, build_lib32_companion_package, clean_build_source_dirs,
@@ -1426,26 +1428,24 @@ fn install_planned_packages_to_rootfs_with_pre_removed(
     Ok(())
 }
 
-fn run_parallel_verification<T, F>(items: &[T], progress: &ProgressBar, verify: F) -> Result<()>
+fn run_parallel_tasks<T, U, F>(items: &[T], worker_count: usize, task: F) -> Result<Vec<U>>
 where
     T: Sync,
-    F: Fn(&T) -> Result<()> + Sync,
+    U: Send,
+    F: Fn(usize, &T) -> Result<U> + Sync,
 {
     if items.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    let worker_count = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .min(items.len());
+    let worker_count = worker_count.max(1).min(items.len());
     let next_index = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::channel();
 
-    std::thread::scope(|scope| -> Result<()> {
+    std::thread::scope(|scope| -> Result<Vec<U>> {
         for _ in 0..worker_count {
             let sender = sender.clone();
-            let verify = &verify;
+            let task = &task;
             let next_index = &next_index;
             scope.spawn(move || {
                 loop {
@@ -1453,7 +1453,7 @@ where
                     if index >= items.len() {
                         break;
                     }
-                    let result = verify(&items[index]);
+                    let result = task(index, &items[index]);
                     if sender.send((index, result)).is_err() {
                         break;
                     }
@@ -1462,20 +1462,35 @@ where
         }
         drop(sender);
 
-        let mut results: Vec<Option<Result<()>>> = (0..items.len()).map(|_| None).collect();
+        let mut results: Vec<Option<Result<U>>> = (0..items.len()).map(|_| None).collect();
         for _ in 0..items.len() {
             let (index, result) = receiver
                 .recv()
-                .context("Verification worker exited before reporting a result")?;
+                .context("Parallel worker exited before reporting a result")?;
             results[index] = Some(result);
-            progress.inc(1);
         }
 
-        for result in results {
-            result.expect("every verification item must report a result")?;
-        }
-        Ok(())
+        results
+            .into_iter()
+            .map(|result| result.expect("every parallel item must report a result"))
+            .collect()
     })
+}
+
+fn run_parallel_verification<T, F>(items: &[T], progress: &ProgressBar, verify: F) -> Result<()>
+where
+    T: Sync,
+    F: Fn(&T) -> Result<()> + Sync,
+{
+    let worker_count = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    run_parallel_tasks(items, worker_count, |_, item| {
+        let result = verify(item);
+        progress.inc(1);
+        result
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1775,8 +1790,11 @@ fn execute_install_plan_with_child_commands(
     let mut binary_archives: HashMap<(String, String), db::repo::BinaryRepoCachedArchive> =
         HashMap::new();
     let mut binary_phase_items = Vec::new();
+    let mut seen_binary_archives = HashSet::new();
     for step in &actionable_steps {
-        if let planner::PlanOrigin::Binary { repo_name, record } = &step.origin {
+        if let planner::PlanOrigin::Binary { repo_name, record } = &step.origin
+            && seen_binary_archives.insert((repo_name.clone(), record.filename.clone()))
+        {
             binary_phase_items.push(BinaryPhaseItem {
                 repo_name: repo_name.clone(),
                 record: (**record).clone(),
@@ -1790,53 +1808,72 @@ fn execute_install_plan_with_child_commands(
             binary_phase_items.len()
         ));
         let use_tty_progress = std::io::stderr().is_terminal();
-        for item in &binary_phase_items {
-            let label = format!(
-                "{}-{}-{}",
-                item.record.name,
-                item.record.version,
-                binary_arch_from_filename(&item.record.filename)
-            );
-            let pb = ProgressBar::new(item.record.size.max(1));
-            pb.set_draw_target(if use_tty_progress {
-                ProgressDrawTarget::stderr()
-            } else {
-                ProgressDrawTarget::hidden()
-            });
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{prefix:.bold} [{bar:40.cyan/blue}] {eta}")
-                    .unwrap_or_else(|_| ProgressStyle::default_bar())
-                    .progress_chars("#>-"),
-            );
-            pb.set_prefix(label);
-
-            let repo_cfg = config
-                .binary_repos
-                .get(&item.repo_name)
-                .with_context(|| format!("Binary repo '{}' not found in config", item.repo_name))?;
-            let mut progress_cb = |downloaded: u64, total: Option<u64>| {
-                if let Some(t) = total
-                    && t > 0
-                {
-                    pb.set_length(t);
-                }
-                pb.set_position(downloaded);
-            };
-            let cached = db::repo::cache_binary_package_archive_with_progress(
-                &item.repo_name,
-                repo_cfg,
-                &item.record,
-                &config.package_cache_dir,
-                Some(&mut progress_cb),
-            )
-            .with_context(|| {
-                format!(
-                    "Failed to cache binary package '{}' from repo '{}'",
-                    item.record.filename, item.repo_name
-                )
-            })?;
-            pb.finish_and_clear();
+        let download_progress = MultiProgress::with_draw_target(if use_tty_progress {
+            ProgressDrawTarget::stderr()
+        } else {
+            ProgressDrawTarget::hidden()
+        });
+        let download_bars = binary_phase_items
+            .iter()
+            .map(|item| {
+                let label = format!(
+                    "{}-{}-{}",
+                    item.record.name,
+                    item.record.version,
+                    binary_arch_from_filename(&item.record.filename)
+                );
+                let pb = download_progress.add(ProgressBar::new(item.record.size.max(1)));
+                pb.set_style(
+                    ProgressStyle::default_bar()
+                        .template("{prefix:.bold} [{bar:40.cyan/blue}] {eta}")
+                        .unwrap_or_else(|_| ProgressStyle::default_bar())
+                        .progress_chars("#>-"),
+                );
+                pb.set_prefix(label);
+                pb
+            })
+            .collect::<Vec<_>>();
+        let download_client = db::repo::binary_package_http_client()?;
+        let download_results = run_parallel_tasks(
+            &binary_phase_items,
+            MAX_PARALLEL_DOWNLOADS,
+            |index, item| {
+                let pb = &download_bars[index];
+                let mut progress_cb = |downloaded: u64, total: Option<u64>| {
+                    if let Some(t) = total
+                        && t > 0
+                    {
+                        pb.set_length(t);
+                    }
+                    pb.set_position(downloaded);
+                };
+                let result = (|| {
+                    let repo_cfg = config.binary_repos.get(&item.repo_name).with_context(|| {
+                        format!("Binary repo '{}' not found in config", item.repo_name)
+                    })?;
+                    db::repo::cache_binary_package_archive_with_client_and_progress(
+                        &item.repo_name,
+                        repo_cfg,
+                        &item.record,
+                        &config.package_cache_dir,
+                        &download_client,
+                        Some(&mut progress_cb),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Failed to cache binary package '{}' from repo '{}'",
+                            item.record.filename, item.repo_name
+                        )
+                    })
+                })();
+                pb.finish_and_clear();
+                result
+            },
+        );
+        download_progress
+            .clear()
+            .context("Failed to clear binary download progress")?;
+        for (item, cached) in binary_phase_items.iter().zip(download_results?) {
             binary_archives.insert(
                 (item.repo_name.clone(), item.record.filename.clone()),
                 cached,
@@ -1844,59 +1881,34 @@ fn execute_install_plan_with_child_commands(
         }
 
         ui::info(format!(
-            "Verifying checksums for {} binary package(s)...",
+            "Verifying checksums and detached signatures for {} binary package(s)...",
             binary_phase_items.len()
         ));
-        let checksum_pb = ProgressBar::new(binary_phase_items.len() as u64);
-        checksum_pb.set_draw_target(if use_tty_progress {
+        let integrity_pb = ProgressBar::new(binary_phase_items.len() as u64);
+        integrity_pb.set_draw_target(if use_tty_progress {
             ProgressDrawTarget::stderr()
         } else {
             ProgressDrawTarget::hidden()
         });
-        checksum_pb.set_style(
+        integrity_pb.set_style(
             ProgressStyle::default_bar()
                 .template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {eta}")
                 .unwrap_or_else(|_| ProgressStyle::default_bar())
                 .progress_chars("#>-"),
         );
-        checksum_pb.set_prefix("checksums");
-        run_parallel_verification(&binary_phase_items, &checksum_pb, |item| {
-            let cached = binary_archives
+        integrity_pb.set_prefix("integrity");
+        let has_detached_signatures = binary_phase_items.iter().any(|item| {
+            binary_archives
                 .get(&(item.repo_name.clone(), item.record.filename.clone()))
-                .with_context(|| {
-                    format!(
-                        "Cached archive missing for {} from repo '{}'",
-                        item.record.filename, item.repo_name
-                    )
-                })?;
-            db::repo::verify_binary_package_archive_checksums(&cached.package_path, &item.record)
-                .with_context(|| {
-                    format!(
-                        "Checksum verification failed for {} from repo '{}'",
-                        item.record.filename, item.repo_name
-                    )
-                })
-        })?;
-        checksum_pb.finish_and_clear();
-
-        ui::info(format!(
-            "Verifying detached signatures for {} binary package(s)...",
-            binary_phase_items.len()
-        ));
-        let signature_pb = ProgressBar::new(binary_phase_items.len() as u64);
-        signature_pb.set_draw_target(if use_tty_progress {
-            ProgressDrawTarget::stderr()
-        } else {
-            ProgressDrawTarget::hidden()
+                .is_some_and(|cached| cached.signature_path.exists())
         });
-        signature_pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{prefix:.bold} [{bar:40.cyan/blue}] {pos}/{len} {eta}")
-                .unwrap_or_else(|_| ProgressStyle::default_bar())
-                .progress_chars("#>-"),
-        );
-        signature_pb.set_prefix("signatures");
-        run_parallel_verification(&binary_phase_items, &signature_pb, |item| {
+        let trusted_keys = if has_detached_signatures {
+            signing::load_trusted_public_keys(rootfs)
+                .context("Failed to load trusted Minisign public keys")?
+        } else {
+            Vec::new()
+        };
+        run_parallel_verification(&binary_phase_items, &integrity_pb, |item| {
             let repo_cfg = config
                 .binary_repos
                 .get(&item.repo_name)
@@ -1909,21 +1921,22 @@ fn execute_install_plan_with_child_commands(
                         item.record.filename, item.repo_name
                     )
                 })?;
-            db::repo::verify_binary_package_archive_signature(
+            db::repo::verify_binary_package_archive_integrity_with_trusted_keys(
                 &item.repo_name,
                 repo_cfg,
-                rootfs,
+                &item.record,
                 &cached.package_path,
                 &cached.signature_path,
+                &trusted_keys,
             )
             .with_context(|| {
                 format!(
-                    "Detached signature verification failed for {} from repo '{}'",
+                    "Integrity verification failed for {} from repo '{}'",
                     item.record.filename, item.repo_name
                 )
             })
         })?;
-        signature_pb.finish_and_clear();
+        integrity_pb.finish_and_clear();
     }
 
     if should_delegate_live_rootfs_installs(rootfs) {

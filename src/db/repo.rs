@@ -6,7 +6,7 @@ use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Mutex, OnceLock,
@@ -988,26 +988,11 @@ fn verify_with_any_trusted_public_key(
     input: &Path,
     sig_path: &Path,
 ) -> Result<PathBuf> {
-    let keys = crate::signing::list_trusted_public_keys(rootfs)?;
+    let keys = crate::signing::load_trusted_public_keys(rootfs)?;
     if keys.is_empty() {
         anyhow::bail!("No trusted minisign public keys found in rootfs or host");
     }
-
-    let mut last_failure: Option<(PathBuf, anyhow::Error)> = None;
-    for key_path in keys {
-        match crate::signing::verify_zst_file_detached_with_public_key(input, sig_path, &key_path) {
-            Ok(()) => return Ok(key_path),
-            Err(err) => last_failure = Some((key_path, err)),
-        }
-    }
-
-    let (key_path, err) = last_failure.expect("non-empty key list must produce a failure");
-    Err(err).with_context(|| {
-        format!(
-            "Detached signature verification failed with all trusted public keys (last tried {})",
-            key_path.display()
-        )
-    })
+    crate::signing::verify_zst_file_detached_with_trusted_keys(input, sig_path, &keys)
 }
 
 fn sanitize_filename_component(input: &str) -> String {
@@ -2199,16 +2184,7 @@ fn verify_binary_package_record_checksums(
     path: &Path,
     rec: &BinaryRepoPackageRecord,
 ) -> Result<()> {
-    use sha2::{Digest, Sha512};
-
-    let expected = rec.sha512.trim().to_ascii_lowercase();
-    if expected.is_empty() {
-        anyhow::bail!(
-            "Missing SHA-512 checksum for {} from repo '{}'",
-            path.display(),
-            rec.repo_name
-        );
-    }
+    let expected = expected_binary_package_sha512(path, rec)?;
 
     let mut file =
         fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
@@ -2222,7 +2198,33 @@ fn verify_binary_package_record_checksums(
         hasher.update(&buf[..n]);
     }
 
-    if crate::hex::encode_lower(hasher.finalize()) != expected {
+    verify_binary_package_sha512_digest(
+        path,
+        rec,
+        &expected,
+        &crate::hex::encode_lower(hasher.finalize()),
+    )
+}
+
+fn expected_binary_package_sha512(path: &Path, rec: &BinaryRepoPackageRecord) -> Result<String> {
+    let expected = rec.sha512.trim().to_ascii_lowercase();
+    if expected.is_empty() {
+        anyhow::bail!(
+            "Missing SHA-512 checksum for {} from repo '{}'",
+            path.display(),
+            rec.repo_name
+        );
+    }
+    Ok(expected)
+}
+
+fn verify_binary_package_sha512_digest(
+    path: &Path,
+    rec: &BinaryRepoPackageRecord,
+    expected: &str,
+    actual: &str,
+) -> Result<()> {
+    if actual != expected {
         anyhow::bail!(
             "SHA-512 mismatch for {} from repo '{}'",
             path.display(),
@@ -2230,6 +2232,48 @@ fn verify_binary_package_record_checksums(
         );
     }
     Ok(())
+}
+
+struct Sha512Reader<R> {
+    inner: R,
+    hasher: Sha512,
+}
+
+impl<R> Sha512Reader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha512::new(),
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        crate::hex::encode_lower(self.hasher.finalize())
+    }
+}
+
+impl<R: Read> Read for Sha512Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        if read > 0 {
+            self.hasher.update(&buf[..read]);
+        }
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for Sha512Reader<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        if position != SeekFrom::Start(0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "checksum reader only supports rewinding to the start",
+            ));
+        }
+        let position = self.inner.seek(position)?;
+        self.hasher = Sha512::new();
+        Ok(position)
+    }
 }
 
 fn download_binary_package_archive(
@@ -2312,12 +2356,12 @@ fn fetch_binary_package_signature(
     Ok(found)
 }
 
-fn verify_binary_package_signature(
+fn verify_binary_package_signature_with_trusted_keys(
     repo_name: &str,
     repo: &crate::config::BinaryRepo,
-    rootfs: &Path,
     pkg_path: &Path,
     sig_path: &Path,
+    trusted_keys: &[crate::signing::TrustedPublicKey],
 ) -> Result<()> {
     if !sig_path.exists() {
         if repo.allow_unsigned {
@@ -2329,7 +2373,6 @@ fn verify_binary_package_signature(
         );
     }
 
-    let trusted_keys = crate::signing::list_trusted_public_keys(rootfs)?;
     if trusted_keys.is_empty() {
         if repo.allow_unsigned {
             crate::log_warn!(
@@ -2344,13 +2387,17 @@ fn verify_binary_package_signature(
         );
     }
 
-    let _verified_key = verify_with_any_trusted_public_key(rootfs, pkg_path, sig_path)
-        .with_context(|| {
-            format!(
-                "Failed to verify detached package signature for {}",
-                pkg_path.display()
-            )
-        })?;
+    let _verified_key = crate::signing::verify_zst_file_detached_with_trusted_keys(
+        pkg_path,
+        sig_path,
+        trusted_keys,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to verify detached package signature for {}",
+            pkg_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -2373,6 +2420,31 @@ pub fn cache_binary_package_archive_with_progress(
     repo: &crate::config::BinaryRepo,
     rec: &BinaryRepoPackageRecord,
     package_cache_dir: &Path,
+    progress_cb: Option<&mut dyn FnMut(u64, Option<u64>)>,
+) -> Result<BinaryRepoCachedArchive> {
+    let client = binary_package_http_client()?;
+    cache_binary_package_archive_with_client_and_progress(
+        repo_name,
+        repo,
+        rec,
+        package_cache_dir,
+        &client,
+        progress_cb,
+    )
+}
+
+pub(crate) fn binary_package_http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .build()
+        .context("Failed to build HTTP client for binary package fetch")
+}
+
+pub(crate) fn cache_binary_package_archive_with_client_and_progress(
+    repo_name: &str,
+    repo: &crate::config::BinaryRepo,
+    rec: &BinaryRepoPackageRecord,
+    package_cache_dir: &Path,
+    client: &reqwest::blocking::Client,
     mut progress_cb: Option<&mut dyn FnMut(u64, Option<u64>)>,
 ) -> Result<BinaryRepoCachedArchive> {
     let machine_arch = std::env::consts::ARCH;
@@ -2393,12 +2465,8 @@ pub fn cache_binary_package_archive_with_progress(
     let pkg_url = join_repo_url(base_url, &rec.filename)?;
     let sig_url = join_repo_url(base_url, &format!("{}.sig", rec.filename))?;
 
-    let client = reqwest::blocking::Client::builder()
-        .build()
-        .context("Failed to build HTTP client for binary package fetch")?;
-
     let package_downloaded = if !package_path.exists() {
-        download_binary_package_archive(&client, &pkg_url, &tmp_path, &mut progress_cb)?;
+        download_binary_package_archive(client, &pkg_url, &tmp_path, &mut progress_cb)?;
         fs::rename(&tmp_path, &package_path).with_context(|| {
             format!(
                 "Failed to move {} to {}",
@@ -2419,7 +2487,7 @@ pub fn cache_binary_package_archive_with_progress(
 
     if package_downloaded || !signature_path.exists() {
         let sig_downloaded =
-            fetch_binary_package_signature(repo_name, repo, &client, &sig_url, &tmp_sig_path)?;
+            fetch_binary_package_signature(repo_name, repo, client, &sig_url, &tmp_sig_path)?;
         if sig_downloaded {
             fs::rename(&tmp_sig_path, &signature_path).with_context(|| {
                 format!(
@@ -2448,15 +2516,44 @@ pub fn verify_binary_package_archive_checksums(
     verify_binary_package_record_checksums(archive_path, rec)
 }
 
-/// Verify a cached/downloaded package archive against its detached signature.
-pub fn verify_binary_package_archive_signature(
+pub(crate) fn verify_binary_package_archive_integrity_with_trusted_keys(
     repo_name: &str,
     repo: &crate::config::BinaryRepo,
-    rootfs: &Path,
+    record: &BinaryRepoPackageRecord,
     package_path: &Path,
     signature_path: &Path,
+    trusted_keys: &[crate::signing::TrustedPublicKey],
 ) -> Result<()> {
-    verify_binary_package_signature(repo_name, repo, rootfs, package_path, signature_path)
+    if signature_path.exists() && !trusted_keys.is_empty() {
+        let expected = expected_binary_package_sha512(package_path, record)?;
+        let file = fs::File::open(package_path)
+            .with_context(|| format!("Failed to open {}", package_path.display()))?;
+        let mut reader = Sha512Reader::new(file);
+        let _verified_key = crate::signing::verify_reader_detached_with_trusted_keys(
+            &mut reader,
+            package_path,
+            signature_path,
+            trusted_keys,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to verify detached package signature for {}",
+                package_path.display()
+            )
+        })?;
+        let actual = reader.finalize_hex();
+        verify_binary_package_sha512_digest(package_path, record, &expected, &actual)?;
+        return Ok(());
+    }
+
+    verify_binary_package_archive_checksums(package_path, record)?;
+    verify_binary_package_signature_with_trusted_keys(
+        repo_name,
+        repo,
+        package_path,
+        signature_path,
+        trusted_keys,
+    )
 }
 
 /// Download a binary package archive and verify it against detached signatures
@@ -2469,22 +2566,22 @@ pub fn fetch_binary_package_archive(
     package_cache_dir: &Path,
 ) -> Result<PathBuf> {
     let cached = cache_binary_package_archive(repo_name, repo, rec, package_cache_dir)?;
-    verify_binary_package_archive_checksums(&cached.package_path, rec).with_context(|| {
-        format!(
-            "Binary package failed checksum verification: {}",
-            cached.package_path.display()
-        )
-    })?;
-    verify_binary_package_archive_signature(
+    let trusted_keys = if cached.signature_path.exists() {
+        crate::signing::load_trusted_public_keys(rootfs)?
+    } else {
+        Vec::new()
+    };
+    verify_binary_package_archive_integrity_with_trusted_keys(
         repo_name,
         repo,
-        rootfs,
+        rec,
         &cached.package_path,
         &cached.signature_path,
+        &trusted_keys,
     )
     .with_context(|| {
         format!(
-            "Binary package failed signature verification: {}",
+            "Binary package failed integrity verification: {}",
             cached.package_path.display()
         )
     })?;
@@ -3239,7 +3336,7 @@ revision = 1
     }
 
     #[test]
-    fn test_cache_binary_package_archive_supports_phased_verification() {
+    fn test_cache_binary_package_archive_supports_combined_integrity_verification() {
         let rootfs = tempfile::tempdir().unwrap();
         let repo_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
@@ -3286,14 +3383,29 @@ revision = 1
 
         verify_binary_package_archive_checksums(&cached.package_path, &rec)
             .expect("checksum verification should succeed");
-        verify_binary_package_archive_signature(
+        let trusted_keys = crate::signing::load_trusted_public_keys(rootfs.path()).unwrap();
+        verify_binary_package_archive_integrity_with_trusted_keys(
             "repo",
             &repo_cfg,
-            rootfs.path(),
+            &rec,
             &cached.package_path,
             &cached.signature_path,
+            &trusted_keys,
         )
-        .expect("signature verification should succeed");
+        .expect("combined integrity verification should succeed");
+
+        let mut wrong_record = rec.clone();
+        wrong_record.sha512 = crate::hex::encode_lower(Sha512::digest(b"wrong payload"));
+        let error = verify_binary_package_archive_integrity_with_trusted_keys(
+            "repo",
+            &repo_cfg,
+            &wrong_record,
+            &cached.package_path,
+            &cached.signature_path,
+            &trusted_keys,
+        )
+        .expect_err("combined verification must reject a checksum mismatch");
+        assert!(error.to_string().contains("SHA-512 mismatch"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use inquire::Password;
 use minisign::{PublicKey, SecretKey, SecretKeyBox, SignatureBox};
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read, Seek};
 use std::path::{Path, PathBuf};
 
 const PUBLIC_KEYS_DIR_REL: &str = "usr/share/depot/keys/public";
@@ -162,6 +162,24 @@ pub fn trusted_public_keys_dir(rootfs: &Path) -> PathBuf {
 /// List all trusted minisign public keys found in `rootfs` and then the host `/`.
 pub fn list_trusted_public_keys(rootfs: &Path) -> Result<Vec<PathBuf>> {
     list_public_key_files_in_roots(rootfs, Path::new("/"))
+}
+
+#[derive(Clone)]
+pub(crate) struct TrustedPublicKey {
+    pub(crate) path: PathBuf,
+    pub(crate) key: PublicKey,
+}
+
+pub(crate) fn load_trusted_public_keys(rootfs: &Path) -> Result<Vec<TrustedPublicKey>> {
+    list_trusted_public_keys(rootfs)?
+        .into_iter()
+        .map(|path| {
+            let key = PublicKey::from_file(&path).with_context(|| {
+                format!("Failed to load minisign public key: {}", path.display())
+            })?;
+            Ok(TrustedPublicKey { path, key })
+        })
+        .collect()
 }
 
 fn detached_sig_path(input: &Path) -> PathBuf {
@@ -388,6 +406,70 @@ pub fn verify_zst_file_detached_with_public_key(
     verify_detached_with_key_paths(input, sig_path, &keys)
 }
 
+pub(crate) fn verify_zst_file_detached_with_trusted_keys(
+    input: &Path,
+    sig_path: &Path,
+    trusted_keys: &[TrustedPublicKey],
+) -> Result<PathBuf> {
+    if !input.exists() {
+        anyhow::bail!("File not found: {}", input.display());
+    }
+    if !sig_path.exists() {
+        anyhow::bail!("Detached signature not found: {}", sig_path.display());
+    }
+    if !is_verify_supported_zst_file(input) {
+        anyhow::bail!(
+            "Verification currently only supports .zst and .zst.tmp files: {}",
+            input.display()
+        );
+    }
+
+    let mut file =
+        fs::File::open(input).with_context(|| format!("Failed to open {}", input.display()))?;
+    verify_reader_detached_with_trusted_keys(&mut file, input, sig_path, trusted_keys)
+}
+
+pub(crate) fn verify_reader_detached_with_trusted_keys<R: Read + Seek>(
+    reader: &mut R,
+    input: &Path,
+    sig_path: &Path,
+    trusted_keys: &[TrustedPublicKey],
+) -> Result<PathBuf> {
+    let signature = SignatureBox::from_file(sig_path)
+        .with_context(|| format!("Failed to load detached signature: {}", sig_path.display()))?;
+    let matching_keys = trusted_keys
+        .iter()
+        .filter(|trusted| trusted.key.keynum() == signature.keynum())
+        .collect::<Vec<_>>();
+    if matching_keys.is_empty() {
+        anyhow::bail!(
+            "No trusted minisign public key matches signature key ID {} for {}",
+            crate::hex::encode_lower(signature.keynum()),
+            input.display()
+        );
+    }
+
+    let mut last_failure = None;
+    for trusted in matching_keys {
+        reader
+            .rewind()
+            .with_context(|| format!("Failed to rewind {}", input.display()))?;
+        match minisign::verify(&trusted.key, &signature, &mut *reader, true, false, false) {
+            Ok(()) => return Ok(trusted.path.clone()),
+            Err(err) => last_failure = Some((trusted.path.clone(), err)),
+        }
+    }
+
+    let (key_path, err) = last_failure.expect("at least one matching trusted key was tried");
+    Err(err).with_context(|| {
+        format!(
+            "Detached signature verification failed for {} with trusted key {}",
+            input.display(),
+            key_path.display()
+        )
+    })
+}
+
 /// Sign one or more `.zst` files with detached minisign signatures written to `<file>.sig`.
 pub fn sign_zst_files_detached(rootfs: &Path, inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let signable_inputs = collect_signable_inputs(inputs, true)?;
@@ -581,6 +663,43 @@ mod tests {
         let tmp_file = rootfs.path().join("artifact.tar.zst.tmp");
         fs::rename(&file, &tmp_file)?;
         verify_zst_file_detached_with_public_key(&tmp_file, &sig_path, &pub_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_key_verification_selects_signature_key_id() -> Result<()> {
+        let rootfs = tempfile::tempdir()?;
+        let file = rootfs.path().join("artifact.tar.zst");
+        fs::write(&file, b"signed payload")?;
+
+        let wrong_pair = KeyPair::generate_unencrypted_keypair()?;
+        let signing_pair = KeyPair::generate_unencrypted_keypair()?;
+        let signature = minisign::sign(
+            Some(&signing_pair.pk),
+            &signing_pair.sk,
+            fs::File::open(&file)?,
+            None,
+            Some("test signature"),
+        )?;
+        let sig_path = detached_sig_path(&file);
+        fs::write(&sig_path, signature.to_bytes())?;
+
+        let wrong_path = rootfs.path().join("wrong.pub");
+        let signing_path = rootfs.path().join("signing.pub");
+        let trusted_keys = vec![
+            TrustedPublicKey {
+                path: wrong_path,
+                key: wrong_pair.pk,
+            },
+            TrustedPublicKey {
+                path: signing_path.clone(),
+                key: signing_pair.pk,
+            },
+        ];
+
+        let verified_path =
+            verify_zst_file_detached_with_trusted_keys(&file, &sig_path, &trusted_keys)?;
+        assert_eq!(verified_path, signing_path);
         Ok(())
     }
 

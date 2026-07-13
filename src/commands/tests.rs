@@ -7,7 +7,7 @@ use crate::test_support::TestEnv;
 use git2::{Oid, Repository};
 use std::path::Path;
 use std::sync::{
-    Mutex, MutexGuard,
+    Barrier, Mutex, MutexGuard,
     atomic::{AtomicUsize, Ordering as AtomicOrdering},
 };
 
@@ -104,6 +104,20 @@ fn parallel_verification_processes_every_item() -> Result<()> {
     })?;
 
     assert_eq!(completed.load(AtomicOrdering::Relaxed), items.len());
+    Ok(())
+}
+
+#[test]
+fn parallel_tasks_run_concurrently_and_preserve_input_order() -> Result<()> {
+    let items = vec![3_u8, 1, 4, 2];
+    let barrier = Barrier::new(items.len());
+
+    let results = run_parallel_tasks(&items, items.len(), |_, item| {
+        barrier.wait();
+        Ok(item * 2)
+    })?;
+
+    assert_eq!(results, vec![6, 2, 8, 4]);
     Ok(())
 }
 
