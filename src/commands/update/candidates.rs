@@ -747,26 +747,131 @@ pub(crate) fn collect_missing_update_dependencies(
     Ok(missing)
 }
 
-fn confirm_update_replacements(candidates: &[UpdateCandidate]) -> Result<()> {
-    for candidate in candidates {
-        if !candidate.replaces_installed {
-            continue;
-        }
-        if !ui::prompt_yes_no(
-            &format!(
-                "replace {} with {}?",
-                candidate.installed_package, candidate.candidate_package
-            ),
-            true,
-        )? {
-            anyhow::bail!(
-                "Replacement declined: {} -> {}",
-                candidate.installed_package,
-                candidate.candidate_package
-            );
+fn update_release(version: &str, revision: u32) -> String {
+    format!("{version}-{revision}")
+}
+
+fn package_word(count: usize) -> &'static str {
+    if count == 1 { "package" } else { "packages" }
+}
+
+fn update_package_label(candidate: &UpdateCandidate) -> String {
+    if candidate.replaces_installed {
+        format!(
+            "{} → {}",
+            candidate.installed_package, candidate.candidate_package
+        )
+    } else {
+        candidate.candidate_package.clone()
+    }
+}
+
+fn format_update_summary(
+    updates: &[UpdateCandidate],
+    missing_dependencies: &[String],
+    download_size: Option<u64>,
+) -> String {
+    let labels: Vec<_> = updates.iter().map(update_package_label).collect();
+    let label_width = labels
+        .iter()
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut output = format!("Updates ({})\n", updates.len());
+
+    for (candidate, label) in updates.iter().zip(labels) {
+        let installed = update_release(&candidate.installed_version, candidate.installed_revision);
+        let available = update_release(&candidate.candidate_version, candidate.candidate_revision);
+        let newer_build = candidate.installed_version == candidate.candidate_version
+            && candidate.installed_revision == candidate.candidate_revision
+            && compare_completed_at(
+                candidate.candidate_completed_at,
+                candidate.installed_completed_at,
+            ) == Ordering::Greater;
+        let build_note = if newer_build { " (newer build)" } else { "" };
+        output.push_str(&format!(
+            "  {label:<label_width$}  {installed} → {available}{build_note}\n"
+        ));
+    }
+
+    if let Some(bytes) = download_size {
+        output.push_str(&format!("\nDownload: {}\n", human_bytes(bytes)));
+    }
+    if !missing_dependencies.is_empty() {
+        output.push_str(&format!(
+            "Dependencies: {}\n",
+            missing_dependencies.join(", ")
+        ));
+    }
+    output.push('\n');
+    output
+}
+
+fn planned_update_download_size(
+    updates: &[UpdateCandidate],
+    dependency_plan: Option<&planner::ExecutionPlan>,
+) -> Option<u64> {
+    let mut total = 0u64;
+    for candidate in updates {
+        let UpdateOrigin::Binary { record, .. } = &candidate.origin else {
+            return None;
+        };
+        total = total.checked_add(record.size)?;
+    }
+
+    if let Some(plan) = dependency_plan {
+        for step in plan.actionable_steps() {
+            match &step.origin {
+                planner::PlanOrigin::Binary { record, .. } => {
+                    total = total.checked_add(record.size)?;
+                }
+                planner::PlanOrigin::Source { .. } => return None,
+                planner::PlanOrigin::Installed => {}
+            }
         }
     }
-    Ok(())
+
+    Some(total)
+}
+
+fn start_update_status(package_count: usize) -> (ProgressBar, bool) {
+    let interactive = std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
+    if !interactive {
+        println!(
+            "Updating {package_count} {}...",
+            package_word(package_count)
+        );
+        return (ProgressBar::hidden(), false);
+    }
+
+    let status = ProgressBar::new_spinner();
+    status.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    status.enable_steady_tick(std::time::Duration::from_millis(80));
+    status.set_message(format!(
+        "Updating {package_count} {}",
+        package_word(package_count)
+    ));
+    (status, true)
+}
+
+fn print_update_complete(updates: &[UpdateCandidate], interactive: bool) {
+    if interactive {
+        println!("Updated {} {}", updates.len(), package_word(updates.len()));
+        return;
+    }
+
+    for candidate in updates {
+        println!(
+            "Updated {} {} → {}",
+            update_package_label(candidate),
+            update_release(&candidate.installed_version, candidate.installed_revision),
+            update_release(&candidate.candidate_version, candidate.candidate_revision)
+        );
+    }
 }
 
 pub(crate) fn run_update_command(
@@ -776,35 +881,9 @@ pub(crate) fn run_update_command(
 ) -> Result<()> {
     let updates = collect_update_candidates(config, options.rootfs, packages)?;
     if updates.is_empty() {
-        ui::info("All installed packages are up to date.");
+        println!("All packages are up to date.");
         return Ok(());
     }
-
-    let targets: Vec<String> = updates
-        .iter()
-        .map(|candidate| {
-            let summary = format!(
-                "{} v{}-{} -> {} v{}-{}",
-                candidate.installed_package,
-                candidate.installed_version,
-                candidate.installed_revision,
-                candidate.candidate_package,
-                candidate.candidate_version,
-                candidate.candidate_revision
-            );
-            if candidate.installed_version == candidate.candidate_version
-                && candidate.installed_revision == candidate.candidate_revision
-                && compare_completed_at(
-                    candidate.candidate_completed_at,
-                    candidate.installed_completed_at,
-                ) == Ordering::Greater
-            {
-                format!("{summary} (newer UTC build timestamp)")
-            } else {
-                summary
-            }
-        })
-        .collect();
 
     let conflict_subjects: Vec<_> = updates
         .iter()
@@ -816,30 +895,37 @@ pub(crate) fn run_update_command(
         .collect();
     super::super::validate_no_transaction_conflicts(&conflict_subjects)?;
 
-    ui::info(format!("{} package(s) can be updated:", updates.len()));
-    for target in &targets {
-        ui::info(format!("  {}", target));
-    }
-
     let db_path = config.installed_db_path(options.rootfs);
     let missing_deps = if options.no_deps {
         Vec::new()
     } else {
         collect_missing_update_dependencies(&updates, &db_path)?
     };
-    if !missing_deps.is_empty() {
-        ui::info(format!(
-            "New dependencies required by updates: {}",
-            missing_deps.join(", ")
-        ));
-    }
 
-    if !options.dry_run && !ui::prompt_package_action("update", &targets, true)? {
+    let dependency_plan = if missing_deps.is_empty() {
+        None
+    } else {
+        Some(planner::build_dependency_install_plan(
+            config,
+            options.rootfs,
+            &missing_deps,
+            planner::PlannerOptions {
+                assume_yes: options.assume_yes,
+                prefer_binary: config.repo_settings.prefer_binary,
+                local_sibling_root: None,
+                include_test_deps: options.install_test_deps,
+                lib32_only_requested_specs: false,
+            },
+        )?)
+    };
+    let download_size = planned_update_download_size(&updates, dependency_plan.as_ref());
+    print!(
+        "{}",
+        format_update_summary(&updates, &missing_deps, download_size)
+    );
+
+    if !options.dry_run && !options.assume_yes && !ui::prompt_yes_no("Proceed?", true)? {
         anyhow::bail!("Aborted");
-    }
-
-    if !options.dry_run {
-        confirm_update_replacements(&updates)?;
     }
 
     if options.dry_run {
@@ -851,70 +937,173 @@ pub(crate) fn run_update_command(
         )?;
     }
 
-    let mut transaction_requests = Vec::new();
-    if !missing_deps.is_empty() {
-        let dep_plan = planner::build_dependency_install_plan(
-            config,
-            options.rootfs,
-            &missing_deps,
-            planner::PlannerOptions {
-                assume_yes: options.assume_yes,
-                prefer_binary: config.repo_settings.prefer_binary,
-                local_sibling_root: None,
-                include_test_deps: options.install_test_deps,
-                lib32_only_requested_specs: false,
-            },
-        )?;
-        crate::commands::print_plan_summary(&dep_plan);
-
-        if options.dry_run {
-            ui::info("Dry run enabled, stopping before dependency installation/update.");
-            return Ok(());
+    if options.dry_run {
+        if let Some(plan) = dependency_plan.as_ref() {
+            crate::commands::print_plan_summary(plan);
         }
-
-        transaction_requests.extend(super::super::install_requests_for_plan(
-            &dep_plan,
-            config,
-            options.rootfs,
-        )?);
-    } else if options.dry_run {
-        ui::info("Dry run enabled, stopping before update.");
+        println!("Dry run: no changes made.");
         return Ok(());
     }
 
-    for (idx, candidate) in updates.iter().enumerate() {
-        ui::info(format!(
-            "[{}/{}] staging update {} v{}-{} -> {} v{}-{}",
-            idx + 1,
-            updates.len(),
-            candidate.installed_package,
-            candidate.installed_version,
-            candidate.installed_revision,
-            candidate.candidate_package,
-            candidate.candidate_version,
-            candidate.candidate_revision
-        ));
-        let request = candidate_request_path(candidate, config, options.rootfs)?;
-        transaction_requests.push(request);
-    }
-    super::super::run_update_transaction_install_requests(
-        super::super::DirectInstallOptions {
-            rootfs: options.rootfs,
-            no_deps: true,
-            no_flags: options.no_flags,
-            cross_prefix: options.cross_prefix,
-            clean: options.clean,
-            dry_run: false,
-            lib32_only: false,
-            install_test_deps: options.install_test_deps,
-        },
-        config,
-        &transaction_requests,
-    )?;
+    let (status, interactive) = start_update_status(updates.len());
+    let update_result = (|| -> Result<()> {
+        let mut transaction_requests = Vec::new();
+        if let Some(plan) = dependency_plan.as_ref() {
+            crate::commands::print_plan_summary(plan);
+            transaction_requests.extend(super::super::install_requests_for_plan(
+                plan,
+                config,
+                options.rootfs,
+            )?);
+        }
 
-    if options.clean {
-        crate::commands::clean_build_workspace(config)?;
-    }
+        for candidate in &updates {
+            status.set_message(format!(
+                "Updating {} {} · preparing {}",
+                updates.len(),
+                package_word(updates.len()),
+                candidate.candidate_package
+            ));
+            let request = candidate_request_path(candidate, config, options.rootfs)?;
+            transaction_requests.push(request);
+        }
+
+        status.set_message(format!(
+            "Updating {} {} · installing",
+            updates.len(),
+            package_word(updates.len())
+        ));
+        super::super::run_update_transaction_install_requests(
+            super::super::DirectInstallOptions {
+                rootfs: options.rootfs,
+                no_deps: true,
+                no_flags: options.no_flags,
+                cross_prefix: options.cross_prefix,
+                clean: options.clean,
+                dry_run: false,
+                lib32_only: false,
+                install_test_deps: options.install_test_deps,
+            },
+            config,
+            &transaction_requests,
+        )?;
+
+        if options.clean {
+            crate::commands::clean_build_workspace(config)?;
+        }
+        Ok(())
+    })();
+    status.finish_and_clear();
+    update_result?;
+    print_update_complete(&updates, interactive);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod ux_tests {
+    use super::*;
+
+    fn binary_record(name: &str, version: &str, size: u64) -> db::repo::BinaryRepoPackageRecord {
+        db::repo::BinaryRepoPackageRecord {
+            repo_name: "core".into(),
+            name: name.into(),
+            real_name: None,
+            version: version.into(),
+            revision: 1,
+            abi_breaking: false,
+            built_against: Vec::new(),
+            completed_at: None,
+            filename: format!("{name}-{version}-1-x86_64.depot.pkg.tar.zst"),
+            size,
+            sha512: String::new(),
+            description: None,
+            homepage: None,
+            license: None,
+            provides: Vec::new(),
+            conflicts: Vec::new(),
+            replaces: Vec::new(),
+            runtime_dependencies: Vec::new(),
+            optional_dependencies: Vec::new(),
+            groups: Vec::new(),
+        }
+    }
+
+    fn binary_update(
+        name: &str,
+        installed_version: &str,
+        candidate_version: &str,
+        size: u64,
+    ) -> UpdateCandidate {
+        UpdateCandidate {
+            installed_package: name.into(),
+            candidate_package: name.into(),
+            replaces_installed: false,
+            installed_version: installed_version.into(),
+            installed_revision: 1,
+            installed_completed_at: None,
+            candidate_version: candidate_version.into(),
+            candidate_revision: 1,
+            candidate_completed_at: None,
+            runtime_dependencies: Vec::new(),
+            provides: Vec::new(),
+            conflicts: Vec::new(),
+            repo_priority: 0,
+            origin: UpdateOrigin::Binary {
+                repo_name: "core".into(),
+                record: Box::new(binary_record(name, candidate_version, size)),
+            },
+        }
+    }
+
+    #[test]
+    fn update_summary_is_compact_and_aligned() {
+        let updates = [
+            binary_update("curl", "8.11.0", "8.12.0", 3 * 1024),
+            binary_update("openssl", "3.4.0", "3.4.1", 5 * 1024),
+        ];
+
+        assert_eq!(
+            format_update_summary(&updates, &["ca-certificates".into()], Some(8 * 1024)),
+            concat!(
+                "Updates (2)\n",
+                "  curl     8.11.0-1 → 8.12.0-1\n",
+                "  openssl  3.4.0-1 → 3.4.1-1\n",
+                "\n",
+                "Download: 8.0 KiB\n",
+                "Dependencies: ca-certificates\n",
+                "\n",
+            )
+        );
+    }
+
+    #[test]
+    fn update_summary_marks_replacements_and_newer_builds() {
+        let mut update = binary_update("icu78", "78.1", "79.1", 1024);
+        update.candidate_package = "icu79".into();
+        update.replaces_installed = true;
+        update.installed_version = "79.1".into();
+        update.installed_completed_at = Some(1);
+        update.candidate_completed_at = Some(2);
+
+        let summary = format_update_summary(&[update], &[], Some(1024));
+        assert!(summary.contains("icu78 → icu79"));
+        assert!(summary.contains("79.1-1 → 79.1-1 (newer build)"));
+    }
+
+    #[test]
+    fn planned_download_size_requires_all_binary_inputs() {
+        let binary = binary_update("curl", "8.11.0", "8.12.0", 3 * 1024);
+        assert_eq!(
+            planned_update_download_size(std::slice::from_ref(&binary), None),
+            Some(3 * 1024)
+        );
+
+        let mut source = binary;
+        source.origin = UpdateOrigin::Source {
+            repo_name: "core".into(),
+            path: PathBuf::from("/repo/curl.toml"),
+        };
+        assert_eq!(planned_update_download_size(&[source], None), None);
+    }
 }
