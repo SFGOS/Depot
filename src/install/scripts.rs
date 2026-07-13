@@ -320,7 +320,7 @@ enum HookRunOutcome {
 }
 
 #[derive(Default)]
-struct ChrootMountGuard {
+pub(super) struct ChrootMountGuard {
     mounted: Vec<Mount>,
 }
 
@@ -359,7 +359,7 @@ impl Drop for ChrootMountGuard {
     }
 }
 
-fn should_use_chroot(rootfs: &Path) -> bool {
+pub(super) fn should_use_chroot(rootfs: &Path) -> bool {
     let canonical_root = fs::canonicalize("/").ok();
     let canonical_rootfs = fs::canonicalize(rootfs).ok();
     match (canonical_rootfs, canonical_root) {
@@ -372,7 +372,7 @@ fn should_bootstrap_host_shell(should_chroot: bool, is_root: bool, shell_exists:
     should_chroot && is_root && !shell_exists
 }
 
-fn mount_chroot_filesystems(
+pub(super) fn mount_chroot_filesystems(
     rootfs: &Path,
     bootstrap_script_path: Option<&Path>,
 ) -> Result<ChrootMountGuard> {

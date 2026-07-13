@@ -550,7 +550,14 @@ fn run_hook_command(
         None
     };
 
-    let mut command = if fakeroot::is_root() && rootfs.join("bin/sh").exists() {
+    let use_chroot = fakeroot::is_root() && rootfs.join("bin/sh").exists();
+    let _mounts = if should_mount_chroot_filesystems(rootfs, use_chroot) {
+        Some(super::scripts::mount_chroot_filesystems(rootfs, None)?)
+    } else {
+        None
+    };
+
+    let mut command = if use_chroot {
         let mut cmd = Command::new("chroot");
         cmd.arg(rootfs).arg("/bin/sh").arg("-lc").arg(&hook.command);
         cmd
@@ -587,6 +594,10 @@ fn run_hook_command(
     }
 
     Ok(())
+}
+
+fn should_mount_chroot_filesystems(rootfs: &Path, use_chroot: bool) -> bool {
+    use_chroot && super::scripts::should_use_chroot(rootfs)
 }
 
 fn run_command_with_optional_stdin(
@@ -660,6 +671,15 @@ mod tests {
         assert!(wildcard_match("usr/lib/*", "usr/lib/libc.so"));
         assert!(wildcard_match("lib??", "lib32"));
         assert!(!wildcard_match("usr/bin/*", "usr/lib/libc.so"));
+    }
+
+    #[test]
+    fn transaction_hooks_mount_filesystems_only_for_target_chroots() {
+        let rootfs = tempfile::tempdir().unwrap();
+
+        assert!(should_mount_chroot_filesystems(rootfs.path(), true));
+        assert!(!should_mount_chroot_filesystems(rootfs.path(), false));
+        assert!(!should_mount_chroot_filesystems(Path::new("/"), true));
     }
 
     #[test]
