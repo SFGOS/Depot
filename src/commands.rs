@@ -1378,7 +1378,13 @@ fn install_planned_packages_to_rootfs(
     rootfs: &Path,
     config: &config::Config,
 ) -> Result<()> {
-    install_planned_packages_to_rootfs_with_pre_removed(plans, rootfs, config, &HashSet::new())
+    install_planned_packages_to_rootfs_with_pre_removed(
+        plans,
+        rootfs,
+        config,
+        &HashSet::new(),
+        true,
+    )
 }
 
 fn install_planned_packages_to_rootfs_with_pre_removed(
@@ -1386,18 +1392,21 @@ fn install_planned_packages_to_rootfs_with_pre_removed(
     rootfs: &Path,
     config: &config::Config,
     pre_removed_packages: &HashSet<String>,
+    show_progress: bool,
 ) -> Result<()> {
     let mut removed_replacements = HashSet::new();
     let mut pending_post_hooks = Vec::new();
     for (idx, plan) in plans.iter().enumerate() {
-        ui::info(format!(
-            "{}/{} Installing package {}-{}-{}",
-            idx + 1,
-            plans.len(),
-            plan.spec.package.name,
-            plan.spec.package.version,
-            plan.spec.package.revision
-        ));
+        if show_progress {
+            ui::info(format!(
+                "{}/{} Installing package {}-{}-{}",
+                idx + 1,
+                plans.len(),
+                plan.spec.package.name,
+                plan.spec.package.version,
+                plan.spec.package.revision
+            ));
+        }
         for package in &plan.staged.replacement_removals {
             if pre_removed_packages.contains(package) {
                 continue;
@@ -2712,10 +2721,6 @@ fn install_update_transaction(
     install::hooks::run_transaction_hooks_batch(rootfs, install::hooks::HookPhase::Pre, &contexts)?;
 
     for removal in removals {
-        ui::info(format!(
-            "Removing package for update transaction: {}",
-            removal.package
-        ));
         remove_installed_package_without_transaction_hooks(
             &removal.package,
             rootfs,
@@ -2733,6 +2738,7 @@ fn install_update_transaction(
         rootfs,
         config,
         &pre_removed_packages,
+        false,
     )?;
     install::hooks::run_transaction_hooks_batch(
         rootfs,
@@ -2865,7 +2871,6 @@ fn run_update_transaction_install_requests(
     let install_lock_path = locking::lock_path(config);
     let _install_lock_guard = locking::try_write(&mut install_lock, &install_lock_path, "update")?;
 
-    let suppress_output = suppress_nested_install_output();
     if requests
         .iter()
         .any(|request| !is_archive_install_request(request))
@@ -2876,14 +2881,6 @@ fn run_update_transaction_install_requests(
     let mut transaction_plans = Vec::new();
     let mut resources = Vec::with_capacity(requests.len());
     for (idx, request) in requests.iter().enumerate() {
-        if !suppress_output {
-            ui::info(format!(
-                "[{}/{}] preparing update payload from {}",
-                idx + 1,
-                requests.len(),
-                request.display()
-            ));
-        }
         let build_dir = isolated_update_build_dir(config, idx);
         let prepared = prepare_direct_install_request(
             options,
@@ -2892,7 +2889,7 @@ fn run_update_transaction_install_requests(
             DirectInstallPreparationOptions {
                 build_dir: &build_dir,
                 clean_sources_before_build: false,
-                suppress_output,
+                suppress_output: true,
                 confirm_installation: false,
                 resolve_installed_conflicts: false,
             },
