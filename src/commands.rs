@@ -1292,6 +1292,163 @@ fn run_transaction_hooks_for_plans(
     install::hooks::run_transaction_hooks_batch(rootfs, phase, &contexts)
 }
 
+fn preflight_file_ownership_and_order(
+    plans: &[PlannedPackageInstall],
+    pre_removed_packages: &HashSet<String>,
+    rootfs: &Path,
+    config: &config::Config,
+) -> Result<Vec<PlannedPackageInstall>> {
+    let db_path = config.installed_db_path(rootfs);
+    let installed_ownership = db::get_file_ownership(&db_path)?;
+    let mut manifests = Vec::with_capacity(plans.len());
+    let mut plan_by_package = BTreeMap::new();
+    let mut replacement_plan_by_package = BTreeMap::new();
+    let mut violations = BTreeSet::new();
+
+    for (idx, plan) in plans.iter().enumerate() {
+        let package = &plan.spec.package.name;
+        if plan_by_package.insert(package.clone(), idx).is_some() {
+            violations.insert(format!(
+                "package '{}' appears more than once in the transaction",
+                package
+            ));
+        }
+        for replaced in &plan.staged.replacement_removals {
+            if replacement_plan_by_package
+                .insert(replaced.clone(), idx)
+                .is_some()
+            {
+                violations.insert(format!(
+                    "installed package '{}' is replaced by more than one transaction package",
+                    replaced
+                ));
+            }
+        }
+        if let Some(transition) = &plan.staged.renamed_transition
+            && replacement_plan_by_package
+                .insert(transition.replaced.name.clone(), idx)
+                .is_some()
+        {
+            violations.insert(format!(
+                "installed package '{}' is replaced by more than one transaction package",
+                transition.replaced.name
+            ));
+        }
+
+        let manifest = staging::generate_manifest_with_dirs(&plan.destdir).with_context(|| {
+            format!(
+                "Failed to inspect staged files for package '{}'",
+                plan.spec.package.name
+            )
+        })?;
+        manifests.push(manifest.files.into_iter().collect::<BTreeSet<_>>());
+    }
+
+    let mut planned_owner_by_path: BTreeMap<&str, usize> = BTreeMap::new();
+    for (idx, manifest) in manifests.iter().enumerate() {
+        for path in manifest {
+            if let Some(previous_idx) = planned_owner_by_path.insert(path, idx)
+                && plans[previous_idx].spec.package.name != plans[idx].spec.package.name
+                && !db::should_auto_clear_conflict(&plans[previous_idx].spec.package.name, path)
+            {
+                violations.insert(format!(
+                    "{} -> provided by both {} and {}",
+                    path, plans[previous_idx].spec.package.name, plans[idx].spec.package.name
+                ));
+            }
+        }
+    }
+
+    let mut edges = vec![BTreeSet::new(); plans.len()];
+    let mut indegree = vec![0_usize; plans.len()];
+    for (taker_idx, manifest) in manifests.iter().enumerate() {
+        let taker = &plans[taker_idx].spec.package.name;
+        for path in manifest {
+            let Some(owner) = installed_ownership.get(path) else {
+                continue;
+            };
+            if owner == taker
+                || pre_removed_packages.contains(owner)
+                || db::should_auto_clear_conflict(owner, path)
+            {
+                continue;
+            }
+
+            let owner_plan_idx = if let Some(owner_idx) = plan_by_package.get(owner) {
+                if manifests[*owner_idx].contains(path) {
+                    violations.insert(format!(
+                        "{} -> owned by {} and still provided by its transaction update (wanted by {})",
+                        path, owner, taker
+                    ));
+                    continue;
+                }
+                Some(*owner_idx)
+            } else if let Some(owner_idx) = replacement_plan_by_package.get(owner) {
+                let retained_by_rename = plans[*owner_idx]
+                    .staged
+                    .renamed_transition
+                    .as_ref()
+                    .is_some_and(|transition| {
+                        transition.replaced.name == *owner
+                            && transition.retained_files.contains(path)
+                    });
+                if retained_by_rename {
+                    violations.insert(format!(
+                        "{} -> retained by renamed package {} (wanted by {})",
+                        path, owner, taker
+                    ));
+                    continue;
+                }
+                Some(*owner_idx)
+            } else {
+                violations.insert(format!(
+                    "{} -> owned by {} (wanted by {})",
+                    path, owner, taker
+                ));
+                None
+            };
+
+            if let Some(owner_idx) = owner_plan_idx
+                && owner_idx != taker_idx
+                && edges[owner_idx].insert(taker_idx)
+            {
+                indegree[taker_idx] += 1;
+            }
+        }
+    }
+
+    if !violations.is_empty() {
+        let mut message = String::from("File ownership conflict detected before transaction:\n");
+        for violation in violations {
+            message.push_str(&format!("  {violation}\n"));
+        }
+        anyhow::bail!(message);
+    }
+
+    let mut order = Vec::with_capacity(plans.len());
+    let mut emitted = vec![false; plans.len()];
+    while order.len() < plans.len() {
+        let Some(next) = (0..plans.len()).find(|idx| !emitted[*idx] && indegree[*idx] == 0) else {
+            let packages = (0..plans.len())
+                .filter(|idx| !emitted[*idx])
+                .map(|idx| plans[idx].spec.package.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "File ownership handoff cycle detected before transaction among: {}",
+                packages
+            );
+        };
+        emitted[next] = true;
+        order.push(next);
+        for dependent in &edges[next] {
+            indegree[*dependent] -= 1;
+        }
+    }
+
+    Ok(order.into_iter().map(|idx| plans[idx].clone()).collect())
+}
+
 fn install_staged_to_rootfs(
     pkg_spec: &package::PackageSpec,
     destdir: &Path,
@@ -1388,6 +1545,24 @@ fn install_planned_packages_to_rootfs(
 }
 
 fn install_planned_packages_to_rootfs_with_pre_removed(
+    plans: &[PlannedPackageInstall],
+    rootfs: &Path,
+    config: &config::Config,
+    pre_removed_packages: &HashSet<String>,
+    show_progress: bool,
+) -> Result<()> {
+    let ordered_plans =
+        preflight_file_ownership_and_order(plans, pre_removed_packages, rootfs, config)?;
+    install_preflighted_planned_packages_to_rootfs_with_pre_removed(
+        &ordered_plans,
+        rootfs,
+        config,
+        pre_removed_packages,
+        show_progress,
+    )
+}
+
+fn install_preflighted_planned_packages_to_rootfs_with_pre_removed(
     plans: &[PlannedPackageInstall],
     rootfs: &Path,
     config: &config::Config,
@@ -1510,6 +1685,8 @@ fn install_package_outputs_to_rootfs(
     config: &config::Config,
 ) -> Result<Vec<InstalledPackageOutcome>> {
     let plans = plan_package_outputs_for_install(pkg_spec, destdir, rootfs, config)?;
+    let ordered_plans =
+        preflight_file_ownership_and_order(&plans, &HashSet::new(), rootfs, config)?;
     let installed = plans
         .iter()
         .map(|plan| InstalledPackageOutcome {
@@ -1517,9 +1694,15 @@ fn install_package_outputs_to_rootfs(
             is_update: plan.staged.is_update,
         })
         .collect();
-    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Pre, &plans)?;
-    install_planned_packages_to_rootfs(&plans, rootfs, config)?;
-    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Post, &plans)?;
+    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Pre, &ordered_plans)?;
+    install_preflighted_planned_packages_to_rootfs_with_pre_removed(
+        &ordered_plans,
+        rootfs,
+        config,
+        &HashSet::new(),
+        true,
+    )?;
+    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Post, &ordered_plans)?;
     Ok(installed)
 }
 
@@ -2183,17 +2366,7 @@ fn run_direct_archive_install_requests(
         transaction_plans.extend(output_plans);
     }
 
-    run_transaction_hooks_for_plans(
-        options.rootfs,
-        install::hooks::HookPhase::Pre,
-        &transaction_plans,
-    )?;
-    install_planned_packages_to_rootfs(&transaction_plans, options.rootfs, config)?;
-    run_transaction_hooks_for_plans(
-        options.rootfs,
-        install::hooks::HookPhase::Post,
-        &transaction_plans,
-    )?;
+    install_direct_transaction(&transaction_plans, options.rootfs, config)?;
 
     Ok(true)
 }
@@ -2624,9 +2797,16 @@ fn install_direct_transaction(
     rootfs: &Path,
     config: &config::Config,
 ) -> Result<()> {
-    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Pre, plans)?;
-    install_planned_packages_to_rootfs(plans, rootfs, config)?;
-    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Post, plans)?;
+    let ordered_plans = preflight_file_ownership_and_order(plans, &HashSet::new(), rootfs, config)?;
+    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Pre, &ordered_plans)?;
+    install_preflighted_planned_packages_to_rootfs_with_pre_removed(
+        &ordered_plans,
+        rootfs,
+        config,
+        &HashSet::new(),
+        true,
+    )?;
+    run_transaction_hooks_for_plans(rootfs, install::hooks::HookPhase::Post, &ordered_plans)?;
     Ok(())
 }
 
@@ -2717,7 +2897,13 @@ fn install_update_transaction(
     rootfs: &Path,
     config: &config::Config,
 ) -> Result<()> {
-    let contexts = transaction_contexts_for_update(removals, plans);
+    let pre_removed_packages: HashSet<String> = removals
+        .iter()
+        .map(|removal| removal.package.clone())
+        .collect();
+    let ordered_plans =
+        preflight_file_ownership_and_order(plans, &pre_removed_packages, rootfs, config)?;
+    let contexts = transaction_contexts_for_update(removals, &ordered_plans);
     install::hooks::run_transaction_hooks_batch(rootfs, install::hooks::HookPhase::Pre, &contexts)?;
 
     for removal in removals {
@@ -2729,12 +2915,8 @@ fn install_update_transaction(
         )?;
     }
 
-    let pre_removed_packages: HashSet<String> = removals
-        .iter()
-        .map(|removal| removal.package.clone())
-        .collect();
-    install_planned_packages_to_rootfs_with_pre_removed(
-        plans,
+    install_preflighted_planned_packages_to_rootfs_with_pre_removed(
+        &ordered_plans,
         rootfs,
         config,
         &pre_removed_packages,

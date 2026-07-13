@@ -6,6 +6,7 @@ use crate::package::PackageSpec;
 use crate::staging;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -24,8 +25,41 @@ fn should_ignore_sbase_conflicts() -> bool {
     std::env::var_os(DEPOT_BOOTSTRAP_IGNORE_SBASE_CONFLICTS).is_some()
 }
 
-fn should_auto_clear_conflict(owner: &str, path: &str) -> bool {
+pub(crate) fn should_auto_clear_conflict(owner: &str, path: &str) -> bool {
     (owner == "sbase" && should_ignore_sbase_conflicts()) || is_auto_removable_path(path)
+}
+
+/// Return every installed file path and its owning package.
+pub(crate) fn get_file_ownership(db_path: &Path) -> Result<BTreeMap<String, String>> {
+    if !db_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("Failed to open package database at {}", db_path.display()))?;
+    init_db(&conn).with_context(|| {
+        format!(
+            "Failed to initialize package database at {}",
+            db_path.display()
+        )
+    })?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.path, p.name
+             FROM files f
+             JOIN packages p ON p.id = f.package_id
+             ORDER BY f.path, p.name",
+        )
+        .context("Failed to prepare installed file ownership query")?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .context("Failed to query installed file ownership")?;
+    let mut ownership = BTreeMap::new();
+    for row in rows {
+        let (path, owner) = row.context("Failed to read installed file ownership row")?;
+        ownership.insert(path, owner);
+    }
+    Ok(ownership)
 }
 
 /// Installed package row from the local package database.

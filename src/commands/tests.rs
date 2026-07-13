@@ -1158,6 +1158,123 @@ fn plan_staged_install_reads_updates_from_rootfs_installed_db() -> Result<()> {
     Ok(())
 }
 
+fn file_ownership_test_spec(name: &str, version: &str) -> package::PackageSpec {
+    let mut spec = test_package_spec(package::BuildType::Bin, None, &[]);
+    spec.package.name = name.to_string();
+    spec.package.version = version.to_string();
+    spec.source.clear();
+    spec
+}
+
+fn stage_file(destdir: &Path, path: &str, contents: &str) -> Result<()> {
+    let file = destdir.join(path);
+    fs::create_dir_all(
+        file.parent()
+            .context("Staged file path must have a parent")?,
+    )?;
+    fs::write(file, contents)?;
+    Ok(())
+}
+
+#[test]
+fn transaction_orders_relinquishing_update_before_new_file_owner() -> Result<()> {
+    let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+    let payloads = tempfile::tempdir().context("Failed to create payload dir")?;
+    let mut cfg = config::Config::for_rootfs(rootfs.path());
+    cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+    cfg.db_dir = rootfs.path().join("var/lib/depot");
+    let db_path = cfg.installed_db_path(rootfs.path());
+
+    let old_alpha = file_ownership_test_spec("alpha", "1.0");
+    let old_alpha_dest = payloads.path().join("old-alpha");
+    stage_file(&old_alpha_dest, "usr/bin/shared", "alpha-old")?;
+    stage_file(rootfs.path(), "usr/bin/shared", "alpha-old")?;
+    db::register_package(&db_path, &old_alpha, &old_alpha_dest)?;
+
+    let new_alpha = file_ownership_test_spec("alpha", "2.0");
+    let new_alpha_dest = payloads.path().join("new-alpha");
+    stage_file(&new_alpha_dest, "usr/bin/alpha", "alpha-new")?;
+    let beta = file_ownership_test_spec("beta", "1.0");
+    let beta_dest = payloads.path().join("beta");
+    stage_file(&beta_dest, "usr/bin/shared", "beta")?;
+
+    let mut plans = plan_package_outputs_for_install(&beta, &beta_dest, rootfs.path(), &cfg)?;
+    plans.extend(plan_package_outputs_for_install(
+        &new_alpha,
+        &new_alpha_dest,
+        rootfs.path(),
+        &cfg,
+    )?);
+
+    let ordered = preflight_file_ownership_and_order(&plans, &HashSet::new(), rootfs.path(), &cfg)?;
+    assert_eq!(ordered[0].spec.package.name, "alpha");
+    assert_eq!(ordered[1].spec.package.name, "beta");
+
+    install_direct_transaction(&plans, rootfs.path(), &cfg)?;
+
+    assert_eq!(
+        fs::read_to_string(rootfs.path().join("usr/bin/shared"))?,
+        "beta"
+    );
+    assert_eq!(
+        db::owns_path(&db_path, Path::new("usr/bin/shared"))?,
+        Some("beta".into())
+    );
+    assert_eq!(
+        db::get_package_version(&db_path, "alpha")?,
+        Some("2.0".into())
+    );
+    Ok(())
+}
+
+#[test]
+fn transaction_rejects_file_still_owned_after_planned_update_before_mutation() -> Result<()> {
+    let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
+    let payloads = tempfile::tempdir().context("Failed to create payload dir")?;
+    let mut cfg = config::Config::for_rootfs(rootfs.path());
+    cfg.build_dir = rootfs.path().join("var/cache/depot/build");
+    cfg.db_dir = rootfs.path().join("var/lib/depot");
+    let db_path = cfg.installed_db_path(rootfs.path());
+
+    let old_alpha = file_ownership_test_spec("alpha", "1.0");
+    let old_alpha_dest = payloads.path().join("old-alpha");
+    stage_file(&old_alpha_dest, "usr/bin/shared", "alpha-old")?;
+    stage_file(rootfs.path(), "usr/bin/shared", "alpha-old")?;
+    db::register_package(&db_path, &old_alpha, &old_alpha_dest)?;
+
+    let new_alpha = file_ownership_test_spec("alpha", "2.0");
+    let new_alpha_dest = payloads.path().join("new-alpha");
+    stage_file(&new_alpha_dest, "usr/bin/shared", "alpha-new")?;
+    let beta = file_ownership_test_spec("beta", "1.0");
+    let beta_dest = payloads.path().join("beta");
+    stage_file(&beta_dest, "usr/bin/shared", "beta")?;
+
+    let mut plans = plan_package_outputs_for_install(&beta, &beta_dest, rootfs.path(), &cfg)?;
+    plans.extend(plan_package_outputs_for_install(
+        &new_alpha,
+        &new_alpha_dest,
+        rootfs.path(),
+        &cfg,
+    )?);
+
+    let err = install_direct_transaction(&plans, rootfs.path(), &cfg)
+        .expect_err("retained ownership conflict should fail preflight");
+    assert!(
+        err.to_string()
+            .contains("still provided by its transaction update")
+    );
+    assert_eq!(
+        fs::read_to_string(rootfs.path().join("usr/bin/shared"))?,
+        "alpha-old"
+    );
+    assert_eq!(
+        db::get_package_version(&db_path, "alpha")?,
+        Some("1.0".into())
+    );
+    assert_eq!(db::get_package_version(&db_path, "beta")?, None);
+    Ok(())
+}
+
 #[test]
 fn renamed_abi_updates_keep_versioned_shared_libraries() -> Result<()> {
     let rootfs = tempfile::tempdir().context("Failed to create temp rootfs")?;
