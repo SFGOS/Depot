@@ -170,7 +170,7 @@ pub fn build(
             })?;
         }
 
-        let mut install_cmd = fakeroot::wrap_install_command("meson", &install_destdir);
+        let mut install_cmd = fakeroot::wrap_install_command("meson", &install_destdir)?;
         install_cmd.arg("install");
         install_cmd.arg("-C").arg(&build_dir);
 
@@ -336,7 +336,7 @@ pub(crate) fn run_helper_install(
         .unwrap_or_else(|| resolve_build_dir(&helper_source_dir(), &flags));
     let destdir = std::env::var("DESTDIR").context("DESTDIR must be set for meson_install")?;
 
-    let mut install_cmd = fakeroot::wrap_install_command("meson", Path::new(&destdir));
+    let mut install_cmd = fakeroot::wrap_install_command("meson", Path::new(&destdir))?;
     install_cmd.arg("install");
     install_cmd.arg("-C").arg(&build_dir);
     for arg in extra_args {

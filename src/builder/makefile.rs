@@ -100,7 +100,7 @@ pub fn build(
             crate::log_info!("  Executing: {}", cmd_str);
 
             // We need to run each command under internal fakeroot
-            let mut cmd = crate::fakeroot::wrap_install_command("sh", &install_destdir);
+            let mut cmd = crate::fakeroot::wrap_install_command("sh", &install_destdir)?;
             cmd.arg("-c").arg(&cmd_str);
             cmd.current_dir(src_dir);
 

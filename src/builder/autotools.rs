@@ -339,7 +339,7 @@ pub fn build(
             Some("install"),
         );
         for install_dir in install_dirs {
-            let mut install_cmd = fakeroot::wrap_install_command(make_exec, &install_destdir);
+            let mut install_cmd = fakeroot::wrap_install_command(make_exec, &install_destdir)?;
             install_cmd.current_dir(&install_dir);
             if make_exec_supports_make_assignments(make_exec)
                 && !has_make_variable_override(&flags.make_install_vars, "DESTDIR")
@@ -652,7 +652,7 @@ pub(crate) fn run_helper_install(
     );
 
     for install_dir in install_dirs {
-        let mut install_cmd = fakeroot::wrap_install_command(make_exec, Path::new(&destdir));
+        let mut install_cmd = fakeroot::wrap_install_command(make_exec, Path::new(&destdir))?;
         install_cmd.current_dir(&install_dir);
         if make_exec_supports_make_assignments(make_exec)
             && !has_make_variable_override(&flags.make_install_vars, "DESTDIR")

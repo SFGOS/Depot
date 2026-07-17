@@ -156,7 +156,7 @@ pub fn build(
                 }
             );
             // Use POSIX `sh` (doing something wrong if your system doesn't have it...)
-            let mut cmd = fakeroot::wrap_install_command("sh", &install_destdir);
+            let mut cmd = fakeroot::wrap_install_command("sh", &install_destdir)?;
             let wrapper = crate::shell_helpers::wrap_shell_command(". \"$1\"");
             // Run custom scripts through `sh -c` so helper commands like `haul`
             // work even when the helper scripts live on a `noexec` mount.
@@ -257,7 +257,7 @@ fn build_function_mode_install_command(
     destdir: &Path,
     build_script: &Path,
     build_ran: bool,
-) -> Command {
+) -> Result<Command> {
     let mut wrapper = function_mode_shell_prelude();
     wrapper.push_str(&format!(
         "depot_build_ran={}\n",
@@ -311,9 +311,9 @@ fn build_function_mode_install_command(
         wrapper.push_str("fi\n");
     }
 
-    let mut cmd = fakeroot::wrap_install_command("sh", destdir);
+    let mut cmd = fakeroot::wrap_install_command("sh", destdir)?;
     cmd.arg("-c").arg(wrapper).arg("sh").arg(build_script);
-    cmd
+    Ok(cmd)
 }
 
 fn run_function_mode_build_script(
@@ -357,7 +357,7 @@ fn run_function_mode_build_script(
         .unwrap_or(false);
 
     let mut install_cmd =
-        build_function_mode_install_command(spec, install_destdir, build_script, build_ran);
+        build_function_mode_install_command(spec, install_destdir, build_script, build_ran)?;
     install_cmd.current_dir(build_dir);
     crate::builder::prepare_tool_command(&mut install_cmd, env_vars);
     let install_status = crate::interrupts::command_status(&mut install_cmd).map_err(|e| {
@@ -613,18 +613,20 @@ depot_install() {
     }
 
     #[test]
-    fn test_build_function_mode_commands_split_fakeroot_boundary() {
+    fn test_build_function_mode_commands_split_fakeroot_boundary() -> Result<()> {
+        let tmp_dest = tempdir()?;
         let build_script = Path::new("/tmp/build.sh");
         let state_file = Path::new("/tmp/build-state");
-        let install_destdir = Path::new("/tmp/destdir");
+        let install_destdir = tmp_dest.path();
 
         let build_cmd = build_function_mode_build_command(build_script, state_file);
         assert_eq!(build_cmd.get_program(), std::ffi::OsStr::new("sh"));
 
         let spec = mk_spec("custom-function-fakeroot-split", "1.0");
         let install_cmd =
-            build_function_mode_install_command(&spec, install_destdir, build_script, true);
+            build_function_mode_install_command(&spec, install_destdir, build_script, true)?;
         assert_eq!(install_cmd.get_program(), std::ffi::OsStr::new("sh"));
+        Ok(())
     }
 
     #[test]

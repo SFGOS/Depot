@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use tar::{Builder, EntryType};
+use tar::{Builder, EntryType, Header, HeaderMode};
 use zstd::stream::write::Encoder;
 
 type HardlinkKey = (u64, u64);
@@ -40,6 +40,20 @@ fn license_value(licenses: &[String]) -> toml::Value {
                 .collect(),
         )
     }
+}
+
+fn package_header(
+    path: &Path,
+    metadata: &fs::Metadata,
+    symlink: bool,
+    mode: HeaderMode,
+) -> Result<Header> {
+    let mut header = Header::new_gnu();
+    header.set_metadata_in_mode(metadata, mode);
+    let (uid, gid) = crate::fakeroot::archive_ownership(path, metadata, symlink)?;
+    header.set_uid(uid);
+    header.set_gid(gid);
+    Ok(header)
 }
 
 pub struct Packager {
@@ -109,15 +123,16 @@ impl Packager {
 
             let file_type = entry.file_type();
             if file_type.is_dir() {
-                tar.append_dir(rel_path, path)?;
+                let metadata = fs::symlink_metadata(path)?;
+                let mut header = package_header(path, &metadata, false, HeaderMode::Complete)?;
+                header.set_size(0);
+                tar.append_data(&mut header, rel_path, std::io::empty())?;
             } else if file_type.is_symlink() {
                 // For symlinks, we need to read the link and append to tar correctly
                 let target = fs::read_link(path)?;
-                let mut header = tar::Header::new_gnu();
-                header.set_metadata_in_mode(
-                    &fs::symlink_metadata(path)?,
-                    tar::HeaderMode::Deterministic,
-                );
+                let metadata = fs::symlink_metadata(path)?;
+                let mut header = package_header(path, &metadata, true, HeaderMode::Deterministic)?;
+                header.set_size(0);
                 tar.append_link(&mut header, rel_path, target)?;
             } else {
                 // Files
@@ -126,14 +141,15 @@ impl Packager {
                 if let Some(first_rel_path) =
                     hardlink_key.and_then(|key| archived_hardlinks.get(&key))
                 {
-                    let mut header = tar::Header::new_gnu();
-                    header.set_metadata_in_mode(&metadata, tar::HeaderMode::Deterministic);
+                    let mut header =
+                        package_header(path, &metadata, false, HeaderMode::Deterministic)?;
                     header.set_entry_type(EntryType::Link);
                     header.set_size(0);
                     tar.append_link(&mut header, rel_path, first_rel_path)?;
                 } else {
                     let mut file = fs::File::open(path)?;
-                    tar.append_file(rel_path, &mut file)?;
+                    let mut header = package_header(path, &metadata, false, HeaderMode::Complete)?;
+                    tar.append_data(&mut header, rel_path, &mut file)?;
                     if let Some(key) = hardlink_key {
                         archived_hardlinks.insert(key, rel_path.to_path_buf());
                     }
@@ -682,5 +698,42 @@ mod tests {
         assert_eq!(coreutils_meta.ino(), ls_meta.ino());
         assert_eq!(coreutils_meta.nlink(), 2);
         assert_eq!(ls_meta.nlink(), 2);
+    }
+
+    #[test]
+    fn test_create_package_preserves_rootless_fakeroot_ownership() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dest = tmp.path().join("dest");
+        let out = tmp.path().join("out");
+        fs::create_dir_all(dest.join("usr/lib"))?;
+        fs::create_dir_all(&out)?;
+
+        let mut command = crate::fakeroot::wrap_install_command("/bin/sh", &dest)?;
+        command.arg("-c").arg(
+            "/usr/bin/touch \"$DESTDIR/usr/lib/dbus-daemon-launch-helper\"; \
+             /usr/bin/chown 0:81 \"$DESTDIR/usr/lib/dbus-daemon-launch-helper\"; \
+             /usr/bin/chmod 4750 \"$DESTDIR/usr/lib/dbus-daemon-launch-helper\"",
+        );
+        let status = command.status()?;
+        assert!(status.success());
+
+        let packager = mk_packager(dest);
+        let archive_path = packager.create_package(&out, "x86_64")?;
+        let archive_file = fs::File::open(archive_path)?;
+        let decoder = zstd::Decoder::new(archive_file)?;
+        let mut archive = tar::Archive::new(decoder);
+        let mut found = false;
+        for entry in archive.entries()? {
+            let entry = entry?;
+            if entry.path()?.as_ref() == Path::new("usr/lib/dbus-daemon-launch-helper") {
+                assert_eq!(entry.header().uid()?, 0);
+                assert_eq!(entry.header().gid()?, 81);
+                assert_eq!(entry.header().mode()? & 0o7777, 0o4750);
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+        Ok(())
     }
 }

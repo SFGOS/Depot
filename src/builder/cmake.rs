@@ -227,7 +227,7 @@ pub fn build(
             })?;
         }
 
-        let mut install_cmd = fakeroot::wrap_install_command("cmake", &install_destdir);
+        let mut install_cmd = fakeroot::wrap_install_command("cmake", &install_destdir)?;
         if !install_targets.is_empty() {
             install_cmd.arg("--build").arg(&build_dir);
             install_cmd.arg("--target");
@@ -466,7 +466,7 @@ pub(crate) fn run_helper_install(
     let destdir = std::env::var("DESTDIR").context("DESTDIR must be set for cmake_install")?;
     let install_targets = phase_targets(&flags.make_install_target, &flags.make_install_targets);
 
-    let mut install_cmd = fakeroot::wrap_install_command("cmake", Path::new(&destdir));
+    let mut install_cmd = fakeroot::wrap_install_command("cmake", Path::new(&destdir))?;
     if install_targets.is_empty() {
         install_cmd.arg("--install").arg(&build_dir);
     } else {
